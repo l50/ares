@@ -1,0 +1,64 @@
+---
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=10240]
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-json
+      - id: check-symlinks
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.2
+    hooks:
+      - id: codespell
+        entry: codespell -q 3 -f --skip=".git,.github,README.md,target,Cargo.lock" --ignore-words-list="astroid,braket,unstall,infinit,sems,te"
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        pass_filenames: false
+
+  # Rust checks
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: Rust format check
+        entry: cargo fmt --all
+        language: system
+        files: '\.rs$'
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: Rust clippy lint
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        files: '\.rs$'
+        pass_filenames: false
+
+      - id: cargo-check
+        name: Rust compile check
+        entry: cargo check --all-targets
+        language: system
+        files: '\.rs$'
+        pass_filenames: false
+
+      - id: cargo-test
+        name: Rust tests
+        entry: cargo test
+        language: system
+        files: '\.rs$'
+        pass_filenames: false
