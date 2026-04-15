@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde_yaml = { workspace = true }
 regex = { workspace = true }
-md-5 = "0.10"
+md-5 = "0.11"
 base64 = "0.22"
 tera = { workspace = true }
 sqlx = { workspace = true }
