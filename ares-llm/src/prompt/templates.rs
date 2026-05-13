@@ -45,6 +45,8 @@ const TASK_PRIVESC_ENUMERATION_TEMPLATE: &str =
     include_str!("../../templates/redteam/tasks/privesc_enumeration.md.tera");
 const TASK_ACL_ANALYSIS_TEMPLATE: &str =
     include_str!("../../templates/redteam/tasks/acl_analysis.md.tera");
+const TASK_ACL_CHAIN_STEP_TEMPLATE: &str =
+    include_str!("../../templates/redteam/tasks/acl_chain_step.md.tera");
 const TASK_COMMAND_TEMPLATE: &str = include_str!("../../templates/redteam/tasks/command.md.tera");
 
 const TASK_EXPLOIT_ADCS_ENUMERATE_TEMPLATE: &str =
@@ -144,6 +146,7 @@ pub const TASK_LATERAL: &str = "redteam/tasks/lateral";
 pub const TASK_COERCION: &str = "redteam/tasks/coercion";
 pub const TASK_PRIVESC_ENUMERATION: &str = "redteam/tasks/privesc_enumeration";
 pub const TASK_ACL_ANALYSIS: &str = "redteam/tasks/acl_analysis";
+pub const TASK_ACL_CHAIN_STEP: &str = "redteam/tasks/acl_chain_step";
 pub const TASK_COMMAND: &str = "redteam/tasks/command";
 
 // Exploit task templates
@@ -231,6 +234,7 @@ static TEMPLATES: LazyLock<Tera> = LazyLock::new(|| {
         (TASK_COERCION, TASK_COERCION_TEMPLATE),
         (TASK_PRIVESC_ENUMERATION, TASK_PRIVESC_ENUMERATION_TEMPLATE),
         (TASK_ACL_ANALYSIS, TASK_ACL_ANALYSIS_TEMPLATE),
+        (TASK_ACL_CHAIN_STEP, TASK_ACL_CHAIN_STEP_TEMPLATE),
         (TASK_COMMAND, TASK_COMMAND_TEMPLATE),
         // Exploit task templates
         (

@@ -102,6 +102,16 @@ pub async fn undominated_forests(state: &SharedState) -> Vec<String> {
     )
 }
 
+/// Redis-authoritative count of red-team tasks still pending completion.
+async fn redis_pending_red_tasks(dispatcher: &Arc<Dispatcher>) -> Result<usize, redis::RedisError> {
+    let key = ares_core::state::build_key(
+        &dispatcher.config.operation_id,
+        ares_core::state::KEY_PENDING_TASKS,
+    );
+    let mut conn = dispatcher.queue.connection();
+    redis::cmd("HLEN").arg(&key).query_async(&mut conn).await
+}
+
 /// Extract forest root from a domain FQDN.
 ///
 /// For `north.contoso.local` → `contoso.local`
@@ -206,10 +216,42 @@ pub async fn wait_for_completion(
                     None // Continue — waiting for golden ticket
                 }
             } else {
-                // Default: continue until all forests are dominated
+                // Default: continue until all forests are dominated,
+                // then allow a post-exploitation grace period for group/ACL/ADCS
+                // enumeration to complete.
                 let remaining = undominated_forests(state).await;
                 if remaining.is_empty() {
-                    Some("all forests dominated")
+                    // Grace period: continue for 180s after all forests dominated
+                    // to allow post-exploitation automation (group enum, ACL
+                    // discovery, ADCS enumeration) to fire and complete.
+                    // 180s needed because: automations check on 20-60s intervals,
+                    // domain hashes may arrive late, and LLM tasks need time to
+                    // complete LDAP queries.
+                    let inner = state.read().await;
+                    let all_dominated_at = inner.all_forests_dominated_at;
+                    drop(inner);
+                    if let Some(dominated_at) = all_dominated_at {
+                        let grace = Duration::from_secs(180);
+                        let since = dominated_at.elapsed();
+                        if since >= grace {
+                            Some("all forests dominated (post-exploitation complete)")
+                        } else {
+                            debug!(
+                                remaining_secs = (grace - since).as_secs(),
+                                "All forests dominated — post-exploitation grace period"
+                            );
+                            None // Still in grace period
+                        }
+                    } else {
+                        // First time we see all forests dominated — record the timestamp
+                        let mut inner = state.write().await;
+                        inner.all_forests_dominated_at = Some(tokio::time::Instant::now());
+                        drop(inner);
+                        info!(
+                            "All forests dominated — starting 180s post-exploitation grace period"
+                        );
+                        None
+                    }
                 } else {
                     debug!(
                         undominated = ?remaining,
@@ -304,6 +346,58 @@ pub async fn wait_for_completion(
                             if *shutdown_rx.borrow() {
                                 break;
                             }
+                        }
+                    }
+                }
+            }
+
+            // Wait for active red team tasks and deferred queue to drain
+            // before signalling shutdown. Cap at 5 minutes to avoid hanging.
+            let red_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            loop {
+                if *shutdown_rx.borrow() {
+                    info!("Completion monitor interrupted by shutdown while waiting for red team drain");
+                    break;
+                }
+
+                if tokio::time::Instant::now() >= red_deadline {
+                    warn!("Red team drain deadline reached (5m) — proceeding with shutdown");
+                    break;
+                }
+
+                let active_tasks = dispatcher.tracker.total().await;
+                let deferred_tasks = dispatcher.deferred.total_count().await;
+                let redis_pending_tasks = match redis_pending_red_tasks(dispatcher).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        warn!(err = %e, "Failed to read pending red task count from Redis");
+                        usize::MAX
+                    }
+                };
+
+                if redis_pending_tasks == 0 && deferred_tasks == 0 {
+                    if active_tasks != 0 {
+                        warn!(
+                            active_tasks,
+                            "Local active-task tracker is non-zero, but Redis has no pending tasks; treating tracker entries as stale and proceeding with shutdown"
+                        );
+                    }
+                    info!("All red team tasks drained");
+                    break;
+                }
+
+                info!(
+                    active_tasks,
+                    redis_pending_tasks,
+                    deferred_tasks,
+                    "Waiting for red team tasks to drain before shutdown..."
+                );
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
                         }
                     }
                 }

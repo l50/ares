@@ -11,8 +11,10 @@ const TRUST_DIRECTION_BIDIRECTIONAL: u32 = 3;
 const TRUST_TYPE_PARENT_CHILD: u32 = 1; // same forest
 const TRUST_TYPE_TREE_ROOT: u32 = 2; // tree root (also intra-forest)
 
-/// LDAP trustAttributes (MS-ADTS 6.1.6.7.9) flag for forest transitive trust.
+/// LDAP trustAttributes (MS-ADTS 6.1.6.7.9) flags.
 const TRUST_ATTR_FOREST_TRANSITIVE: u32 = 0x00000008;
+const TRUST_ATTR_WITHIN_FOREST: u32 = 0x00000020;
+const TRUST_ATTR_QUARANTINED_DOMAIN: u32 = 0x00000004;
 
 /// Parse `enumerate_domain_trusts` ldapsearch output into TrustInfo-compatible JSON values.
 ///
@@ -46,8 +48,19 @@ pub fn parse_domain_trusts(output: &str) -> Vec<Value> {
 
         let classified_type = classify_trust_type(trust_type, trust_attributes, cn);
 
-        let sid_filtering =
-            trust_attributes & TRUST_ATTR_FOREST_TRANSITIVE != 0 || classified_type == "forest";
+        // Modern AD defaults to SID filtering on cross-forest/external trusts,
+        // but `netdom trust /SidFiltering /Disable` is a common lab and
+        // production reconfiguration with no corresponding LDAP attribute. The
+        // only authoritative LDAP-visible signal that filtering is *on* is the
+        // QUARANTINED_DOMAIN bit, which AD sets when a trust has been
+        // explicitly quarantined. Inferring filtering from FOREST_TRANSITIVE
+        // alone (or from classified_type) is a false-positive that
+        // permanently suppresses `forge_inter_realm_and_dump` against any
+        // misconfigured cross-forest trust — losing the entire foreign forest
+        // (the op-20260502-185055 fabrikam regression). The forge's
+        // dedup-on-empty-output path already handles the false-negative case
+        // (~30s doomed DCSync, then dedup locks and fallbacks fire).
+        let sid_filtering = trust_attributes & TRUST_ATTR_QUARANTINED_DOMAIN != 0;
 
         Some(json!({
             "domain": cn.to_lowercase(),
@@ -111,12 +124,27 @@ pub fn parse_domain_trusts(output: &str) -> Vec<Value> {
 }
 
 /// Classify trust type from LDAP trustType and trustAttributes values.
+///
+/// trustAttributes is the authoritative signal:
+/// - WITHIN_FOREST (0x20) → intra-forest (parent_child or tree_root)
+/// - FOREST_TRANSITIVE (0x08) → cross-forest
+/// - QUARANTINED_DOMAIN (0x04) → external (with SID filtering)
+///
+/// trustType is largely informational in modern AD (almost always 2 = uplevel).
+/// Fall back to cn-label heuristics only when attributes are missing.
 fn classify_trust_type(trust_type: u32, trust_attributes: u32, cn: &str) -> String {
-    // Forest transitive flag → cross-forest trust
+    // Authoritative attribute checks first.
+    if trust_attributes & TRUST_ATTR_WITHIN_FOREST != 0 {
+        return "parent_child".to_string();
+    }
     if trust_attributes & TRUST_ATTR_FOREST_TRANSITIVE != 0 {
         return "forest".to_string();
     }
+    if trust_attributes & TRUST_ATTR_QUARANTINED_DOMAIN != 0 {
+        return "external".to_string();
+    }
 
+    // Fall back to legacy trustType-based heuristics.
     match trust_type {
         TRUST_TYPE_PARENT_CHILD => "parent_child".to_string(),
         TRUST_TYPE_TREE_ROOT => {
@@ -150,7 +178,9 @@ flatName: FABRIKAM
         assert_eq!(trusts[0]["flat_name"], "FABRIKAM");
         assert_eq!(trusts[0]["direction"], "bidirectional");
         assert_eq!(trusts[0]["trust_type"], "forest");
-        assert!(trusts[0]["sid_filtering"].as_bool().unwrap());
+        // FOREST_TRANSITIVE (0x08) alone does NOT imply SID filtering — only
+        // QUARANTINED_DOMAIN (0x04) is authoritative. See parse_domain_trusts.
+        assert!(!trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
     #[test]
@@ -221,6 +251,10 @@ flatName: CHILD
         assert_eq!(trusts.len(), 1);
         assert_eq!(trusts[0]["direction"], "outbound");
         assert_eq!(trusts[0]["trust_type"], "external");
+        // Without QUARANTINED_DOMAIN we don't infer SID filtering — labs and
+        // misconfigured prod often have it disabled and there's no other
+        // LDAP-visible signal. The forge will attempt and dedup-on-empty if
+        // filtering is actually on.
         assert!(!trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
@@ -248,6 +282,30 @@ flatName: CHILD
         let trusts = parse_domain_trusts(output);
         assert_eq!(trusts.len(), 1);
         assert_eq!(trusts[0]["trust_type"], "parent_child");
+    }
+
+    #[test]
+    fn parse_trust_within_forest_from_child_view() {
+        // When enumerating from child looking up to parent, cn is short
+        // ("contoso.local") but trustAttributes has WITHIN_FOREST (0x20).
+        // The attribute is authoritative and should yield parent_child.
+        let output =
+            "cn: contoso.local\ntrustDirection: 3\ntrustType: 2\ntrustAttributes: 32\nflatName: CONTOSO\n";
+        let trusts = parse_domain_trusts(output);
+        assert_eq!(trusts.len(), 1);
+        assert_eq!(trusts[0]["trust_type"], "parent_child");
+        assert!(!trusts[0]["sid_filtering"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn parse_trust_quarantined_external() {
+        // QUARANTINED_DOMAIN (0x04) → external trust with SID filtering.
+        let output =
+            "cn: partner.com\ntrustDirection: 3\ntrustType: 2\ntrustAttributes: 4\nflatName: PARTNER\n";
+        let trusts = parse_domain_trusts(output);
+        assert_eq!(trusts.len(), 1);
+        assert_eq!(trusts[0]["trust_type"], "external");
+        assert!(trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
     #[test]

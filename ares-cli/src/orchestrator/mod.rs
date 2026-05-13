@@ -25,7 +25,7 @@ mod exploitation;
 mod llm_runner;
 mod monitoring;
 mod output_extraction;
-mod recovery;
+pub(crate) mod recovery;
 mod result_processing;
 mod results;
 mod routing;
@@ -185,6 +185,8 @@ async fn run_inner() -> Result<()> {
         }
     };
 
+    shared_state.initialize_self_ips().await;
+
     // Phase 4 (opt-in): replay state from the JetStream event log instead of
     // loading from Redis. Falls through to Redis on failure or when the env
     // var is unset, so the default startup path is unchanged.
@@ -241,43 +243,75 @@ async fn run_inner() -> Result<()> {
             // Seed domain_controllers from target IPs so automation tasks
             // (AS-REP roast, Kerberoast, BloodHound, delegation enum) can fire
             // immediately without waiting for recon to report back.
-            // Probe port 88 (Kerberos) to find a real DC, don't blindly use first IP.
+            //
+            // Probe ALL target IPs on port 88/389 to find every DC, then query
+            // each DC's LDAP rootDSE (`defaultNamingContext`) to discover which
+            // domain it serves. This eliminates the race condition where
+            // automation tasks fire before recon discovers child-domain DCs
+            // (e.g. child.contoso.local at 192.168.58.11 vs the parent
+            // contoso.local at 192.168.58.10).
             if state.domain_controllers.is_empty() {
-                let dc_ip = bootstrap::probe_dc_port(&config.target_ips).await;
-                if let Some(ref ip) = dc_ip {
+                let dc_map = bootstrap::discover_dc_domains(&config.target_ips, &domain).await;
+
+                if !dc_map.is_empty() {
                     let dc_key = format!(
                         "{}:{}:{}",
                         ares_core::state::KEY_PREFIX,
                         state.operation_id,
                         ares_core::state::KEY_DC_MAP,
                     );
+                    let domain_key = format!("ares:op:{}:domains", state.operation_id);
                     let mut conn = queue.connection();
-                    let _: Result<(), _> =
-                        redis::AsyncCommands::hset(&mut conn, &dc_key, &domain, ip).await;
-                    state.domain_controllers.insert(domain.clone(), ip.clone());
-                    info!(
-                        domain = %domain,
-                        dc_ip = %ip,
-                        "Seeded domain controller from target IPs (port 88 probe)"
-                    );
 
-                    // Also register the credential's domain (may differ from target_domain,
-                    // e.g., child.contoso.local vs contoso.local).
-                    // This ensures automation tasks (spray, kerberoast) can find a DC
-                    // for the credential's domain.
+                    for (dc_domain, dc_ip) in &dc_map {
+                        let _: Result<(), _> =
+                            redis::AsyncCommands::hset(&mut conn, &dc_key, dc_domain, dc_ip).await;
+                        state
+                            .domain_controllers
+                            .insert(dc_domain.clone(), dc_ip.clone());
+
+                        // Add discovered domains to the domains list so automation
+                        // tasks can enumerate them (AS-REP roast, BloodHound, etc.)
+                        if !state.domains.contains(dc_domain) {
+                            state.domains.push(dc_domain.clone());
+                            let _: Result<(), _> =
+                                redis::AsyncCommands::sadd(&mut conn, &domain_key, dc_domain).await;
+                        }
+
+                        info!(
+                            domain = %dc_domain,
+                            dc_ip = %dc_ip,
+                            "Seeded domain controller from bootstrap DC discovery"
+                        );
+                    }
+
+                    let _: Result<(), _> =
+                        redis::AsyncCommands::expire(&mut conn, &domain_key, 86400i64).await;
+
+                    // Also register the credential's domain if not already mapped.
+                    // The credential domain may differ from any discovered DC domain
+                    // (e.g. if the credential is for a domain whose DC is behind a
+                    // firewall and didn't respond to probes).
                     if let Some(ref cred) = config.initial_credential {
                         let cred_domain = cred.domain.to_lowercase();
-                        if cred_domain != domain && !cred_domain.is_empty() {
-                            let _: Result<(), _> =
-                                redis::AsyncCommands::hset(&mut conn, &dc_key, &cred_domain, ip)
-                                    .await;
+                        if !cred_domain.is_empty()
+                            && !state.domain_controllers.contains_key(&cred_domain)
+                        {
+                            // Use the first discovered DC as fallback for the
+                            // credential's domain — better than no mapping at all.
+                            let fallback_ip = &dc_map[0].1;
+                            let _: Result<(), _> = redis::AsyncCommands::hset(
+                                &mut conn,
+                                &dc_key,
+                                &cred_domain,
+                                fallback_ip,
+                            )
+                            .await;
                             state
                                 .domain_controllers
-                                .insert(cred_domain.clone(), ip.clone());
-                            // Also add this domain to the domains set
+                                .insert(cred_domain.clone(), fallback_ip.clone());
                             if !state.domains.contains(&cred_domain) {
                                 state.domains.push(cred_domain.clone());
-                                let domain_key = format!("ares:op:{}:domains", state.operation_id);
                                 let _: Result<(), _> = redis::AsyncCommands::sadd(
                                     &mut conn,
                                     &domain_key,
@@ -287,8 +321,8 @@ async fn run_inner() -> Result<()> {
                             }
                             info!(
                                 cred_domain = %cred_domain,
-                                dc_ip = %ip,
-                                "Also registered credential domain in DC map"
+                                dc_ip = %fallback_ip,
+                                "Registered credential domain with fallback DC"
                             );
                         }
                     }
@@ -400,18 +434,24 @@ async fn run_inner() -> Result<()> {
     let tool_disp: Arc<dyn ares_llm::ToolDispatcher> =
         if std::env::var("ARES_TOOL_DISPATCH").as_deref() == Ok("local") {
             info!("Tool dispatch: local (in-process via ares-tools)");
-            Arc::new(tool_dispatcher::LocalToolDispatcher::new(
-                queue.clone(),
-                config.operation_id.clone(),
-                auth_throttle.clone(),
-            ))
+            Arc::new(
+                tool_dispatcher::LocalToolDispatcher::new(
+                    queue.clone(),
+                    config.operation_id.clone(),
+                    auth_throttle.clone(),
+                )
+                .with_state(shared_state.clone()),
+            )
         } else {
             info!("Tool dispatch: Redis queue (ares:tool_exec:{{role}})");
-            Arc::new(tool_dispatcher::RedisToolDispatcher::new(
-                queue.clone(),
-                config.operation_id.clone(),
-                auth_throttle.clone(),
-            ))
+            Arc::new(
+                tool_dispatcher::RedisToolDispatcher::new(
+                    queue.clone(),
+                    config.operation_id.clone(),
+                    auth_throttle.clone(),
+                )
+                .with_state(shared_state.clone()),
+            )
         };
 
     // Build sorted technique priorities for the LLM system prompt.
@@ -467,6 +507,7 @@ async fn run_inner() -> Result<()> {
         queue.clone(),
         registry.clone(),
         tracker.clone(),
+        dispatcher.credential_inflight.clone(),
         config.clone(),
         shutdown_rx.clone(),
     );
@@ -474,6 +515,7 @@ async fn run_inner() -> Result<()> {
     let (_result_handle, mut result_rx) = spawn_result_consumer(
         queue.clone(),
         tracker.clone(),
+        dispatcher.credential_inflight.clone(),
         config.clone(),
         shutdown_rx.clone(),
     );
@@ -487,6 +529,17 @@ async fn run_inner() -> Result<()> {
     );
 
     let cost_handle = spawn_cost_summary(queue.clone(), config.clone(), shutdown_rx.clone());
+
+    // Candidate-domain probe worker — verifies hostname-inferred domains
+    // (e.g. `corp.example.com` derived from `host.corp.example.com`) via
+    // `_ldap._tcp.dc._msdcs.<fqdn>` SRV lookups before promoting them.
+    let probe_ctx = state::domain_probe::DomainProbeContext {
+        state: shared_state.clone(),
+        queue: queue.clone(),
+        prober: Arc::new(state::domain_probe::DnsSrvProber::from_system()),
+    };
+    let probe_handle =
+        state::domain_probe::spawn_domain_probe_worker(probe_ctx, shutdown_rx.clone());
 
     // Exploitation workflow
     let exploit_disp = dispatcher.clone();
@@ -714,6 +767,7 @@ async fn run_inner() -> Result<()> {
                         let (_new_handle, new_rx) = spawn_result_consumer(
                             queue.clone(),
                             tracker.clone(),
+                            dispatcher.credential_inflight.clone(),
                             config.clone(),
                             shutdown_rx.clone(),
                         );
@@ -758,6 +812,7 @@ async fn run_inner() -> Result<()> {
                 hb_handle,
                 deferred_handle,
                 cost_handle,
+                probe_handle,
                 exploit_handle,
                 disc_handle,
                 refresh_handle,
@@ -794,6 +849,37 @@ async fn run_inner() -> Result<()> {
                 operation_id = %config.operation_id,
                 err = %e,
                 "Failed to finalize operation in Redis"
+            ),
+        }
+
+        // Auto-generate the red team report and cache it at ares:op:{id}:report
+        // so `ares ops report` / `task ec2:report` returns instantly from cache,
+        // and write a markdown file to disk for direct pickup.
+        match crate::ops::report::generate_and_cache_report(&mut conn, &config.operation_id).await {
+            Ok(report) => {
+                let output_dir =
+                    std::env::var("ARES_REPORT_DIR").unwrap_or_else(|_| "/tmp/reports".to_string());
+                let dir = format!("{output_dir}/red");
+                let path = format!("{dir}/{}.md", config.operation_id);
+                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &report)) {
+                    Ok(()) => info!(
+                        operation_id = %config.operation_id,
+                        path = %path,
+                        bytes = report.len(),
+                        "Auto-generated red team report"
+                    ),
+                    Err(e) => warn!(
+                        operation_id = %config.operation_id,
+                        path = %path,
+                        err = %e,
+                        "Failed to write auto-generated report to disk (still cached in Redis)"
+                    ),
+                }
+            }
+            Err(e) => warn!(
+                operation_id = %config.operation_id,
+                err = %e,
+                "Failed to auto-generate red team report on completion"
             ),
         }
     }

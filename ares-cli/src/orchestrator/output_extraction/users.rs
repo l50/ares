@@ -54,6 +54,21 @@ static RE_SMB_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"SMB\s+\S+\s+\d+\s+\S+\s+([A-Za-z0-9_.\-]+)\s+\d{4}-\d{2}-\d{2}").unwrap()
 });
 
+/// Check if a domain string looks like a machine hostname rather than an AD domain.
+///
+/// Machine FQDNs like `win-g7fpa5zzxzv.w5an.local` or NetBIOS machine names like
+/// `WIN-G7FPA5ZZXZV` pollute domain tracking when they appear in SMB banners or
+/// UPN suffixes (e.g., null session enum on a DC reports the Kali box's own domain).
+pub fn is_machine_hostname_domain(domain: &str) -> bool {
+    let first_label = domain.split('.').next().unwrap_or(domain);
+    let lower = first_label.to_lowercase();
+    // Windows auto-generated hostnames: WIN-XXXXXXXX, DESKTOP-XXXXXXX
+    if lower.starts_with("win-") || lower.starts_with("desktop-") {
+        return true;
+    }
+    false
+}
+
 /// Reject garbage usernames and invalid domains from regex extraction.
 pub fn is_valid_extracted_user(username: &str, domain: &str) -> bool {
     if username.is_empty() || username.ends_with('$') {
@@ -121,7 +136,11 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
                 .captures(stripped)
                 .map(|c| c.get(1).unwrap().as_str().trim().to_string())
                 .unwrap_or_default();
-            if !is_workgroup_domain(&line_name, &candidate) {
+            // Don't let machine hostnames (Kali's own SMB banner) or workgroup
+            // self-named pseudo-domains override the task's default domain.
+            if !is_machine_hostname_domain(&candidate)
+                && !is_workgroup_domain(&line_name, &candidate)
+            {
                 current_domain = candidate;
             }
         }
@@ -137,7 +156,13 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
         if let Some(caps) = RE_UPN.captures(stripped) {
             let user = caps.get(1).unwrap().as_str();
             let dom = caps.get(2).unwrap().as_str();
-            found.push((user.to_string(), dom.to_string()));
+            // If UPN suffix is a machine hostname (e.g. user@win-xxx.w5an.local),
+            // substitute the default domain to avoid storing garbage domains.
+            if is_machine_hostname_domain(dom) {
+                found.push((user.to_string(), default_domain.to_string()));
+            } else {
+                found.push((user.to_string(), dom.to_string()));
+            }
         }
 
         for caps in RE_USER_BRACKET.captures_iter(stripped) {
@@ -150,9 +175,16 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
             found.push((user.to_string(), current_domain.clone()));
         }
 
+        // Track high-confidence matches separately. `sAMAccountName: foo`
+        // only appears in genuine LDAP/ldapsearch output (the attribute is
+        // server-emitted, not user-generated), so RE_SAM matches survive the
+        // kerbrute/asrep wordlist false-positive guard at the publishing
+        // layer. Other regexes match prose like "User foo doesn't have ..."
+        // which iterates wordlist failures and must stay gated.
+        let mut found_ldap = Vec::new();
         if let Some(caps) = RE_SAM.captures(stripped) {
             let user = caps.get(1).unwrap().as_str();
-            found.push((user.to_string(), current_domain.clone()));
+            found_ldap.push((user.to_string(), current_domain.clone()));
         }
 
         if let Some(caps) = RE_SMB_TIMESTAMP.captures(stripped) {
@@ -174,6 +206,26 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
                     description: String::new(),
                     is_admin: false,
                     source: "output_extraction".to_string(),
+                });
+            }
+        }
+
+        for (raw_username, raw_domain) in found_ldap {
+            let username = raw_username.trim().trim_end_matches('.').to_string();
+            let domain = raw_domain.trim().trim_end_matches('.').to_string();
+            if !is_valid_extracted_user(&username, &domain) {
+                continue;
+            }
+            let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+            if seen.insert(key) {
+                users.push(User {
+                    username,
+                    domain,
+                    description: String::new(),
+                    is_admin: false,
+                    // High-confidence: sAMAccountName attribute is only
+                    // emitted by an LDAP server, not by tool prose.
+                    source: "ldap_extraction".to_string(),
                 });
             }
         }
@@ -253,6 +305,86 @@ mod tests {
     }
 
     #[test]
+    fn machine_hostname_win_prefix() {
+        assert!(is_machine_hostname_domain("WIN-G7FPA5ZZXZV"));
+        assert!(is_machine_hostname_domain("win-abc123"));
+    }
+
+    #[test]
+    fn machine_hostname_win_fqdn() {
+        assert!(is_machine_hostname_domain("win-g7fpa5zzxzv.w5an.local"));
+        assert!(is_machine_hostname_domain("WIN-ABC123.contoso.local"));
+    }
+
+    #[test]
+    fn machine_hostname_desktop_prefix() {
+        assert!(is_machine_hostname_domain("DESKTOP-ABC1234"));
+        assert!(is_machine_hostname_domain("desktop-xyz.fabrikam.local"));
+    }
+
+    #[test]
+    fn real_domain_not_machine_hostname() {
+        assert!(!is_machine_hostname_domain("contoso.local"));
+        assert!(!is_machine_hostname_domain("child.contoso.local"));
+        assert!(!is_machine_hostname_domain("CONTOSO"));
+        assert!(!is_machine_hostname_domain("CHILD"));
+    }
+
+    #[test]
+    fn extract_users_samaccountname_tagged_ldap_extraction() {
+        // sAMAccountName: <name> only appears in LDAP/ldapsearch output (server-
+        // emitted attribute), so the matched user is tagged as a verified
+        // ldap_extraction discovery and survives the kerbrute false-positive
+        // guard at the publishing layer.
+        let output = "\
+sAMAccountName: alice
+distinguishedName: CN=alice,DC=contoso,DC=local
+";
+        let users = extract_users(output, "contoso.local");
+        let alice = users.iter().find(|u| u.username == "alice").unwrap();
+        assert_eq!(alice.source, "ldap_extraction");
+    }
+
+    #[test]
+    fn extract_users_domain_backslash_tagged_output_extraction() {
+        // DOMAIN\user matches wordlist iterations in kerbrute output and stays
+        // tagged with the lower-confidence `output_extraction` source so
+        // result_processing can drop them.
+        let users = extract_users("CONTOSO\\bob (SidTypeUser)", "contoso.local");
+        let bob = users.iter().find(|u| u.username == "bob").unwrap();
+        assert_eq!(bob.source, "output_extraction");
+    }
+
+    #[test]
+    fn extract_users_smb_banner_machine_domain_ignored() {
+        let output = concat!(
+            "SMB  192.168.58.10  445  DC01  (domain:WIN-G7FPA5ZZXZV) ...\n",
+            "user:[jdoe] rid:[0x44e]\n",
+        );
+        let users = extract_users(output, "contoso.local");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "jdoe");
+        assert_eq!(users[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn extract_users_upn_machine_domain_substituted() {
+        let output = "jdoe@win-g7fpa5zzxzv.w5an.local\n";
+        let users = extract_users(output, "contoso.local");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "jdoe");
+        assert_eq!(users[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn extract_users_real_upn_preserved() {
+        let output = "jdoe@contoso.local\n";
+        let users = extract_users(output, "contoso.local");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].domain, "contoso.local");
+    }
+
+    #[test]
     fn extract_users_ignores_workgroup_domain_context() {
         // SMB banner from a non-domain-joined host (the attacker's own kali
         // box) appears in the same enumeration output as a real target. The
@@ -276,8 +408,6 @@ SMB  192.168.58.178  445  WIN-ABCDEFGHIJK  [+] user:[svc_local]";
 
     #[test]
     fn extract_users_keeps_real_domain_context() {
-        // Sanity check — real AD `(domain:contoso.local)` still updates
-        // current_domain.
         let output = "\
 SMB  192.168.58.10  445  DC01  [*] Windows Server 2019 (name:DC01) (domain:contoso.local) (signing:True)
 SMB  192.168.58.10  445  DC01  [+] user:[alice]";

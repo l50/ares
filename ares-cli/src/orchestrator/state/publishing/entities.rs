@@ -9,6 +9,7 @@ use ares_core::state::{self, RedisStateReader};
 use redis::aio::ConnectionLike;
 
 use super::emit_op_state;
+use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::state::{SharedState, KEY_VULN_QUEUE};
 use crate::orchestrator::task_queue::TaskQueueCore;
 
@@ -82,8 +83,27 @@ impl SharedState {
                 OpStateEventPayload::UserDiscovered { user: user.clone() },
             )
             .await;
-            let mut state = self.inner.write().await;
-            state.users.push(user);
+            let user_domain = user.domain.clone();
+            {
+                let mut state = self.inner.write().await;
+                state.users.push(user);
+            }
+            // A new user in a domain unblocks AS-REP roasting for that domain:
+            // the first auto_credential_access tick may have fired against the
+            // domain with no usernames in state (cross-forest target where
+            // anonymous SAMR is denied) and dedup'd; clearing the dedup lets
+            // the next tick re-dispatch with the now-known userlist. This is
+            // the load-bearing path for compromising a SID-filtered foreign
+            // forest where DCSync via the trust key won't work — AS-REP roast
+            // of a vulnerable account is the only no-cred-needed entry point.
+            if !user_domain.is_empty() {
+                let mut state = self.inner.write().await;
+                state.unmark_processed(super::super::DEDUP_ASREP_DOMAINS, &user_domain);
+                drop(state);
+                let _ = self
+                    .unpersist_dedup(queue, super::super::DEDUP_ASREP_DOMAINS, &user_domain)
+                    .await;
+            }
         }
         Ok(added)
     }
@@ -108,6 +128,16 @@ impl SharedState {
         mut vuln: VulnerabilityInfo,
         strategy: Option<&crate::orchestrator::strategy::Strategy>,
     ) -> Result<bool> {
+        if should_drop_ghost_acl_vulnerability(&vuln) {
+            tracing::debug!(
+                vuln_id = %vuln.vuln_id,
+                vuln_type = %vuln.vuln_type,
+                target = %vuln.target,
+                "Dropping ghost-machine ACL vulnerability"
+            );
+            return Ok(false);
+        }
+
         // Apply strategy weight override if provided
         if let Some(strategy_cfg) = strategy {
             let effective = strategy_cfg.effective_priority(&vuln.vuln_type);
@@ -325,6 +355,15 @@ impl SharedState {
     }
 
     /// Add a trust relationship to state and Redis.
+    ///
+    /// Also publishes the trust target as an authoritative candidate domain.
+    /// Trust enumeration is the only path that surfaces a foreign forest's
+    /// FQDN before any of its hosts are scanned. Without this, downstream
+    /// per-domain automations (AS-REP roast, SID enum, cross-forest forge)
+    /// that iterate `state.domains` would never see the foreign forest until
+    /// host discovery catches up — which on hardened/segmented networks may
+    /// never happen. Trust enumeration is `AuthenticatedAd` evidence, which
+    /// is authoritative on its own and promotes immediately.
     pub async fn publish_trust_info(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
@@ -339,8 +378,27 @@ impl SharedState {
         let added = reader.add_trusted_domain(&mut conn, &trust).await?;
         if added {
             let domain_key = trust.domain.to_lowercase();
-            let mut state = self.inner.write().await;
-            state.trusted_domains.insert(domain_key, trust);
+            {
+                let mut state = self.inner.write().await;
+                state.trusted_domains.insert(domain_key.clone(), trust);
+            }
+            // Also promote the foreign domain into state.domains so the
+            // per-domain automations pick it up.
+            if let Err(e) = self
+                .publish_candidate_domain(
+                    queue,
+                    &domain_key,
+                    ares_core::models::DomainEvidence::AuthenticatedAd,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    domain = %domain_key,
+                    err = %e,
+                    "Failed to promote trust target domain into state.domains"
+                );
+            }
         }
         Ok(added)
     }
@@ -356,6 +414,42 @@ fn are_in_same_forest(a: &str, b: &str) -> bool {
         return true;
     }
     a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+}
+
+fn should_drop_ghost_acl_vulnerability(vuln: &VulnerabilityInfo) -> bool {
+    if !is_acl_style_vulnerability(&vuln.vuln_type) {
+        return false;
+    }
+
+    ghost_machine_target(vuln)
+}
+
+fn is_acl_style_vulnerability(vuln_type: &str) -> bool {
+    let vtype = vuln_type.trim().to_lowercase();
+    matches!(
+        vtype.as_str(),
+        "genericall"
+            | "genericwrite"
+            | "writedacl"
+            | "writeowner"
+            | "writeproperty"
+            | "allextendedrights"
+            | "self_membership"
+            | "write_membership"
+            | "genericall_computer"
+            | "genericwrite_computer"
+    ) || vtype.contains("forcechangepassword")
+}
+
+fn ghost_machine_target(vuln: &VulnerabilityInfo) -> bool {
+    if is_ghost_machine_account(&vuln.target) {
+        return true;
+    }
+
+    ["target", "target_computer", "target_account"]
+        .into_iter()
+        .filter_map(|key| vuln.details.get(key).and_then(|v| v.as_str()))
+        .any(is_ghost_machine_account)
 }
 
 #[cfg(test)]
@@ -395,12 +489,31 @@ mod tests {
         }
     }
 
+    fn make_vuln_with_details(
+        vuln_id: &str,
+        vuln_type: &str,
+        target: &str,
+        details: HashMap<String, serde_json::Value>,
+    ) -> VulnerabilityInfo {
+        VulnerabilityInfo {
+            vuln_id: vuln_id.to_string(),
+            vuln_type: vuln_type.to_string(),
+            target: target.to_string(),
+            discovered_by: "test".to_string(),
+            discovered_at: Utc::now(),
+            details,
+            recommended_agent: "exploit".to_string(),
+            priority: 50,
+        }
+    }
+
     fn make_share(host: &str, name: &str) -> Share {
         Share {
             host: host.to_string(),
             name: name.to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         }
     }
 
@@ -525,6 +638,47 @@ mod tests {
 
         let s = state.inner.read().await;
         assert_eq!(s.discovered_vulnerabilities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_vulnerability_rejects_ghost_acl_target() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let vuln = make_vuln("VULN-ACL-001", "allextendedrights", "WIN-DPPJMLU3XS6$");
+        let added = state.publish_vulnerability(&q, vuln).await.unwrap();
+        assert!(!added);
+
+        let s = state.inner.read().await;
+        assert!(s.discovered_vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_vulnerability_rejects_ghost_acl_target_in_details() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut details = HashMap::new();
+        details.insert("target".to_string(), serde_json::json!("WIN-DPPJMLU3XS6$"));
+        let vuln = make_vuln_with_details("VULN-ACL-002", "genericall", "placeholder", details);
+        let added = state.publish_vulnerability(&q, vuln).await.unwrap();
+        assert!(!added);
+
+        let s = state.inner.read().await;
+        assert!(s.discovered_vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_vulnerability_keeps_real_acl_machine_target() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let vuln = make_vuln("VULN-ACL-003", "genericall", "DC01$");
+        let added = state.publish_vulnerability(&q, vuln).await.unwrap();
+        assert!(added);
+
+        let s = state.inner.read().await;
+        assert!(s.discovered_vulnerabilities.contains_key("VULN-ACL-003"));
     }
 
     #[tokio::test]

@@ -117,18 +117,22 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "ldap_search".into(),
-            description: "Execute an LDAP search query against a domain controller.".into(),
+            description: "Execute an LDAP search query against a domain controller. When authenticating with credentials from a different domain (e.g. child domain cred against parent DC), set bind_domain to the credential's domain.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "DC IP or hostname"},
-                    "domain": {"type": "string"},
+                    "domain": {"type": "string", "description": "Target domain (used for LDAP base DN)"},
                     "username": {"type": "string"},
                     "password": {"type": "string"},
                     "filter": {"type": "string", "description": "LDAP filter (e.g. '(objectClass=user)')"},
                     "attributes": {
                         "type": "string",
                         "description": "Comma-separated attributes to retrieve"
+                    },
+                    "bind_domain": {
+                        "type": "string",
+                        "description": "Domain for LDAP bind DN (user@bind_domain). Use when credential domain differs from target domain (e.g. child-domain cred authenticating to parent DC). If omitted, uses 'domain'."
                     }
                 },
                 "required": ["target", "domain", "filter"]
@@ -136,15 +140,16 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rpcclient_command".into(),
-            description: "Execute an rpcclient command against a target.".into(),
+            description: "Execute an rpcclient command against a target. Supports pass-the-hash via the 'hash' parameter.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "target": {"type": "string"},
-                    "command": {"type": "string", "description": "rpcclient command (e.g. 'enumdomusers')"},
+                    "command": {"type": "string", "description": "rpcclient command (e.g. 'enumdomusers', 'enumdomgroups', 'querygroupmem <rid>')"},
                     "username": {"type": "string"},
                     "password": {"type": "string"},
-                    "domain": {"type": "string"}
+                    "domain": {"type": "string"},
+                    "hash": {"type": "string", "description": "NTLM hash for pass-the-hash authentication (use instead of password)"}
                 },
                 "required": ["target", "command"]
             }),
@@ -254,6 +259,25 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     "target_ip": {"type": "string", "description": "Target IP address (if hostname does not resolve via DNS)"}
                 },
                 "required": ["target"]
+            }),
+        },
+        ToolDefinition {
+            name: "ldap_acl_enumeration".into(),
+            description: "Enumerate ACL attack paths by querying nTSecurityDescriptor attributes on AD objects. Identifies dangerous ACEs (GenericAll, WriteDacl, ForceChangePassword, GenericWrite, WriteOwner, Self-Membership) that can be exploited for privilege escalation. Supports pass-the-hash via the 'hash' parameter.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "DC IP or hostname"},
+                    "domain": {"type": "string", "description": "Target domain"},
+                    "username": {"type": "string"},
+                    "password": {"type": "string"},
+                    "hash": {"type": "string", "description": "NTLM hash for pass-the-hash (use instead of password)"},
+                    "bind_domain": {
+                        "type": "string",
+                        "description": "Domain for LDAP bind DN when credential domain differs from target domain"
+                    }
+                },
+                "required": ["target", "domain"]
             }),
         },
     ]

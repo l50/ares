@@ -16,7 +16,10 @@ pub use blue::{
     BlueTaskInfo, Evidence, InvestigationStage, PyramidLevel, SharedBlueTeamState, TimelineEvent,
     TriageDecision, TriageRecord,
 };
-pub use core::{Credential, Hash, Host, Share, Target, TrustInfo, User};
+pub use core::{
+    is_always_disabled_account, CandidateDomain, Credential, DomainEvidence, Hash, Host,
+    KerberosTicket, Share, Target, TrustInfo, User,
+};
 pub use op_state_event::{OpStateEvent, OpStateEventPayload};
 pub use operation::{AttackChainStep, OperationMeta, SharedRedTeamState};
 pub use task::{
@@ -157,5 +160,23 @@ mod tests {
     fn task_status_display() {
         assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
         assert_eq!(TaskStatus::Pending.to_string(), "pending");
+    }
+
+    #[test]
+    fn is_always_disabled_account_canonical() {
+        assert!(is_always_disabled_account("Guest"));
+        assert!(is_always_disabled_account("guest"));
+        assert!(is_always_disabled_account("GUEST"));
+        assert!(is_always_disabled_account("krbtgt"));
+        assert!(is_always_disabled_account("DefaultAccount"));
+        assert!(is_always_disabled_account("WDAGUtilityAccount"));
+    }
+
+    #[test]
+    fn is_always_disabled_account_excludes_real_users() {
+        assert!(!is_always_disabled_account("Administrator"));
+        assert!(!is_always_disabled_account("svc_sql"));
+        assert!(!is_always_disabled_account("jdoe"));
+        assert!(!is_always_disabled_account(""));
     }
 }

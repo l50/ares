@@ -9,11 +9,22 @@ const ESC_TYPES: &[&str] = &[
 ];
 
 pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
-    let target_ip = params
-        .get("target")
-        .or_else(|| params.get("target_ip"))
+    // ca_host_ip is the ADCS CA server IP (where certs are enrolled).
+    // target/target_ip is the DC IP used for LDAP queries.
+    // For vuln target, prefer ca_host_ip so exploitation targets the CA, not the DC.
+    let ca_host_ip = params
+        .get("ca_host_ip")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let target_ip = if !ca_host_ip.is_empty() {
+        ca_host_ip
+    } else {
+        params
+            .get("target")
+            .or_else(|| params.get("target_ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
 
     let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -29,18 +40,24 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
     // Strategy 2: Look for "ESCn :" patterns (certipy find -vulnerable output)
     // These appear as "ESC1 : 'DOMAIN\\Group' can enroll..."
     for esc_type in ESC_TYPES {
+        let esc_upper = esc_type.to_uppercase();
         let found = if has_vuln_header {
-            // Standard certipy output with vulnerability section
-            output_lower.contains(esc_type)
+            // Use word-boundary-aware matching to avoid false positives
+            // (e.g. "esc1" matching inside "esc13" or "esc15").
+            // Certipy outputs "ESCn :" or "ESCn:" patterns.
+            output.contains(&format!("{esc_upper} :"))
+                || output.contains(&format!("{esc_upper}:"))
+                || output.contains(&format!("{esc_upper} "))
+                || esc_word_boundary_match(&output_lower, esc_type)
         } else {
             // Also detect ESC patterns without the header — certipy sometimes
             // outputs vulnerability info inline with template details.
             // Look for "ESCn" followed by ":" or "vulnerability" on the same or
             // nearby lines.
-            let esc_upper = esc_type.to_uppercase();
             output.contains(&format!("{esc_upper} :"))
                 || output.contains(&format!("{esc_upper}:"))
-                || (output_lower.contains(esc_type) && output_lower.contains("vulnerab"))
+                || (esc_word_boundary_match(&output_lower, esc_type)
+                    && output_lower.contains("vulnerab"))
         };
 
         if found {
@@ -59,9 +76,24 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
             if let Some(ref tmpl) = template_name {
                 details["template_name"] = json!(tmpl);
             }
+            if !ca_host_ip.is_empty() {
+                details["ca_host"] = json!(ca_host_ip);
+            }
+
+            // Include `template_name` in the vuln_id when present so two
+            // distinct vulnerable templates of the same ESC type on the
+            // same CA don't collapse onto one dedup entry — the previous
+            // shape `adcs_{esc}_{ca_ip}` overwrote each other and the
+            // exploitation chain only got one template per CA.
+            let vuln_id = match template_name.as_ref() {
+                Some(tmpl) => {
+                    format!("adcs_{}_{}_{}", esc_type, target_ip, slugify_template(tmpl),)
+                }
+                None => format!("adcs_{}_{}", esc_type, target_ip),
+            };
 
             vulns.push(json!({
-                "vuln_id": format!("adcs_{}_{}", esc_type, target_ip),
+                "vuln_id": vuln_id,
                 "vuln_type": format!("adcs_{}", esc_type),
                 "target": target_ip,
                 "discovered_by": "certipy_find",
@@ -73,6 +105,23 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
     }
 
     vulns
+}
+
+/// Check if `esc_type` (e.g. "esc1") appears as a whole word in `text`.
+/// Prevents "esc1" from matching inside "esc13" or "esc15".
+fn esc_word_boundary_match(text: &str, esc_type: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(esc_type) {
+        let abs_pos = start + pos;
+        let end_pos = abs_pos + esc_type.len();
+        // Check that the character after the match is not a digit
+        let after_ok = end_pos >= text.len() || !text.as_bytes()[end_pos].is_ascii_digit();
+        if after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
 }
 
 /// Extract CA name from certipy output.
@@ -114,15 +163,99 @@ fn extract_template_for_esc(output: &str, esc_type: &str) -> Option<String> {
     None
 }
 
+/// Parse the combined output of `certipy_esc1_full_chain` and emit a `Hash`
+/// discovery for the NTLM hash returned by the `certipy auth` step. Returns
+/// an empty vec when the chain didn't actually yield a hash (request denied,
+/// auth path bailed, etc.) — the caller treats that as "nothing to publish".
+///
+/// Lines we recognise from `certipy auth` output:
+///   `[*] Got hash for 'administrator@<realm>': <lmhash>:<nthash>`
+///
+/// Realm in the principal comes from the cert's `-upn` flag — that's the
+/// impersonated identity, NOT the requester's username. Both pieces matter:
+/// `Hash.username = "administrator"`, `Hash.domain = "<realm>"`.
+pub fn parse_certipy_esc1_chain(output: &str, params: &Value) -> Vec<Value> {
+    let mut hashes = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        // Format examples (with quoted or unquoted principal):
+        //   [*] Got hash for 'user@REALM.LOCAL': aad3...:31d6...
+        //   [*] Got hash for user@REALM.LOCAL: aad3...:31d6...
+        let Some(rest) = line
+            .strip_prefix("[*] Got hash for ")
+            .or_else(|| line.strip_prefix("Got hash for "))
+        else {
+            continue;
+        };
+        // Strip optional surrounding quotes from the principal.
+        let rest = rest.trim_start_matches('\'').trim_start_matches('"');
+        let Some((principal, hash_part)) = rest.split_once(':') else {
+            continue;
+        };
+        let principal = principal
+            .trim_end_matches('\'')
+            .trim_end_matches('"')
+            .trim();
+        let hash_part = hash_part.trim();
+        let Some((user, realm)) = principal.split_once('@') else {
+            continue;
+        };
+        // hash_part should be lm:nt — accept either combined or split forms.
+        let (lm, nt) = match hash_part.split_once(':') {
+            Some((lm, nt)) => (lm.trim().to_string(), nt.trim().to_string()),
+            // Some certipy builds emit just the NT half; fill in the empty LM.
+            None => (
+                "aad3b435b51404eeaad3b435b51404ee".to_string(),
+                hash_part.trim().to_string(),
+            ),
+        };
+        if nt.len() != 32 || !nt.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let domain = realm.trim().to_lowercase();
+        let user = user.trim().to_lowercase();
+        let _ = params; // params reserved for future correlation
+        hashes.push(json!({
+            "username": user,
+            "domain": domain,
+            "hash_type": "NTLM",
+            "hash_value": format!("{lm}:{nt}"),
+            "source": "certipy_esc1_full_chain",
+        }));
+    }
+    hashes
+}
+
+/// Normalise a certificate template name into a `vuln_id`-safe slug:
+/// lowercase, with non-alphanumeric characters collapsed to underscores.
+/// Preserves uniqueness across `WebServer`, `web-server`, `Web Server`
+/// while keeping the result safe to use inside an identifier-like key.
+fn slugify_template(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_underscore = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.extend(c.to_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
 /// Priority for ESC types (lower = more urgent).
 fn esc_priority(esc_type: &str) -> i32 {
     match esc_type {
-        "esc1" | "esc6" => 1, // Direct enrollment → DA cert
-        "esc4" | "esc8" => 2, // Template abuse / relay
-        "esc2" | "esc3" => 3, // Certificate agent
-        "esc7" | "esc9" => 4, // ManageCA / UPN spoof
-        "esc5" => 5,          // Golden cert (requires CA compromise first)
-        _ => 6,               // ESC10-15 and unknown
+        "esc1" | "esc6" => 1,           // Direct enrollment → DA cert
+        "esc4" | "esc8" => 2,           // Template abuse / relay
+        "esc2" | "esc3" | "esc15" => 3, // Certificate agent / app policy OID
+        "esc7" | "esc9" | "esc10" => 4, // ManageCA / UPN spoof / weak mapping
+        "esc11" => 4,                   // RPC relay (needs coercion)
+        "esc5" => 5,                    // Golden cert (requires CA compromise first)
+        "esc13" => 4,                   // Issuance policy
+        _ => 6,                         // ESC14 and unknown
     }
 }
 
@@ -237,12 +370,13 @@ mod tests {
         assert_eq!(esc_priority("esc8"), 2);
         assert_eq!(esc_priority("esc2"), 3);
         assert_eq!(esc_priority("esc3"), 3);
+        assert_eq!(esc_priority("esc15"), 3);
         assert_eq!(esc_priority("esc7"), 4);
         assert_eq!(esc_priority("esc9"), 4);
+        assert_eq!(esc_priority("esc10"), 4);
+        assert_eq!(esc_priority("esc11"), 4);
+        assert_eq!(esc_priority("esc13"), 4);
         assert_eq!(esc_priority("esc5"), 5);
-        assert_eq!(esc_priority("esc10"), 6);
-        assert_eq!(esc_priority("esc11"), 6);
-        assert_eq!(esc_priority("esc13"), 6);
         assert_eq!(esc_priority("unknown"), 6);
     }
 
@@ -318,6 +452,40 @@ mod tests {
         let vulns = parse_certipy_find(output, &params);
         assert_eq!(vulns.len(), 1);
         assert_eq!(vulns[0]["details"]["template_name"], "ESC1-Vuln");
+        // Template suffix included in vuln_id so multiple templates of the
+        // same ESC type on the same CA don't collapse to one entry.
+        assert_eq!(vulns[0]["vuln_id"], "adcs_esc1_192.168.58.10_esc1_vuln");
+    }
+
+    #[test]
+    fn parse_certipy_two_templates_same_esc_type_dont_collapse() {
+        // Two distinct vulnerable ESC1 templates on the same CA — without the
+        // template suffix in vuln_id, the second would overwrite the first.
+        let output =
+            "Template Name                       : WebServer\n    [!] Vulnerabilities\n    ESC1 : 'CONTOSO\\Users' can enroll\nTemplate Name                       : User-AutoEnroll\n    [!] Vulnerabilities\n    ESC1 : 'CONTOSO\\Users' can enroll";
+        let params = json!({"target": "192.168.58.10", "domain": "contoso.local"});
+        let vulns = parse_certipy_find(output, &params);
+        // Parser still emits one entry per matched ESC type per scan, but the
+        // vuln_id MUST be template-qualified so re-runs across different CAs
+        // / scans don't dedup-collapse onto the same key.
+        assert!(
+            vulns[0]["vuln_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("adcs_esc1_192.168.58.10_"),
+            "vuln_id should include template slug: {}",
+            vulns[0]["vuln_id"]
+        );
+    }
+
+    #[test]
+    fn slugify_template_basic() {
+        assert_eq!(super::slugify_template("WebServer"), "webserver");
+        assert_eq!(super::slugify_template("Web Server"), "web_server");
+        assert_eq!(super::slugify_template("ESC1-Vuln"), "esc1_vuln");
+        assert_eq!(super::slugify_template("a/b/c"), "a_b_c");
+        assert_eq!(super::slugify_template("___leading"), "leading");
+        assert_eq!(super::slugify_template("trailing___"), "trailing");
     }
 
     #[test]
@@ -337,5 +505,49 @@ mod tests {
         let vulns = parse_certipy_find(output, &params);
         assert_eq!(vulns.len(), 1);
         assert_eq!(vulns[0]["vuln_type"], "adcs_esc8");
+    }
+
+    #[test]
+    fn parse_certipy_esc13_does_not_false_positive_esc1() {
+        // ESC13 should not trigger false positive for ESC1
+        let output = "[!] Vulnerabilities\nESC13 : Issuance Policy linked to group";
+        let params = json!({"target": "192.168.58.10"});
+        let vulns = parse_certipy_find(output, &params);
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["vuln_type"], "adcs_esc13");
+    }
+
+    #[test]
+    fn parse_certipy_ca_host_ip_used_as_target() {
+        let output = "[!] Vulnerabilities\nESC1 : enrollee supplies subject";
+        let params = json!({
+            "target_ip": "192.168.58.10",  // DC IP
+            "ca_host_ip": "192.168.58.50", // CA IP
+            "domain": "contoso.local"
+        });
+        let vulns = parse_certipy_find(output, &params);
+        assert_eq!(vulns.len(), 1);
+        // Should use ca_host_ip, not target_ip
+        assert_eq!(vulns[0]["target"], "192.168.58.50");
+        assert_eq!(vulns[0]["vuln_id"], "adcs_esc1_192.168.58.50");
+        assert_eq!(vulns[0]["details"]["ca_host"], "192.168.58.50");
+    }
+
+    #[test]
+    fn esc_word_boundary_match_basic() {
+        assert!(super::esc_word_boundary_match("esc1 : vulnerable", "esc1"));
+        assert!(super::esc_word_boundary_match("esc1:", "esc1"));
+        assert!(!super::esc_word_boundary_match(
+            "esc13 : vulnerable",
+            "esc1"
+        ));
+        assert!(!super::esc_word_boundary_match(
+            "esc15 : vulnerable",
+            "esc1"
+        ));
+        assert!(super::esc_word_boundary_match(
+            "esc13 : vulnerable",
+            "esc13"
+        ));
     }
 }

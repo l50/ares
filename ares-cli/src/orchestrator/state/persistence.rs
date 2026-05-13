@@ -6,11 +6,12 @@ use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use tracing::{debug, info};
 
+use ares_core::models::CandidateDomain;
 use ares_core::state::{self, RedisStateReader};
 
 use redis::aio::ConnectionLike;
 
-use super::{SharedState, ALL_DEDUP_SETS, DEDUP_ACL_STEPS};
+use super::{SharedState, ALL_DEDUP_SETS, DEDUP_ACL_STEPS, DEDUP_TRUST_FOLLOW};
 use crate::orchestrator::task_queue::TaskQueueCore;
 
 impl SharedState {
@@ -40,6 +41,29 @@ impl SharedState {
                 return Ok(());
             }
         };
+
+        // Trust workflow dedups (`trust_follow:*` and `trust_extract:*` live in
+        // the same set) gate "once per op execution" decisions — forge a Kerberos
+        // ticket for a foreign realm, extract a trust key. They were 24h-TTL'd
+        // and persisted across orchestrator restarts, which meant any code-change
+        // requiring a re-fire had to be paired with a manual SREM. Clear them on
+        // load so a restart re-runs the trust path against the latest code.
+        let trust_follow_key = format!(
+            "{}:{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_DEDUP_PREFIX,
+            DEDUP_TRUST_FOLLOW
+        );
+        let prior_members: HashSet<String> =
+            conn.smembers(&trust_follow_key).await.unwrap_or_default();
+        if !prior_members.is_empty() {
+            let _: redis::RedisResult<i64> = conn.del(&trust_follow_key).await;
+            info!(
+                cleared = prior_members.len(),
+                "Cleared trust_follow dedup on op load — trust workflow will re-fire"
+            );
+        }
 
         // Load dedup sets
         let mut dedup_sets: HashMap<String, HashSet<String>> = HashMap::new();
@@ -103,6 +127,23 @@ impl SharedState {
             }
         }
 
+        let candidate_domains_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_CANDIDATE_DOMAINS
+        );
+        let raw_candidates: HashMap<String, String> = conn
+            .hgetall(&candidate_domains_key)
+            .await
+            .unwrap_or_default();
+        let mut candidate_domains = HashMap::new();
+        for (fqdn, json_str) in &raw_candidates {
+            if let Ok(candidate) = serde_json::from_str::<CandidateDomain>(json_str) {
+                candidate_domains.insert(fqdn.clone(), candidate);
+            }
+        }
+
         // Load ACL chains
         let acl_chains_key = format!(
             "{}:{}:{}",
@@ -163,6 +204,22 @@ impl SharedState {
         let dispatched_acl_steps: HashSet<String> =
             conn.smembers(&acl_dedup_key).await.unwrap_or_default();
 
+        // Load forged Kerberos tickets
+        let kerberos_tickets_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_KERBEROS_TICKETS
+        );
+        let raw_tickets: HashMap<String, String> = conn
+            .hgetall(&kerberos_tickets_key)
+            .await
+            .unwrap_or_default();
+        let kerberos_tickets: Vec<ares_core::models::KerberosTicket> = raw_tickets
+            .into_values()
+            .filter_map(|s| serde_json::from_str(&s).ok())
+            .collect();
+
         // Apply to state
         let mut state = self.inner.write().await;
         state.target = loaded.target;
@@ -180,6 +237,7 @@ impl SharedState {
         state.domain_sids = domain_sids;
         state.admin_names = admin_names;
         state.trusted_domains = trusted_domains;
+        state.candidate_domains = candidate_domains;
         // Rebuild dominated_domains from krbtgt hashes
         state.dominated_domains = state
             .hashes
@@ -210,6 +268,22 @@ impl SharedState {
             })
             .filter(|d| !d.is_empty())
             .collect();
+        // Mirror rebuilt set to Redis so post-mortem `SCARD` stays consistent
+        // after orchestrator restart. Source of truth remains the krbtgt
+        // hashes; this is purely a visibility mirror.
+        let dominated_snapshot: Vec<String> = state.dominated_domains.iter().cloned().collect();
+        if !dominated_snapshot.is_empty() {
+            let dominated_key = format!(
+                "{}:{}:{}",
+                state::KEY_PREFIX,
+                operation_id,
+                state::KEY_DOMINATED_DOMAINS
+            );
+            for d in &dominated_snapshot {
+                let _: redis::RedisResult<i64> = conn.sadd(&dominated_key, d).await;
+            }
+            let _: redis::RedisResult<i64> = conn.expire(&dominated_key, 86400).await;
+        }
         state.has_domain_admin = loaded.has_domain_admin;
         state.has_golden_ticket = loaded.has_golden_ticket;
         state.domain_admin_path = loaded.domain_admin_path;
@@ -219,6 +293,7 @@ impl SharedState {
         state.dispatched_acl_steps = dispatched_acl_steps;
         state.pending_tasks = pending_tasks;
         state.completed_tasks = completed_tasks;
+        state.kerberos_tickets = kerberos_tickets;
 
         let cred_count = state.credentials.len();
         let hash_count = state.hashes.len();
@@ -317,6 +392,39 @@ impl SharedState {
             }
         }
 
+        let candidate_domains_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_CANDIDATE_DOMAINS
+        );
+        let raw_candidates: HashMap<String, String> = conn
+            .hgetall(&candidate_domains_key)
+            .await
+            .unwrap_or_default();
+        let mut candidate_domains = HashMap::new();
+        for (fqdn, json_str) in &raw_candidates {
+            if let Ok(candidate) = serde_json::from_str::<CandidateDomain>(json_str) {
+                candidate_domains.insert(fqdn.clone(), candidate);
+            }
+        }
+
+        // Refresh Kerberos tickets
+        let kerberos_tickets_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_KERBEROS_TICKETS
+        );
+        let raw_tickets: HashMap<String, String> = conn
+            .hgetall(&kerberos_tickets_key)
+            .await
+            .unwrap_or_default();
+        let kerberos_tickets: Vec<ares_core::models::KerberosTicket> = raw_tickets
+            .into_values()
+            .filter_map(|s| serde_json::from_str(&s).ok())
+            .collect();
+
         let mut state = self.inner.write().await;
         state.credentials = credentials;
         state.hashes = hashes;
@@ -331,7 +439,9 @@ impl SharedState {
         state.domain_sids = domain_sids;
         state.admin_names = admin_names;
         state.trusted_domains = trusted_domains;
+        state.candidate_domains = candidate_domains;
         state.acl_chains = acl_chains;
+        state.kerberos_tickets = kerberos_tickets;
         // Rebuild dominated_domains from refreshed hashes
         state.dominated_domains = state
             .hashes
@@ -412,13 +522,15 @@ mod tests {
         // Seed meta so exists() returns true, then publish data
         seed_meta(&q, "op-1").await;
 
+        // Publish a DC host so the suffix is promoted authoritatively
+        // (non-DC FQDN suffixes are now held as candidates, not domains).
         let host = ares_core::models::Host {
             ip: "192.168.58.5".to_string(),
-            hostname: "srv01.contoso.local".to_string(),
+            hostname: "dc01.contoso.local".to_string(),
             os: String::new(),
             roles: vec![],
             services: vec!["445/tcp".to_string()],
-            is_dc: false,
+            is_dc: true,
             owned: false,
         };
         state.publish_host(&q, host).await.unwrap();
@@ -467,6 +579,83 @@ mod tests {
 
         let s = state2.inner.read().await;
         assert!(s.dedup["crack_requests"].contains("hash123"));
+    }
+
+    #[tokio::test]
+    async fn load_from_redis_clears_trust_follow_dedup() {
+        // trust_follow / trust_extract dedups are "once per op execution"
+        // decisions. Persisting them across orchestrator restarts blocks
+        // re-firing the trust workflow after a code change. Confirm load
+        // clears the set so the workflow runs again on the next tick.
+        let state = SharedState::new("op-trust".to_string());
+        let q = mock_queue();
+        seed_meta(&q, "op-trust").await;
+
+        // Other dedup sets must NOT be cleared — only trust_follow.
+        state
+            .persist_dedup(&q, "trust_follow", "trust_follow:foreign.local:foreign$")
+            .await
+            .unwrap();
+        state
+            .persist_dedup(&q, "trust_follow", "trust_extract:foreign.local")
+            .await
+            .unwrap();
+        state
+            .persist_dedup(&q, "crack_requests", "hash-stays")
+            .await
+            .unwrap();
+
+        let state2 = SharedState::new("op-trust".to_string());
+        state2.load_from_redis(&q).await.unwrap();
+
+        let s = state2.inner.read().await;
+        assert!(
+            s.dedup
+                .get("trust_follow")
+                .map(|set| set.is_empty())
+                .unwrap_or(true),
+            "trust_follow dedup should be cleared on op load"
+        );
+        // Sibling dedup must survive — only trust_follow gets reset.
+        assert!(s.dedup["crack_requests"].contains("hash-stays"));
+
+        // And the Redis-side set should be deleted too, not just the
+        // in-memory copy, otherwise SADD-NX checks would still see prior keys.
+        let mut conn = q.connection();
+        let live: HashSet<String> = conn
+            .smembers("ares:op:op-trust:dedup:trust_follow")
+            .await
+            .unwrap();
+        assert!(live.is_empty(), "Redis trust_follow set must be empty");
+    }
+
+    #[tokio::test]
+    async fn load_from_redis_restores_candidate_domains() {
+        let state = SharedState::new("op-candidates".to_string());
+        let q = mock_queue();
+
+        seed_meta(&q, "op-candidates").await;
+        state
+            .publish_candidate_domain(
+                &q,
+                "transient.example.com",
+                ares_core::models::DomainEvidence::HostnameInference,
+                Some("192.168.58.50".to_string()),
+            )
+            .await
+            .unwrap();
+        state
+            .mark_candidate_probed(&q, "transient.example.com")
+            .await
+            .unwrap();
+
+        let state2 = SharedState::new("op-candidates".to_string());
+        state2.load_from_redis(&q).await.unwrap();
+
+        let s = state2.inner.read().await;
+        let candidate = s.candidate_domains.get("transient.example.com").unwrap();
+        assert!(candidate.probed);
+        assert_eq!(candidate.source_host_ip.as_deref(), Some("192.168.58.50"));
     }
 
     #[tokio::test]

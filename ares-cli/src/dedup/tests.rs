@@ -45,6 +45,10 @@ fn make_hash(domain: &str, username: &str, hash_type: &str, hash_value: &str) ->
         parent_id: None,
         attack_step: 0,
         aes_key: None,
+        is_previous: false,
+        source_host: None,
+        is_trust_key: false,
+        trust_pair_label: None,
     }
 }
 
@@ -362,6 +366,25 @@ fn strip_trailing_dot_removes_dot() {
 }
 
 #[test]
+fn strip_trailing_dot_removes_netexec_zero_artifact() {
+    use super::strip_trailing_dot;
+    // NetExec appends "0" or "0." to domain names
+    assert_eq!(strip_trailing_dot("contoso.local0"), "contoso.local");
+    assert_eq!(strip_trailing_dot("contoso.local0."), "contoso.local");
+    assert_eq!(
+        strip_trailing_dot("child.contoso.local0"),
+        "child.contoso.local"
+    );
+    assert_eq!(strip_trailing_dot("fabrikam.local0."), "fabrikam.local");
+    // Must NOT strip real trailing 0 from hostnames like "host10"
+    assert_eq!(strip_trailing_dot("host10"), "host10");
+    assert_eq!(
+        strip_trailing_dot("dc10.contoso.local"),
+        "dc10.contoso.local"
+    );
+}
+
+#[test]
 fn strip_ansi_removes_escape_sequences() {
     use super::credentials::strip_ansi;
     let input = "\x1b[31mred text\x1b[0m";
@@ -619,6 +642,26 @@ fn normalize_state_domains_domain_filtering_based_on_host_fqdns() {
     assert!(domains.contains(&"contoso.local".to_string()));
     assert!(domains.contains(&"fabrikam.local".to_string()));
     assert!(!domains.contains(&"orphan.local".to_string()));
+}
+
+#[test]
+fn normalize_state_domains_drops_host_fqdn_masquerading_as_domain() {
+    // A parser/credential publish path sometimes pushes a DC's FQDN
+    // (e.g. `WIN-30DZ5NGFA7M.c26h.local`) into the domain set. The dedup
+    // filter must drop entries that exactly match a known host hostname,
+    // even when a user or credential has the FQDN in its `domain` field.
+    let users = vec![make_user("win-30dz5ngfa7m.c26h.local", "admin")];
+    let mut creds = vec![];
+    let mut hashes = vec![];
+    let mut domains = vec![
+        "c26h.local".to_string(),
+        "win-30dz5ngfa7m.c26h.local".to_string(),
+    ];
+    let hosts = vec![make_host("192.168.58.10", "win-30dz5ngfa7m.c26h.local")];
+
+    normalize_state_domains(&users, &mut creds, &mut hashes, &mut domains, &hosts, None);
+
+    assert_eq!(domains, vec!["c26h.local".to_string()]);
 }
 
 #[test]
@@ -1054,4 +1097,119 @@ fn dedup_credentials_normalizes_username_case() {
     let creds = vec![make_cred("contoso.local", "ADMIN", "P@ss1")];
     let deduped = dedup_credentials(&creds);
     assert_eq!(deduped[0].username, "admin");
+}
+
+#[test]
+fn is_ghost_machine_account_matches_nopac_pattern() {
+    use super::is_ghost_machine_account;
+    assert!(is_ghost_machine_account("WIN-G9FWV8ZNSCL$"));
+    assert!(is_ghost_machine_account("WIN-4D75DLR6UCC$"));
+    assert!(is_ghost_machine_account("win-bjak8xunhgd$"));
+    // without trailing $
+    assert!(is_ghost_machine_account("WIN-3KSGCLTS7NX"));
+}
+
+#[test]
+fn is_ghost_machine_account_rejects_real_hosts() {
+    use super::is_ghost_machine_account;
+    assert!(!is_ghost_machine_account("DC01$"));
+    assert!(!is_ghost_machine_account("WS01$"));
+    assert!(!is_ghost_machine_account("WIN-2019$")); // wrong length
+    assert!(!is_ghost_machine_account("administrator"));
+    assert!(!is_ghost_machine_account(""));
+}
+
+#[test]
+fn sanitize_credentials_drops_ghost_machine_accounts() {
+    let mut creds = vec![
+        make_cred("contoso.local", "WIN-G9FWV8ZNSCL$", "P@ss1"),
+        make_cred("contoso.local", "jdoe", "P@ss1"),
+    ];
+    sanitize_credentials(&mut creds);
+    assert_eq!(creds.len(), 1);
+    assert_eq!(creds[0].username, "jdoe");
+}
+
+#[test]
+fn dedup_hashes_collapses_bare_and_prefixed_same_user() {
+    // Parsers emit the same hash twice when secretsdump output mixes
+    // `Administrator:RID:...` (bare) and `DOMAIN\Administrator:RID:...` (prefixed)
+    // — bare gets empty domain, prefixed gets the resolved FQDN.
+    // The bare row should be folded into the prefixed one.
+    let hashes = vec![
+        make_hash("", "Administrator", "NTLM", "aabbccdd"),
+        make_hash("contoso.local", "Administrator", "NTLM", "aabbccdd"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].domain, "contoso.local");
+}
+
+#[test]
+fn dedup_hashes_keeps_distinct_users_sharing_hash() {
+    // Two different users can end up with identical NTLMs (shared password).
+    // They must NOT be folded together — dedup keys on
+    // (username, hash_type, hash_value), not just (hash_type, hash_value).
+    let hashes = vec![
+        make_hash("contoso.local", "Administrator", "NTLM", "deadbeefcafe"),
+        make_hash("contoso.local", "svc_backup", "NTLM", "deadbeefcafe"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 2);
+}
+
+#[test]
+fn dedup_hashes_bare_with_no_domain_sibling_kept() {
+    // If we only ever saw the bare form, we cannot infer a domain — keep it as-is.
+    let hashes = vec![make_hash("", "Administrator", "NTLM", "aabbccdd")];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].domain, "");
+}
+
+#[test]
+fn dedup_hashes_picks_longest_domain_when_multiple_known() {
+    // If the same user+hash appears with both a parent and a child domain (rare
+    // cross-forest replication artifact), prefer the longer/more-specific FQDN
+    // when filling in a bare entry.
+    let hashes = vec![
+        make_hash("", "krbtgt", "NTLM", "deadbeef"),
+        make_hash("contoso.local", "krbtgt", "NTLM", "deadbeef"),
+        make_hash("child.contoso.local", "krbtgt", "NTLM", "deadbeef"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    // The bare entry folds into the longest sibling; the two populated entries stay distinct.
+    assert_eq!(deduped.len(), 2);
+    let domains: Vec<&str> = deduped.iter().map(|h| h.domain.as_str()).collect();
+    assert!(domains.contains(&"contoso.local"));
+    assert!(domains.contains(&"child.contoso.local"));
+}
+
+#[test]
+fn dedup_hashes_drops_ghost_machine_accounts() {
+    let hashes = vec![
+        make_hash(
+            "contoso.local",
+            "WIN-4D75DLR6UCC$",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:da118ed665879916ceaacfb98e3ee74e",
+        ),
+        make_hash("contoso.local", "admin", "NTLM", "aabb"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].username, "admin");
+}
+
+#[test]
+fn dedup_users_drops_ghost_machine_accounts() {
+    let nb = HashMap::new();
+    let mut ghost = make_user("contoso.local", "WIN-BJAK8XUNHGD$");
+    ghost.source = "kerberos_enum".to_string();
+    let mut real = make_user("contoso.local", "jdoe");
+    real.source = "kerberos_enum".to_string();
+    let users = vec![ghost, real];
+    let deduped = dedup_users(&users, &nb);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].username, "jdoe");
 }

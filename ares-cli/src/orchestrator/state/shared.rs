@@ -64,6 +64,26 @@ impl SharedState {
             &s.domain_controllers,
         );
 
+        // Hide quarantined principals from LLM agents. A locked-out account
+        // can't authenticate during the quarantine window, and surfacing it
+        // just invites more failed-auth attempts on the same principal
+        // (which keep the badPwdCount climbing on shared lockout policies).
+        // The state's own resolvers already filter is_principal_quarantined
+        // for automation paths; this filter does the same for the LLM-facing
+        // snapshot.
+        let credentials: Vec<_> = s
+            .credentials
+            .iter()
+            .filter(|c| !s.is_principal_quarantined(&c.username, &c.domain))
+            .cloned()
+            .collect();
+        let hashes: Vec<_> = s
+            .hashes
+            .iter()
+            .filter(|h| !s.is_principal_quarantined(&h.username, &h.domain))
+            .cloned()
+            .collect();
+
         let target_domain = s
             .target
             .as_ref()
@@ -99,8 +119,8 @@ impl SharedState {
             .unwrap_or_else(|| target_domain.clone());
 
         ares_llm::prompt::StateSnapshot {
-            credentials: s.credentials.clone(),
-            hashes: s.hashes.clone(),
+            credentials,
+            hashes,
             hosts: s.hosts.clone(),
             shares: s.shares.clone(),
             domains: s.domains.clone(),
@@ -163,6 +183,33 @@ impl SharedState {
     /// Get the operation ID.
     pub async fn operation_id(&self) -> String {
         self.inner.read().await.operation_id.clone()
+    }
+
+    /// Enumerate the orchestrator host's IPv4 interface addresses and stash
+    /// them in `state.self_ips`. Used by `publish_host` to filter the
+    /// attacker's own NIC out of host-discovery results — e.g. an SMB sweep
+    /// from the Kali pivot will respond on the box's own address and would
+    /// otherwise pollute the discovered-host list with a phantom entry.
+    /// Failures (no permission, unsupported platform) degrade gracefully to
+    /// an empty set: filtering is a polish concern, not a correctness gate.
+    pub async fn initialize_self_ips(&self) {
+        let ips: std::collections::HashSet<std::net::IpAddr> =
+            match local_ip_address::list_afinet_netifas() {
+                Ok(ifs) => ifs
+                    .into_iter()
+                    .map(|(_, ip)| ip)
+                    .filter(|ip| matches!(ip, std::net::IpAddr::V4(_)))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(err = %e, "Failed to enumerate local interfaces — self-IP filtering disabled");
+                    return;
+                }
+            };
+        tracing::info!(
+            count = ips.len(),
+            "Discovered self IPv4 addresses for host-discovery filter"
+        );
+        self.inner.write().await.self_ips = ips;
     }
 }
 
@@ -269,6 +316,77 @@ mod tests {
         let key = state.discovery_key().await;
         assert!(key.contains("op-xyz"));
         assert!(key.starts_with("ares:discoveries:"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_hides_quarantined_principals() {
+        let state = SharedState::new("op-1".into());
+        {
+            let mut inner = state.write().await;
+            inner.credentials.push(Credential {
+                id: "c1".into(),
+                username: "live_user".into(),
+                password: "p1".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.credentials.push(Credential {
+                id: "c2".into(),
+                username: "locked_user".into(),
+                password: "p2".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.hashes.push(Hash {
+                id: "h1".into(),
+                username: "locked_user".into(),
+                hash_type: "NTLM".into(),
+                hash_value: "aabbcc".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                cracked_password: None,
+                aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: false,
+                trust_pair_label: None,
+                discovered_at: Some(chrono::Utc::now()),
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.hashes.push(Hash {
+                id: "h2".into(),
+                username: "live_user".into(),
+                hash_type: "NTLM".into(),
+                hash_value: "ddeeff".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                cracked_password: None,
+                aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: false,
+                trust_pair_label: None,
+                discovered_at: Some(chrono::Utc::now()),
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.quarantine_principal("locked_user", "contoso.local");
+        }
+
+        let snap = state.snapshot().await;
+        assert_eq!(snap.credentials.len(), 1, "quarantined cred must be hidden");
+        assert_eq!(snap.credentials[0].username, "live_user");
+        assert_eq!(snap.hashes.len(), 1, "quarantined hash must be hidden");
+        assert_eq!(snap.hashes[0].username, "live_user");
     }
 
     #[tokio::test]

@@ -53,7 +53,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password to spray"
+                        "description": "Single candidate password to spray across all users (e.g. 'Welcome1'). Either this OR `use_common_passwords` must be set."
+                    },
+                    "use_common_passwords": {
+                        "type": "boolean",
+                        "description": "If true, spray a built-in list of common passwords instead of a single candidate. Mutually exclusive with `password`."
                     },
                     "domain": {
                         "type": "string",
@@ -74,9 +78,13 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "acknowledge_no_policy": {
                         "type": "boolean",
                         "description": "Override that allows spraying without lockout_threshold. Use only when password_policy cannot be retrieved; lockouts are likely."
+                    },
+                    "excluded_users": {
+                        "type": "string",
+                        "description": "Comma-separated usernames to drop from the wordlist before spraying. Use this with the quarantine list provided in the task payload to avoid re-locking already-locked accounts."
                     }
                 },
-                "required": ["target", "password", "domain"]
+                "required": ["target", "domain"]
             }),
         },
         ToolDefinition {
@@ -96,9 +104,39 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "domain": {
                         "type": "string",
                         "description": "Target domain name"
+                    },
+                    "excluded_users": {
+                        "type": "string",
+                        "description": "Comma-separated usernames to drop from the wordlist before spraying. Use this with the quarantine list provided in the task payload to avoid re-locking already-locked accounts."
                     }
                 },
                 "required": ["target", "domain"]
+            }),
+        },
+        ToolDefinition {
+            name: "smb_login_check".into(),
+            description: "Validate a single credential against a target via SMB. Use this to verify that a credential works before attempting more complex attacks.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Target IP address or hostname"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username to authenticate with"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password to authenticate with"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain name"
+                    }
+                },
+                "required": ["target", "username", "password", "domain"]
             }),
         },
         ToolDefinition {

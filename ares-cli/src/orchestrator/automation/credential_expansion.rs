@@ -8,8 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use redis::AsyncCommands;
 use tokio::sync::watch;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -51,7 +52,7 @@ pub async fn auto_credential_expansion(
                 // Skip delegation accounts — their auth is reserved for S4U.
                 .filter(|c| c.is_admin || !state.is_delegation_account(&c.username))
                 // Skip quarantined credentials — locked out, retry after expiry.
-                .filter(|c| !state.is_credential_quarantined(&c.username, &c.domain))
+                .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
                 .filter_map(|cred| {
                     let dedup = format!(
                         "{}:{}",
@@ -317,9 +318,26 @@ pub async fn auto_credential_expansion(
 
             // 4. Hash→secretsdump: try pass-the-hash secretsdump against DCs.
             // This is the fastest path from hash → krbtgt → DA.
+            //
+            // Filter DCs to those in the same forest as the hash's domain
+            // (exact match or child-of). Cross-forest PTH secretsdump fails
+            // at DRSUAPI with `rpc_s_access_denied` and burns a
+            // CredentialInflight slot plus ~30k LLM tokens per failed attempt.
+            // The password-cred path above already filters this way; the hash
+            // path was missing the gate, dispatching foreign-forest creds
+            // against unrelated DCs.
             {
                 let state = dispatcher.state.read().await;
-                let dc_ips: Vec<String> = state.domain_controllers.values().cloned().collect();
+                let hash_domain = item.hash.domain.to_lowercase();
+                let dc_ips: Vec<String> = state
+                    .all_domains_with_dcs()
+                    .into_iter()
+                    .filter(|(domain, _)| {
+                        let d = domain.to_lowercase();
+                        d == hash_domain || d.ends_with(&format!(".{hash_domain}"))
+                    })
+                    .map(|(_, ip)| ip)
+                    .collect();
                 drop(state);
 
                 if !dispatcher.is_technique_allowed("secretsdump") {
@@ -378,7 +396,120 @@ pub async fn auto_credential_expansion(
                     .await;
             }
         }
+
+        // 5. Re-dispatch unsuccessful mssql_access vulns when a new same-domain
+        //    cleartext credential is available. Cross-forest MSSQL pivots fail
+        //    if the LLM tries them before any usable cred exists in the linked
+        //    server's source forest — once that cred arrives, push the vuln
+        //    back into the exploitation ZSET so the LLM gets another shot
+        //    with the new credential set in its prompt context.
+        let retries = collect_mssql_retries(&dispatcher).await;
+        for retry in retries {
+            if let Err(e) = requeue_mssql_vuln(&dispatcher, &retry).await {
+                debug!(err = %e, vuln_id = %retry.vuln_id, "Failed to requeue mssql_access");
+                continue;
+            }
+            info!(
+                vuln_id = %retry.vuln_id,
+                cred_user = %retry.cred_user,
+                cred_domain = %retry.cred_domain,
+                "Re-queued mssql_access for new credential"
+            );
+            dispatcher
+                .state
+                .write()
+                .await
+                .mark_processed(DEDUP_MSSQL_RETRY, retry.dedup_key.clone());
+            let _ = dispatcher
+                .state
+                .persist_dedup(&dispatcher.queue, DEDUP_MSSQL_RETRY, &retry.dedup_key)
+                .await;
+        }
     }
+}
+
+struct MssqlRetry {
+    vuln_id: String,
+    vuln_json: String,
+    priority: i32,
+    cred_user: String,
+    cred_domain: String,
+    dedup_key: String,
+}
+
+/// Walk discovered vulnerabilities for `mssql_access` entries that are not
+/// yet exploited and have at least one matching unseen credential. Builds
+/// a (vuln, credential) work item with a stable dedup key so the same
+/// vuln/cred pair is not re-queued repeatedly.
+async fn collect_mssql_retries(dispatcher: &Arc<Dispatcher>) -> Vec<MssqlRetry> {
+    let state = dispatcher.state.read().await;
+    let mut out = Vec::new();
+    for vuln in state.discovered_vulnerabilities.values() {
+        if vuln.vuln_type != "mssql_access" {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+        let vuln_domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        for cred in &state.credentials {
+            if cred.password.is_empty() || cred.domain.is_empty() {
+                continue;
+            }
+            // Match on domain when the vuln carries one. Otherwise match any
+            // cred — the LLM will pick from the prompt's credential list.
+            let cred_dom = cred.domain.to_lowercase();
+            let matches_domain = vuln_domain.is_empty()
+                || cred_dom == vuln_domain
+                || cred_dom.ends_with(&format!(".{vuln_domain}"))
+                || vuln_domain.ends_with(&format!(".{cred_dom}"));
+            if !matches_domain {
+                continue;
+            }
+            let dedup_key = format!(
+                "{}:{}:{}",
+                vuln.vuln_id,
+                cred.username.to_lowercase(),
+                cred_dom
+            );
+            if state.is_processed(DEDUP_MSSQL_RETRY, &dedup_key) {
+                continue;
+            }
+            let Ok(vuln_json) = serde_json::to_string(vuln) else {
+                continue;
+            };
+            out.push(MssqlRetry {
+                vuln_id: vuln.vuln_id.clone(),
+                vuln_json,
+                priority: vuln.priority,
+                cred_user: cred.username.clone(),
+                cred_domain: cred.domain.clone(),
+                dedup_key,
+            });
+        }
+    }
+    out
+}
+
+/// Push the vuln back into the exploitation ZSET. The exploitation_workflow
+/// loop pops by lowest score; reuse the original priority so the retry
+/// competes fairly with other work.
+async fn requeue_mssql_vuln(
+    dispatcher: &Arc<Dispatcher>,
+    retry: &MssqlRetry,
+) -> anyhow::Result<()> {
+    let key = dispatcher.state.vuln_queue_key().await;
+    let mut conn = dispatcher.queue.connection();
+    let _: () = conn
+        .zadd(&key, &retry.vuln_json, retry.priority as f64)
+        .await?;
+    let _: () = conn.expire(&key, 86400).await.unwrap_or(());
+    Ok(())
 }
 
 struct ExpansionWork {
@@ -423,12 +554,12 @@ mod tests {
     #[test]
     fn netbios_domain_resolution() {
         // Simulate the NetBIOS→FQDN resolution logic from the automation loop
-        let raw = "NORTH";
+        let raw = "CHILD";
         let raw_lower = raw.to_lowercase();
 
         // When netbios_to_fqdn has a mapping, use it
         let mut map = std::collections::HashMap::new();
-        map.insert("north".to_string(), "north.contoso.local".to_string());
+        map.insert("child".to_string(), "child.contoso.local".to_string());
 
         let resolved = if !raw_lower.contains('.') {
             map.get(&raw_lower)
@@ -437,7 +568,7 @@ mod tests {
         } else {
             raw_lower.clone()
         };
-        assert_eq!(resolved, "north.contoso.local");
+        assert_eq!(resolved, "child.contoso.local");
 
         // When FQDN is already used, pass through
         let fqdn_raw = "contoso.local";
@@ -452,7 +583,7 @@ mod tests {
         assert_eq!(resolved2, "contoso.local");
 
         // When no mapping exists, use the raw value
-        let unknown = "CHILD";
+        let unknown = "UNKNOWN";
         let unknown_lower = unknown.to_lowercase();
         let resolved3 = if !unknown_lower.contains('.') {
             map.get(&unknown_lower)
@@ -461,7 +592,7 @@ mod tests {
         } else {
             unknown_lower.clone()
         };
-        assert_eq!(resolved3, "child");
+        assert_eq!(resolved3, "unknown");
     }
 
     #[test]
@@ -569,6 +700,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let pth_cred = ares_core::models::Credential {
             id: format!("pth_{}", hash.username),

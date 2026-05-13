@@ -2,9 +2,13 @@
 //! to both in-memory state and Redis.
 
 mod credentials;
+mod domains;
 mod entities;
 mod hosts;
+mod kerberos;
 mod milestones;
+
+pub use domains::DomainPublishOutcome;
 
 use ares_core::models::{OpStateEvent, OpStateEventPayload};
 use ares_core::op_state_log::OpStateRecorder;
@@ -32,6 +36,33 @@ pub(super) async fn emit_op_state(
 /// Regex matching `Password` (case-insensitive) followed by optional `:` and space.
 pub(super) static PASSWORD_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^password\s*:\s*").unwrap());
+
+/// Trust ranking for a credential source.
+///
+/// Used by `publish_credential` to decide whether a new (user, password)
+/// pair claiming a different realm than an existing entry should be treated
+/// as authoritative or as a phantom. Higher value = more trusted.
+///
+/// - **High (3)**: deterministic, host-bound dumps where the realm is
+///   pinned by the source DC's NTDS / LSA storage.
+/// - **Medium (2)**: realm validated by an actual authentication round-trip
+///   or by a cracking pipeline whose input was already realm-pinned.
+/// - **Low (1)**: heuristic / format-fragile sources where the realm is
+///   inferred from surrounding tool output and can bleed across forests
+///   (description fields, registry autologon, SYSVOL scripts).
+/// - **Unknown (0)**: anything not classified — treated as least trusted.
+pub(super) fn credential_source_trust(source: &str) -> u8 {
+    match source {
+        "secretsdump" | "lsa_secrets" | "dpapi" | "kerberos_extracted" | "initial" => 3,
+        "netexec_auth" | "cracked:hashcat" | "cracked:john" | "cracked" => 2,
+        "description_field"
+        | "autologon_registry"
+        | "sysvol_script"
+        | "user_description_leak"
+        | "netexec_password" => 1,
+        _ => 0,
+    }
+}
 
 /// Regex matching trailing parenthetical metadata like ` (Guest)`, ` (Pwn3d!)`.
 pub(super) static TRAILING_PAREN_RE: LazyLock<Regex> =
@@ -158,6 +189,12 @@ pub(super) fn sanitize_credential(
         }
     }
 
+    // Canonicalize realm casing. AD realms are case-insensitive; storing them
+    // mixed-case (`CONTOSO.LOCAL` from one tool, `contoso.local` from another)
+    // splits the same identity into two state entries and slips past dedup
+    // keys built with `format!("{domain}\\{user}:{pass}")`.
+    cred.domain = cred.domain.to_lowercase();
+
     // Validate after sanitization
     if !crate::orchestrator::output_extraction::is_valid_credential(&cred.username, &cred.password)
     {
@@ -167,10 +204,103 @@ pub(super) fn sanitize_credential(
     Some(cred)
 }
 
-/// Check if a hostname is an AWS internal PTR name.
-pub(super) fn is_aws_hostname(hostname: &str) -> bool {
-    let lower = hostname.to_lowercase();
-    lower.starts_with("ip-") && lower.contains("compute.internal")
+/// Strip the trailing "0." artifact that NetExec sometimes appends to domain
+/// names (e.g. `dc01.contoso.local0.` → `dc01.contoso.local`,
+/// `contoso.local0` → `contoso.local`).
+pub(super) fn strip_netexec_artifact(s: &str) -> &str {
+    let s = s.trim_end_matches('.');
+    // "0." already collapsed to "0" after trimming "."; strip if preceded by a label
+    match s.strip_suffix("0.") {
+        Some(clean) => clean.trim_end_matches('.'),
+        None => match s.strip_suffix('0') {
+            // Avoid stripping a real trailing 0 from e.g. "host10" —
+            // only strip if the char before the 0 is alphabetic (TLD-like).
+            Some(clean) if clean.ends_with(|c: char| c.is_ascii_alphabetic()) => clean,
+            _ => s,
+        },
+    }
+}
+
+/// Check if a label matches a known default-OS auto-generated hostname
+/// (Windows OOBE, Win10/11 OOBE, AWS EC2 default). These appear on hosts
+/// that haven't been renamed or domain-joined; they are never valid AD
+/// domain labels.
+///
+/// Matches:
+/// - `WIN-XXXXXXXX` (Win Server / older Win, 8–15 alphanumeric tail)
+/// - `DESKTOP-XXXXXXX` / `LAPTOP-XXXXXXX` (Win10/11 OOBE, exactly 7 alphanumerics)
+/// - `ip-A-B-C-D` (AWS EC2 default)
+pub(super) fn is_default_os_label(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    if let Some(suffix) = lower.strip_prefix("win-") {
+        let len = suffix.len();
+        return (8..=15).contains(&len) && suffix.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    if let Some(suffix) = lower
+        .strip_prefix("desktop-")
+        .or_else(|| lower.strip_prefix("laptop-"))
+    {
+        return suffix.len() == 7 && suffix.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    if let Some(rest) = lower.strip_prefix("ip-") {
+        let octets: Vec<&str> = rest.split('-').collect();
+        if octets.len() == 4
+            && octets
+                .iter()
+                .all(|o| !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Single predicate for "this multi-label DNS name could plausibly be a real
+/// AD-style FQDN." Used both as a pre-filter on candidate domains
+/// (`publish_candidate_domain`) and as a hostname-normalization gate on
+/// `Host.hostname` (`publish_host`, `register_dc`) — every cloud / mDNS /
+/// default-OS / bare-TLD rejection lives here so call sites don't have to
+/// know the rules.
+///
+/// Rejects shapes that are *never* AD domains across OS families:
+/// - Empty / whitespace, or single-label (`local`, `workgroup`)
+/// - Pure mDNS link-local TLDs (`localhost`, `localdomain`)
+/// - Cloud / hypervisor internal suffixes (AWS `compute.internal`,
+///   `amazonaws.com`; Azure `internal.cloudapp.net`; GCP `c.<project>.internal`)
+/// - Any label (in any position) matching a known default-OS auto-name
+///   (`WIN-XXXX`, `DESKTOP-XXXX`, `LAPTOP-XXXX`, `ip-A-B-C-D`) — an unrenamed
+///   host can't be trusted as a source of AD domain truth even if its suffix
+///   looks plausible.
+pub(super) fn looks_like_real_domain(name: &str) -> bool {
+    let trimmed = name.trim().trim_end_matches('.').to_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = trimmed.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    if matches!(trimmed.as_str(), "localhost" | "localdomain") {
+        return false;
+    }
+    if labels
+        .last()
+        .map(|l| matches!(*l, "localhost" | "localdomain"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if trimmed.contains("compute.internal")
+        || trimmed.ends_with(".amazonaws.com")
+        || trimmed.ends_with(".internal.cloudapp.net")
+        || (trimmed.starts_with("c.") && trimmed.ends_with(".internal"))
+    {
+        return false;
+    }
+    if labels.iter().any(|l| is_default_os_label(l)) {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -192,6 +322,8 @@ mod tests {
             attack_step: 0,
         }
     }
+
+    // --- sanitize_credential ---
 
     #[test]
     fn valid_credential_passes_through() {
@@ -280,6 +412,17 @@ mod tests {
     }
 
     #[test]
+    fn realm_case_canonicalized_to_lowercase() {
+        // Tools surface realm in mixed/upper case (`CONTOSO.LOCAL` from
+        // rpcclient, `Contoso.Local` from LDAP). Without canonicalization, the
+        // same identity ends up split across multiple state entries and
+        // realm-strict credential lookups miss matches.
+        let cred = make_cred("alice", "P@ssw0rd!", "CONTOSO.LOCAL");
+        let result = sanitize_credential(cred, &HashMap::new(), &[]).unwrap();
+        assert_eq!(result.domain, "contoso.local");
+    }
+
+    #[test]
     fn netbios_domain_resolved_to_fqdn() {
         let mut map = HashMap::new();
         map.insert("CHILD".to_string(), "dc01.child.contoso.local".to_string());
@@ -357,23 +500,127 @@ mod tests {
         assert_eq!(result.domain, "contoso.local");
     }
 
+    // --- is_default_os_label ---
+
     #[test]
-    fn aws_hostname_detected() {
-        assert!(is_aws_hostname("ip-10-0-0-1.ec2.compute.internal"));
+    fn default_os_label_detects_windows_oobe() {
+        assert!(is_default_os_label("WIN-HVTT4F8YN5N"));
+        assert!(is_default_os_label("win-hvtt4f8yn5n"));
+        assert!(is_default_os_label("WIN-ABCDEFGH"));
     }
 
     #[test]
-    fn aws_hostname_case_insensitive() {
-        assert!(is_aws_hostname("IP-10-0-0-1.EC2.COMPUTE.INTERNAL"));
+    fn default_os_label_detects_win10_11_oobe() {
+        assert!(is_default_os_label("DESKTOP-ABC1234"));
+        assert!(is_default_os_label("desktop-abc1234"));
+        assert!(is_default_os_label("LAPTOP-XYZ7890"));
+        // Wrong tail length (Win10/11 OOBE is exactly 7).
+        assert!(!is_default_os_label("DESKTOP-ABCDEFGH"));
+        assert!(!is_default_os_label("DESKTOP-ABC"));
     }
 
     #[test]
-    fn non_aws_hostname_rejected() {
-        assert!(!is_aws_hostname("webserver01.contoso.local"));
+    fn default_os_label_detects_aws_default() {
+        assert!(is_default_os_label("ip-10-0-1-50"));
+        assert!(is_default_os_label("ip-192-168-1-1"));
+        // Not 4 octets:
+        assert!(!is_default_os_label("ip-10-0-1"));
+        // Non-numeric:
+        assert!(!is_default_os_label("ip-foo-bar-baz-qux"));
     }
 
     #[test]
-    fn ip_prefix_without_compute_internal_rejected() {
-        assert!(!is_aws_hostname("ip-missing-suffix.local"));
+    fn default_os_label_rejects_legitimate_names() {
+        assert!(!is_default_os_label("dc01"));
+        assert!(!is_default_os_label("contoso"));
+        assert!(!is_default_os_label("local"));
+        // Too short
+        assert!(!is_default_os_label("WIN-ABC"));
+        // Too long
+        assert!(!is_default_os_label("WIN-ABCDEFGHIJKLMNOP"));
+        // Wrong prefix
+        assert!(!is_default_os_label("LIN-ABCDEFGH"));
+        // Contains non-alphanumerics
+        assert!(!is_default_os_label("WIN-HVTT4F8.YN5N"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_accepts_typical_ad() {
+        assert!(looks_like_real_domain("contoso.local"));
+        assert!(looks_like_real_domain("child.contoso.local"));
+        assert!(looks_like_real_domain("eu.contoso.local"));
+        assert!(looks_like_real_domain("contoso.com"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_rejects_bare_tld_and_mdns() {
+        assert!(!looks_like_real_domain("local"));
+        assert!(!looks_like_real_domain(""));
+        assert!(!looks_like_real_domain("localhost"));
+        assert!(!looks_like_real_domain("foo.localhost"));
+        assert!(!looks_like_real_domain("foo.localdomain"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_rejects_cloud_internals() {
+        assert!(!looks_like_real_domain("us-west-2.compute.internal"));
+        assert!(!looks_like_real_domain("eu-west-1.amazonaws.com"));
+        assert!(!looks_like_real_domain("vm123.internal.cloudapp.net"));
+        assert!(!looks_like_real_domain("c.myproject.internal"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_rejects_default_os_labels_anywhere() {
+        assert!(!looks_like_real_domain("win-hvtt4f8yn5n.ttb0.local"));
+        assert!(!looks_like_real_domain("desktop-abc1234.workgroup.local"));
+        assert!(!looks_like_real_domain("ip-10-0-0-1.something.com"));
+        assert!(!looks_like_real_domain("dc01.win-abc12345.contoso.local"));
+        assert!(!looks_like_real_domain(
+            "ip-10-0-0-1.us-west-2.compute.internal"
+        ));
+    }
+
+    // --- strip_netexec_artifact ---
+
+    #[test]
+    fn strip_netexec_zero_dot() {
+        assert_eq!(
+            strip_netexec_artifact("dc01.contoso.local0."),
+            "dc01.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_zero_no_dot() {
+        assert_eq!(
+            strip_netexec_artifact("dc01.contoso.local0"),
+            "dc01.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_preserves_clean_hostname() {
+        assert_eq!(
+            strip_netexec_artifact("dc01.contoso.local"),
+            "dc01.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_preserves_numeric_suffix() {
+        // Must NOT strip the 0 from "host10" or "dc10"
+        assert_eq!(strip_netexec_artifact("host10"), "host10");
+        assert_eq!(
+            strip_netexec_artifact("dc10.contoso.local"),
+            "dc10.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_child_domain() {
+        assert_eq!(
+            strip_netexec_artifact("dc02.child.contoso.local0."),
+            "dc02.child.contoso.local"
+        );
     }
 }

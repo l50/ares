@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::dispatcher::Dispatcher;
 
 /// Dedup key prefix for RBCD attacks.
@@ -91,6 +92,14 @@ pub async fn auto_rbcd_exploitation(
                         .or_else(|| vuln.details.get("victim"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())?;
+                    if is_ghost_machine_account(&target_computer) {
+                        debug!(
+                            vuln_id = %vuln.vuln_id,
+                            target = %target_computer,
+                            "RBCD skipped: ghost machine account target"
+                        );
+                        return None;
+                    }
 
                     let domain = vuln
                         .details
@@ -99,28 +108,14 @@ pub async fn auto_rbcd_exploitation(
                         .unwrap_or("")
                         .to_string();
 
-                    // Find credential for the source user
-                    let credential = state
-                        .credentials
-                        .iter()
-                        .find(|c| {
-                            c.username.to_lowercase() == source_user.to_lowercase()
-                                && (domain.is_empty()
-                                    || c.domain.to_lowercase() == domain.to_lowercase())
-                        })
-                        .cloned();
-
+                    // Find credential for the source user. Cross-forest ACL
+                    // edges (e.g. leo@contoso → sql01$@fabrikam) put the
+                    // source user in a different domain than the vuln's `domain`
+                    // field (which is the target's domain), so we cannot
+                    // domain-restrict against the target.
+                    let credential = state.find_source_credential(&source_user, &domain);
                     let hash = if credential.is_none() {
-                        state
-                            .hashes
-                            .iter()
-                            .find(|h| {
-                                h.username.to_lowercase() == source_user.to_lowercase()
-                                    && h.hash_type.to_uppercase() == "NTLM"
-                                    && (domain.is_empty()
-                                        || h.domain.to_lowercase() == domain.to_lowercase())
-                            })
-                            .cloned()
+                        state.find_source_hash(&source_user, &domain)
                     } else {
                         None
                     };
@@ -294,6 +289,11 @@ mod tests {
         assert!(!is_rbcd_candidate("genericwrite", Some("Group")));
         assert!(!is_rbcd_candidate("esc1", None));
         assert!(!is_rbcd_candidate("shadow_credentials", Some("Computer")));
+    }
+
+    #[test]
+    fn ghost_machine_target_detected() {
+        assert!(is_ghost_machine_account("WIN-DPPJMLU3XS6$"));
     }
 
     #[test]

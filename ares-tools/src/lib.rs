@@ -9,6 +9,7 @@ pub mod args;
 #[cfg(feature = "blue")]
 pub mod blue;
 pub mod coercion;
+pub mod concurrency;
 pub mod cracker;
 pub mod credential_access;
 pub mod credentials;
@@ -65,11 +66,24 @@ impl ToolOutput {
 /// Dispatch a tool call by name, executing the corresponding CLI command.
 ///
 /// Returns the tool output or an error if the tool is unknown or execution
-/// fails. Calls whose `target` / `target_ip` is a literal IP outside the
-/// configured operation scope are rejected before any subprocess runs (see
-/// [`scope::validate_in_scope`]).
+/// fails. Validates that no credential argument carries a placeholder value
+/// (see [`credentials::validate_arguments`]) and that any `target` / `target_ip`
+/// IP is within the configured operation scope (see [`scope::validate_in_scope`])
+/// before any subprocess runs.
 pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> {
+    credentials::validate_arguments(tool_name, arguments)?;
     scope::validate_in_scope(tool_name, arguments)?;
+
+    // Cap concurrent spider_plus dispatches process-wide to prevent the
+    // netexec fork-storm OOM observed on EC2.
+    // The permit is held for the duration of the tool execution and dropped
+    // when this function returns.
+    let _spider_permit = if concurrency::is_spider_plus_tool(tool_name) {
+        Some(concurrency::acquire_spider_plus_permit().await)
+    } else {
+        None
+    };
+
     match tool_name {
         // ── Reconnaissance ──────────────────────────────────────────
         "nmap_scan" => recon::nmap_scan(arguments).await,
@@ -88,6 +102,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "adidnsdump" => recon::adidnsdump(arguments).await,
         "save_users_to_file" => recon::save_users_to_file(arguments).await,
         "smbclient_kerberos_shares" => recon::smbclient_kerberos_shares(arguments).await,
+        "ldap_acl_enumeration" => recon::ldap_acl_enumeration(arguments).await,
 
         // ── Credential Access ───────────────────────────────────────
         "kerberoast" => credential_access::kerberoast(arguments).await,
@@ -97,6 +112,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         }
         "secretsdump" => credential_access::secretsdump(arguments).await,
         "lsassy" => credential_access::lsassy(arguments).await,
+        "smb_login_check" => credential_access::smb_login_check(arguments).await,
         "domain_admin_checker" => credential_access::domain_admin_checker(arguments).await,
         "gpp_password_finder" => credential_access::gpp_password_finder(arguments).await,
         "sysvol_script_search" => credential_access::sysvol_script_search(arguments).await,
@@ -140,6 +156,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
             lateral::mssql_linked_enable_xpcmdshell(arguments).await
         }
         "mssql_linked_xpcmdshell" => lateral::mssql_linked_xpcmdshell(arguments).await,
+        "mssql_openquery" => lateral::mssql_openquery(arguments).await,
         "mssql_ntlm_coerce" => lateral::mssql_ntlm_coerce(arguments).await,
 
         // ── Privilege Escalation ────────────────────────────────────
@@ -149,6 +166,13 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "certipy_shadow" => privesc::certipy_shadow(arguments).await,
         "certipy_template_esc4" => privesc::certipy_template_esc4(arguments).await,
         "certipy_esc4_full_chain" => privesc::certipy_esc4_full_chain(arguments).await,
+        "certipy_esc3_full_chain" => privesc::certipy_esc3_full_chain(arguments).await,
+        "certipy_esc1_full_chain" => privesc::certipy_esc1_full_chain(arguments).await,
+        "certipy_ca" => privesc::certipy_ca(arguments).await,
+        "certipy_forge" => privesc::certipy_forge(arguments).await,
+        "certipy_retrieve" => privesc::certipy_retrieve(arguments).await,
+        "certipy_esc7_full_chain" => privesc::certipy_esc7_full_chain(arguments).await,
+        "certipy_relay" => privesc::certipy_relay(arguments).await,
         "find_delegation" => privesc::find_delegation(arguments).await,
         "s4u_attack" => privesc::s4u_attack(arguments).await,
         "generate_golden_ticket" => privesc::generate_golden_ticket(arguments).await,
@@ -159,6 +183,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "raise_child" => privesc::raise_child(arguments).await,
         "extract_trust_key" => privesc::extract_trust_key(arguments).await,
         "create_inter_realm_ticket" => privesc::create_inter_realm_ticket(arguments).await,
+        "forge_inter_realm_and_dump" => privesc::forge_inter_realm_and_dump(arguments).await,
         "get_sid" => privesc::get_sid(arguments).await,
         "dnstool" => privesc::dnstool(arguments).await,
         "gmsa_dump_passwords" => privesc::gmsa_dump_passwords(arguments).await,
@@ -174,6 +199,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "bloodyad_add_group_member" => acl::bloodyad_add_group_member(arguments).await,
         "bloodyad_set_password" => acl::bloodyad_set_password(arguments).await,
         "bloodyad_add_genericall" => acl::bloodyad_add_genericall(arguments).await,
+        "bloodyad_set_object_attr" => acl::bloodyad_set_object_attr(arguments).await,
         "adminsd_holder_add_ace" => acl::adminsd_holder_add_ace(arguments).await,
         "gmsa_read_password_bloodyad" => acl::gmsa_read_password_bloodyad(arguments).await,
         "pywhisker" => acl::pywhisker(arguments).await,
@@ -192,6 +218,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "ntlmrelayx_to_adcs" => coercion::ntlmrelayx_to_adcs(arguments).await,
         "ntlmrelayx_to_smb" => coercion::ntlmrelayx_to_smb(arguments).await,
         "ntlmrelayx_multirelay" => coercion::ntlmrelayx_multirelay(arguments).await,
+        "relay_and_coerce" => coercion::relay_and_coerce(arguments).await,
 
         _ => Err(anyhow::anyhow!("unknown tool: {tool_name}")),
     }

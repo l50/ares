@@ -1,5 +1,23 @@
 use super::*;
 
+/// Test-only wrappers that synthesize an empty `ToolOutputCtx` so legacy tests
+/// (predating tool-aware extraction) can keep their `(output, domain)` shape.
+fn extract_plaintext_passwords(output: &str, default_domain: &str) -> Vec<Credential> {
+    let ctx = ToolOutputCtx {
+        arguments: None,
+        output,
+    };
+    super::passwords::extract_plaintext_passwords(&ctx, default_domain)
+}
+
+fn extract_from_output_text(output: &str, default_domain: &str) -> TextExtractions {
+    let ctx = ToolOutputCtx {
+        arguments: None,
+        output,
+    };
+    super::extract_from_output_text(&ctx, default_domain)
+}
+
 #[test]
 fn extract_ntlm_with_domain() {
     let output =
@@ -364,6 +382,36 @@ SMB  192.168.58.11  445  DC02  [+] child.contoso.local\\jdoe:jdoe";
 }
 
 #[test]
+fn extract_netexec_skips_hash_auth_echo() {
+    let output =
+        "SMB  192.168.58.11  445  DC01  [+] contoso.local\\frank:6dccf1c567c56a40e56691a723a49664 (Pwn3d!)";
+    let args = serde_json::json!({"hashes": "6dccf1c567c56a40e56691a723a49664"});
+    let ctx = ToolOutputCtx {
+        arguments: Some(&args),
+        output,
+    };
+    let result = super::extract_from_output_text(&ctx, "contoso.local");
+    assert!(
+        result.credentials.is_empty(),
+        "hash echo must not become a credential: {:?}",
+        result.credentials
+    );
+}
+
+#[test]
+fn extract_netexec_password_auth_still_extracted() {
+    let output = "SMB  192.168.58.11  445  DC01  [+] contoso.local\\jdoe:RealPass1 (Pwn3d!)";
+    let args = serde_json::json!({"password": "RealPass1"});
+    let ctx = ToolOutputCtx {
+        arguments: Some(&args),
+        output,
+    };
+    let result = super::extract_from_output_text(&ctx, "contoso.local");
+    assert_eq!(result.credentials.len(), 1);
+    assert_eq!(result.credentials[0].password, "RealPass1");
+}
+
+#[test]
 fn extract_netexec_success_with_pwned() {
     let output = "SMB  192.168.58.11  445  DC01  [+] contoso.local\\Administrator:P@ssw0rd(Pwn3d!)";
 
@@ -508,12 +556,12 @@ fn extract_cracked_tgs_john_show_unknown_user() {
     let output = "Loaded 1 password hash (krb5tgs)\n\
         $krb5tgs$23$*john.smith$CHILD.CONTOSO.LOCAL$CIFS/filesvr01*$abcdef$123456\n\
         --- john --show ---\n\
-        ?:iknownothing\n\n\
+        ?:P@ssw0rd!\n\n\
         1 password hash cracked, 0 left\n";
     let creds = extract_cracked_passwords(output, "child.contoso.local");
     assert_eq!(creds.len(), 1);
     assert_eq!(creds[0].username, "john.smith");
-    assert_eq!(creds[0].password, "iknownothing");
+    assert_eq!(creds[0].password, "P@ssw0rd!");
     assert_eq!(creds[0].domain, "CHILD.CONTOSO.LOCAL");
     assert_eq!(creds[0].source, "cracked:john");
 }
@@ -522,7 +570,7 @@ fn extract_cracked_tgs_john_show_unknown_user() {
 fn extract_cracked_tgs_john_unknown_user_no_hash_context() {
     // Without a TGS hash line in the output, ?:password is skipped
     let output = "--- john --show ---\n\
-        ?:iknownothing\n\n\
+        ?:P@ssw0rd!\n\n\
         1 password hash cracked, 0 left\n";
     let creds = extract_cracked_passwords(output, "contoso.local");
     assert!(creds.is_empty(), "No TGS hash context = no credential");
@@ -538,6 +586,51 @@ fn extract_cracked_no_false_positive_on_raw_asrep_hash() {
         creds.is_empty(),
         "Raw AS-REP hash body should not be treated as cracked password"
     );
+}
+
+/// rpcclient queryuser output puts User Name and Description on separate lines.
+/// The block-aware parser should extract the password from the Description field.
+#[test]
+fn extract_rpcclient_queryuser_description_password() {
+    let output = "\
+\tUser Name   :\tjdoe\n\
+\tFull Name   :\t\n\
+\tHome Drive  :\t\n\
+\tDir Drive   :\t\n\
+\tProfile Path:\t\n\
+\tLogon Script:\t\n\
+\tDescription :\tJohn Doe (Password : Summer2024!)\n\
+\tWorkstations:\t\n\
+\tComment     :\t\n\
+\tRemote Dial :\n";
+    let creds = extract_plaintext_passwords(output, "child.contoso.local");
+    assert_eq!(
+        creds.len(),
+        1,
+        "Should extract credential from rpcclient queryuser block"
+    );
+    assert_eq!(creds[0].username, "jdoe");
+    assert_eq!(creds[0].password, "Summer2024!");
+    assert_eq!(creds[0].domain, "child.contoso.local");
+    assert_eq!(creds[0].source, "description_field");
+}
+
+/// Multiple rpcclient queryuser blocks — only users WITH passwords should produce creds.
+#[test]
+fn extract_rpcclient_queryuser_multiple_users() {
+    let output = "\
+\tUser Name   :\tasmith\n\
+\tDescription :\tAlice Smith\n\
+\n\
+\tUser Name   :\tjdoe\n\
+\tDescription :\tJohn Doe (Password : Summer2024!)\n\
+\n\
+\tUser Name   :\tbjones\n\
+\tDescription :\tBob Jones\n";
+    let creds = extract_plaintext_passwords(output, "child.contoso.local");
+    assert_eq!(creds.len(), 1, "Only jdoe has a password in description");
+    assert_eq!(creds[0].username, "jdoe");
+    assert_eq!(creds[0].password, "Summer2024!");
 }
 
 #[test]

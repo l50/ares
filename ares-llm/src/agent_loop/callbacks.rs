@@ -61,10 +61,37 @@ pub(super) fn handle_builtin_callback(call: &ToolCall) -> Result<CallbackResult>
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            info!(finding_type = %finding_type, "Finding reported: {description}");
-            Ok(CallbackResult::Continue(format!(
-                "Finding recorded: {finding_type}"
-            )))
+            let target = call.arguments["target"].as_str().unwrap_or("").to_string();
+            let severity = call.arguments["severity"]
+                .as_str()
+                .unwrap_or("info")
+                .to_string();
+            info!(finding_type = %finding_type, target = %target, severity = %severity, "Finding reported: {description}");
+
+            // Route into `llm_findings` (NOT `discoveries`). The LLM-asserted
+            // payload reaches reports for context but MUST NOT feed
+            // `publish_vulnerability` — only parser-produced discoveries do.
+            let vuln_id = if target.is_empty() {
+                format!("finding_{finding_type}")
+            } else {
+                format!("finding_{}_{}", finding_type, target.replace('.', "_"))
+            };
+            let finding = serde_json::json!({
+                "vulnerabilities": [{
+                    "vuln_id": vuln_id,
+                    "vuln_type": finding_type,
+                    "target": target,
+                    "details": {
+                        "description": description,
+                        "severity": severity,
+                        "discovered_by": "agent_report_finding",
+                    },
+                }]
+            });
+            Ok(CallbackResult::LlmFinding {
+                response: format!("Finding recorded: {finding_type}"),
+                finding,
+            })
         }
         "report_lateral_success" => {
             let target = call.arguments["target_ip"]
@@ -77,9 +104,25 @@ pub(super) fn handle_builtin_callback(call: &ToolCall) -> Result<CallbackResult>
                 .unwrap_or("")
                 .to_string();
             info!(target = %target, technique = %technique, "Lateral movement succeeded");
-            Ok(CallbackResult::Continue(format!(
-                "Lateral movement recorded: {technique} → {target}"
-            )))
+
+            // Surface as an LLM finding only — does NOT feed `publish_vulnerability`.
+            let vuln_id = format!("lateral_success_{}_{}", technique, target.replace('.', "_"));
+            let finding = serde_json::json!({
+                "vulnerabilities": [{
+                    "vuln_id": vuln_id,
+                    "vuln_type": format!("lateral_{technique}"),
+                    "target": target,
+                    "details": {
+                        "description": format!("Successful lateral movement via {technique}"),
+                        "severity": "high",
+                        "discovered_by": "agent_lateral_movement",
+                    },
+                }]
+            });
+            Ok(CallbackResult::LlmFinding {
+                response: format!("Lateral movement recorded: {technique} → {target}"),
+                finding,
+            })
         }
         "report_lateral_failed" => {
             let target = call.arguments["target_ip"]
@@ -344,14 +387,18 @@ mod tests {
     fn report_finding() {
         let call = make_call(
             "report_finding",
-            serde_json::json!({"finding_type": "kerberoastable_account", "description": "Found SPN"}),
+            serde_json::json!({"finding_type": "kerberoastable_account", "description": "Found SPN", "target": "192.168.58.10"}),
         );
         let result = handle_builtin_callback(&call).unwrap();
         match result {
-            CallbackResult::Continue(msg) => {
-                assert!(msg.contains("kerberoastable_account"));
+            CallbackResult::LlmFinding { response, finding } => {
+                assert!(response.contains("kerberoastable_account"));
+                let vulns = finding["vulnerabilities"].as_array().unwrap();
+                assert_eq!(vulns.len(), 1);
+                assert_eq!(vulns[0]["vuln_type"], "kerberoastable_account");
+                assert_eq!(vulns[0]["target"], "192.168.58.10");
             }
-            other => panic!("Expected Continue, got {other:?}"),
+            other => panic!("Expected LlmFinding, got {other:?}"),
         }
     }
 
@@ -363,11 +410,14 @@ mod tests {
         );
         let result = handle_builtin_callback(&call).unwrap();
         match result {
-            CallbackResult::Continue(msg) => {
-                assert!(msg.contains("psexec"));
-                assert!(msg.contains("192.168.58.10"));
+            CallbackResult::LlmFinding { response, finding } => {
+                assert!(response.contains("psexec"));
+                assert!(response.contains("192.168.58.10"));
+                let vulns = finding["vulnerabilities"].as_array().unwrap();
+                assert_eq!(vulns.len(), 1);
+                assert_eq!(vulns[0]["vuln_type"], "lateral_psexec");
             }
-            other => panic!("Expected Continue, got {other:?}"),
+            other => panic!("Expected LlmFinding, got {other:?}"),
         }
     }
 
@@ -380,11 +430,13 @@ mod tests {
         );
         let result = handle_builtin_callback(&call).unwrap();
         match result {
-            CallbackResult::Continue(msg) => {
-                assert!(msg.contains("wmiexec"));
-                assert!(msg.contains("srv01.contoso.local"));
+            CallbackResult::LlmFinding { response, finding } => {
+                assert!(response.contains("wmiexec"));
+                assert!(response.contains("srv01.contoso.local"));
+                let vulns = finding["vulnerabilities"].as_array().unwrap();
+                assert_eq!(vulns[0]["vuln_type"], "lateral_wmiexec");
             }
-            other => panic!("Expected Continue, got {other:?}"),
+            other => panic!("Expected LlmFinding, got {other:?}"),
         }
     }
 

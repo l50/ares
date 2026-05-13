@@ -3,8 +3,83 @@ use super::admin_checks::{
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
 use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
+use super::{result_has_credential_evidence, result_has_parser_evidence};
 use ares_core::models::{Credential, Hash};
 use serde_json::json;
+
+#[test]
+fn parser_evidence_requires_discoveries_key() {
+    // No payload at all → no evidence
+    assert!(!result_has_parser_evidence(&None));
+    // Payload without discoveries → no evidence
+    assert!(!result_has_parser_evidence(&Some(json!({"summary": "ok"}))));
+    // Empty discoveries object → no evidence
+    assert!(!result_has_parser_evidence(&Some(
+        json!({"discoveries": {}})
+    )));
+    // Empty arrays → no evidence
+    assert!(!result_has_parser_evidence(&Some(
+        json!({"discoveries": {"credentials": [], "hashes": []}})
+    )));
+}
+
+#[test]
+fn parser_evidence_accepts_any_populated_array() {
+    for key in [
+        "credentials",
+        "hashes",
+        "hosts",
+        "shares",
+        "vulnerabilities",
+        "delegations",
+        "trusts",
+        "users",
+        "spns",
+    ] {
+        let payload = json!({"discoveries": {key: [{"placeholder": true}]}});
+        assert!(
+            result_has_parser_evidence(&Some(payload)),
+            "key {key} should count as parser evidence"
+        );
+    }
+}
+
+#[test]
+fn credential_evidence_only_credentials_or_hashes() {
+    // Only hosts → not credential evidence
+    assert!(!result_has_credential_evidence(&Some(
+        json!({"discoveries": {"hosts": [{"ip": "192.168.58.10"}]}})
+    )));
+    // Credentials present → credential evidence
+    assert!(result_has_credential_evidence(&Some(
+        json!({"discoveries": {"credentials": [{"username": "admin"}]}})
+    )));
+    // Hashes present → credential evidence
+    assert!(result_has_credential_evidence(&Some(
+        json!({"discoveries": {"hashes": [{"username": "admin"}]}})
+    )));
+    // Vulnerabilities alone are NOT credential evidence (would be parser evidence)
+    assert!(!result_has_credential_evidence(&Some(
+        json!({"discoveries": {"vulnerabilities": [{"vuln_id": "v1"}]}})
+    )));
+}
+
+#[test]
+fn llm_findings_field_is_not_treated_as_evidence() {
+    // LLM-fabricated findings live under `llm_findings`, never `discoveries`.
+    // The grounding check must IGNORE them.
+    let payload = json!({
+        "summary": "claimed exploit success",
+        "llm_findings": [{
+            "vulnerabilities": [{
+                "vuln_id": "finding_kerberoastable_account_192_168_58_10",
+                "vuln_type": "kerberoastable_account",
+            }]
+        }]
+    });
+    assert!(!result_has_parser_evidence(&Some(payload.clone())));
+    assert!(!result_has_credential_evidence(&Some(payload)));
+}
 
 #[test]
 fn parse_credentials_array() {
@@ -287,6 +362,10 @@ fn make_test_hash(id: &str, username: &str, domain: &str, attack_step: i32) -> H
         parent_id: None,
         attack_step,
         aes_key: None,
+        is_previous: false,
+        source_host: None,
+        is_trust_key: false,
+        trust_pair_label: None,
     }
 }
 
@@ -669,6 +748,8 @@ fn parse_shares_with_comment() {
     assert_eq!(parsed.shares[0].comment, "Logon server share");
 }
 
+// --- parse_pwned_line tests ---
+
 #[test]
 fn pwned_line_standard_format() {
     let line = "[+] CONTOSO\\admin:P@ssw0rd! (Pwn3d!)";
@@ -745,6 +826,8 @@ fn pwned_line_username_with_special_chars() {
     );
 }
 
+// --- extract_ip_from_line tests ---
+
 #[test]
 fn extract_ip_basic() {
     let line = "SMB 192.168.58.10 445 DC01 [+] CONTOSO\\admin (Pwn3d!)";
@@ -789,6 +872,8 @@ fn extract_ip_boundary_values() {
     assert_eq!(extract_ip_from_line(line), Some("0.0.0.0".to_string()));
 }
 
+// --- has_golden_ticket_indicator tests ---
+
 #[test]
 fn golden_ticket_indicator_present() {
     let text = "Saving ticket in administrator.ccache";
@@ -817,6 +902,8 @@ fn golden_ticket_indicator_both_present_not_adjacent() {
     let text = "Saving ticket in /tmp/krbtgt@CONTOSO.LOCAL.ccache\nDone";
     assert!(has_golden_ticket_indicator(text));
 }
+
+// --- resolve_da_path tests ---
 
 #[test]
 fn da_path_explicit_flag_with_path() {
@@ -862,6 +949,8 @@ fn da_path_null_flag_defaults_to_krbtgt() {
         Some("secretsdump -> krbtgt hash".to_string())
     );
 }
+
+// --- credential_techniques tests ---
 
 #[test]
 fn credential_techniques_admin_base() {
@@ -919,6 +1008,8 @@ fn credential_techniques_empty_source() {
     let t = credential_techniques("", false);
     assert_eq!(t, vec!["T1552"]);
 }
+
+// --- hash_techniques tests ---
 
 #[test]
 fn hash_techniques_base() {
@@ -1005,6 +1096,8 @@ fn hash_techniques_as_rep_hyphenated_source() {
     assert!(t.contains(&"T1558.004".to_string()));
 }
 
+// --- is_critical_hash tests ---
+
 #[test]
 fn critical_hash_krbtgt() {
     assert!(is_critical_hash("krbtgt"));
@@ -1035,4 +1128,420 @@ fn critical_hash_empty() {
 fn critical_hash_partial_match() {
     assert!(!is_critical_hash("krbtgt_backup"));
     assert!(!is_critical_hash("admin"));
+}
+
+#[test]
+fn extract_locked_users_basic_netexec_format() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": [
+            "SMB    192.168.58.10  445  DC01  [-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT\n\
+             SMB    192.168.58.10  445  DC01  [+] CONTOSO\\testuser3:testuser3 (Pwn3d!)\n\
+             SMB    192.168.58.10  445  DC01  [-] CONTOSO\\testuser2:testuser2 STATUS_ACCOUNT_LOCKED_OUT"
+        ]
+    });
+    let mut locked = extract_locked_usernames_from_result(&Some(payload));
+    locked.sort();
+    assert_eq!(
+        locked,
+        vec![
+            ("testuser1".to_string(), Some("contoso".to_string())),
+            ("testuser2".to_string(), Some("contoso".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn extract_locked_users_kdc_revoked_format() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "summary": "[-] CONTOSO\\testuser1:testuser1 KDC_ERR_CLIENT_REVOKED"
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert_eq!(
+        locked,
+        vec![("testuser1".to_string(), Some("contoso".to_string()))]
+    );
+}
+
+#[test]
+fn extract_locked_users_skips_disabled_builtins() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": [
+            "[-] CONTOSO\\Guest:Guest STATUS_ACCOUNT_LOCKED_OUT\n\
+             [-] CONTOSO\\krbtgt:krbtgt STATUS_ACCOUNT_LOCKED_OUT\n\
+             [-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT"
+        ]
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert_eq!(
+        locked,
+        vec![("testuser1".to_string(), Some("contoso".to_string()))]
+    );
+}
+
+#[test]
+fn extract_locked_users_dedups_repeats() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": [
+            "[-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT\n\
+             [-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT"
+        ]
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert_eq!(locked.len(), 1);
+}
+
+#[test]
+fn extract_locked_users_no_matches_returns_empty() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": ["[+] CONTOSO\\testuser1:testuser1 (Pwn3d!)"]
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert!(locked.is_empty());
+}
+
+#[test]
+fn extract_locked_users_rejects_bare_principal() {
+    use super::extract_locked_usernames_from_result;
+    // Bare `user:pass` (no DOMAIN\ prefix) is rejected — netexec always
+    // emits the canonical `DOMAIN\user:pass` form on auth events.
+    let payload = json!({
+        "summary": "[-] testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT"
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert!(locked.is_empty());
+}
+
+#[test]
+fn extract_locked_users_rejects_llm_narrative_tokens() {
+    use super::extract_locked_usernames_from_result;
+    // LLM summary text often contains `word:` tokens (technique names,
+    // password values, list bullets) that are not principals. The
+    // backslash gate prevents these from being misclassified.
+    let payload = json!({
+        "summary": "1) username_as_password: returned STATUS_ACCOUNT_LOCKED_OUT\n\
+                    Notable: P@ssw0rd1 spray got STATUS_ACCOUNT_LOCKED_OUT\n\
+                    auth: failed with STATUS_ACCOUNT_LOCKED_OUT"
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert!(locked.is_empty(), "got false positives: {locked:?}");
+}
+
+#[test]
+fn is_ticket_grant_vuln_recognizes_delegation_prefixes() {
+    use super::is_ticket_grant_vuln;
+    assert!(is_ticket_grant_vuln("constrained_delegation_alice"));
+    assert!(is_ticket_grant_vuln("UNCONSTRAINED_DELEGATION_WEB01$"));
+    assert!(is_ticket_grant_vuln("rbcd_dc01_target"));
+    assert!(is_ticket_grant_vuln("s4u_admin_at_contoso"));
+}
+
+#[test]
+fn is_ticket_grant_vuln_rejects_non_ticket_primitives() {
+    use super::is_ticket_grant_vuln;
+    assert!(!is_ticket_grant_vuln("kerberoast_svc_sql"));
+    assert!(!is_ticket_grant_vuln("adcs_esc1_192.168.58.50"));
+    assert!(!is_ticket_grant_vuln("mssql_impersonation_192.168.58.51"));
+    assert!(!is_ticket_grant_vuln(""));
+}
+
+#[test]
+fn ccache_evidence_detects_saving_ticket_line() {
+    use super::result_has_ccache_evidence;
+    let payload = json!({
+        "output": "[*] Impersonating Administrator\n\
+                   [*] Requesting S4U2self\n\
+                   [*] Requesting S4U2Proxy\n\
+                   [*] Saving ticket in Administrator@cifs_dc01@CONTOSO.LOCAL.ccache"
+    });
+    assert!(result_has_ccache_evidence(&Some(payload)));
+}
+
+#[test]
+fn ccache_evidence_detects_in_tool_outputs_array() {
+    use super::result_has_ccache_evidence;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "[*] Saving ticket in alice@CIFS.ccache"}
+        ]
+    });
+    assert!(result_has_ccache_evidence(&Some(payload)));
+}
+
+#[test]
+fn ccache_evidence_rejects_bare_mention() {
+    use super::result_has_ccache_evidence;
+    // LLM commentary that mentions a ticket path but doesn't prove a save.
+    let payload = json!({
+        "summary": "S4U2Proxy returned an error before saving the .ccache"
+    });
+    assert!(!result_has_ccache_evidence(&Some(payload)));
+}
+
+#[test]
+fn ccache_evidence_empty_payload() {
+    use super::result_has_ccache_evidence;
+    assert!(!result_has_ccache_evidence(&None));
+    assert!(!result_has_ccache_evidence(&Some(json!({}))));
+}
+
+#[test]
+fn is_gmsa_principal_matches_trailing_dollar_with_gmsa_name() {
+    use super::is_gmsa_principal;
+    assert!(is_gmsa_principal("gmsaDragon$"));
+    assert!(is_gmsa_principal("GMSA_WEB$"));
+    assert!(is_gmsa_principal("svc_gmsa$"));
+}
+
+#[test]
+fn is_gmsa_principal_rejects_machine_account_without_gmsa_substring() {
+    use super::is_gmsa_principal;
+    // Plain machine accounts end with $ but are not gMSA.
+    assert!(!is_gmsa_principal("DC01$"));
+    assert!(!is_gmsa_principal("WEB01$"));
+}
+
+#[test]
+fn is_gmsa_principal_rejects_user_without_trailing_dollar() {
+    use super::is_gmsa_principal;
+    // A user named "gmsa_admin" (no trailing $) is a regular user, not gMSA.
+    assert!(!is_gmsa_principal("gmsa_admin"));
+    assert!(!is_gmsa_principal(""));
+    assert!(!is_gmsa_principal("$"));
+}
+
+#[test]
+fn gmsa_exploit_token_strips_dollar_and_lowercases() {
+    use super::gmsa_exploit_token;
+    assert_eq!(gmsa_exploit_token("gmsaDragon$"), "gmsa_gmsadragon");
+    assert_eq!(gmsa_exploit_token("GMSA_WEB$"), "gmsa_gmsa_web");
+    assert_eq!(gmsa_exploit_token("svc_gmsa$"), "gmsa_svc_gmsa");
+}
+
+#[test]
+fn gmsa_exploit_token_converges_with_enumeration_format() {
+    // Enumeration path emits `gmsa_{name}` lowercased; secretsdump-surfaced
+    // path must produce the same key so the exploited-set entry deduplicates
+    // across paths and the scoreboard counts the primitive once.
+    use super::gmsa_exploit_token;
+    assert_eq!(gmsa_exploit_token("gmsaDragon$"), "gmsa_gmsadragon");
+}
+
+mod emit_gmsa_exploit_token {
+    use super::super::emit_gmsa_exploit_token_if_gmsa;
+    use crate::orchestrator::state::SharedState;
+    use crate::orchestrator::task_queue::TaskQueueCore;
+    use ares_core::state::mock_redis::MockRedisConnection;
+
+    fn mock_queue() -> TaskQueueCore<MockRedisConnection> {
+        TaskQueueCore::from_connection(MockRedisConnection::new())
+    }
+
+    #[tokio::test]
+    async fn marks_exploited_for_gmsa_principal() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "gmsaDragon$").await;
+        let s = state.read().await;
+        assert!(s.exploited_vulnerabilities.contains("gmsa_gmsadragon"));
+    }
+
+    #[tokio::test]
+    async fn no_op_for_plain_machine_account() {
+        // DC01$ ends with `$` but is not a gMSA — no token should be emitted.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "DC01$").await;
+        let s = state.read().await;
+        assert!(s.exploited_vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_op_for_regular_user() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "alice").await;
+        let s = state.read().await;
+        assert!(s.exploited_vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_normalized_lowercase_for_mixed_case_input() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "GMSA_WEB$").await;
+        let s = state.read().await;
+        assert!(s.exploited_vulnerabilities.contains("gmsa_gmsa_web"));
+    }
+}
+
+#[test]
+fn seimpersonate_signal_detects_enabled_in_whoami_priv_output() {
+    use super::result_has_seimpersonate_signal;
+    // Real-world `whoami /priv` row format from a service account context.
+    let payload = json!({
+        "output": "PRIVILEGES INFORMATION\n\
+                   ----------------------\n\
+                   Privilege Name                Description                                 State\n\
+                   ============================= =========================================== ========\n\
+                   SeAssignPrimaryTokenPrivilege Replace a process level token               Disabled\n\
+                   SeImpersonatePrivilege        Impersonate a client after authentication   Enabled\n\
+                   SeIncreaseQuotaPrivilege      Adjust memory quotas for a process          Disabled"
+    });
+    assert!(result_has_seimpersonate_signal(&Some(payload)));
+}
+
+#[test]
+fn seimpersonate_signal_ignores_disabled_priv() {
+    use super::result_has_seimpersonate_signal;
+    let payload = json!({
+        "output": "SeImpersonatePrivilege  Impersonate a client after authentication  Disabled"
+    });
+    assert!(!result_has_seimpersonate_signal(&Some(payload)));
+}
+
+#[test]
+fn seimpersonate_signal_ignores_bare_mention_without_state() {
+    use super::result_has_seimpersonate_signal;
+    // LLM commentary that names the privilege but doesn't prove it's held.
+    let payload = json!({
+        "summary": "Plan: check for SeImpersonatePrivilege if we get xp_cmdshell working"
+    });
+    assert!(!result_has_seimpersonate_signal(&Some(payload)));
+}
+
+#[test]
+fn seimpersonate_signal_detects_in_tool_outputs_array() {
+    use super::result_has_seimpersonate_signal;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "whoami output:\nSeImpersonatePrivilege Impersonate a client Enabled"}
+        ]
+    });
+    assert!(result_has_seimpersonate_signal(&Some(payload)));
+}
+
+#[test]
+fn seimpersonate_signal_empty_payload() {
+    use super::result_has_seimpersonate_signal;
+    assert!(!result_has_seimpersonate_signal(&None));
+    assert!(!result_has_seimpersonate_signal(&Some(json!({}))));
+}
+
+#[test]
+fn seimpersonate_signal_case_insensitive() {
+    use super::result_has_seimpersonate_signal;
+    // Some shells/agents may upper- or lower-case the row.
+    let payload = json!({
+        "output": "seimpersonateprivilege   description text   ENABLED"
+    });
+    assert!(result_has_seimpersonate_signal(&Some(payload)));
+}
+
+#[test]
+fn ntlmv1_signal_detects_explicit_verdict() {
+    use super::result_has_ntlmv1_signal;
+    let payload = json!({
+        "output": "[+] NTLMv1 is allowed (LmCompatibilityLevel registry value indicates vulnerable config)"
+    });
+    assert!(result_has_ntlmv1_signal(&Some(payload)));
+}
+
+#[test]
+fn ntlmv1_signal_detects_lmcompat_le_2() {
+    use super::result_has_ntlmv1_signal;
+    for value in [0, 1, 2] {
+        let payload = json!({
+            "output": format!("LmCompatibilityLevel: {value}")
+        });
+        assert!(
+            result_has_ntlmv1_signal(&Some(payload)),
+            "should match LmCompatibilityLevel={value}"
+        );
+    }
+}
+
+#[test]
+fn ntlmv1_signal_rejects_lmcompat_ge_3() {
+    use super::result_has_ntlmv1_signal;
+    for value in [3, 4, 5] {
+        let payload = json!({
+            "output": format!("LmCompatibilityLevel: {value}")
+        });
+        assert!(
+            !result_has_ntlmv1_signal(&Some(payload)),
+            "should NOT match LmCompatibilityLevel={value}"
+        );
+    }
+}
+
+#[test]
+fn ntlmv1_signal_recognizes_reg_dword_format() {
+    use super::result_has_ntlmv1_signal;
+    let payload = json!({
+        "output": "LmCompatibilityLevel    REG_DWORD    0x2"
+    });
+    assert!(result_has_ntlmv1_signal(&Some(payload)));
+}
+
+#[test]
+fn ntlmv1_signal_rejects_bare_mention() {
+    use super::result_has_ntlmv1_signal;
+    let payload = json!({
+        "summary": "Plan: check whether the DC permits NTLMv1 downgrade by reading LmCompatibilityLevel"
+    });
+    assert!(!result_has_ntlmv1_signal(&Some(payload)));
+}
+
+#[test]
+fn ntlmv1_signal_empty_payload() {
+    use super::result_has_ntlmv1_signal;
+    assert!(!result_has_ntlmv1_signal(&None));
+    assert!(!result_has_ntlmv1_signal(&Some(json!({}))));
+}
+
+#[test]
+fn ntlmv1_signal_detects_in_tool_outputs_array() {
+    use super::result_has_ntlmv1_signal;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "Registry probe returned LmCompatibilityLevel: 1"}
+        ]
+    });
+    assert!(result_has_ntlmv1_signal(&Some(payload)));
+}
+
+#[test]
+fn error_indicates_stall_recognises_canonical_strings() {
+    use super::error_indicates_stall;
+    assert!(error_indicates_stall(Some(
+        "Agent ended turn without task_complete or request_assistance"
+    )));
+    assert!(error_indicates_stall(Some("Agent hit max steps")));
+    assert!(error_indicates_stall(Some("Agent hit max tokens")));
+    assert!(error_indicates_stall(Some(
+        "Budget exceeded: input_tokens=1000000"
+    )));
+    // Case-insensitive
+    assert!(error_indicates_stall(Some(
+        "AGENT ENDED TURN WITHOUT TASK_COMPLETE"
+    )));
+}
+
+#[test]
+fn error_indicates_stall_rejects_real_failures() {
+    use super::error_indicates_stall;
+    // Substantive failures must not be treated as stalls — the underlying
+    // primitive really did fail and the vuln must stay unexplodited.
+    assert!(!error_indicates_stall(Some("rpc_s_access_denied")));
+    assert!(!error_indicates_stall(Some(
+        "KDC_ERR_PREAUTH_FAILED — credential rejected"
+    )));
+    assert!(!error_indicates_stall(Some("LDAP bind failed: 0x52e")));
+    assert!(!error_indicates_stall(Some("")));
+    assert!(!error_indicates_stall(None));
 }

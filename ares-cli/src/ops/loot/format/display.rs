@@ -312,7 +312,157 @@ pub(super) fn print_loot_human(
     print_mitre_techniques(&state.all_techniques, &state.all_timeline_events);
 }
 
-/// Print discovered vulnerabilities table.
+/// Compact summary used by `ops runtime`: DA/GT banner with per-domain
+/// breakdown plus a one-line host/DC count. Shares formatting with
+/// `print_loot_human` so the live-watch view stays consistent with `ops loot`.
+pub(super) fn print_runtime_summary(
+    state: &SharedRedTeamState,
+    credentials: &[Credential],
+    hashes: &[Hash],
+    domains_input: &[String],
+) {
+    let mut domains: Vec<String> = domains_input
+        .iter()
+        .map(|d| d.trim().trim_end_matches('.').to_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    domains.sort();
+    domains.dedup();
+
+    let mut forest_roots: Vec<String> = Vec::new();
+    let mut child_domains: HashMap<String, String> = HashMap::new();
+    for domain in &domains {
+        let parts: Vec<&str> = domain.split('.').collect();
+        if parts.len() >= 3 {
+            let parent = parts[1..].join(".");
+            if domains.contains(&parent) {
+                child_domains.insert(domain.clone(), parent);
+            } else {
+                forest_roots.push(domain.clone());
+            }
+        } else {
+            forest_roots.push(domain.clone());
+        }
+    }
+    forest_roots.sort();
+
+    let achievements = build_domain_achievements(state, hashes, credentials);
+    let compromised_count = achievements
+        .values()
+        .filter(|a| a.has_da || a.has_golden_ticket)
+        .count();
+    let compromised_forests: Vec<_> = forest_roots
+        .iter()
+        .filter(|root| {
+            let root_hit = achievements
+                .get(*root)
+                .map(|a| a.has_da || a.has_golden_ticket)
+                .unwrap_or(false);
+            let child_hit = child_domains
+                .iter()
+                .filter(|(_, parent)| *parent == *root)
+                .any(|(child, _)| {
+                    achievements
+                        .get(child)
+                        .map(|a| a.has_da || a.has_golden_ticket)
+                        .unwrap_or(false)
+                });
+            root_hit || child_hit
+        })
+        .cloned()
+        .collect();
+
+    if state.has_domain_admin || state.has_golden_ticket {
+        let mut lines = Vec::new();
+        let total_domains = domains.len();
+        if state.has_domain_admin {
+            let da_count = achievements.values().filter(|a| a.has_da).count();
+            if total_domains > 0 {
+                lines.push(format!(
+                    "\u{2605} DOMAIN ADMIN ACHIEVED ({da_count}/{total_domains} domains)"
+                ));
+            } else {
+                lines.push("\u{2605} DOMAIN ADMIN ACHIEVED".to_string());
+            }
+            if let Some(path) = &state.domain_admin_path {
+                lines.push(format!("  path: {path}"));
+            }
+        }
+        if state.has_golden_ticket {
+            let gt_count = achievements
+                .values()
+                .filter(|a| a.has_golden_ticket)
+                .count();
+            if total_domains > 0 {
+                lines.push(format!(
+                    "\u{2605} GOLDEN TICKET OBTAINED ({gt_count}/{total_domains} domains)"
+                ));
+            } else {
+                lines.push("\u{2605} GOLDEN TICKET OBTAINED".to_string());
+            }
+        }
+        let inner_width = lines.iter().map(|l| l.len()).max().unwrap_or(0) + 2;
+        println!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner_width));
+        for line in &lines {
+            println!(
+                "\u{2502} {:<width$} \u{2502}",
+                line,
+                width = inner_width - 2
+            );
+        }
+        println!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_width));
+        println!();
+    }
+
+    if !domains.is_empty() {
+        println!(
+            "Domains ({}/{} compromised, {}/{} forests):",
+            compromised_count,
+            domains.len(),
+            compromised_forests.len(),
+            forest_roots.len()
+        );
+        let mut displayed = HashSet::new();
+        for root in &forest_roots {
+            print_domain_line(root, "(forest root)", "  ", &achievements);
+            displayed.insert(root.clone());
+            let mut children: Vec<_> = child_domains
+                .iter()
+                .filter(|(_, parent)| *parent == root)
+                .map(|(child, _)| child.clone())
+                .collect();
+            children.sort();
+            for child in &children {
+                print_domain_line(child, "(child)", "    \u{2514}\u{2500} ", &achievements);
+                displayed.insert(child.clone());
+            }
+        }
+        let mut extra: Vec<_> = achievements
+            .keys()
+            .filter(|d| !displayed.contains(*d))
+            .cloned()
+            .collect();
+        extra.sort();
+        for domain in &extra {
+            print_domain_line(domain, "", "  ", &achievements);
+        }
+    }
+
+    let merged_hosts = dedup_hosts(
+        &state.all_hosts,
+        &state.netbios_to_fqdn,
+        &state.domain_controllers,
+    );
+    let dcs_count = merged_hosts.iter().filter(|h| h.is_dc).count();
+    println!("Hosts: {} ({} DCs)", merged_hosts.len(), dcs_count);
+}
+
+/// Priority threshold (inclusive) at or below which a vulnerability is treated
+/// as actively exploitable rather than an informational finding.
+const EXPLOITABLE_PRIORITY_MAX: i32 = 3;
+
+/// Print vulnerabilities split into two tables: actively exploitable
+/// (priority <= EXPLOITABLE_PRIORITY_MAX) and informational findings (rest).
 fn print_vulnerabilities(
     discovered: &HashMap<String, VulnerabilityInfo>,
     exploited: &HashSet<String>,
@@ -321,20 +471,57 @@ fn print_vulnerabilities(
         return;
     }
 
-    let mut vulns: Vec<(&String, &VulnerabilityInfo)> = discovered.iter().collect();
-    vulns.sort_by(|a, b| {
-        a.1.priority
-            .cmp(&b.1.priority)
-            .then(a.1.vuln_type.cmp(&b.1.vuln_type))
-    });
+    let mut exploitable: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
+    let mut findings: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
+    for (id, vuln) in discovered.iter() {
+        if vuln.priority <= EXPLOITABLE_PRIORITY_MAX {
+            exploitable.push((id, vuln));
+        } else {
+            findings.push((id, vuln));
+        }
+    }
+    let sort_vulns = |vulns: &mut Vec<(&String, &VulnerabilityInfo)>| {
+        vulns.sort_by(|a, b| {
+            a.1.priority
+                .cmp(&b.1.priority)
+                .then(a.1.vuln_type.cmp(&b.1.vuln_type))
+        });
+    };
+    sort_vulns(&mut exploitable);
+    sort_vulns(&mut findings);
 
-    println!("Discovered Vulnerabilities ({}):", vulns.len());
+    let exploited_in_exploitable = exploitable
+        .iter()
+        .filter(|(id, _)| exploited.contains(*id))
+        .count();
+
+    println!(
+        "Exploitable Vulnerabilities ({}, {} exploited):",
+        exploitable.len(),
+        exploited_in_exploitable
+    );
+    if exploitable.is_empty() {
+        println!("  (none)");
+    } else {
+        print_vuln_table(&exploitable, exploited);
+    }
+    println!();
+
+    println!("Findings ({}):", findings.len());
+    if !findings.is_empty() {
+        print_vuln_table(&findings, exploited);
+    }
+    println!();
+}
+
+/// Render a single vulnerability table body (header + rows).
+fn print_vuln_table(vulns: &[(&String, &VulnerabilityInfo)], exploited: &HashSet<String>) {
     println!(
         "  {:<30} {:<20} {:>8} {:>9}  Details",
         "Type", "Target", "Priority", "Exploited"
     );
     println!("  {}", "-".repeat(100));
-    for (vuln_id, vuln) in &vulns {
+    for (vuln_id, vuln) in vulns {
         let is_exploited = exploited.contains(*vuln_id);
         let exploited_mark = if is_exploited { "\u{2713}" } else { "\u{2717}" };
 
@@ -354,7 +541,6 @@ fn print_vulnerabilities(
             vuln.vuln_type, vuln.target, vuln.priority, exploited_mark, details_display
         );
     }
-    println!();
 }
 
 /// Format vulnerability details HashMap into a readable string.
@@ -440,10 +626,12 @@ fn print_attack_path(timeline_events: &[serde_json::Value]) {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown event");
 
+        let already_critical = description.starts_with("CRITICAL:");
         let desc_lower = description.to_lowercase();
-        let is_critical = desc_lower.contains("krbtgt")
-            || (desc_lower.contains("administrator") && desc_lower.contains("hash"))
-            || desc_lower.contains("domain admin");
+        let is_critical = !already_critical
+            && (desc_lower.contains("krbtgt")
+                || (desc_lower.contains("administrator") && desc_lower.contains("hash"))
+                || desc_lower.contains("domain admin"));
         let prefix = if is_critical { "CRITICAL: " } else { "" };
 
         let mitre = extract_mitre_from_event(event);
@@ -767,6 +955,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         }
     }
 

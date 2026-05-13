@@ -10,7 +10,7 @@ mod list;
 mod loot;
 mod queue;
 mod replay;
-mod report;
+pub(crate) mod report;
 pub(crate) mod resolve;
 mod runtime;
 mod sessions;

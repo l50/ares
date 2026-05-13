@@ -21,6 +21,13 @@ use crate::orchestrator::routing::ActiveTaskTracker;
 const CRITICAL_PATH_TASK_TYPES: &[&str] = &["exploit"];
 
 /// High-value exploit subtypes that bypass hard cap.
+///
+/// Forest-pivot vulns (`forest_trust_escalation`, `child_to_parent`) are the
+/// only path off the source forest; if they get parked in the deferred queue
+/// behind ordinary recon/exploit work and stale-evict before running, the op
+/// stalls in a single forest with no signal to the operator. Treat them as
+/// critical-path so the throttler routes them straight to dispatch even when
+/// the LLM concurrency cap is saturated.
 const CRITICAL_PATH_VULN_TYPES: &[&str] = &[
     "constrained_delegation",
     "unconstrained_delegation",
@@ -31,10 +38,18 @@ const CRITICAL_PATH_VULN_TYPES: &[&str] = &[
     "adcs_esc1",
     "adcs_esc4",
     "adcs_esc8",
+    "forest_trust_escalation",
+    "child_to_parent",
 ];
 
 /// Maximum tasks allowed to bypass the hard cap simultaneously.
-const MAX_BYPASS_TASKS: usize = 3;
+///
+/// Sized to accommodate restart-requeue scenarios where many in-flight critical
+/// tasks rehydrate at once and the active-task tracker hasn't yet evicted stale
+/// entries from the previous orchestrator instance. With MAX_BYPASS_TASKS=3 the
+/// bypass channel saturates trivially and even ACL chain steps deadlock waiting
+/// for stale exploit tasks to be evicted.
+const MAX_BYPASS_TASKS: usize = 10;
 
 /// What the throttler decided about a candidate task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +116,18 @@ impl Throttler {
         let hard_cap = self.config.hard_cap();
 
         if llm_count >= hard_cap {
+            // Always-bypass tasks (acl_chain_step) skip even the bypass-cap.
+            // Stale exploit-task buildup must not block the ACL exploitation
+            // pipeline since those steps are the actual path to forest
+            // compromise.
+            if self.is_always_bypass(task_type) {
+                info!(
+                    llm_count,
+                    hard_cap, task_type, "Hard cap: always-bypass critical task — allowing"
+                );
+                return ThrottleDecision::Allow;
+            }
+
             if self.is_critical_path(task_type, payload) {
                 let bypass_count = llm_count.saturating_sub(hard_cap);
                 if bypass_count >= MAX_BYPASS_TASKS {
@@ -129,7 +156,7 @@ impl Throttler {
 
         if llm_count >= max_tasks {
             let role_count = self.tracker.count_for_role(target_role).await;
-            let min_per_role = 1_usize; // matches get_min_slots_per_role default
+            let min_per_role = self.config.max_tasks_per_role;
             if role_count < min_per_role {
                 info!(
                     llm_count,
@@ -201,7 +228,22 @@ impl Throttler {
         sem.try_acquire_owned().ok()
     }
 
+    /// Task types that bypass even the bypass-cap (always allowed past hard cap).
+    /// These are paths whose dispatch must never be blocked by stale or
+    /// hung in-flight tasks — `acl_chain_step` runs from `auto_dacl_abuse`
+    /// with a pre-resolved credential and is the practical path to forest
+    /// compromise via ACL exploitation.
+    fn is_always_bypass(&self, task_type: &str) -> bool {
+        matches!(task_type, "acl_chain_step")
+    }
+
     fn is_critical_path(&self, task_type: &str, payload: Option<&serde_json::Value>) -> bool {
+        // Always-bypass tasks are also critical path (covered separately
+        // earlier in `check`, but keep the function consistent).
+        if self.is_always_bypass(task_type) {
+            return true;
+        }
+
         // Check exploit + vuln_type
         if CRITICAL_PATH_TASK_TYPES.contains(&task_type) {
             if let Some(p) = payload {
@@ -318,6 +360,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    credential_key: None,
                 })
                 .await;
         }
@@ -337,6 +380,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    credential_key: None,
                 })
                 .await;
         }
@@ -357,6 +401,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    credential_key: None,
                 })
                 .await;
         }
@@ -378,6 +423,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    credential_key: None,
                 })
                 .await;
         }
@@ -385,6 +431,78 @@ mod tests {
         assert_eq!(
             t.check("coercion", "coercion", Some(&payload)).await,
             ThrottleDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_path_forest_trust_escalation_bypasses_hard_cap() {
+        // Forest pivot vulns must not be parked behind ordinary recon work —
+        // they're the only path off the source forest.
+        let (t, tracker) = make_throttler(2);
+        for i in 0..3 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("t{i}"),
+                    task_type: "recon".into(),
+                    role: "recon".into(),
+                    submitted_at: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+        for vt in ["forest_trust_escalation", "child_to_parent"] {
+            let payload = json!({"vuln_type": vt});
+            assert_eq!(
+                t.check("exploit", "privesc", Some(&payload)).await,
+                ThrottleDecision::Allow,
+                "{vt} should bypass hard cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_path_acl_chain_step_bypasses_hard_cap() {
+        let (t, tracker) = make_throttler(2);
+        // Saturate well beyond hard_cap (3) and beyond MAX_BYPASS_TASKS (10)
+        // to verify acl_chain_step bypasses even the bypass-cap.
+        for i in 0..50 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("t{i}"),
+                    task_type: "exploit".into(),
+                    role: "privesc".into(),
+                    submitted_at: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+        let payload = json!({"acl_type": "writeproperty", "target_user": "krbtgt"});
+        assert_eq!(
+            t.check("acl_chain_step", "acl", Some(&payload)).await,
+            ThrottleDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_path_exploit_still_bypass_capped() {
+        let (t, tracker) = make_throttler(2);
+        // Saturate beyond MAX_BYPASS_TASKS — ordinary critical-path exploits
+        // must still be deferred (only acl_chain_step is always-bypass).
+        for i in 0..50 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("t{i}"),
+                    task_type: "exploit".into(),
+                    role: "privesc".into(),
+                    submitted_at: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+        let payload = json!({"vuln_type": "constrained_delegation"});
+        assert_eq!(
+            t.check("exploit", "privesc", Some(&payload)).await,
+            ThrottleDecision::Defer
         );
     }
 

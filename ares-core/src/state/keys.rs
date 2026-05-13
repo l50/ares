@@ -22,6 +22,9 @@ pub const KEY_USERS: &str = "users";
 pub const KEY_SHARES: &str = "shares";
 /// Redis SET key suffix for discovered domain names.
 pub const KEY_DOMAINS: &str = "domains";
+/// Redis HASH key suffix for candidate domains awaiting corroboration.
+/// Field = lowercase FQDN, value = `CandidateDomain` JSON.
+pub const KEY_CANDIDATE_DOMAINS: &str = "candidate_domains";
 /// Redis HASH key suffix for discovered vulnerabilities (vuln_id → JSON).
 pub const KEY_VULNS: &str = "vulns";
 /// Redis SET key suffix for exploited vulnerability IDs.
@@ -62,6 +65,10 @@ pub const KEY_DOMAIN_SIDS: &str = "domain_sids";
 pub const KEY_ADMIN_NAMES: &str = "admin_names";
 /// Redis HASH key suffix mapping domain FQDN → TrustInfo JSON.
 pub const KEY_TRUSTED_DOMAINS: &str = "trusted_domains";
+/// Redis SET key suffix for domain FQDNs where krbtgt has been compromised
+/// (full domain admin via DCSync). Mirrors `state.dominated_domains` so
+/// post-mortem reports and `SCARD` checks see the same view.
+pub const KEY_DOMINATED_DOMAINS: &str = "dominated_domains";
 
 /// Redis STRING key suffix for operation status JSON.
 pub const KEY_STATUS: &str = "status";
@@ -161,6 +168,10 @@ pub const BLUE_OP_PREFIX: &str = "ares:blue:op";
 #[cfg(feature = "blue")]
 pub const BLUE_STATUS_PREFIX: &str = "ares:blue:inv";
 
+/// Redis HASH key suffix for forged inter-realm Kerberos tickets.
+/// Field = `{source}:{target}:{username}`, value = `KerberosTicket` JSON.
+pub const KEY_KERBEROS_TICKETS: &str = "kerberos_tickets";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +212,7 @@ mod tests {
             KEY_DOMAIN_SIDS,
             KEY_ADMIN_NAMES,
             KEY_TRUSTED_DOMAINS,
+            KEY_DOMINATED_DOMAINS,
             KEY_STATUS,
             KEY_MODEL,
             KEY_STOP_REQUESTED,
@@ -247,6 +259,7 @@ mod tests {
             KEY_DOMAIN_SIDS,
             KEY_ADMIN_NAMES,
             KEY_TRUSTED_DOMAINS,
+            KEY_DOMINATED_DOMAINS,
             KEY_STATUS,
             KEY_MODEL,
             KEY_STOP_REQUESTED,

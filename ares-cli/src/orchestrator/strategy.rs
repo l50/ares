@@ -292,45 +292,126 @@ fn fast_weights() -> HashMap<String, i32> {
         ("adcs_esc8", 5),
         ("gpo_abuse", 6),
         ("laps", 4),
+        ("ntlm_relay", 5),
+        ("nopac", 4),
+        ("zerologon", 3),
+        ("printnightmare", 6),
+        ("share_coercion", 5),
+        ("mssql_coercion", 4),
+        ("password_policy", 3),
+        ("gpp_sysvol", 3),
+        ("ntlmv1_downgrade", 3),
+        ("ldap_signing", 3),
+        ("webdav_detection", 4),
+        ("spooler_check", 3),
+        ("machine_account_quota", 3),
+        ("dfs_coercion", 5),
+        ("petitpotam_unauth", 4),
+        ("winrm_lateral", 5),
+        ("group_enumeration", 2),
+        ("localuser_spray", 4),
+        ("krbrelayup", 5),
+        ("searchconnector_coercion", 5),
+        ("lsassy_dump", 3),
+        ("rdp_lateral", 5),
+        ("foreign_group_enum", 3),
+        ("certipy_auth", 2),
+        ("sid_enumeration", 3),
+        ("dns_enum", 3),
+        ("domain_user_enumeration", 2),
+        ("pth_spray", 4),
+        ("certifried", 4),
+        ("dacl_abuse", 2),
+        ("smbclient_enum", 4),
+        ("cross_forest_enum", 3),
+        ("acl_discovery", 2),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect()
 }
 
-/// Comprehensive: flat priorities so all techniques get equal attention.
+/// Comprehensive: prioritize exploitation breadth over speed-to-DA.
+///
+/// With flat priorities (old design), the deferred queue drained FIFO, meaning
+/// the credential pipeline (AS-REP → Kerberoast → secretsdump) always won
+/// because its conditions were met first. ADCS, delegation, NTLM relay, and
+/// other exploitation techniques never got slots before DA terminated the op.
+///
+/// This design uses 3 tiers:
+///   1 = high-value exploitation (ADCS, delegation, NTLM relay, ACL abuse)
+///   2 = credential pipeline + lateral movement
+///   3 = recon, enumeration, low-value checks
+///
+/// The goal: exploit *everything* discovered, not just the fastest path to DA.
 fn comprehensive_weights() -> HashMap<String, i32> {
     [
-        ("dc_secretsdump", 3),
-        ("golden_ticket", 3),
-        ("forest_trust_escalation", 3),
-        ("child_to_parent", 3),
-        ("domain_admin", 3),
-        ("secretsdump", 3),
-        ("credential_reuse", 3),
-        ("mssql_access", 3),
-        ("mssql_linked_server", 3),
-        ("mssql_impersonation", 3),
-        ("constrained_delegation", 3),
-        ("unconstrained_delegation", 3),
-        ("esc1", 3),
-        ("esc4", 3),
-        ("esc8", 3),
-        ("rbcd", 3),
-        ("acl_abuse", 3),
-        ("shadow_credentials", 3),
-        ("mssql_deep_exploitation", 3),
-        ("kerberoast", 3),
-        ("asrep_roast", 3),
-        ("password_spray", 3),
-        ("gmsa", 3),
-        ("low_hanging_fruit", 3),
+        // --- Tier 1: Exploitation breadth (these were starved before) ---
+        ("esc1", 1),
+        ("esc4", 1),
+        ("esc8", 1),
+        ("adcs_esc1", 1),
+        ("adcs_esc4", 1),
+        ("adcs_esc8", 1),
+        ("constrained_delegation", 1),
+        ("unconstrained_delegation", 1),
+        ("ntlm_relay", 1),
+        ("rbcd", 1),
+        ("acl_abuse", 1),
+        ("dacl_abuse", 1),
+        ("shadow_credentials", 1),
+        ("gpo_abuse", 1),
+        ("nopac", 1),
+        ("certifried", 1),
+        ("krbrelayup", 1),
+        ("printnightmare", 1),
+        // --- Tier 2: Credential pipeline + lateral + persistence ---
+        ("dc_secretsdump", 2),
+        ("golden_ticket", 2),
+        ("forest_trust_escalation", 2),
+        ("child_to_parent", 2),
+        ("domain_admin", 2),
+        ("secretsdump", 2),
+        ("credential_reuse", 2),
+        ("mssql_access", 2),
+        ("mssql_linked_server", 2),
+        ("mssql_impersonation", 2),
+        ("mssql_deep_exploitation", 2),
+        ("kerberoast", 2),
+        ("asrep_roast", 2),
+        ("password_spray", 2),
+        ("gmsa", 2),
+        ("laps", 2),
+        ("low_hanging_fruit", 2),
+        ("gpp_sysvol", 2),
+        ("certipy_auth", 2),
+        ("lsassy_dump", 2),
+        ("pth_spray", 2),
+        ("winrm_lateral", 2),
+        ("rdp_lateral", 2),
+        ("localuser_spray", 2),
+        // --- Tier 3: Recon, enumeration, coercion setup ---
         ("smb_signing_disabled", 3),
-        ("adcs_esc1", 3),
-        ("adcs_esc4", 3),
-        ("adcs_esc8", 3),
-        ("gpo_abuse", 3),
-        ("laps", 3),
+        ("share_coercion", 3),
+        ("mssql_coercion", 3),
+        ("password_policy", 3),
+        ("ntlmv1_downgrade", 3),
+        ("ldap_signing", 3),
+        ("webdav_detection", 3),
+        ("spooler_check", 3),
+        ("machine_account_quota", 3),
+        ("dfs_coercion", 3),
+        ("petitpotam_unauth", 3),
+        ("group_enumeration", 3),
+        ("searchconnector_coercion", 3),
+        ("foreign_group_enum", 3),
+        ("sid_enumeration", 3),
+        ("dns_enum", 3),
+        ("domain_user_enumeration", 3),
+        ("smbclient_enum", 3),
+        ("zerologon", 3),
+        ("cross_forest_enum", 3),
+        ("acl_discovery", 2),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -370,6 +451,39 @@ fn stealth_weights() -> HashMap<String, i32> {
         ("adcs_esc8", 2),
         ("gpo_abuse", 3),
         ("laps", 3),
+        ("ntlm_relay", 7),
+        ("nopac", 5),
+        ("zerologon", 4),
+        ("printnightmare", 8),
+        ("share_coercion", 6),
+        ("mssql_coercion", 5),
+        ("password_policy", 2),
+        ("gpp_sysvol", 2),
+        ("ntlmv1_downgrade", 2),
+        ("ldap_signing", 2),
+        ("webdav_detection", 3),
+        ("spooler_check", 2),
+        ("machine_account_quota", 2),
+        ("dfs_coercion", 6),
+        ("petitpotam_unauth", 5),
+        ("winrm_lateral", 4),
+        ("group_enumeration", 2),
+        ("localuser_spray", 7),
+        ("krbrelayup", 4),
+        ("searchconnector_coercion", 6),
+        ("lsassy_dump", 5),
+        ("rdp_lateral", 4),
+        ("foreign_group_enum", 2),
+        ("certipy_auth", 1),
+        ("sid_enumeration", 2),
+        ("dns_enum", 2),
+        ("domain_user_enumeration", 2),
+        ("pth_spray", 5),
+        ("certifried", 3),
+        ("dacl_abuse", 2),
+        ("smbclient_enum", 3),
+        ("cross_forest_enum", 2),
+        ("acl_discovery", 1),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -471,11 +585,20 @@ mod tests {
     }
 
     #[test]
-    fn comprehensive_flat_weights() {
+    fn comprehensive_tiered_weights() {
         let s = Strategy::from_preset(StrategyPreset::Comprehensive);
-        assert_eq!(s.effective_priority("secretsdump"), 3);
-        assert_eq!(s.effective_priority("esc1"), 3);
-        assert_eq!(s.effective_priority("acl_abuse"), 3);
+        // Tier 1: exploitation breadth — highest priority
+        assert_eq!(s.effective_priority("esc1"), 1);
+        assert_eq!(s.effective_priority("acl_abuse"), 1);
+        assert_eq!(s.effective_priority("constrained_delegation"), 1);
+        assert_eq!(s.effective_priority("ntlm_relay"), 1);
+        // Tier 2: credential pipeline
+        assert_eq!(s.effective_priority("secretsdump"), 2);
+        assert_eq!(s.effective_priority("kerberoast"), 2);
+        assert_eq!(s.effective_priority("golden_ticket"), 2);
+        // Tier 3: recon/enumeration
+        assert_eq!(s.effective_priority("group_enumeration"), 3);
+        assert_eq!(s.effective_priority("dns_enum"), 3);
     }
 
     #[test]
@@ -625,7 +748,44 @@ mod tests {
     #[test]
     fn new_technique_weights_in_presets() {
         // Verify that new techniques added in this branch are in all presets
-        let new_techniques = ["rbcd", "shadow_credentials", "mssql_deep_exploitation"];
+        let new_techniques = [
+            "rbcd",
+            "shadow_credentials",
+            "mssql_deep_exploitation",
+            "ntlm_relay",
+            "nopac",
+            "zerologon",
+            "printnightmare",
+            "share_coercion",
+            "mssql_coercion",
+            "password_policy",
+            "gpp_sysvol",
+            "ntlmv1_downgrade",
+            "ldap_signing",
+            "webdav_detection",
+            "spooler_check",
+            "machine_account_quota",
+            "dfs_coercion",
+            "petitpotam_unauth",
+            "winrm_lateral",
+            "group_enumeration",
+            "localuser_spray",
+            "krbrelayup",
+            "searchconnector_coercion",
+            "lsassy_dump",
+            "rdp_lateral",
+            "foreign_group_enum",
+            "certipy_auth",
+            "sid_enumeration",
+            "dns_enum",
+            "domain_user_enumeration",
+            "pth_spray",
+            "certifried",
+            "dacl_abuse",
+            "smbclient_enum",
+            "cross_forest_enum",
+            "acl_discovery",
+        ];
         for preset in [
             StrategyPreset::Fast,
             StrategyPreset::Comprehensive,
@@ -643,20 +803,26 @@ mod tests {
     }
 
     #[test]
-    fn comprehensive_has_equal_weights() {
+    fn comprehensive_has_tiered_weights() {
         let s = Strategy::from_preset(StrategyPreset::Comprehensive);
-        // All comprehensive weights should be 3
+        // All weights should be 1, 2, or 3
         for (tech, weight) in &s.weights {
-            assert_eq!(*weight, 3, "Technique {tech} has weight {weight} != 3");
+            assert!(
+                (1..=3).contains(weight),
+                "Technique {tech} has weight {weight}, expected 1-3"
+            );
         }
     }
 
     #[test]
     fn stealth_penalizes_noisy_techniques() {
         let s = Strategy::from_preset(StrategyPreset::Stealth);
-        // Password spray and SMB signing should be most penalized (8)
+        // Password spray, SMB signing, and PrintNightmare should be most penalized (8)
         assert_eq!(s.effective_priority("password_spray"), 8);
         assert_eq!(s.effective_priority("smb_signing_disabled"), 8);
+        assert_eq!(s.effective_priority("printnightmare"), 8);
+        // NTLM relay is noisy too (7)
+        assert_eq!(s.effective_priority("ntlm_relay"), 7);
         // ADCS/ACL should be most prioritized (1)
         assert_eq!(s.effective_priority("esc1"), 1);
         assert_eq!(s.effective_priority("acl_abuse"), 1);

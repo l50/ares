@@ -18,9 +18,22 @@ pub async fn secretsdump(args: &Value) -> Result<ToolOutput> {
     let dc_ip = optional_str(args, "dc_ip");
     let use_kerberos = optional_bool(args, "no_pass").unwrap_or(false);
     let ticket_path = optional_str(args, "ticket_path");
+    let just_dc_user = optional_str(args, "just_dc_user");
+    let use_vss = optional_bool(args, "use_vss").unwrap_or(false);
     let timeout_minutes = optional_i64(args, "timeout_minutes");
 
     let timeout_secs = timeout_minutes.map(|m| (m * 60) as u64).unwrap_or(180);
+
+    if !use_kerberos && password.is_none() && hash.is_none() {
+        anyhow::bail!(
+            "secretsdump requires password, hash, or no_pass+ticket_path. \
+             None were provided for {username}@{} on {target} — credentials \
+             must be present in operation state for the (username, domain) pair, \
+             or the LLM must call this with no_pass=true and a valid Kerberos ticket. \
+             Refusing to run because impacket would call getpass() and crash on no-TTY.",
+            domain.unwrap_or("(no domain)")
+        );
+    }
 
     let (auth_string, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
@@ -28,6 +41,7 @@ pub async fn secretsdump(args: &Value) -> Result<ToolOutput> {
     let mut cmd = CommandBuilder::new("impacket-secretsdump");
 
     cmd = cmd.flag_opt("-dc-ip", dc_ip);
+    cmd = cmd.flag_opt("-just-dc-user", just_dc_user);
 
     if use_kerberos {
         cmd = cmd.arg("-k").arg("-no-pass");
@@ -36,6 +50,10 @@ pub async fn secretsdump(args: &Value) -> Result<ToolOutput> {
         }
     } else {
         cmd = cmd.args(extra_args);
+    }
+
+    if use_vss {
+        cmd = cmd.arg("-use-vss");
     }
 
     cmd = cmd.arg(&auth_string);
@@ -159,6 +177,8 @@ mod tests {
         });
         assert_eq!(optional_str(&args, "dc_ip"), Some("192.168.58.2"));
     }
+
+    // --- mock executor tests ---
 
     use crate::executor::mock;
 

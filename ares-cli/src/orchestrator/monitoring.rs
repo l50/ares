@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
+use crate::orchestrator::dispatcher::CredentialInflight;
 use crate::orchestrator::routing::ActiveTaskTracker;
 use crate::orchestrator::task_queue::TaskQueue;
 
@@ -193,6 +194,7 @@ pub fn spawn_heartbeat_monitor(
     queue: TaskQueue,
     registry: AgentRegistry,
     tracker: ActiveTaskTracker,
+    credential_inflight: CredentialInflight,
     config: Arc<OrchestratorConfig>,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -227,7 +229,9 @@ pub fn spawn_heartbeat_monitor(
             consecutive_failures = 0;
 
             // Clean up stale tasks (salvage any pending results first)
-            if let Err(e) = cleanup_stale_tasks(&tracker, &queue, &config).await {
+            if let Err(e) =
+                cleanup_stale_tasks(&tracker, &queue, &credential_inflight, &config).await
+            {
                 warn!(err = %e, "Stale task cleanup failed");
             }
         }
@@ -282,6 +286,7 @@ async fn run_heartbeat_sweep(
 async fn cleanup_stale_tasks(
     tracker: &ActiveTaskTracker,
     queue: &TaskQueue,
+    credential_inflight: &CredentialInflight,
     config: &OrchestratorConfig,
 ) -> Result<()> {
     let llm_count = tracker.llm_task_count().await;
@@ -317,7 +322,16 @@ async fn cleanup_stale_tasks(
                 "Removing stale task"
             );
         }
-        tracker.remove(&task.task_id).await;
+        // Release the per-credential inflight slot if the stale task held
+        // one. Without this the slot leaks: the spawned LLM future may
+        // still be running long after the task was declared stale, and
+        // every subsequent task with the same credential gets deferred
+        // until the future eventually returns.
+        if let Some(removed) = tracker.remove(&task.task_id).await {
+            if let Some(ref key) = removed.credential_key {
+                credential_inflight.release(key).await;
+            }
+        }
     }
 
     if !stale.is_empty() {
@@ -344,7 +358,7 @@ pub(crate) const CRITICAL_TOOLS: &[(&str, &[&str])] = &[
     ),
     ("privesc", &["impacket-findDelegation", "impacket-getST"]),
     (
-        "lateral",
+        "lateral_movement",
         &[
             "impacket-psexec",
             "impacket-smbexec",
@@ -353,38 +367,67 @@ pub(crate) const CRITICAL_TOOLS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Query Redis for each worker's tool inventory and report any missing
-/// critical tools. Returns a list of (role, missing_tools) pairs.
+/// Check if a binary is available on the local PATH.
+async fn is_in_path(binary: &str) -> bool {
+    tokio::process::Command::new("which")
+        .arg(binary)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
+}
+
+/// Report any missing critical tools per role.
+///
+/// In local-dispatch mode (`ARES_TOOL_DISPATCH=local`) there are no separate
+/// worker processes publishing inventory to Redis, so we probe the local
+/// PATH directly. In remote mode we read each worker's published inventory
+/// from `ares:tools:ares-{role}-agent`.
 pub(crate) async fn preflight_tool_check(
     conn: &mut redis::aio::ConnectionManager,
 ) -> Vec<(String, Vec<String>)> {
     use redis::AsyncCommands;
 
+    let local_dispatch = std::env::var("ARES_TOOL_DISPATCH").as_deref() == Ok("local");
     let mut problems = Vec::new();
 
     for &(role, critical) in CRITICAL_TOOLS {
-        let agent_key = format!("ares:tools:ares-{role}-agent");
-        let available: Vec<String> = match conn.get::<_, Option<String>>(&agent_key).await {
-            Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
-            _ => {
-                // No inventory published yet — worker may not have started
-                warn!(
-                    role = role,
-                    "No tool inventory found — worker may not be running"
-                );
-                problems.push((
-                    role.to_string(),
-                    critical.iter().map(|s| s.to_string()).collect(),
-                ));
-                continue;
+        let missing: Vec<String> = if local_dispatch {
+            let mut out = Vec::new();
+            for &tool in critical {
+                if !is_in_path(tool).await {
+                    out.push(tool.to_string());
+                }
             }
-        };
+            out
+        } else {
+            // Worker publishes inventory under hyphenated agent name
+            // (see ares-cli/src/worker/config.rs: agent_name = format!("ares-{}-agent", role.replace('_', "-"))).
+            // Mirror that here so role names with underscores resolve correctly.
+            let agent_key = format!("ares:tools:ares-{}-agent", role.replace('_', "-"));
+            let available: Vec<String> = match conn.get::<_, Option<String>>(&agent_key).await {
+                Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+                _ => {
+                    // No inventory published yet — worker may not have started
+                    warn!(
+                        role = role,
+                        "No tool inventory found — worker may not be running"
+                    );
+                    problems.push((
+                        role.to_string(),
+                        critical.iter().map(|s| s.to_string()).collect(),
+                    ));
+                    continue;
+                }
+            };
 
-        let missing: Vec<String> = critical
-            .iter()
-            .filter(|&&tool| !available.iter().any(|a| a == tool))
-            .map(|s| s.to_string())
-            .collect();
+            critical
+                .iter()
+                .filter(|&&tool| !available.iter().any(|a| a == tool))
+                .map(|s| s.to_string())
+                .collect()
+        };
 
         if !missing.is_empty() {
             problems.push((role.to_string(), missing));
@@ -545,7 +588,7 @@ mod tests {
 
     #[test]
     fn critical_tools_have_valid_roles() {
-        let known_roles = ["recon", "credential_access", "privesc", "lateral"];
+        let known_roles = ["recon", "credential_access", "privesc", "lateral_movement"];
         for &(role, tools) in CRITICAL_TOOLS {
             assert!(
                 known_roles.contains(&role),
@@ -568,6 +611,14 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn is_in_path_finds_which_itself() {
+        // `which` is on PATH on every dev box and CI; a nonsense binary is not.
+        // Used by the local-dispatch branch of preflight_tool_check.
+        assert!(is_in_path("which").await);
+        assert!(!is_in_path("nonexistent_binary_for_preflight_xyz_123").await);
+    }
+
     #[test]
     fn critical_tools_secretsdump_in_cred_and_lateral() {
         // secretsdump is critical for both credential_access and lateral
@@ -578,7 +629,7 @@ mod tests {
             .unwrap_or(false);
         let has_lateral = CRITICAL_TOOLS
             .iter()
-            .find(|&&(r, _)| r == "lateral")
+            .find(|&&(r, _)| r == "lateral_movement")
             .map(|&(_, tools)| tools.contains(&"impacket-secretsdump"))
             .unwrap_or(false);
         assert!(has_cred);

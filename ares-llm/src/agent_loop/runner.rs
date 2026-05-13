@@ -174,7 +174,8 @@ async fn run_agent_loop_inner(
     let mut steps: u32 = 0;
     let mut tool_calls_dispatched: u32 = 0;
     let mut all_discoveries: Vec<serde_json::Value> = Vec::new();
-    let mut all_tool_outputs: Vec<String> = Vec::new();
+    let mut all_llm_findings: Vec<serde_json::Value> = Vec::new();
+    let mut all_tool_outputs: Vec<crate::ToolOutput> = Vec::new();
 
     // Dynamic tool filtering: track unavailable tools and per-tool call counts
     // to prevent infinite retry loops on missing binaries and runaway tool calls.
@@ -193,6 +194,7 @@ async fn run_agent_loop_inner(
                 total_usage,
                 tool_calls_dispatched,
                 all_discoveries,
+                all_llm_findings,
                 all_tool_outputs,
             );
         }
@@ -217,6 +219,7 @@ async fn run_agent_loop_inner(
                 total_usage,
                 tool_calls_dispatched,
                 all_discoveries,
+                all_llm_findings,
                 all_tool_outputs,
             );
         }
@@ -274,6 +277,7 @@ async fn run_agent_loop_inner(
                     total_usage,
                     tool_calls_dispatched,
                     all_discoveries,
+                    all_llm_findings,
                     all_tool_outputs,
                 );
             }
@@ -310,6 +314,7 @@ async fn run_agent_loop_inner(
                     total_usage,
                     tool_calls_dispatched,
                     all_discoveries,
+                    all_llm_findings,
                     all_tool_outputs,
                 );
             }
@@ -321,6 +326,7 @@ async fn run_agent_loop_inner(
                     total_usage,
                     tool_calls_dispatched,
                     all_discoveries,
+                    all_llm_findings,
                     all_tool_outputs,
                 );
             }
@@ -459,8 +465,17 @@ async fn run_agent_loop_inner(
 
                     let output =
                         truncate_tool_output(&dr.output, config.context.max_tool_output_chars);
-                    // Collect raw tool output for secondary regex extraction
-                    all_tool_outputs.push(dr.output.clone());
+                    // Collect raw tool output (with tool name + args) for secondary
+                    // regex extraction. Tool-aware extractors use the args to skip
+                    // patterns that would misclassify echoed inputs (e.g. nxc -H
+                    // echoes the hash on the same `[+] DOMAIN\user:secret` line that
+                    // password-auth would emit, so the secret must not be ingested
+                    // as a credential when args carry hash flags).
+                    all_tool_outputs.push(crate::ToolOutput {
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        output: dr.output.clone(),
+                    });
                     let tr = ChatMessage::tool_result(&call.id, &output);
                     if session_log.enabled() {
                         session_log.record_message(steps, &tr);
@@ -608,6 +623,7 @@ async fn run_agent_loop_inner(
                                     total_usage,
                                     tool_calls_dispatched,
                                     all_discoveries,
+                                    all_llm_findings,
                                     all_tool_outputs,
                                 );
                             }
@@ -620,6 +636,7 @@ async fn run_agent_loop_inner(
                                     total_usage,
                                     tool_calls_dispatched,
                                     all_discoveries,
+                                    all_llm_findings,
                                     all_tool_outputs,
                                 );
                             }
@@ -629,6 +646,10 @@ async fn run_agent_loop_inner(
                                     session_log.record_message(steps, &tr);
                                 }
                                 messages.push(tr);
+                            }
+                            Ok(CallbackResult::LlmFinding { response, finding }) => {
+                                all_llm_findings.push(finding);
+                                messages.push(ChatMessage::tool_result(&call_id, &response));
                             }
                             Err(e) => {
                                 let tr = ChatMessage::tool_result(
@@ -683,6 +704,7 @@ async fn run_agent_loop_inner(
                                 total_usage,
                                 tool_calls_dispatched,
                                 all_discoveries,
+                                all_llm_findings,
                                 all_tool_outputs,
                             );
                         }
@@ -695,6 +717,7 @@ async fn run_agent_loop_inner(
                                 total_usage,
                                 tool_calls_dispatched,
                                 all_discoveries,
+                                all_llm_findings,
                                 all_tool_outputs,
                             );
                         }
@@ -704,6 +727,10 @@ async fn run_agent_loop_inner(
                                 session_log.record_message(steps, &tr);
                             }
                             messages.push(tr);
+                        }
+                        Ok(CallbackResult::LlmFinding { response, finding }) => {
+                            all_llm_findings.push(finding);
+                            messages.push(ChatMessage::tool_result(&call.id, &response));
                         }
                         Err(e) => {
                             let tr =
@@ -756,6 +783,7 @@ async fn run_agent_loop_inner(
                             total_usage,
                             tool_calls_dispatched,
                             all_discoveries,
+                            all_llm_findings,
                             all_tool_outputs,
                         );
                     }
@@ -768,6 +796,7 @@ async fn run_agent_loop_inner(
                             total_usage,
                             tool_calls_dispatched,
                             all_discoveries,
+                            all_llm_findings,
                             all_tool_outputs,
                         );
                     }
@@ -777,6 +806,10 @@ async fn run_agent_loop_inner(
                             session_log.record_message(steps, &tr);
                         }
                         messages.push(tr);
+                    }
+                    Ok(CallbackResult::LlmFinding { response, finding }) => {
+                        all_llm_findings.push(finding);
+                        messages.push(ChatMessage::tool_result(&call.id, &response));
                     }
                     Err(e) => {
                         let tr = ChatMessage::tool_result(&call.id, format!("Callback error: {e}"));
@@ -793,6 +826,7 @@ async fn run_agent_loop_inner(
 
 /// Centralized exit path: writes the terminal `outcome` record to the
 /// session log and assembles the `AgentLoopOutcome`.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     session_log: &SessionLog,
     steps: u32,
@@ -800,7 +834,8 @@ fn finish(
     total_usage: TokenUsage,
     tool_calls_dispatched: u32,
     discoveries: Vec<serde_json::Value>,
-    tool_outputs: Vec<String>,
+    llm_findings: Vec<serde_json::Value>,
+    tool_outputs: Vec<crate::ToolOutput>,
 ) -> AgentLoopOutcome {
     if session_log.enabled() {
         let (label, detail) = describe_reason(&reason);
@@ -812,6 +847,7 @@ fn finish(
         steps,
         tool_calls_dispatched,
         discoveries,
+        llm_findings,
         tool_outputs,
     }
 }

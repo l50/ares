@@ -7,7 +7,77 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::parsing::has_domain_admin_indicator;
+use super::timeline::{create_admin_upgrade_timeline_event, create_domain_admin_timeline_event};
 use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::state::StateInner;
+
+/// Resolve a NetBIOS/flat domain name (e.g. `FABRIKAM`) to a known FQDN.
+///
+/// Checks three sources, in order:
+/// 1. `state.trusted_domains`: each `TrustInfo` carries an explicit `flat_name`.
+/// 2. `state.netbios_to_fqdn`: published mappings from host short names; useful
+///    when the flat name happens to match a hostname mapping.
+/// 3. `state.domains`: derive each FQDN's first label and compare. Catches the
+///    primary domain (which is rarely in `trusted_domains`).
+///
+/// Returns `None` when the flat name does not correspond to any known domain.
+/// Callers must treat that as "skip caching" — guessing risks attributing the
+/// SID to the wrong domain.
+fn resolve_flat_to_fqdn(flat: &str, state: &StateInner) -> Option<String> {
+    let target = flat.to_uppercase();
+
+    if let Some(t) = state
+        .trusted_domains
+        .values()
+        .find(|t| !t.flat_name.is_empty() && t.flat_name.to_uppercase() == target)
+    {
+        return Some(t.domain.to_lowercase());
+    }
+
+    if let Some(fqdn) = state
+        .netbios_to_fqdn
+        .get(&target)
+        .or_else(|| state.netbios_to_fqdn.get(flat))
+    {
+        // Only accept the mapping if it looks like a domain FQDN, not a host
+        // FQDN (e.g. "DC02" → "dc02.contoso.local" should NOT yield "dc02…").
+        let lower = fqdn.to_lowercase();
+        if is_valid_domain_fqdn(&lower) && state.domains.iter().any(|d| d.to_lowercase() == lower) {
+            return Some(lower);
+        }
+    }
+
+    state
+        .domains
+        .iter()
+        .find(|d| {
+            d.split('.')
+                .next()
+                .map(|first| first.eq_ignore_ascii_case(flat))
+                .unwrap_or(false)
+        })
+        .map(|d| d.to_lowercase())
+}
+
+/// Validate that a string looks like a domain FQDN.
+///
+/// Rejects empty strings, IP-like patterns, strings with whitespace, and strings
+/// without at least one dot. Used to filter out malformed domain values that
+/// occasionally appear in tool payloads (e.g. `"192.168.58.30 - dc01"`).
+fn is_valid_domain_fqdn(s: &str) -> bool {
+    if s.is_empty() || s.contains(' ') || s.contains(':') || s.contains('/') {
+        return false;
+    }
+    if !s.contains('.') {
+        return false;
+    }
+    let first_label = s.split('.').next().unwrap_or("");
+    if first_label.is_empty() || first_label.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
 
 /// Determine the domain admin path from a payload.
 ///
@@ -80,6 +150,12 @@ pub(crate) async fn check_domain_admin_indicators(payload: &Value, dispatcher: &
         info!("Domain Admin achieved!");
     }
     if !already_da {
+        // Emit Domain Admin timeline event
+        let da_domain = {
+            let state = dispatcher.state.read().await;
+            state.domains.first().cloned().unwrap_or_default()
+        };
+        create_domain_admin_timeline_event(dispatcher, &da_domain, path.as_deref()).await;
         let (domain, dc_target) = {
             let state = dispatcher.state.read().await;
             let domain = state.domains.first().cloned().unwrap_or_default();
@@ -133,12 +209,9 @@ pub(crate) async fn check_golden_ticket_completion(
     if !task_id.contains("exploit") && !task_id.contains("golden") {
         return;
     }
-    {
-        let state = dispatcher.state.read().await;
-        if state.has_golden_ticket {
-            return;
-        }
-    }
+    // Per-domain dedup happens after we resolve `domain` below — a forge
+    // for one domain must not block recording another (multi-domain ops
+    // routinely capture krbtgt for parent + child or both forests).
     let mut found_ticket = false;
     let mut domain = String::new();
     if let Some(arr) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
@@ -172,9 +245,46 @@ pub(crate) async fn check_golden_ticket_completion(
     if let Some(d) = payload.get("domain").and_then(|v| v.as_str()) {
         domain = d.to_string();
     }
-    if domain.is_empty() {
+    // Require a krbtgt hash to actually exist for the chosen domain before
+    // marking GT — `Saving ticket in *.ccache` also appears in inter-realm
+    // forge output where no target krbtgt was ever obtained, so without this
+    // gate we'd publish a false-positive GT for the source/first domain.
+    {
         let state = dispatcher.state.read().await;
-        domain = state.domains.first().cloned().unwrap_or_default();
+        let has_krbtgt = |d: &str| -> bool {
+            let lower = d.to_lowercase();
+            state.hashes.iter().any(|h| {
+                h.username.eq_ignore_ascii_case("krbtgt") && h.domain.to_lowercase() == lower
+            })
+        };
+        if domain.is_empty() {
+            domain = state
+                .domains
+                .iter()
+                .find(|d| has_krbtgt(d))
+                .cloned()
+                .unwrap_or_default();
+        } else if !has_krbtgt(&domain) {
+            warn!(
+                domain = %domain,
+                "Suppressing golden_ticket marker — no krbtgt hash present for domain (likely inter-realm forge output)"
+            );
+            return;
+        }
+    }
+    if domain.is_empty() {
+        return;
+    }
+    // Per-domain dedup: skip the timeline-event emit + set_golden_ticket
+    // call when this specific domain's GT vuln is already exploited. The
+    // global `has_golden_ticket` bool is not consulted here — it would
+    // suppress legitimate forges for additional domains.
+    {
+        let state = dispatcher.state.read().await;
+        let vuln_id = format!("golden_ticket_{}", domain.to_lowercase());
+        if state.exploited_vulnerabilities.contains(&vuln_id) {
+            return;
+        }
     }
     if let Err(e) = dispatcher
         .state
@@ -183,6 +293,21 @@ pub(crate) async fn check_golden_ticket_completion(
     {
         warn!(err = %e, "Failed to set golden ticket flag");
     }
+
+    // Emit attack path timeline event for golden ticket
+    let techniques = vec!["T1558.001".to_string()];
+    let event_id = format!("evt-gt-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let event = serde_json::json!({
+        "id": event_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "golden_ticket",
+        "description": format!("Golden ticket forged for domain {domain}"),
+        "mitre_techniques": techniques,
+    });
+    let _ = dispatcher
+        .state
+        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
+        .await;
 }
 
 pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher: &Arc<Dispatcher>) {
@@ -214,6 +339,17 @@ pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher:
                 pwned_host = ?pwned_ip,
                 "Credential upgraded to admin -- dispatching priority secretsdump"
             );
+            // Mark the host as owned so automations (lsassy_dump, etc.) can fire
+            if let Some(ref ip) = pwned_ip {
+                if let Err(e) = dispatcher
+                    .state
+                    .mark_host_owned(&dispatcher.queue, ip)
+                    .await
+                {
+                    warn!(err = %e, ip = %ip, "Failed to mark host as owned");
+                }
+            }
+            create_admin_upgrade_timeline_event(dispatcher, &username, &domain).await;
             let work: Vec<(String, ares_core::models::Credential)> = {
                 let state = dispatcher.state.read().await;
                 let dc_ips: Vec<String> = state.domain_controllers.values().cloned().collect();
@@ -280,72 +416,124 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
         return;
     }
     let combined = text_parts.join("\n");
-    if let Some(sid) = ares_core::parsing::extract_domain_sid(&combined) {
-        let domain = payload
-            .get("domain")
-            .and_then(|v| v.as_str())
-            .map(|d| d.to_lowercase())
-            .filter(|d| !d.is_empty());
-        let domain = match domain {
-            Some(d) => d,
-            None => {
-                let state = dispatcher.state.read().await;
-                match state.domains.first() {
-                    Some(d) => d.to_lowercase(),
-                    None => return,
-                }
-            }
-        };
-        let already_cached = {
+
+    // Only cache when the output is genuine LSARPC SID-discovery output — i.e.
+    // it has either the impacket-lookupsid `[*] Domain SID is: …` header or
+    // the rpcclient `lsaquery` `Domain Name / Domain Sid` pair. Arbitrary recon
+    // output (LDAP group enumeration, BloodHound dumps, etc.) routinely contains
+    // foreign-security-principal SIDs that *look* like domain SIDs but are
+    // actually `<sid>-<rid>` entries from a different forest. Caching a
+    // regex-truncated FSP SID against the task's payload domain misforges
+    // every downstream golden / inter-realm ticket — caused op-20260429-164553
+    // to forge a TGT for contoso.local with a bogus ExtraSid that the
+    // parent KDC rejected with rpc_s_access_denied.
+    //
+    // lsaquery is the primary unauth path for cross-forest target SID discovery
+    // — it routinely succeeds against null sessions where impacket-lookupsid
+    // gets STATUS_ACCESS_DENIED. op-20260429-181500 discovered fabrikam's SID via
+    // lsaquery but failed to cache it (only lookupsid was wired up), so the
+    // subsequent forge_inter_realm_and_dump fired with has_target_sid=false
+    // and produced no krbtgt extraction.
+    let lookupsid_sid = ares_core::parsing::LOOKUPSID_HEADER_RE
+        .captures(&combined)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+    let lsaquery_pair = ares_core::parsing::extract_lsaquery_domain_sid(&combined);
+    let (sid, lsaquery_flat) = match (lookupsid_sid, lsaquery_pair) {
+        (Some(s), _) => (s, None),
+        (None, Some((flat, s))) => (s, Some(flat)),
+        (None, None) => return,
+    };
+
+    // Resolve the FQDN this SID belongs to. Anchor preference order:
+    // 1. Flat name parsed from the output — authoritative when present. For
+    //    impacket-lookupsid we get it from the RID lines (e.g. `500: FABRIKAM\…`);
+    //    for rpcclient lsaquery we get it from `Domain Name: FABRIKAM`.
+    // 2. Payload's `domain` field — used only when output has no flat name AND
+    //    the field is a valid FQDN. The payload's domain is the *task* target,
+    //    not necessarily the domain that produced the SID; trusting it blindly
+    //    misattributed fabrikam.local's SID to child.contoso.local in
+    //    op-20260429-112418.
+    // 3. State's primary domain — last resort, only when nothing else applies.
+    let parsed_flat = lsaquery_flat.or_else(|| {
+        ares_core::parsing::extract_domain_sid_and_flat_name(&combined).map(|(flat, _)| flat)
+    });
+    let domain = {
+        let state = dispatcher.state.read().await;
+        if let Some(flat) = parsed_flat.as_deref() {
+            resolve_flat_to_fqdn(flat, &state).or_else(|| {
+                // Flat name parsed but unmapped — refuse to cache. Caching
+                // against the payload's domain here is exactly the bug we
+                // are trying to avoid.
+                warn!(
+                    flat_name = %flat,
+                    sid = %sid,
+                    "Skipping SID cache: flat name does not match any known domain"
+                );
+                None
+            })
+        } else {
+            // No flat name in output. Fall back to payload domain or primary.
+            payload
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(|d| d.to_lowercase())
+                .filter(|d| is_valid_domain_fqdn(d))
+                .or_else(|| state.domains.first().map(|d| d.to_lowercase()))
+        }
+    };
+    let domain = match domain {
+        Some(d) => d,
+        None => return,
+    };
+    let already_cached = {
+        let state = dispatcher.state.read().await;
+        state
+            .domain_sids
+            .get(&domain)
+            .map(|s| s == &sid)
+            .unwrap_or(false)
+    };
+    if !already_cached {
+        let op_id = {
             let state = dispatcher.state.read().await;
-            state
-                .domain_sids
-                .get(&domain)
-                .map(|s| s == &sid)
-                .unwrap_or(false)
+            state.operation_id.clone()
         };
-        if !already_cached {
+        let reader = ares_core::state::RedisStateReader::new(op_id);
+        let mut conn = dispatcher.queue.connection();
+        if let Err(e) = reader.set_domain_sid(&mut conn, &domain, &sid).await {
+            warn!(err = %e, domain = %domain, "Failed to persist domain SID to Redis");
+        } else {
+            info!(domain = %domain, sid = %sid, "Domain SID cached from task output");
+            dispatcher
+                .state
+                .write()
+                .await
+                .domain_sids
+                .insert(domain.clone(), sid.clone());
+        }
+    }
+    if let Some(admin_name) = ares_core::parsing::extract_rid500_name(&combined) {
+        let already_known = {
+            let state = dispatcher.state.read().await;
+            state.admin_names.contains_key(&domain)
+        };
+        if !already_known {
             let op_id = {
                 let state = dispatcher.state.read().await;
                 state.operation_id.clone()
             };
             let reader = ares_core::state::RedisStateReader::new(op_id);
             let mut conn = dispatcher.queue.connection();
-            if let Err(e) = reader.set_domain_sid(&mut conn, &domain, &sid).await {
-                warn!(err = %e, domain = %domain, "Failed to persist domain SID to Redis");
+            if let Err(e) = reader.set_admin_name(&mut conn, &domain, &admin_name).await {
+                warn!(err = %e, domain = %domain, "Failed to persist admin name to Redis");
             } else {
-                info!(domain = %domain, sid = %sid, "Domain SID cached from task output");
+                info!(domain = %domain, name = %admin_name, "RID-500 account name cached from task output");
                 dispatcher
                     .state
                     .write()
                     .await
-                    .domain_sids
-                    .insert(domain.clone(), sid);
-            }
-        }
-        if let Some(admin_name) = ares_core::parsing::extract_rid500_name(&combined) {
-            let already_known = {
-                let state = dispatcher.state.read().await;
-                state.admin_names.contains_key(&domain)
-            };
-            if !already_known {
-                let op_id = {
-                    let state = dispatcher.state.read().await;
-                    state.operation_id.clone()
-                };
-                let reader = ares_core::state::RedisStateReader::new(op_id);
-                let mut conn = dispatcher.queue.connection();
-                if let Err(e) = reader.set_admin_name(&mut conn, &domain, &admin_name).await {
-                    warn!(err = %e, domain = %domain, "Failed to persist admin name to Redis");
-                } else {
-                    info!(domain = %domain, name = %admin_name, "RID-500 account name cached from task output");
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .admin_names
-                        .insert(domain, admin_name);
-                }
+                    .admin_names
+                    .insert(domain, admin_name);
             }
         }
     }
@@ -354,7 +542,80 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ares_core::models::TrustInfo;
     use serde_json::json;
+
+    fn make_trust(domain: &str, flat: &str) -> TrustInfo {
+        TrustInfo {
+            domain: domain.to_string(),
+            flat_name: flat.to_string(),
+            direction: "bidirectional".to_string(),
+            trust_type: "forest".to_string(),
+            sid_filtering: true,
+        }
+    }
+
+    // -- resolve_flat_to_fqdn -----------------------------------------------
+
+    #[test]
+    fn resolve_flat_uses_trusted_domain_metadata() {
+        let mut state = StateInner::new("op-test".into());
+        state.trusted_domains.insert(
+            "fabrikam.local".into(),
+            make_trust("fabrikam.local", "FABRIKAM"),
+        );
+        assert_eq!(
+            resolve_flat_to_fqdn("FABRIKAM", &state).as_deref(),
+            Some("fabrikam.local")
+        );
+    }
+
+    #[test]
+    fn resolve_flat_falls_back_to_primary_domain_label() {
+        let mut state = StateInner::new("op-test".into());
+        state.domains.push("contoso.local".into());
+        assert_eq!(
+            resolve_flat_to_fqdn("CONTOSO", &state).as_deref(),
+            Some("contoso.local")
+        );
+    }
+
+    #[test]
+    fn resolve_flat_unknown_returns_none() {
+        let state = StateInner::new("op-test".into());
+        assert_eq!(resolve_flat_to_fqdn("UNKNOWN", &state), None);
+    }
+
+    #[test]
+    fn resolve_flat_does_not_match_host_short_name() {
+        // netbios_to_fqdn maps DC02 → dc02.contoso.local (a host, not domain).
+        // resolve_flat_to_fqdn must reject this — dc02.contoso.local is not in
+        // state.domains, so it cannot be a domain FQDN.
+        let mut state = StateInner::new("op-test".into());
+        state.domains.push("contoso.local".into());
+        state
+            .netbios_to_fqdn
+            .insert("DC02".into(), "dc02.contoso.local".into());
+        assert_eq!(resolve_flat_to_fqdn("DC02", &state), None);
+    }
+
+    #[test]
+    fn resolve_flat_prefers_trust_metadata_over_primary_label() {
+        // Both child.contoso.local and contoso.local are known.
+        // Flat "CONTOSO" should resolve to the parent FQDN even when
+        // both could plausibly match by first-label heuristic.
+        let mut state = StateInner::new("op-test".into());
+        state.domains.push("child.contoso.local".into());
+        state.domains.push("contoso.local".into());
+        state.trusted_domains.insert(
+            "contoso.local".into(),
+            make_trust("contoso.local", "CONTOSO"),
+        );
+        assert_eq!(
+            resolve_flat_to_fqdn("CONTOSO", &state).as_deref(),
+            Some("contoso.local")
+        );
+    }
 
     // -- resolve_da_path ----------------------------------------------------
 

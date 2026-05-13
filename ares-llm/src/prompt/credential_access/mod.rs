@@ -34,6 +34,11 @@ pub(crate) struct Params<'a> {
     pub has_password: bool,
     pub has_hash: bool,
     pub has_creds: bool,
+    /// Comma-separated list of usernames that are quarantined (locked out)
+    /// in this domain. The orchestrator extracts these from prior lockout
+    /// observations and passes them through so spray prompts instruct the
+    /// LLM to skip them and the worker tool drops them from the wordlist.
+    pub excluded_users: &'a str,
 }
 
 pub(crate) fn generate_credential_access_prompt(
@@ -73,9 +78,23 @@ pub(crate) fn generate_credential_access_prompt(
         .or_else(|| payload.get("target_ip"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let domain = payload.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-    // Read from nested "credential" object first (dispatchers nest it), flat fallback
+    // Read from nested "credential" object first (dispatchers nest it), flat fallback.
+    // Domain falls back to `credential.domain` so secretsdump dispatches that
+    // only nest the auth realm (request_secretsdump / request_secretsdump_hash)
+    // still surface a real domain in the prompt. Without this fallback the
+    // template emits `domain=''`, the LLM faithfully calls the tool with an
+    // empty realm, and downstream auth fails STATUS_LOGON_FAILURE.
     let cred_obj = payload.get("credential");
+    let domain = payload
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cred_obj
+                .and_then(|c| c.get("domain"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
     let username = cred_obj
         .and_then(|c| c.get("username"))
         .and_then(|v| v.as_str())
@@ -87,6 +106,10 @@ pub(crate) fn generate_credential_access_prompt(
         .or_else(|| payload.get("password").and_then(|v| v.as_str()))
         .unwrap_or("");
     let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let excluded_users = payload
+        .get("excluded_users")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let ticket_path = payload.get("ticket_path").and_then(|v| v.as_str());
     let no_pass = payload
@@ -112,6 +135,7 @@ pub(crate) fn generate_credential_access_prompt(
         has_password,
         has_hash,
         has_creds,
+        excluded_users,
     };
 
     // Branch 1: Kerberos ticket-based secretsdump

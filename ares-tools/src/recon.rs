@@ -269,15 +269,23 @@ pub async fn run_bloodhound(args: &Value) -> Result<ToolOutput> {
 /// Run an LDAP search query against a target.
 ///
 /// Required args: `target`, `domain`
-/// Optional args: `username`, `password`, `base_dn`, `filter`, `attributes`
+/// Optional args: `username`, `password`, `bind_domain`, `base_dn`, `filter`, `attributes`
+///
+/// `domain` controls the base DN (the partition being queried).
+/// `bind_domain` (optional) overrides the domain used in the bind DN
+/// (`user@bind_domain`). Use this when authenticating with a credential
+/// from a different domain than the one being searched — e.g. querying
+/// a parent DC with a child-domain credential. Defaults to `domain`.
 pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let domain = required_str(args, "domain")?;
     let username = optional_str(args, "username");
     let password = optional_str(args, "password");
+    let bind_domain = optional_str(args, "bind_domain");
     let base_dn = optional_str(args, "base_dn");
     let filter = optional_str(args, "filter");
     let attributes = optional_str(args, "attributes");
+    let ticket_path = optional_str(args, "ticket_path");
 
     let computed_base_dn = match base_dn {
         Some(dn) => dn.to_string(),
@@ -287,13 +295,19 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
     let uri = format!("ldap://{target}");
 
     let mut cmd = CommandBuilder::new("ldapsearch")
-        .arg("-x")
         .flag("-H", &uri)
         .timeout_secs(120);
 
-    if let (Some(u), Some(p)) = (username, password) {
-        let bind_dn = format!("{u}@{domain}");
-        cmd = cmd.flag("-D", bind_dn).flag("-w", p);
+    if let Some(ccache) = ticket_path {
+        // Kerberos GSSAPI bind via cached ticket. Caller must ensure `target`
+        // is an FQDN so ldapsearch can derive the ldap/<host>@<REALM> SPN.
+        cmd = cmd.env("KRB5CCNAME", ccache).arg("-Y").arg("GSSAPI");
+    } else if let (Some(u), Some(p)) = (username, password) {
+        let auth_domain = bind_domain.unwrap_or(domain);
+        let bind_dn = format!("{u}@{auth_domain}");
+        cmd = cmd.arg("-x").flag("-D", bind_dn).flag("-w", p);
+    } else {
+        cmd = cmd.arg("-x");
     }
 
     cmd = cmd.flag("-b", computed_base_dn);
@@ -317,16 +331,34 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
 /// Execute an rpcclient command against a target.
 ///
 /// Required args: `target`, `command`
-/// Optional args: `username`, `password`, `domain`, `null_session`
+/// Optional args: `username`, `password`, `domain`, `null_session`, `hash`
 pub async fn rpcclient_command(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let command = required_str(args, "command")?;
     let null_session = optional_bool(args, "null_session").unwrap_or(false);
+    let hash = optional_str(args, "hash");
 
     let mut cmd = CommandBuilder::new("rpcclient").timeout_secs(120);
 
     if null_session {
         cmd = cmd.args(["-U", "", "-N"]);
+    } else if let Some(ntlm_hash) = hash {
+        // Pass-the-hash: use --pw-nt-hash and supply the NTLM hash as the password.
+        // rpcclient --pw-nt-hash expects only the NT hash (32 hex chars), not LM:NT.
+        // If the hash is in LM:NT format (e.g. "aad3b435...:2e993405..."), extract
+        // just the NT part (after the colon).
+        let nt_hash = if ntlm_hash.contains(':') {
+            ntlm_hash.rsplit(':').next().unwrap_or(ntlm_hash)
+        } else {
+            ntlm_hash
+        };
+        let domain = optional_str(args, "domain");
+        let username = optional_str(args, "username").unwrap_or("Administrator");
+        let user_spec = match domain {
+            Some(d) => format!("{d}/{username}%{nt_hash}"),
+            None => format!("{username}%{nt_hash}"),
+        };
+        cmd = cmd.flag("-U", user_spec).arg("--pw-nt-hash");
     } else {
         let domain = optional_str(args, "domain");
         let username = optional_str(args, "username").unwrap_or("");
@@ -381,6 +413,12 @@ pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let hash = optional_str(args, "hash");
     let base_dn = optional_str(args, "base_dn");
+    // Cross-realm auth: orchestrator sets `bind_domain` to the cred's actual
+    // realm when the credential lives in a different forest from the search
+    // target (e.g. cred is `user@contoso.local` querying `fabrikam.local` DC).
+    // Without this, the bind DN gets the target realm and the foreign DC
+    // rejects with `invalidCredentials`. Falls back to `domain` when absent.
+    let bind_domain = optional_str(args, "bind_domain").unwrap_or(domain);
 
     // Hash-based auth: use impacket LDAP client with pass-the-hash (NTLM)
     if let (Some(u), Some(h)) = (username, hash) {
@@ -400,7 +438,7 @@ pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
             r#"python3 -c "
 from impacket.ldap import ldap as ldap_mod
 conn = ldap_mod.LDAPConnection('ldap://{target}', '{base_dn}', '{target}')
-conn.login('{u}', '', '{domain}', lmhash='', nthash='{nt_hash}')
+conn.login('{u}', '', '{bind_domain}', lmhash='', nthash='{nt_hash}')
 sc = ldap_mod.SimplePagedResultsControl(size=1000)
 resp = conn.search(searchFilter='(objectClass=trustedDomain)', attributes=['cn','trustDirection','trustType','trustAttributes','flatName'], searchControls=[sc])
 for item in resp:
@@ -419,7 +457,7 @@ for item in resp:
 "
 "#,
             target = target,
-            domain = domain,
+            bind_domain = bind_domain,
             u = u,
             nt_hash = nt_hash,
             base_dn = computed_base_dn,
@@ -444,7 +482,7 @@ for item in resp:
         .timeout_secs(120);
 
     if let (Some(u), Some(p)) = (username, password) {
-        let bind_dn = format!("{u}@{domain}");
+        let bind_dn = format!("{u}@{bind_domain}");
         cmd = cmd.flag("-D", bind_dn).flag("-w", p);
     }
 
@@ -573,6 +611,137 @@ pub async fn smbclient_kerberos_shares(args: &Value) -> Result<ToolOutput> {
     cmd.arg(format!("@{target}")).execute().await
 }
 
+/// Enumerate ACL attack paths via LDAP nTSecurityDescriptor queries.
+///
+/// Queries all user, group, and computer objects requesting nTSecurityDescriptor,
+/// sAMAccountName, objectClass, and objectSid. The binary SD data is parsed
+/// by the ntsd parser to identify dangerous ACEs.
+///
+/// Required args: `target`, `domain`
+/// Optional args: `username`, `password`, `bind_domain`, `hash`
+pub async fn ldap_acl_enumeration(args: &Value) -> Result<ToolOutput> {
+    let target = required_str(args, "target")?;
+    let domain = required_str(args, "domain")?;
+    let username = optional_str(args, "username");
+    let password = optional_str(args, "password");
+    let bind_domain = optional_str(args, "bind_domain");
+    let hash = optional_str(args, "hash");
+    let ticket_path = optional_str(args, "ticket_path");
+
+    let base_dn = domain_to_base_dn(domain);
+    let uri = format!("ldap://{target}");
+
+    // Kerberos GSSAPI bind for cross-forest LDAP enumeration. Takes precedence
+    // over hash/password — when a forged inter-realm ticket is present we MUST
+    // use it, otherwise simple bind with source-realm cred fails 0x52e.
+    if let Some(ccache) = ticket_path {
+        return CommandBuilder::new("ldapsearch")
+            .env("KRB5CCNAME", ccache)
+            .flag("-H", &uri)
+            .arg("-Y")
+            .arg("GSSAPI")
+            .timeout_secs(300)
+            .flag("-b", &base_dn)
+            .args(["-E", "1.2.840.113556.1.4.801=::MAMCAQQ="])
+            .arg("(|(objectCategory=person)(objectCategory=group)(objectCategory=computer))")
+            .args([
+                "sAMAccountName",
+                "objectClass",
+                "objectSid",
+                "nTSecurityDescriptor",
+            ])
+            .execute()
+            .await;
+    }
+
+    // If hash is provided, use impacket LDAP for pass-the-hash
+    if let (Some(u), Some(h)) = (username, hash) {
+        let nt_hash = if h.contains(':') {
+            h.rsplit(':').next().unwrap_or(h)
+        } else {
+            h
+        };
+        let ldap_query = format!(
+            r#"python3 -c "
+import base64
+from impacket.ldap import ldap as ldap_mod
+conn = ldap_mod.LDAPConnection('ldap://{target}', '{base_dn}', '{target}')
+conn.login('{u}', '', '{domain}', lmhash='', nthash='{nt_hash}')
+sc = ldap_mod.SimplePagedResultsControl(size=1000)
+resp = conn.search(
+    searchFilter='(|(objectCategory=person)(objectCategory=group)(objectCategory=computer))',
+    attributes=['sAMAccountName','objectClass','objectSid','nTSecurityDescriptor'],
+    searchControls=[sc],
+    sizeLimit=0,
+)
+for item in resp:
+    try:
+        dn = str(item['objectName'])
+        if not dn:
+            continue
+        print(f'dn: {{dn}}')
+        for attr in item['attributes']:
+            name = str(attr['type'])
+            for val in attr['vals']:
+                if name == 'nTSecurityDescriptor':
+                    b = bytes(val)
+                    print(f'nTSecurityDescriptor:: {{base64.b64encode(b).decode()}}')
+                elif name == 'objectSid':
+                    b = bytes(val)
+                    print(f'objectSid:: {{base64.b64encode(b).decode()}}')
+                else:
+                    print(f'{{name}}: {{val}}')
+        print()
+    except Exception:
+        pass
+"
+"#,
+            target = target,
+            domain = domain,
+            u = u,
+            nt_hash = nt_hash,
+            base_dn = base_dn,
+        );
+        return CommandBuilder::new("bash")
+            .args(["-c", &ldap_query])
+            .timeout_secs(300)
+            .execute()
+            .await;
+    }
+
+    // Password-based: use ldapsearch with LDAP_SERVER_SD_FLAGS_OID control
+    // to request DACL (value 4) in the nTSecurityDescriptor attribute
+    let mut cmd = CommandBuilder::new("ldapsearch")
+        .arg("-x")
+        .flag("-H", &uri)
+        .timeout_secs(300);
+
+    if let (Some(u), Some(p)) = (username, password) {
+        let auth_domain = bind_domain.unwrap_or(domain);
+        let bind_dn = format!("{u}@{auth_domain}");
+        cmd = cmd.flag("-D", bind_dn).flag("-w", p);
+    }
+
+    cmd = cmd
+        .flag("-b", &base_dn)
+        // Request DACL only via SD_FLAGS control (0x04 = DACL)
+        // BER: SEQUENCE { INTEGER 4 } = 30 03 02 01 04 → base64 MAMCAQQ=
+        .args(["-E", "1.2.840.113556.1.4.801=::MAMCAQQ="])
+        .arg("(|(objectCategory=person)(objectCategory=group)(objectCategory=computer))")
+        .args([
+            "sAMAccountName",
+            "objectClass",
+            "objectSid",
+            "nTSecurityDescriptor",
+        ]);
+
+    cmd.execute().await
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +763,8 @@ mod tests {
     fn domain_to_base_dn_single() {
         assert_eq!(domain_to_base_dn("local"), "DC=local");
     }
+
+    // --- mock executor tests: exercise full CommandBuilder code paths ---
 
     use crate::executor::mock;
     use serde_json::json;
@@ -801,6 +972,37 @@ mod tests {
         let args = json!({
             "target": "192.168.58.1",
             "domain": "contoso.local",
+            "username": "admin",
+            "hash": "aad3b435:aabbccdd"
+        });
+        let result = enumerate_domain_trusts(&args).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enumerate_domain_trusts_cross_realm_bind_domain() {
+        // Cross-forest: cred is for contoso.local but we're querying
+        // fabrikam.local DC. The tool must bind with the cred's realm,
+        // not the target realm.
+        mock::push(mock::success());
+        let args = json!({
+            "target": "192.168.58.20",
+            "domain": "fabrikam.local",
+            "bind_domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ss"
+        });
+        let result = enumerate_domain_trusts(&args).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enumerate_domain_trusts_cross_realm_pth_bind_domain() {
+        mock::push(mock::success());
+        let args = json!({
+            "target": "192.168.58.20",
+            "domain": "fabrikam.local",
+            "bind_domain": "contoso.local",
             "username": "admin",
             "hash": "aad3b435:aabbccdd"
         });

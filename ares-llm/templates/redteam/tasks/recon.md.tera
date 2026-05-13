@@ -3,15 +3,31 @@
 **Target:** {{ target_ip }}
 {% if domain %}**Domain:** {{ domain }}
 {% endif -%}
-{% if credential_username %}**Credential:** {{ credential_username }}@{{ credential_domain }}{% if credential_password %} / Password: {{ credential_password }}{% endif %}
+{% if credential_username %}**Principal:** {{ credential_username }}@{{ credential_domain }} (auth: {{ credential_auth_type }} — auto-resolved at dispatch, do NOT pass password/hash/ticket fields)
+{% endif -%}
+{% if bind_domain %}**Bind Domain:** {{ bind_domain }} (use bind_domain={{ bind_domain }} in ldap_search when credential domain differs from target domain)
 {% endif -%}
 
+{% if technique -%}
+**Technique:** {{ technique }}
+{% endif -%}
 {% if techniques -%}
 **Requested Techniques:**
 {% for t in techniques -%}
 - {{ t }}
 {% endfor -%}
-{% else -%}
+{% endif -%}
+{% if has_ntlm_hash -%}
+**NTLM Hash available** (auto-resolved at dispatch — do NOT pass `nthash`/`hashes` fields){% if hash_username %} for user: {{ hash_username }}{% endif %}
+{% endif -%}
+
+{% if instructions -%}
+## Instructions
+
+**IMPORTANT: Follow these instructions exactly. Do NOT perform generic scanning — execute only the specific technique described below.**
+
+{{ instructions }}
+{% elif not techniques -%}
 Perform a comprehensive reconnaissance scan of the target.
 {% endif -%}
 

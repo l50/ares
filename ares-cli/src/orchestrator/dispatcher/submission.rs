@@ -16,7 +16,7 @@ use crate::orchestrator::throttling::ThrottleDecision;
 
 use ares_llm::LoopEndReason;
 
-use super::Dispatcher;
+use super::{Dispatcher, SubmissionOutcome};
 
 impl Dispatcher {
     /// Submit a task with throttle checking. Returns the task_id if submitted,
@@ -28,6 +28,26 @@ impl Dispatcher {
         payload: serde_json::Value,
         priority: i32,
     ) -> Result<Option<String>> {
+        match self
+            .throttled_submit_outcome(task_type, target_role, payload, priority)
+            .await?
+        {
+            SubmissionOutcome::Submitted(id) => Ok(Some(id)),
+            SubmissionOutcome::Deferred | SubmissionOutcome::Dropped => Ok(None),
+        }
+    }
+
+    /// Like `throttled_submit` but returns a `SubmissionOutcome` distinguishing
+    /// "deferred and safely enqueued" from "dropped due to overflow". Use this
+    /// when the caller needs to dedup deferred work without losing tasks that
+    /// got silently dropped on queue overflow.
+    pub async fn throttled_submit_outcome(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
         let span = info_span!(
             "automation.dispatch",
             task_type = task_type,
@@ -36,19 +56,43 @@ impl Dispatcher {
             "task.id" = Empty,
             "automation.decision" = Empty,
         );
-        self.throttled_submit_inner(task_type, target_role, payload, priority, span.clone())
+        self.throttled_submit_outcome_inner(task_type, target_role, payload, priority, span.clone())
             .instrument(span)
             .await
     }
 
-    async fn throttled_submit_inner(
+    async fn throttled_submit_outcome_inner(
         &self,
         task_type: &str,
         target_role: &str,
         payload: serde_json::Value,
         priority: i32,
         span: tracing::Span,
-    ) -> Result<Option<String>> {
+    ) -> Result<SubmissionOutcome> {
+        // Hard rate cap: if this (task_type, target, principal) pattern
+        // already ended with `RequestAssistance` once this op, refuse to
+        // redispatch. The pattern is doomed — usually a missing tool
+        // primitive, a wrong-realm cred pairing, or a stale automation
+        // entry — and each re-attempt burns ~30k input tokens loading the
+        // LLM context only for the agent to bail with the same complaint.
+        // Re-enabling requires the operator to manually clear the dedup
+        // (or starts a new op with a wiped Redis).
+        let assist_key = assist_pattern_key(task_type, &payload);
+        if let Some(ref key) = assist_key {
+            let state = self.state.read().await;
+            if state.is_processed(crate::orchestrator::state::DEDUP_ASSIST_ABANDONED, key) {
+                drop(state);
+                span.record("automation.decision", "drop_assist_abandoned");
+                debug!(
+                    task_type,
+                    target_role,
+                    pattern = %key,
+                    "Refusing dispatch — task pattern previously ended with RequestAssistance",
+                );
+                return Ok(SubmissionOutcome::Dropped);
+            }
+        }
+
         let decision = self
             .throttler
             .check(task_type, target_role, Some(&payload))
@@ -57,50 +101,21 @@ impl Dispatcher {
         match decision {
             ThrottleDecision::Allow => {
                 span.record("automation.decision", "allow");
-                let result = self
-                    .do_submit(task_type, target_role, payload, priority)
-                    .await;
-                if let Ok(Some(ref tid)) = result {
+                let outcome = self
+                    .do_submit_outcome(task_type, target_role, payload, priority)
+                    .await?;
+                if let SubmissionOutcome::Submitted(ref tid) = outcome {
                     span.record("task.id", tid.as_str());
                 }
-                result
+                Ok(outcome)
             }
             ThrottleDecision::Defer => {
                 span.record("automation.decision", "defer");
-                let task = DeferredTask {
-                    priority,
-                    enqueue_time: Utc::now().timestamp() as f64,
-                    task_type: task_type.to_string(),
-                    target_role: target_role.to_string(),
-                    payload,
-                    source_agent: "orchestrator".to_string(),
-                };
-                match self.deferred.enqueue(&task).await {
-                    Ok(true) => {
-                        debug!(task_type, target_role, "Task deferred");
-                        Ok(None)
-                    }
-                    Ok(false) => {
-                        span.record("automation.decision", "defer_full");
-                        debug!(task_type, target_role, "Deferred queue full, task dropped");
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        span.record("automation.decision", "defer_failed_direct_submit");
-                        warn!(err = %e, "Failed to defer task, attempting direct submit");
-                        let result = self
-                            .do_submit(task_type, target_role, task.payload, priority)
-                            .await;
-                        if let Ok(Some(ref tid)) = result {
-                            span.record("task.id", tid.as_str());
-                        }
-                        result
-                    }
-                }
+                self.enqueue_deferred(task_type, target_role, payload, priority)
+                    .await
             }
             ThrottleDecision::Wait(dur) => {
                 span.record("automation.decision", "wait");
-                // Sleep and retry once
                 tokio::time::sleep(dur).await;
                 let retry_decision = self
                     .throttler
@@ -109,30 +124,72 @@ impl Dispatcher {
                 match retry_decision {
                     ThrottleDecision::Allow => {
                         span.record("automation.decision", "wait_allow");
-                        let result = self
-                            .do_submit(task_type, target_role, payload, priority)
-                            .await;
-                        if let Ok(Some(ref tid)) = result {
+                        let outcome = self
+                            .do_submit_outcome(task_type, target_role, payload, priority)
+                            .await?;
+                        if let SubmissionOutcome::Submitted(ref tid) = outcome {
                             span.record("task.id", tid.as_str());
                         }
-                        result
+                        Ok(outcome)
                     }
                     _ => {
                         span.record("automation.decision", "wait_defer");
-                        let task = DeferredTask {
-                            priority,
-                            enqueue_time: Utc::now().timestamp() as f64,
-                            task_type: task_type.to_string(),
-                            target_role: target_role.to_string(),
-                            payload,
-                            source_agent: "orchestrator".to_string(),
-                        };
-                        let _ = self.deferred.enqueue(&task).await;
-                        Ok(None)
+                        self.enqueue_deferred(task_type, target_role, payload, priority)
+                            .await
                     }
                 }
             }
         }
+    }
+
+    async fn enqueue_deferred(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
+        let task = DeferredTask {
+            priority,
+            enqueue_time: Utc::now().timestamp() as f64,
+            task_type: task_type.to_string(),
+            target_role: target_role.to_string(),
+            payload,
+            source_agent: "orchestrator".to_string(),
+        };
+        match self.deferred.enqueue(&task).await {
+            Ok(true) => {
+                debug!(task_type, target_role, "Task deferred");
+                Ok(SubmissionOutcome::Deferred)
+            }
+            Ok(false) => {
+                warn!(
+                    task_type,
+                    target_role, "Deferred queue full, task dropped (will retry next tick)"
+                );
+                Ok(SubmissionOutcome::Dropped)
+            }
+            Err(e) => {
+                warn!(err = %e, "Failed to defer task, attempting direct submit");
+                self.do_submit_outcome(task_type, target_role, task.payload, priority)
+                    .await
+            }
+        }
+    }
+
+    /// Submit bypassing the throttle soft/hard cap.  Used by automations
+    /// whose tasks are small (single LDAP query) and must not be blocked by
+    /// long-running initial recon.  Still routes through `do_submit` which
+    /// respects the per-role semaphore.
+    pub async fn force_submit(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<Option<String>> {
+        self.do_submit(task_type, target_role, payload, priority)
+            .await
     }
 
     /// Direct submit (bypasses throttle). Returns task_id.
@@ -145,11 +202,25 @@ impl Dispatcher {
         task_type: &str,
         target_role: &str,
         payload: serde_json::Value,
-        _priority: i32,
+        priority: i32,
     ) -> Result<Option<String>> {
-        // Prefer the caller-specified target_role (from recommended_agent)
-        // over the static task_type → role mapping. This lets automation
-        // modules like MSSQL route exploits to lateral instead of privesc.
+        match self
+            .do_submit_outcome(task_type, target_role, payload, priority)
+            .await?
+        {
+            SubmissionOutcome::Submitted(id) => Ok(Some(id)),
+            SubmissionOutcome::Deferred | SubmissionOutcome::Dropped => Ok(None),
+        }
+    }
+
+    /// Like `do_submit` but returns a `SubmissionOutcome`.
+    pub async fn do_submit_outcome(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
         let role = ares_llm::tool_registry::AgentRole::parse(target_role)
             .or_else(|| crate::orchestrator::llm_runner::role_for_task_type(task_type));
 
@@ -161,7 +232,7 @@ impl Dispatcher {
                     target_role = target_role,
                     "No LLM role mapping for task type or target role, dropping"
                 );
-                return Ok(None);
+                return Ok(SubmissionOutcome::Dropped);
             }
         };
 
@@ -171,6 +242,7 @@ impl Dispatcher {
             target_role,
             role,
             payload,
+            priority,
         )
         .await
     }
@@ -185,26 +257,39 @@ impl Dispatcher {
         target_role: &str,
         role: ares_llm::tool_registry::AgentRole,
         payload: serde_json::Value,
-    ) -> Result<Option<String>> {
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
         // Per-credential concurrency gate: if too many tasks are already
         // in-flight for this credential, defer instead of spawning another.
         let cred_key = super::credential_key_from_payload(&payload);
         if let Some(ref key) = cred_key {
             if !self.credential_inflight.try_acquire(key).await {
-                info!(
+                debug!(
                     credential = key.as_str(),
                     task_type, "Credential concurrency limit reached, deferring task"
                 );
                 let task = DeferredTask {
-                    priority: 3,
+                    priority,
                     enqueue_time: Utc::now().timestamp() as f64,
                     task_type: task_type.to_string(),
                     target_role: target_role.to_string(),
                     payload,
                     source_agent: "orchestrator".to_string(),
                 };
-                let _ = self.deferred.enqueue(&task).await;
-                return Ok(None);
+                return match self.deferred.enqueue(&task).await {
+                    Ok(true) => Ok(SubmissionOutcome::Deferred),
+                    Ok(false) => {
+                        warn!(
+                            credential = key.as_str(),
+                            task_type, "Deferred queue full while gating on cred — task dropped"
+                        );
+                        Ok(SubmissionOutcome::Dropped)
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "Failed to defer cred-gated task");
+                        Ok(SubmissionOutcome::Dropped)
+                    }
+                };
             }
         }
 
@@ -227,6 +312,7 @@ impl Dispatcher {
                 task_type: task_type.to_string(),
                 role: target_role.to_string(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: cred_key.clone(),
             })
             .await;
 
@@ -250,6 +336,22 @@ impl Dispatcher {
         let mut task_params: HashMap<String, serde_json::Value> = HashMap::new();
         if let Some(ref key) = cred_key {
             task_params.insert("credential_key".to_string(), serde_json::json!(key));
+        }
+        // Propagate task metadata so process_completed_task can access them
+        // (mark_host_owned needs target_ip, domain attribution needs domain,
+        // the Impacket failure classifier needs technique/hash_value/
+        // just_dc_user/credential to rebuild a corrected re-dispatch).
+        for key in &[
+            "target_ip",
+            "domain",
+            "technique",
+            "hash_value",
+            "just_dc_user",
+            "credential",
+        ] {
+            if let Some(val) = payload.get(*key) {
+                task_params.insert(key.to_string(), val.clone());
+            }
         }
         let task_info = ares_core::models::TaskInfo {
             task_id: task_id.clone(),
@@ -278,8 +380,10 @@ impl Dispatcher {
         let queue = self.queue.clone();
         let tid = task_id.clone();
         let tt = task_type.to_string();
-        let cred_inflight = self.credential_inflight.clone();
-        let cred_key_owned = cred_key.clone();
+        // Capture the assist-abandon pattern key + state handle so the
+        // spawn can record on RequestAssistance without re-resolving them.
+        let state_for_assist = self.state.clone();
+        let assist_key_for_spawn = assist_pattern_key(&tt, &payload);
         tokio::spawn(async move {
             let outcome = runner.execute_task(&tt, &tid, role, &payload).await;
 
@@ -296,11 +400,30 @@ impl Dispatcher {
                         Some(ares_tools::parsers::merge_discoveries(&outcome.discoveries))
                     };
 
-                    // Collect raw tool outputs for secondary regex extraction
+                    // LLM-fabricated findings (`report_finding`,
+                    // `report_lateral_success`) are kept on a SEPARATE field so
+                    // `extract_discoveries` (which only reads "discoveries")
+                    // never feeds them into `publish_*` state writes. Reports
+                    // surface them under `llm_findings` for context only.
+                    let llm_findings_json: Option<Value> = if outcome.llm_findings.is_empty() {
+                        None
+                    } else {
+                        Some(Value::Array(outcome.llm_findings.clone()))
+                    };
+
+                    // Collect raw tool outputs for secondary regex extraction.
+                    // Serialize as objects {name, arguments, output} so consumers
+                    // can be tool-aware (skip credential regex for hash-auth invocations).
                     let tool_outputs_json: Vec<Value> = outcome
                         .tool_outputs
                         .iter()
-                        .map(|s| Value::String(s.clone()))
+                        .map(|to| {
+                            serde_json::json!({
+                                "name": to.name,
+                                "arguments": to.arguments,
+                                "output": to.output,
+                            })
+                        })
                         .collect();
 
                     match &outcome.reason {
@@ -334,12 +457,17 @@ impl Dispatcher {
                             // The LLM's task_complete result is untrusted prose —
                             // any discovery-like keys it contains are ignored.
                             // Only ares-tools parsers (run on real tool stdout)
-                            // produce authoritative discoveries.
+                            // produce authoritative discoveries. LLM-fabricated
+                            // findings live on a separate `llm_findings` field.
                             if let Some(obj) = result_json.as_object_mut() {
                                 obj.remove("discoveries");
+                                obj.remove("llm_findings");
                             }
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
+                            }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
                             }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
@@ -363,9 +491,36 @@ impl Dispatcher {
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
                             }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
+                            }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
                                     Value::Array(tool_outputs_json.clone());
+                            }
+                            // Record this pattern as abandoned so future
+                            // dispatches of (task_type, target, user, domain)
+                            // get refused at throttled_submit. One failure is
+                            // enough — re-running an LLM round on a doomed
+                            // task costs ~30k input tokens for a guaranteed
+                            // repeat of the same "Assistance requested".
+                            if let Some(ref key) = assist_key_for_spawn {
+                                state_for_assist.write().await.mark_processed(
+                                    crate::orchestrator::state::DEDUP_ASSIST_ABANDONED,
+                                    key.clone(),
+                                );
+                                let _ = state_for_assist
+                                    .persist_dedup(
+                                        &queue,
+                                        crate::orchestrator::state::DEDUP_ASSIST_ABANDONED,
+                                        key,
+                                    )
+                                    .await;
+                                warn!(
+                                    task_id = %tid,
+                                    pattern = %key,
+                                    "Marked task pattern as assist-abandoned — future dispatches will be dropped",
+                                );
                             }
                             TaskResult {
                                 task_id: tid.clone(),
@@ -387,6 +542,9 @@ impl Dispatcher {
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
                             }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
+                            }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
                                     Value::Array(tool_outputs_json.clone());
@@ -406,15 +564,27 @@ impl Dispatcher {
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
                             }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
+                            }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
                                     Value::Array(tool_outputs_json.clone());
                             }
+                            // Bare end-of-turn means the LLM stopped without
+                            // calling task_complete or request_assistance — it
+                            // is a stall, not a success. Treating it as success
+                            // lets capability-gap exits masquerade as
+                            // accomplished objectives in run accounting.
                             TaskResult {
                                 task_id: tid.clone(),
-                                success: true,
+                                success: false,
                                 result: Some(result_json),
-                                error: None,
+                                error: Some(
+                                    "Agent ended turn without task_complete or \
+                                     request_assistance"
+                                        .into(),
+                                ),
                                 completed_at: Some(Utc::now()),
                                 worker_pod: Some("rust-llm-runner".into()),
                                 agent_name: Some(tt.clone()),
@@ -427,6 +597,9 @@ impl Dispatcher {
                             });
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
+                            }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
                             }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
@@ -495,10 +668,12 @@ impl Dispatcher {
                 }
             }
 
-            // Release per-credential concurrency slot
-            if let Some(ref key) = cred_key_owned {
-                cred_inflight.release(key).await;
-            }
+            // The CredentialInflight slot is released by whichever caller
+            // evicts this task from `ActiveTaskTracker` — either the result
+            // consumer when it picks up the result, or the stale-task
+            // cleanup when this future has hung past the timeout. That
+            // mirrors the slot to the tracker entry's lifetime, so a hung
+            // future doesn't pin the slot indefinitely.
 
             // Push result to the normal result queue so the result consumer picks it up
             if let Err(e) = queue.send_result(&tid, &result).await {
@@ -510,6 +685,97 @@ impl Dispatcher {
             }
         });
 
-        Ok(Some(task_id))
+        Ok(SubmissionOutcome::Submitted(task_id))
+    }
+}
+
+/// Canonical key identifying a task pattern for the assist-abandon dedup
+/// set. Keys off (task_type, target_ip-or-dc_ip, username, domain).
+///
+/// Only returns a key when the payload identifies a SPECIFIC principal
+/// (non-empty `username`). Generic enum tasks dispatched without a
+/// username — anonymous recon, low-hanging-fruit probes, automation
+/// tasks targeting a host without binding a user — MUST NOT be
+/// abandoned, because (a) they routinely fire many times against the
+/// same target as state accumulates and (b) one transient failure of
+/// an empty-user enum task against a DC would otherwise blacklist all
+/// further enumeration of that host. The previous version of this
+/// function returned a key with empty username embedded
+/// (`task_type|target||domain`); a single assistance failure on a
+/// generic recon task permanently blocked all further enum dispatches
+/// against that target — choking the orchestrator after ~6 such
+/// failures across the 3 DCs in a typical multi-forest run.
+///
+/// With a non-empty username, one failure of (task_type, target, user,
+/// domain) is enough to suppress retries: the same principal failing
+/// the same task against the same target is the "wrong realm cred",
+/// "missing tool primitive", or "no auth resolvable" signature we want
+/// to stop burning tokens on.
+pub(crate) fn assist_pattern_key(task_type: &str, payload: &serde_json::Value) -> Option<String> {
+    let obj = payload.as_object()?;
+    let pick = |k: &str| -> &str { obj.get(k).and_then(|v| v.as_str()).unwrap_or("") };
+    let username = pick("username");
+    if username.is_empty() {
+        return None;
+    }
+    let target = {
+        let t = pick("target_ip");
+        if !t.is_empty() {
+            t.to_string()
+        } else {
+            pick("dc_ip").to_string()
+        }
+    };
+    let domain = pick("domain");
+    Some(format!(
+        "{task_type}|{target}|{u}|{d}",
+        u = username.to_lowercase(),
+        d = domain.to_lowercase(),
+    ))
+}
+
+#[cfg(test)]
+mod assist_key_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pattern_key_includes_target_user_domain() {
+        let p =
+            json!({"target_ip": "192.168.58.10", "username": "Alice", "domain": "Contoso.LOCAL"});
+        let k = assist_pattern_key("smb_login_check", &p).unwrap();
+        assert_eq!(k, "smb_login_check|192.168.58.10|alice|contoso.local");
+    }
+
+    #[test]
+    fn pattern_key_falls_back_to_dc_ip() {
+        let p = json!({"dc_ip": "192.168.58.10", "username": "alice", "domain": "contoso.local"});
+        let k = assist_pattern_key("certipy_find", &p).unwrap();
+        assert!(k.starts_with("certipy_find|192.168.58.10|"));
+    }
+
+    #[test]
+    fn pattern_key_none_when_no_identifying_fields() {
+        let p = json!({"technique": "recon"});
+        assert!(assist_pattern_key("recon", &p).is_none());
+    }
+
+    #[test]
+    fn pattern_key_none_for_empty_username_generic_enum() {
+        // The dispatcher fires generic enum tasks against a target with
+        // no `username` field; one transient assistance failure must NOT
+        // permanently blacklist all future enumeration of that target.
+        // Regression for: empty-user keys (`recon|target||domain`) earlier
+        // choked the orchestrator after ~6 failures across 3 DCs.
+        let p = json!({"target_ip": "192.168.58.10", "domain": "contoso.local"});
+        assert!(
+            assist_pattern_key("recon", &p).is_none(),
+            "generic-enum task (no username) must never be abandoned"
+        );
+        let p = json!({"dc_ip": "192.168.58.10", "domain": "contoso.local", "username": ""});
+        assert!(
+            assist_pattern_key("credential_access", &p).is_none(),
+            "explicit empty username must never be abandoned"
+        );
     }
 }

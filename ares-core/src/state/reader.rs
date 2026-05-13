@@ -6,7 +6,7 @@ use chrono::Utc;
 use redis::AsyncCommands;
 
 use crate::models::{
-    Credential, Hash, Host, OperationMeta, Share, SharedRedTeamState, Target, User,
+    Credential, Hash, Host, KerberosTicket, OperationMeta, Share, SharedRedTeamState, Target, User,
     VulnerabilityInfo,
 };
 
@@ -382,8 +382,26 @@ impl RedisStateReader {
         let added: bool = conn.hset_nx(&key, &dedup_field, &data).await?;
         if added {
             let _: () = conn.expire(&key, 86400).await?;
+            return Ok(true);
         }
-        Ok(added)
+
+        // Upsert path: a prior call added this user/hash with no AES256 key,
+        // and this call carries one. Win2016+ DCs reject RC4-only inter-realm
+        // tickets, so the AES key is required for cross-forest forge — we
+        // can't afford to lose it to dedup.
+        if hash.aes_key.is_some() {
+            let existing: Option<String> = conn.hget(&key, &dedup_field).await?;
+            let existing_has_aes = existing
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Hash>(s).ok())
+                .and_then(|h| h.aes_key)
+                .is_some();
+            if !existing_has_aes {
+                let _: () = conn.hset(&key, &dedup_field, &data).await?;
+                let _: () = conn.expire(&key, 86400).await?;
+            }
+        }
+        Ok(false)
     }
 
     /// Set a meta field in the operation's meta HASH.
@@ -415,6 +433,27 @@ impl RedisStateReader {
         Ok(())
     }
 
+    /// Get a domain SID from the `domain_sids` HASH.
+    pub async fn get_domain_sid(
+        &self,
+        conn: &mut impl AsyncCommands,
+        domain: &str,
+    ) -> Result<Option<String>, redis::RedisError> {
+        let key = self.key(KEY_DOMAIN_SIDS);
+        let sid: Option<String> = conn.hget(&key, domain).await?;
+        Ok(sid)
+    }
+
+    /// Get all domain SIDs from the `domain_sids` HASH (lowercase keys).
+    pub async fn get_domain_sids(
+        &self,
+        conn: &mut impl AsyncCommands,
+    ) -> Result<HashMap<String, String>, redis::RedisError> {
+        let key = self.key(KEY_DOMAIN_SIDS);
+        let data: HashMap<String, String> = conn.hgetall(&key).await?;
+        Ok(data)
+    }
+
     /// Set the RID-500 account name for a domain in the `admin_names` HASH.
     pub async fn set_admin_name(
         &self,
@@ -426,6 +465,48 @@ impl RedisStateReader {
         let _: () = conn.hset(&key, domain, name).await?;
         let _: () = conn.expire(&key, 86400).await?;
         Ok(())
+    }
+
+    /// Get the RID-500 account name for a domain from the `admin_names` HASH.
+    pub async fn get_admin_name(
+        &self,
+        conn: &mut impl AsyncCommands,
+        domain: &str,
+    ) -> Result<Option<String>, redis::RedisError> {
+        let key = self.key(KEY_ADMIN_NAMES);
+        let name: Option<String> = conn.hget(&key, domain).await?;
+        Ok(name)
+    }
+
+    /// Add a forged inter-realm Kerberos ticket to `ares:op:{id}:kerberos_tickets` HASH.
+    ///
+    /// Keyed by `{source}:{target}:{username}` for dedup. A newer ticket for
+    /// the same principal silently overwrites the old one (`HSET`, not `HSETNX`).
+    pub async fn add_kerberos_ticket(
+        &self,
+        conn: &mut impl AsyncCommands,
+        ticket: &KerberosTicket,
+    ) -> Result<(), redis::RedisError> {
+        let key = self.key(KEY_KERBEROS_TICKETS);
+        let field = ticket.dedup_key();
+        let data = serde_json::to_string(ticket).unwrap_or_default();
+        let _: () = conn.hset(&key, &field, &data).await?;
+        let _: () = conn.expire(&key, 86400).await?;
+        Ok(())
+    }
+
+    /// Load all forged Kerberos tickets from `ares:op:{id}:kerberos_tickets` HASH.
+    pub async fn get_kerberos_tickets(
+        &self,
+        conn: &mut impl AsyncCommands,
+    ) -> Result<Vec<KerberosTicket>, redis::RedisError> {
+        let key = self.key(KEY_KERBEROS_TICKETS);
+        let items: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
+        let result = items
+            .into_values()
+            .filter_map(|json_str| try_deserialize(&json_str, "kerberos_ticket"))
+            .collect();
+        Ok(result)
     }
 
     /// Add a share to `ares:op:{id}:shares` HASH (with dedup by host+name).
@@ -627,6 +708,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         }
     }
 
@@ -658,6 +743,7 @@ mod tests {
             name: name.to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         }
     }
 

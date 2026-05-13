@@ -83,6 +83,17 @@ pub struct User {
     pub source: String,
 }
 
+/// AD built-in accounts that ship `userAccountControl & ACCOUNTDISABLE` set
+/// out of the box. Spraying or otherwise auth'ing against these can never
+/// succeed and just burns the per-account badPwdCount budget — which on
+/// shared lockout policies trips real accounts in the same window.
+pub fn is_always_disabled_account(username: &str) -> bool {
+    matches!(
+        username.to_lowercase().as_str(),
+        "guest" | "defaultaccount" | "wdagutilityaccount" | "krbtgt"
+    )
+}
+
 /// Discovered credential.
 ///
 /// Matches Python: `class Credential(Model)`
@@ -134,6 +145,32 @@ pub struct Hash {
     /// AES256 key for Kerberos golden tickets (Windows 2016+ rejects RC4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aes_key: Option<String>,
+    /// True when this is a previous (rotated-out) credential history entry —
+    /// NTDS exposes `_history0`, `_history1`, etc. for trust accounts and user
+    /// principals. Operationally, prefer current keys for ticket forging and
+    /// fall back to history only when current fails (e.g. mid-rotation
+    /// window). Defaults to `false` for forward compatibility with existing
+    /// Redis records.
+    #[serde(default)]
+    pub is_previous: bool,
+    /// Source host the hash was dumped from (IP or hostname). Threaded from
+    /// the dispatcher seam so multiple local-SAM `Administrator` / `Guest` /
+    /// `ssm-user` rows from different hosts don't collapse on dedup. Empty for
+    /// domain-qualified (NTDS) rows where the realm already disambiguates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_host: Option<String>,
+    /// True when the row's username ends in `$` AND the row's domain differs
+    /// from the dumping machine's home domain — i.e. this is an inter-realm
+    /// trust account hash (forging material), not the local machine account.
+    /// Set by the secretsdump parser; renderers hoist these into a dedicated
+    /// "Trust Keys / Forging Material" section.
+    #[serde(default)]
+    pub is_trust_key: bool,
+    /// When `is_trust_key` is true, the NetBIOS label of the trust target
+    /// (e.g. `FABRIKAM` for a `FABRIKAM$` row dumped from `contoso.local`).
+    /// Used for symmetric-pair detection in the report renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_pair_label: Option<String>,
 }
 
 #[cfg(test)]
@@ -335,6 +372,10 @@ mod tests {
             parent_id: None,
             attack_step: 1,
             aes_key: Some("aes256key".to_string()),
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let json = serde_json::to_string(&hash).unwrap();
         assert!(json.contains("aes256key"));
@@ -349,6 +390,7 @@ mod tests {
             name: "ADMIN$".to_string(),
             permissions: "READ".to_string(),
             comment: "Remote Admin".to_string(),
+            authenticated_as: None,
         };
         let json = serde_json::to_string(&share).unwrap();
         let deser: Share = serde_json::from_str(&json).unwrap();
@@ -504,6 +546,91 @@ impl TrustInfo {
     }
 }
 
+/// Strength of evidence that a candidate string is a real AD domain.
+///
+/// Production AD discovery tools (BloodHound, NetExec, runZero) never trust a
+/// hostname suffix alone — they require positive AD evidence (DC self-report,
+/// authenticated bind, SRV record) before promoting a string to "authoritative
+/// domain." This enum lets us tag the source of each candidate so the promotion
+/// rules can stay consistent across discovery paths.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainEvidence {
+    /// Configured in the operation target — authoritative starting point.
+    TargetConfig,
+    /// A DC self-reported the domain name (CLDAP NetLogon `DnsDomainName`,
+    /// Kerberos AS-REP `crealm`, anonymous LDAP RootDSE `defaultNamingContext`).
+    DcSelfReport,
+    /// Captured from authenticated AD enumeration — successful LDAP bind,
+    /// secretsdump, SMB session info from a verified auth.
+    AuthenticatedAd,
+    /// DNS SRV record `_ldap._tcp.dc._msdcs.<domain>` resolves.
+    DnsSrv,
+    /// Inferred from a host FQDN suffix (e.g. `srv01.contoso.local` →
+    /// `contoso.local`). Lowest tier — must be corroborated before promotion.
+    HostnameInference,
+}
+
+impl DomainEvidence {
+    /// Whether this evidence is sufficient to promote a candidate to
+    /// authoritative state without further corroboration.
+    pub fn is_authoritative(self) -> bool {
+        matches!(
+            self,
+            Self::TargetConfig | Self::DcSelfReport | Self::AuthenticatedAd | Self::DnsSrv
+        )
+    }
+}
+
+/// A domain name discovered during an operation, with provenance.
+///
+/// Held in `state.candidate_domains` until either (a) the evidence is
+/// authoritative on its own, (b) a probe (DNS SRV / CLDAP) corroborates it,
+/// or (c) it matches a domain already promoted via another path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidateDomain {
+    /// Lowercase FQDN.
+    pub fqdn: String,
+    pub evidence: DomainEvidence,
+    /// IP of the host that produced this candidate (when applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_host_ip: Option<String>,
+    pub discovered_at: DateTime<Utc>,
+    /// Set once a probe has run. `confirmed = false` after probing means the
+    /// probe rejected it; we keep the record so we don't re-probe.
+    #[serde(default)]
+    pub probed: bool,
+    #[serde(default)]
+    pub confirmed: bool,
+    /// Timestamp of the most recent probe attempt. Used to retry transient
+    /// probe failures without hammering DNS every loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probed_at: Option<DateTime<Utc>>,
+    /// Count of transient probe attempts. Useful for visibility/backoff.
+    #[serde(default)]
+    pub probe_failures: u32,
+}
+
+impl CandidateDomain {
+    pub fn new(fqdn: impl Into<String>, evidence: DomainEvidence) -> Self {
+        Self {
+            fqdn: fqdn.into().to_lowercase(),
+            evidence,
+            source_host_ip: None,
+            discovered_at: Utc::now(),
+            probed: false,
+            confirmed: evidence.is_authoritative(),
+            last_probed_at: None,
+            probe_failures: 0,
+        }
+    }
+
+    pub fn with_source(mut self, ip: impl Into<String>) -> Self {
+        self.source_host_ip = Some(ip.into());
+        self
+    }
+}
+
 /// Discovered SMB share.
 ///
 /// Matches Python: `class Share(Model)`
@@ -516,4 +643,43 @@ pub struct Share {
     pub permissions: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// Credential the enumerating tool authenticated as, formatted
+    /// `"DOMAIN\\username"`. Lets the report show which key established
+    /// READ/WRITE on the share so an operator can re-issue the same auth for
+    /// follow-on file ops. `None` for share rows recovered from output that
+    /// lost credential context (legacy serialized records, raw-text fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_as: Option<String>,
+}
+
+/// A forged Kerberos inter-realm ticket produced by `create_inter_realm_ticket`.
+///
+/// Stored in Redis (`ares:op:{id}:kerberos_tickets` HASH keyed by
+/// `{source_domain}:{target_domain}:{username}`) so downstream tools can pick
+/// up the ccache path when no NTLM bind works for the target forest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KerberosTicket {
+    /// The domain whose krbtgt trust key was used to forge (source forest).
+    pub source_domain: String,
+    /// The foreign forest the ticket is valid for.
+    pub target_domain: String,
+    /// Username encoded in the ticket (typically `Administrator`).
+    pub username: String,
+    /// Absolute path to the `.ccache` file on the worker filesystem.
+    pub ticket_path: String,
+    /// When the ticket was forged (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forged_at: Option<DateTime<Utc>>,
+}
+
+impl KerberosTicket {
+    /// Redis HASH field key: `{source}:{target}:{username}`.
+    pub fn dedup_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.source_domain.to_lowercase(),
+            self.target_domain.to_lowercase(),
+            self.username.to_lowercase()
+        )
+    }
 }

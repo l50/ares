@@ -29,9 +29,72 @@ static RE_NTLM_PARTIAL: LazyLock<Regex> =
 static RE_NTLM_CONTINUATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-fA-F0-9]+:::$").unwrap());
 
+// AES256 trust/account key from secretsdump:
+//   DOMAIN\\user:aes256-cts-hmac-sha1-96:<hex>
+//   domain.local/user:aes256-cts-hmac-sha1-96:<hex>
+//   user:aes256-cts-hmac-sha1-96:<hex>
+static RE_AES256_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:[^\\/\s:]+[\\/])?([^:\s\\/]+):aes256-cts-hmac-sha1-96:([a-fA-F0-9]+)").unwrap()
+});
+
+// $MACHINE.ACC markers reveal the dump's source domain (NetBIOS prefix):
+//   CHILD\DC01$:aes256-cts-hmac-sha1-96:<hex>
+//   CHILD\DC01$:plain_password_hex:<hex>
+//   CHILD\DC01$:aad3...:<nthash>:::
+// The captured prefix authoritatively identifies the dump's actual domain,
+// which may differ from the task's params.domain (e.g. a cross-forest task
+// targeting fabrikam.local that ended up dumping a child DC).
+static RE_MACHINE_ACCT_DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^([A-Za-z0-9_-]+)\\[A-Za-z0-9_.-]+\$:(?:aes256-cts-hmac-sha1-96|aes128-cts-hmac-sha1-96|plain_password_hex|des-cbc-md5|aad3b435b51404eeaad3b435b51404ee:[a-fA-F0-9]{32}:::)",
+    )
+    .unwrap()
+});
+
 pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
+
+    // Pre-scan for AES256 keys; these are emitted on separate lines from the
+    // NTLM hash by impacket-secretsdump. Win2016+ DCs reject RC4-only
+    // inter-realm tickets (KDC_ERR_TGT_REVOKED), so we attach the AES256 key
+    // to the matching Hash entry by username.
+    let mut aes_by_user: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for caps in RE_AES256_KEY.captures_iter(output) {
+        let user = caps.get(1).unwrap().as_str().to_lowercase();
+        let aes = caps.get(2).unwrap().as_str().to_lowercase();
+        aes_by_user.insert(user, aes);
+    }
+
+    // Detect the dump's actual NetBIOS domain from $MACHINE.ACC markers.
+    // If found and it conflicts with default_domain (the task's params.domain),
+    // we suppress plain-format NTLM lines to prevent phantom mislabels — the
+    // discoveries blob from the tool's own parser will have already captured
+    // these hashes with the correct domain.
+    let default_netbios = default_domain
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let mut detected_netbios: Option<String> = None;
+    let mut detected_ambiguous = false;
+    for caps in RE_MACHINE_ACCT_DOMAIN.captures_iter(output) {
+        let nb = caps.get(1).unwrap().as_str().to_lowercase();
+        match detected_netbios {
+            None => detected_netbios = Some(nb),
+            Some(ref existing) if *existing == nb => {}
+            Some(_) => {
+                detected_ambiguous = true;
+                break;
+            }
+        }
+    }
+    let suppress_plain_ntlm = !detected_ambiguous
+        && !default_netbios.is_empty()
+        && detected_netbios
+            .as_deref()
+            .is_some_and(|nb| nb != default_netbios);
 
     // First pass: unwrap line-wrapped NTLM hashes
     let lines: Vec<&str> = output.lines().collect();
@@ -94,7 +157,11 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
             continue;
@@ -122,7 +189,11 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
             continue;
@@ -148,7 +219,11 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
             continue;
@@ -156,6 +231,13 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
 
         // NTLM without domain prefix
         if let Some(caps) = RE_NTLM_PLAIN.captures(line) {
+            // Skip plain NTLM lines when the dump came from a domain that
+            // differs from default_domain — applying default_domain would
+            // create phantom entries (e.g. fabrikam.local:krbtgt mislabel of
+            // a child DC dump done under a cross-forest task).
+            if suppress_plain_ntlm {
+                continue;
+            }
             let username = caps.get(1).unwrap().as_str();
             let rid = caps.get(2).unwrap().as_str();
             let lm = caps.get(3).unwrap().as_str();
@@ -191,7 +273,11 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
         }
@@ -434,6 +520,84 @@ WDAGUtilityAccount:504:aad3b435b51404eeaad3b435b51404ee:1234567890abcdef12345678
     #[test]
     fn extract_hashes_empty_output() {
         assert!(extract_hashes("", "CONTOSO").is_empty());
+    }
+
+    #[test]
+    fn extract_hashes_suppresses_plain_ntlm_on_domain_mismatch() {
+        // Regression test for Bug F: a cross-forest task with default_domain=fabrikam.local
+        // dumped a CHILD DC (dc01). The output's $MACHINE.ACC marker
+        // (CHILD\DC01$:aes256-...) reveals the real domain is CHILD, so plain
+        // NTLM lines (krbtgt:502:..., Administrator:500:...) must NOT be labeled fabrikam.local.
+        let output = "\
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:2e993405ab82e4454afc9c9bb0939a25:::
+[*] $MACHINE.ACC
+CHILD\\DC01$:aes256-cts-hmac-sha1-96:583938786f0a9459ced10e35f5803be6d4017c6fd4ba21b6e7479f9bce851d6b
+CHILD\\DC01$:aad3b435b51404eeaad3b435b51404ee:a3f11b5a18f97db9a3d4f16aed85a1b6:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:8c6d94541dbc90f085e86828428d2cbf:::
+krbtgt:aes256-cts-hmac-sha1-96:86eebe21a5af32061e42ef050c447d4467648e54884a92d91a3f97fbfa0114a4";
+        let hashes = extract_hashes(output, "fabrikam.local");
+        // Plain NTLM lines must be suppressed — no hashes should carry the
+        // mismatched fabrikam.local label.
+        let labeled_fabrikam: Vec<_> = hashes
+            .iter()
+            .filter(|h| h.domain.eq_ignore_ascii_case("fabrikam.local"))
+            .collect();
+        assert!(
+            labeled_fabrikam.is_empty(),
+            "no hashes should be labeled fabrikam.local when dump is from CHILD"
+        );
+        // The phantom mislabel was specifically of krbtgt and Administrator —
+        // make sure neither slipped through with the wrong domain.
+        assert!(
+            !hashes.iter().any(|h| h.username == "krbtgt"),
+            "plain-format krbtgt must be suppressed on domain mismatch"
+        );
+        assert!(
+            !hashes
+                .iter()
+                .any(|h| h.username.eq_ignore_ascii_case("Administrator")),
+            "plain-format Administrator must be suppressed on domain mismatch"
+        );
+    }
+
+    #[test]
+    fn extract_hashes_keeps_plain_ntlm_when_domain_matches() {
+        // When default_domain matches the detected NetBIOS prefix, plain NTLM
+        // lines are still extracted (the common case: a domain-targeted task).
+        let output = "\
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:2e993405ab82e4454afc9c9bb0939a25:::
+CHILD\\DC01$:aes256-cts-hmac-sha1-96:5839387800000000000000000000000000000000000000000000000000000000
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:8c6d94541dbc90f085e86828428d2cbf:::";
+        let hashes = extract_hashes(output, "child.contoso.local");
+        assert!(hashes.iter().any(|h| h.username == "krbtgt"));
+        assert!(hashes.iter().any(|h| h.username == "Administrator"));
+    }
+
+    #[test]
+    fn extract_hashes_keeps_plain_ntlm_when_no_machine_acct_marker() {
+        // When the output has no $MACHINE.ACC marker and no domain-prefixed
+        // rows to infer from, custom RIDs (>= 1000) fall back to default_domain.
+        // (Well-known local SAM accounts like Administrator/500 are handled
+        // separately by `extract_hashes_ntlm_local_sam_unattributed`.)
+        let output =
+            "alice:1103:aad3b435b51404eeaad3b435b51404ee:209c6174da490caeb422f3fa5a7ae634:::";
+        let hashes = extract_hashes(output, "contoso.local");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn extract_hashes_attaches_aes256_to_trust_account() {
+        let output = "\
+FABRIKAM\\CONTOSO$:1107:aad3b435b51404eeaad3b435b51404ee:33333333333333333333333333333333:::
+FABRIKAM\\CONTOSO$:aes256-cts-hmac-sha1-96:4444444444444444444444444444444444444444444444444444444444444444";
+        let hashes = extract_hashes(output, "fabrikam.local");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].username, "CONTOSO$");
+        assert_eq!(
+            hashes[0].aes_key.as_deref(),
+            Some("4444444444444444444444444444444444444444444444444444444444444444")
+        );
     }
 
     #[test]
