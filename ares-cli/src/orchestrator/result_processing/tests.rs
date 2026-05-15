@@ -1160,7 +1160,9 @@ fn extract_locked_users_basic_netexec_format() {
 fn extract_locked_users_kdc_revoked_format() {
     use super::extract_locked_usernames_from_result;
     let payload = json!({
-        "summary": "[-] CONTOSO\\testuser1:testuser1 KDC_ERR_CLIENT_REVOKED"
+        "tool_outputs": [
+            "[-] CONTOSO\\testuser1:testuser1 KDC_ERR_CLIENT_REVOKED"
+        ]
     });
     let locked = extract_locked_usernames_from_result(&Some(payload));
     assert_eq!(
@@ -1258,10 +1260,12 @@ fn is_ticket_grant_vuln_rejects_non_ticket_primitives() {
 fn ccache_evidence_detects_saving_ticket_line() {
     use super::result_has_ccache_evidence;
     let payload = json!({
-        "output": "[*] Impersonating Administrator\n\
-                   [*] Requesting S4U2self\n\
-                   [*] Requesting S4U2Proxy\n\
-                   [*] Saving ticket in Administrator@cifs_dc01@CONTOSO.LOCAL.ccache"
+        "tool_outputs": [
+            {"output": "[*] Impersonating Administrator\n\
+                        [*] Requesting S4U2self\n\
+                        [*] Requesting S4U2Proxy\n\
+                        [*] Saving ticket in Administrator@cifs_dc01@CONTOSO.LOCAL.ccache"}
+        ]
     });
     assert!(result_has_ccache_evidence(&Some(payload)));
 }
@@ -1389,13 +1393,15 @@ fn seimpersonate_signal_detects_enabled_in_whoami_priv_output() {
     use super::result_has_seimpersonate_signal;
     // Real-world `whoami /priv` row format from a service account context.
     let payload = json!({
-        "output": "PRIVILEGES INFORMATION\n\
-                   ----------------------\n\
-                   Privilege Name                Description                                 State\n\
-                   ============================= =========================================== ========\n\
-                   SeAssignPrimaryTokenPrivilege Replace a process level token               Disabled\n\
-                   SeImpersonatePrivilege        Impersonate a client after authentication   Enabled\n\
-                   SeIncreaseQuotaPrivilege      Adjust memory quotas for a process          Disabled"
+        "tool_outputs": [
+            {"output": "PRIVILEGES INFORMATION\n\
+                        ----------------------\n\
+                        Privilege Name                Description                                 State\n\
+                        ============================= =========================================== ========\n\
+                        SeAssignPrimaryTokenPrivilege Replace a process level token               Disabled\n\
+                        SeImpersonatePrivilege        Impersonate a client after authentication   Enabled\n\
+                        SeIncreaseQuotaPrivilege      Adjust memory quotas for a process          Disabled"}
+        ]
     });
     assert!(result_has_seimpersonate_signal(&Some(payload)));
 }
@@ -1442,7 +1448,9 @@ fn seimpersonate_signal_case_insensitive() {
     use super::result_has_seimpersonate_signal;
     // Some shells/agents may upper- or lower-case the row.
     let payload = json!({
-        "output": "seimpersonateprivilege   description text   ENABLED"
+        "tool_outputs": [
+            {"output": "seimpersonateprivilege   description text   ENABLED"}
+        ]
     });
     assert!(result_has_seimpersonate_signal(&Some(payload)));
 }
@@ -1451,7 +1459,9 @@ fn seimpersonate_signal_case_insensitive() {
 fn ntlmv1_signal_detects_explicit_verdict() {
     use super::result_has_ntlmv1_signal;
     let payload = json!({
-        "output": "[+] NTLMv1 is allowed (LmCompatibilityLevel registry value indicates vulnerable config)"
+        "tool_outputs": [
+            {"output": "[+] NTLMv1 is allowed (LmCompatibilityLevel registry value indicates vulnerable config)"}
+        ]
     });
     assert!(result_has_ntlmv1_signal(&Some(payload)));
 }
@@ -1461,7 +1471,9 @@ fn ntlmv1_signal_detects_lmcompat_le_2() {
     use super::result_has_ntlmv1_signal;
     for value in [0, 1, 2] {
         let payload = json!({
-            "output": format!("LmCompatibilityLevel: {value}")
+            "tool_outputs": [
+                {"output": format!("LmCompatibilityLevel: {value}")}
+            ]
         });
         assert!(
             result_has_ntlmv1_signal(&Some(payload)),
@@ -1475,7 +1487,9 @@ fn ntlmv1_signal_rejects_lmcompat_ge_3() {
     use super::result_has_ntlmv1_signal;
     for value in [3, 4, 5] {
         let payload = json!({
-            "output": format!("LmCompatibilityLevel: {value}")
+            "tool_outputs": [
+                {"output": format!("LmCompatibilityLevel: {value}")}
+            ]
         });
         assert!(
             !result_has_ntlmv1_signal(&Some(payload)),
@@ -1488,7 +1502,9 @@ fn ntlmv1_signal_rejects_lmcompat_ge_3() {
 fn ntlmv1_signal_recognizes_reg_dword_format() {
     use super::result_has_ntlmv1_signal;
     let payload = json!({
-        "output": "LmCompatibilityLevel    REG_DWORD    0x2"
+        "tool_outputs": [
+            {"output": "LmCompatibilityLevel    REG_DWORD    0x2"}
+        ]
     });
     assert!(result_has_ntlmv1_signal(&Some(payload)));
 }
@@ -1641,7 +1657,7 @@ fn ntlmv1_signal_recognises_explicit_positives() {
         "NTLMv1 downgrade confirmed",
     ];
     for line in &positives {
-        let p = json!({"summary": line});
+        let p = json!({"tool_outputs": [line]});
         assert!(
             result_has_ntlmv1_signal(&Some(p)),
             "{line} should be a positive signal",
@@ -1693,13 +1709,22 @@ fn ntlmv1_signal_walks_tool_outputs_array() {
     assert!(result_has_ntlmv1_signal(&Some(p)));
 }
 
+#[test]
+fn ntlmv1_signal_policy_ignores_scalar_output_when_disabled() {
+    use super::result_has_ntlmv1_signal_with_policy;
+    let p = json!({"output": "LmCompatibilityLevel = 1"});
+    assert!(!result_has_ntlmv1_signal_with_policy(&Some(p), false));
+}
+
 // ── result_has_seimpersonate_signal ────────────────────────────────────
 
 #[test]
 fn seimpersonate_signal_recognises_enabled_row() {
     use super::result_has_seimpersonate_signal;
     let p = json!({
-        "summary": "SeImpersonatePrivilege  Impersonate a client after authentication  Enabled"
+        "tool_outputs": [
+            "SeImpersonatePrivilege  Impersonate a client after authentication  Enabled"
+        ]
     });
     assert!(result_has_seimpersonate_signal(&Some(p)));
 }
@@ -1708,7 +1733,9 @@ fn seimpersonate_signal_recognises_enabled_row() {
 fn seimpersonate_signal_rejects_disabled_row() {
     use super::result_has_seimpersonate_signal;
     let p = json!({
-        "summary": "SeImpersonatePrivilege  Impersonate a client after authentication  Disabled"
+        "tool_outputs": [
+            "SeImpersonatePrivilege  Impersonate a client after authentication  Disabled"
+        ]
     });
     assert!(!result_has_seimpersonate_signal(&Some(p)));
 }
@@ -1737,12 +1764,24 @@ fn seimpersonate_signal_none_payload_false() {
     assert!(!result_has_seimpersonate_signal(&None));
 }
 
+#[test]
+fn seimpersonate_signal_policy_ignores_scalar_output_when_disabled() {
+    use super::result_has_seimpersonate_signal_with_policy;
+    let p = json!({
+        "output": "SeImpersonatePrivilege  Impersonate a client after authentication  Enabled"
+    });
+    assert!(!result_has_seimpersonate_signal_with_policy(
+        &Some(p),
+        false
+    ));
+}
+
 // ── result_has_ccache_evidence ─────────────────────────────────────────
 
 #[test]
 fn ccache_evidence_recognises_canonical_saving_line() {
     use super::result_has_ccache_evidence;
-    let p = json!({"summary": "Saving ticket in admin.ccache"});
+    let p = json!({"tool_outputs": ["Saving ticket in admin.ccache"]});
     assert!(result_has_ccache_evidence(&Some(p)));
 }
 
@@ -1770,6 +1809,13 @@ fn ccache_evidence_requires_both_phrases() {
 fn ccache_evidence_none_payload_false() {
     use super::result_has_ccache_evidence;
     assert!(!result_has_ccache_evidence(&None));
+}
+
+#[test]
+fn ccache_evidence_policy_ignores_scalar_output_when_disabled() {
+    use super::result_has_ccache_evidence_with_policy;
+    let p = json!({"output": "Saving ticket in admin.ccache"});
+    assert!(!result_has_ccache_evidence_with_policy(&Some(p), false));
 }
 
 // ── result_text_indicates_failure ──────────────────────────────────────
@@ -1926,7 +1972,7 @@ fn locked_usernames_dedupes_repeated_lines() {
 #[test]
 fn locked_usernames_lowercases_user_and_domain() {
     use super::extract_locked_usernames_from_result;
-    let p = json!({"summary": "[-] CONTOSO\\Alice:pw STATUS_ACCOUNT_LOCKED_OUT"});
+    let p = json!({"tool_outputs": ["[-] CONTOSO\\Alice:pw STATUS_ACCOUNT_LOCKED_OUT"]});
     let out = extract_locked_usernames_from_result(&Some(p));
     assert_eq!(
         out,
@@ -1938,6 +1984,13 @@ fn locked_usernames_lowercases_user_and_domain() {
 fn locked_usernames_none_payload_empty() {
     use super::extract_locked_usernames_from_result;
     assert!(extract_locked_usernames_from_result(&None).is_empty());
+}
+
+#[test]
+fn locked_usernames_policy_ignores_scalar_output_when_disabled() {
+    use super::extract_locked_usernames_from_result_with_policy;
+    let p = json!({"output": "[-] CONTOSO\\alice:Pw STATUS_ACCOUNT_LOCKED_OUT"});
+    assert!(extract_locked_usernames_from_result_with_policy(&Some(p), false).is_empty());
 }
 
 #[test]
