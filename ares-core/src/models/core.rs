@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::util::{default_hash_type, new_uuid};
 
 /// Primary target information.
-///
-/// Matches Python: `class Target(Model)`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Target {
     pub ip: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -21,9 +19,8 @@ pub struct Target {
 
 /// Discovered host information.
 ///
-/// Matches Python: `class Host(Model)`
 /// Redis serialization: `{"ip","hostname","os","roles","services","is_dc"}`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Host {
     pub ip: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -68,9 +65,8 @@ impl Host {
 
 /// Discovered user account.
 ///
-/// Matches Python: `class User(Model)`
 /// Redis serialization: `{"username","domain","source"}`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct User {
     pub username: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -96,9 +92,8 @@ pub fn is_always_disabled_account(username: &str) -> bool {
 
 /// Discovered credential.
 ///
-/// Matches Python: `class Credential(Model)`
 /// Redis serialization: `{"id","username","password","domain","source","parent_id","attack_step"}`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Credential {
     #[serde(default = "new_uuid")]
     pub id: String,
@@ -120,9 +115,8 @@ pub struct Credential {
 
 /// Discovered password hash.
 ///
-/// Matches Python: `class Hash(Model)`
 /// Redis serialization: `{"id","username","hash_type","hash_value","domain","source","cracked_password","discovered_at","parent_id","attack_step"}`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hash {
     #[serde(default = "new_uuid")]
     pub id: String,
@@ -521,7 +515,7 @@ mod tests {
 ///
 /// Stores structured trust information discovered via `enumerate_domain_trusts`
 /// (LDAP `objectClass=trustedDomain`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustInfo {
     /// FQDN of the trusted domain (e.g. `fabrikam.local`).
     pub domain: String,
@@ -542,9 +536,9 @@ pub struct TrustInfo {
     /// `enumerate_domain_trusts`. Carrying this on the trust object lets the
     /// orchestrator pre-populate `state.domain_sids` for the partner without
     /// a separate authenticated SAMR lookup against the foreign DC — that
-    /// lookup is the gate that previously blocked child→parent forge dispatch
-    /// on hardened (2019+) parent DCs where cross-realm NTLM is rejected and
-    /// null-session lsaquery is disabled.
+    /// lookup gates child→parent forge dispatch on hardened (2019+) parent
+    /// DCs where cross-realm NTLM is rejected and null-session lsaquery is
+    /// disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_identifier: Option<String>,
 }
@@ -602,7 +596,7 @@ impl DomainEvidence {
 /// Held in `state.candidate_domains` until either (a) the evidence is
 /// authoritative on its own, (b) a probe (DNS SRV / CLDAP) corroborates it,
 /// or (c) it matches a domain already promoted via another path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CandidateDomain {
     /// Lowercase FQDN.
     pub fqdn: String,
@@ -648,9 +642,8 @@ impl CandidateDomain {
 
 /// Discovered SMB share.
 ///
-/// Matches Python: `class Share(Model)`
 /// Redis serialization: `{"host","name","permissions","comment"}`
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Share {
     pub host: String,
     pub name: String,
@@ -672,7 +665,7 @@ pub struct Share {
 /// Stored in Redis (`ares:op:{id}:kerberos_tickets` HASH keyed by
 /// `{source_domain}:{target_domain}:{username}`) so downstream tools can pick
 /// up the ccache path when no NTLM bind works for the target forest.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KerberosTicket {
     /// The domain whose krbtgt trust key was used to forge (source forest).
     pub source_domain: String,

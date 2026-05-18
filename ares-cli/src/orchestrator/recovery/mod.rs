@@ -4,8 +4,7 @@
 //! loading it from Redis and re-enqueueing any interrupted tasks (those with
 //! status PENDING, IN_PROGRESS, or RETRYING).
 //!
-//! Ported from `ares.core.recovery` (Python). Key additions over the initial
-//! skeleton:
+//! Key behaviors:
 //!
 //! - **Hash deduplication** (`dedupe_hashes`) -- AS-REP by (domain,username),
 //!   Kerberoast by (domain,username,spn_key), NTLM by exact hash value.
@@ -21,11 +20,9 @@ mod types;
 
 pub use manager::OperationRecoveryManager;
 
-// Items that were module-private in the original single file; re-exported
-// here only for intra-crate use and tests.
-#[allow(unused_imports)]
-pub(crate) use dedup::dedupe_hashes;
-#[allow(unused_imports)]
+// Normalization helpers consumed by `worker::credential_resolver` for
+// realm-strict lookups; re-exported here so the worker doesn't reach into
+// the private submodule layout.
 pub(crate) use normalize::{normalize_credential_domains, normalize_hash_domains, resolve_domain};
 
 #[cfg(test)]
@@ -34,7 +31,7 @@ mod tests {
 
     use ares_core::models::{Credential, Hash, TaskInfo, TaskStatus};
 
-    use super::dedup::extract_kerberoast_spn_key;
+    use super::dedup::{dedupe_hashes, extract_kerberoast_spn_key};
     use super::types::is_connection_error;
     use super::*;
 

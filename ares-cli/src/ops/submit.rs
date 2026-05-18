@@ -75,22 +75,39 @@ pub(crate) fn resolve_model(model: &Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn ops_submit(
-    redis_url: Option<String>,
-    target: String,
-    domain: String,
-    ips: Vec<String>,
-    operation_id: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-    ntlm_hash: Option<String>,
-    resume: bool,
-    model: Option<String>,
-    max_steps: u32,
-    env: Option<String>,
-    pin_active: bool,
-) -> Result<String> {
+pub(crate) struct OpsSubmitParams {
+    pub redis_url: Option<String>,
+    pub target: String,
+    pub domain: String,
+    pub ips: Vec<String>,
+    pub operation_id: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub ntlm_hash: Option<String>,
+    pub resume: bool,
+    pub model: Option<String>,
+    pub max_steps: u32,
+    pub env: Option<String>,
+    pub pin_active: bool,
+}
+
+pub(crate) async fn ops_submit(p: OpsSubmitParams) -> Result<String> {
+    let OpsSubmitParams {
+        redis_url,
+        target,
+        domain,
+        ips,
+        operation_id,
+        username,
+        password,
+        ntlm_hash,
+        resume,
+        model,
+        max_steps,
+        env,
+        pin_active,
+    } = p;
+
     if ips.is_empty() {
         anyhow::bail!(
             "No target IPs specified. Use --ips or --resolve-targets to provide target IPs."
@@ -160,7 +177,6 @@ pub(crate) async fn ops_submit(
 
     let now = Utc::now();
 
-    // Build operation request (matches Python orchestrator_client.py format)
     let request = serde_json::json!({
         "operation_id": op_id,
         "target_domain": domain,
@@ -191,7 +207,6 @@ pub(crate) async fn ops_submit(
         let _: () = conn.expire(&env_vars_key, 3600).await?; // 1 hour TTL
     }
 
-    // Push operation request to queue (matches Python: RPUSH to ares:operations)
     let request_json = serde_json::to_string(&request)?;
     let _: () = conn.rpush("ares:operations", &request_json).await?;
 
@@ -201,7 +216,6 @@ pub(crate) async fn ops_submit(
     Ok(op_id)
 }
 
-/// Follow an operation's progress by polling Redis until it completes.
 pub(crate) async fn follow_operation(
     redis_url: Option<String>,
     op_id: &str,
@@ -234,9 +248,8 @@ pub(crate) async fn follow_operation(
         }
 
         // Read current state
-        let meta = match reader.get_meta(&mut conn).await {
-            Ok(m) => m,
-            Err(_) => continue, // operation not yet initialized
+        let Ok(meta) = reader.get_meta(&mut conn).await else {
+            continue; // operation not yet initialized
         };
 
         let creds = reader
@@ -293,4 +306,81 @@ pub(crate) async fn follow_operation(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env-var tests are bundled into a single `#[test]` function so they run
+    /// serially within the binary — the test runner parallelises across `#[test]`
+    /// boundaries, and `collect_env_vars`/`resolve_model` both read process-wide
+    /// state. Mirrors the pattern in `orchestrator/config.rs`.
+    #[test]
+    fn env_var_helpers() {
+        // Use throwaway names that no other test or runtime path reads, so the
+        // serial assertion holds regardless of what else is in flight.
+        const NAME_A: &str = "ARES_TEST_SUBMIT_COLLECT_A_9c1a";
+        const NAME_B: &str = "ARES_TEST_SUBMIT_COLLECT_B_9c1a";
+        const NAME_C: &str = "ARES_TEST_SUBMIT_COLLECT_C_9c1a";
+
+        // --- collect_env_vars ---
+        std::env::remove_var(NAME_A);
+        std::env::remove_var(NAME_B);
+        std::env::remove_var(NAME_C);
+
+        // All unset → empty map.
+        let got = collect_env_vars(&[NAME_A, NAME_B, NAME_C]);
+        assert!(got.is_empty(), "expected empty, got {got:?}");
+
+        // Set + empty → only set+nonempty entries appear.
+        std::env::set_var(NAME_A, "alpha");
+        std::env::set_var(NAME_B, "");
+        let got = collect_env_vars(&[NAME_A, NAME_B, NAME_C]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get(NAME_A).map(String::as_str), Some("alpha"));
+
+        std::env::remove_var(NAME_A);
+        std::env::remove_var(NAME_B);
+
+        // --- resolve_model ---
+        const ORCH: &str = "ARES_ORCHESTRATOR_MODEL";
+        const LEGACY: &str = "ARES_MODEL";
+        // Snapshot + clear so we don't trample a developer-set var.
+        let prev_orch = std::env::var(ORCH).ok();
+        let prev_legacy = std::env::var(LEGACY).ok();
+        std::env::remove_var(ORCH);
+        std::env::remove_var(LEGACY);
+
+        // No flag, no env → None.
+        assert_eq!(resolve_model(&None), None);
+        // Empty flag, no env → None (empty strings are filtered out).
+        assert_eq!(resolve_model(&Some(String::new())), None);
+        // Explicit flag wins over everything.
+        std::env::set_var(ORCH, "gpt-orch");
+        std::env::set_var(LEGACY, "gpt-legacy");
+        assert_eq!(
+            resolve_model(&Some("gpt-explicit".to_string())),
+            Some("gpt-explicit".to_string())
+        );
+        // No flag → ARES_ORCHESTRATOR_MODEL beats ARES_MODEL.
+        assert_eq!(resolve_model(&None), Some("gpt-orch".to_string()));
+        // Only legacy set.
+        std::env::remove_var(ORCH);
+        assert_eq!(resolve_model(&None), Some("gpt-legacy".to_string()));
+        // Empty env vars are still treated as set by `std::env::var`, but the
+        // trailing filter strips them out.
+        std::env::set_var(LEGACY, "");
+        assert_eq!(resolve_model(&None), None);
+
+        // Restore.
+        std::env::remove_var(ORCH);
+        std::env::remove_var(LEGACY);
+        if let Some(v) = prev_orch {
+            std::env::set_var(ORCH, v);
+        }
+        if let Some(v) = prev_legacy {
+            std::env::set_var(LEGACY, v);
+        }
+    }
 }

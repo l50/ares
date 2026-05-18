@@ -1,9 +1,8 @@
 //! Regex-based extraction of discoveries from raw tool output text.
 //!
-//! This is the orchestrator-level safety net that mirrors Python's
-//! `_process_output_text()` in `result_processing.py`. It parses raw
-//! text from task results to catch credentials, hashes, hosts, shares,
-//! and users that the per-tool parsers or LLM may have missed.
+//! Orchestrator-level safety net: parses raw text from task results to catch
+//! credentials, hashes, hosts, shares, and users that the per-tool parsers or
+//! LLM may have missed.
 //!
 //! The per-tool parsers in `ares_tools::parsers` are the primary extraction
 //! mechanism (they run at tool-call time). This module runs on the full task
@@ -58,8 +57,7 @@ impl TextExtractions {
 /// to gate noisy regexes on the invoking tool's arguments.
 ///
 /// `arguments` is best-effort: when None (e.g. legacy bare-string tool_outputs
-/// payloads), extractors fall back to the untyped behavior they had before this
-/// struct was introduced.
+/// payloads), extractors fall back to untyped behavior.
 pub struct ToolOutputCtx<'a> {
     pub arguments: Option<&'a serde_json::Value>,
     pub output: &'a str,
@@ -123,7 +121,7 @@ pub fn extract_from_output_text(ctx: &ToolOutputCtx<'_>, default_domain: &str) -
     result
 }
 
-/// Validate a credential pair — matches Python's add_credential() rejection checks.
+/// Validate a credential pair — rejects path-like or empty values.
 pub(crate) fn is_valid_credential(username: &str, password: &str) -> bool {
     if username.is_empty() || password.is_empty() {
         return false;

@@ -53,9 +53,8 @@ impl SharedState {
             }
             (state.netbios_to_fqdn.clone(), known)
         };
-        let cred = match sanitize_credential(cred, &netbios_map, &known_domains) {
-            Some(c) => c,
-            None => return Ok(false),
+        let Some(cred) = sanitize_credential(cred, &netbios_map, &known_domains) else {
+            return Ok(false);
         };
 
         // Reject phantom domain misattribution. Forest-wide LDAP/GC searches,
@@ -138,8 +137,8 @@ impl SharedState {
     /// Add a hash to state and Redis (with dedup).
     ///
     /// When a `krbtgt` NTLM hash is stored, `has_domain_admin` is automatically
-    /// set — mirroring Python's `add_hash()` behaviour so that `auto_golden_ticket`
-    /// triggers without requiring the LLM to emit a structured JSON payload.
+    /// set so that `auto_golden_ticket` triggers without requiring the LLM to
+    /// emit a structured JSON payload.
     pub async fn publish_hash(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
@@ -152,7 +151,7 @@ impl SharedState {
         // mixed-case (`CONTOSO.LOCAL` from secretsdump, `contoso.local` from
         // sibling parsers) splits the same identity into two state entries and
         // slips past dedup keys built with `format!("{domain}\\{user}")`.
-        // Mirrors the credential-side fix in `sanitize_credential`.
+        // Mirrors the same normalization in `sanitize_credential`.
         hash.domain = hash.domain.to_lowercase();
 
         // Reject malformed NTLM hashes before they enter state. Accept both a
@@ -290,7 +289,7 @@ impl SharedState {
                 // emit a `dc_secretsdump on ` finding with empty target/domain.
                 let dc_target = state.domain_controllers.get(&krbtgt_domain).cloned();
 
-                // Auto-set domain admin when first krbtgt NTLM hash arrives (matches Python)
+                // Auto-set domain admin when the first krbtgt NTLM hash arrives.
                 if !state.has_domain_admin {
                     let da_domain = krbtgt_domain.clone();
                     drop(state);
@@ -658,8 +657,7 @@ mod tests {
     async fn publish_credential_high_trust_not_rejected_after_low_trust() {
         // Symmetric guard: when the wrong-realm record arrives FIRST from a
         // low-trust source, a later HIGH-trust correct-realm record must NOT
-        // be rejected — the original gate's blanket rejection on any conflict
-        // was the bug Task #21 was filed against.
+        // be rejected by a blanket conflict rule.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
@@ -885,9 +883,9 @@ mod tests {
 
     #[tokio::test]
     async fn publish_krbtgt_hash_without_resolvable_domain_skips_vuln() {
-        // Regression: a krbtgt hash with no domain prefix and no siblings to
-        // resolve from used to synthesize a `dc_secretsdump` vuln with empty
-        // target/domain — surfacing as `dc_secretsdump on ` in the report.
+        // A krbtgt hash with no domain prefix and no siblings to resolve
+        // from must not synthesize a `dc_secretsdump` vuln (would surface
+        // as `dc_secretsdump on ` with empty target/domain in the report).
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 

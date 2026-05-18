@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use super::graph::{mitre_for_connection, HostConnection, LateralGraph};
+use super::graph::{mitre_for_connection, AddConnectionParams, HostConnection, LateralGraph};
 use super::patterns::{LateralPatterns, HOSTNAME_RE, IP_RE};
 
 /// Analyzes query results for lateral movement patterns.
@@ -60,15 +60,15 @@ impl LateralMovementAnalyzer {
             let source = source.to_lowercase();
             for dest in &hosts {
                 if *dest != source {
-                    self.graph.add_connection(
-                        &source,
-                        dest,
+                    self.graph.add_connection(AddConnectionParams {
+                        source: &source,
+                        destination: dest,
                         conn_type,
-                        None,
-                        None,
-                        None,
-                        mitre_for_connection(conn_type),
-                    );
+                        timestamp: None,
+                        user: None,
+                        evidence_id: None,
+                        mitre_technique: mitre_for_connection(conn_type),
+                    });
                 }
             }
         }
@@ -301,10 +301,9 @@ mod tests {
         analyzer.analyze_query_result(&data, Some("ws01.contoso.local"));
         let suggestions = analyzer.get_pivot_suggestions();
         // dc01 is uninvestigated target
-        let hosts: Vec<&str> = suggestions
+        assert!(suggestions
             .iter()
             .filter_map(|s| s["host"].as_str())
-            .collect();
-        assert!(hosts.contains(&"dc01.contoso.local"));
+            .any(|h| h == "dc01.contoso.local"));
     }
 }

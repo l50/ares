@@ -112,10 +112,9 @@ pub(crate) fn find_host_ip_for_machine_account(
 
 /// Select unconstrained-delegation work items to dispatch this tick.
 ///
-/// Mirrors the inline filter previously buried in `auto_unconstrained_exploitation`.
-/// Extracted so the phase-state state machine (no phase → Coerce or Dump,
-/// post-coercion delay → Dump, post-dump retry cap & cooldown) can be
-/// unit-tested without a Dispatcher.
+/// The phase-state state machine (no phase → Coerce or Dump, post-coercion
+/// delay → Dump, post-dump retry cap & cooldown) is isolated here so it can
+/// be unit-tested without a Dispatcher.
 pub(crate) fn select_unconstrained_work_items(
     state: &StateInner,
     phases: &HashMap<String, PhaseState>,
@@ -301,13 +300,11 @@ pub(crate) fn select_unconstrained_work_items(
 /// construction. Caller must ensure `item.credential` and `item.dc_ip` are
 /// `Some(_)` — both are panic-free for `None` (returns `Value::Null`).
 pub(crate) fn build_unconstrained_coerce_payload(item: &UnconstrainedWork) -> Value {
-    let dc_ip = match item.dc_ip.as_ref() {
-        Some(ip) => ip,
-        None => return Value::Null,
+    let Some(dc_ip) = item.dc_ip.as_ref() else {
+        return Value::Null;
     };
-    let cred = match item.credential.as_ref() {
-        Some(c) => c,
-        None => return Value::Null,
+    let Some(cred) = item.credential.as_ref() else {
+        return Value::Null;
     };
     json!({
         "target_ip": dc_ip,
@@ -325,9 +322,8 @@ pub(crate) fn build_unconstrained_coerce_payload(item: &UnconstrainedWork) -> Va
 /// Build the LSASS-dump payload for the `exploit` queue. Pure JSON
 /// construction; `Value::Null` when no credential is attached.
 pub(crate) fn build_unconstrained_dump_payload(item: &UnconstrainedWork) -> Value {
-    let cred = match item.credential.as_ref() {
-        Some(c) => c,
-        None => return Value::Null,
+    let Some(cred) = item.credential.as_ref() else {
+        return Value::Null;
     };
     json!({
         "technique": "unconstrained_tgt_dump",
@@ -348,9 +344,8 @@ pub(crate) fn build_unconstrained_dump_payload(item: &UnconstrainedWork) -> Valu
 /// Build the user-account LLM-exploit payload (for non-machine principals).
 /// Pure JSON construction; `Value::Null` when no credential is attached.
 pub(crate) fn build_unconstrained_llm_exploit_payload(item: &UnconstrainedWork) -> Value {
-    let cred = match item.credential.as_ref() {
-        Some(c) => c,
-        None => return Value::Null,
+    let Some(cred) = item.credential.as_ref() else {
+        return Value::Null;
     };
     json!({
         "technique": "unconstrained_delegation_exploit",
@@ -1354,13 +1349,11 @@ mod tests {
 
     #[test]
     fn select_uc_machine_unknown_host_falls_back_to_llm_exploit() {
-        // Repro of the silent-drop pattern observed in a live op: the
-        // vuln names a machine account (ws01$) that exists in LDAP but
-        // whose IP isn't in state.hosts. Pre-fix: work item dropped on
-        // the floor by the `?` operator and the high-priority delegation
-        // primitive sat unexploited for the whole op. Post-fix: routes to
-        // Action::LlmExploit with a distinct `uc_machine_unknown:` dedup
-        // key so the LLM can resolve the IP and run the exploit.
+        // The vuln names a machine account (ws01$) that exists in LDAP but
+        // whose IP isn't in state.hosts. Must route to Action::LlmExploit
+        // with a distinct `uc_machine_unknown:` dedup key so the LLM can
+        // resolve the IP and run the exploit, rather than being dropped by
+        // the `?` operator and leaving the delegation primitive unexploited.
         let mut s = StateInner::new("op-test".into());
         let v = make_uc_vuln("v1", "WS01$", "contoso.local");
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);

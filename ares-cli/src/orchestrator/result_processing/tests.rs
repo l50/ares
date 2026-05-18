@@ -1670,7 +1670,7 @@ fn ntlmv1_signal_recognises_lmcompatibilitylevel_low_value() {
     use super::result_has_ntlmv1_signal;
     for n in &['0', '1', '2'] {
         let line = format!("Found LmCompatibilityLevel = {n}");
-        let p = json!({"tool_output": line});
+        let p = json!({"tool_outputs": [line]});
         assert!(
             result_has_ntlmv1_signal(&Some(p)),
             "LmCompatibilityLevel = {n} should be a positive",
@@ -1681,9 +1681,9 @@ fn ntlmv1_signal_recognises_lmcompatibilitylevel_low_value() {
 #[test]
 fn ntlmv1_signal_rejects_lmcompatibilitylevel_safe_values() {
     use super::result_has_ntlmv1_signal;
-    let p = json!({"tool_output": "LmCompatibilityLevel = 5"});
+    let p = json!({"tool_outputs": ["LmCompatibilityLevel = 5"]});
     assert!(!result_has_ntlmv1_signal(&Some(p)));
-    let p = json!({"tool_output": "LmCompatibilityLevel = 3"});
+    let p = json!({"tool_outputs": ["LmCompatibilityLevel = 3"]});
     assert!(!result_has_ntlmv1_signal(&Some(p)));
 }
 
@@ -1710,10 +1710,10 @@ fn ntlmv1_signal_walks_tool_outputs_array() {
 }
 
 #[test]
-fn ntlmv1_signal_policy_ignores_scalar_output_when_disabled() {
-    use super::result_has_ntlmv1_signal_with_policy;
+fn ntlmv1_signal_ignores_scalar_output_field() {
+    use super::result_has_ntlmv1_signal;
     let p = json!({"output": "LmCompatibilityLevel = 1"});
-    assert!(!result_has_ntlmv1_signal_with_policy(&Some(p), false));
+    assert!(!result_has_ntlmv1_signal(&Some(p)));
 }
 
 // ── result_has_seimpersonate_signal ────────────────────────────────────
@@ -1765,15 +1765,12 @@ fn seimpersonate_signal_none_payload_false() {
 }
 
 #[test]
-fn seimpersonate_signal_policy_ignores_scalar_output_when_disabled() {
-    use super::result_has_seimpersonate_signal_with_policy;
+fn seimpersonate_signal_ignores_scalar_output_field() {
+    use super::result_has_seimpersonate_signal;
     let p = json!({
         "output": "SeImpersonatePrivilege  Impersonate a client after authentication  Enabled"
     });
-    assert!(!result_has_seimpersonate_signal_with_policy(
-        &Some(p),
-        false
-    ));
+    assert!(!result_has_seimpersonate_signal(&Some(p)));
 }
 
 // ── result_has_ccache_evidence ─────────────────────────────────────────
@@ -1812,10 +1809,10 @@ fn ccache_evidence_none_payload_false() {
 }
 
 #[test]
-fn ccache_evidence_policy_ignores_scalar_output_when_disabled() {
-    use super::result_has_ccache_evidence_with_policy;
+fn ccache_evidence_ignores_scalar_output_field() {
+    use super::result_has_ccache_evidence;
     let p = json!({"output": "Saving ticket in admin.ccache"});
-    assert!(!result_has_ccache_evidence_with_policy(&Some(p), false));
+    assert!(!result_has_ccache_evidence(&Some(p)));
 }
 
 // ── result_text_indicates_failure ──────────────────────────────────────
@@ -1987,10 +1984,10 @@ fn locked_usernames_none_payload_empty() {
 }
 
 #[test]
-fn locked_usernames_policy_ignores_scalar_output_when_disabled() {
-    use super::extract_locked_usernames_from_result_with_policy;
+fn locked_usernames_ignores_scalar_output_field() {
+    use super::extract_locked_usernames_from_result;
     let p = json!({"output": "[-] CONTOSO\\alice:Pw STATUS_ACCOUNT_LOCKED_OUT"});
-    assert!(extract_locked_usernames_from_result_with_policy(&Some(p), false).is_empty());
+    assert!(extract_locked_usernames_from_result(&Some(p)).is_empty());
 }
 
 #[test]
@@ -2138,5 +2135,115 @@ mod reconcile_low_trust_credential_domain {
 
         assert_eq!(got, None);
         assert_eq!(cred.domain, "contoso.local");
+    }
+}
+
+// ── collect_result_text_parts ─────────────────────────────────────────────
+//
+// `collect_result_text_parts` pulls trusted tool stdout out of the
+// `tool_outputs` array, ignoring top-level `output` / `summary` prose fields
+// that may contain LLM-generated text.
+
+#[test]
+fn collect_result_text_parts_from_string_array() {
+    use super::collect_result_text_parts;
+    let payload = serde_json::json!({
+        "tool_outputs": ["first line", "second line"],
+    });
+    let parts = collect_result_text_parts(&payload);
+    assert_eq!(parts, vec!["first line", "second line"]);
+}
+
+#[test]
+fn collect_result_text_parts_from_object_array() {
+    use super::collect_result_text_parts;
+    let payload = serde_json::json!({
+        "tool_outputs": [
+            {"name": "nmap", "output": "PORT 445/tcp open"},
+            {"name": "smb", "output": "Shares: C$, IPC$"},
+        ],
+    });
+    let parts = collect_result_text_parts(&payload);
+    assert_eq!(parts, vec!["PORT 445/tcp open", "Shares: C$, IPC$"]);
+}
+
+#[test]
+fn collect_result_text_parts_ignores_top_level_scalar_fields() {
+    use super::collect_result_text_parts;
+    // The top-level `output` and `summary` fields are LLM prose — they
+    // must NOT be ingested by regex extractors.
+    let payload = serde_json::json!({
+        "output": "Summary: found credentials",
+        "summary": "Task complete",
+        "tool_outputs": ["DC01$ aabbccddeeff00112233445566778899:aabbccddeeff00112233445566778899"],
+    });
+    let parts = collect_result_text_parts(&payload);
+    // Only the tool_outputs entry should appear.
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].contains("DC01$"));
+}
+
+#[test]
+fn collect_result_text_parts_empty_when_no_tool_outputs() {
+    use super::collect_result_text_parts;
+    let payload = serde_json::json!({ "summary": "no tool outputs here" });
+    assert!(collect_result_text_parts(&payload).is_empty());
+}
+
+#[test]
+fn collect_result_text_parts_empty_array_produces_nothing() {
+    use super::collect_result_text_parts;
+    let payload = serde_json::json!({ "tool_outputs": [] });
+    assert!(collect_result_text_parts(&payload).is_empty());
+}
+
+#[test]
+fn collect_result_text_parts_skips_non_string_and_non_object_entries() {
+    use super::collect_result_text_parts;
+    let payload = serde_json::json!({
+        "tool_outputs": [42, true, null, "kept"],
+    });
+    let parts = collect_result_text_parts(&payload);
+    assert_eq!(parts, vec!["kept"]);
+}
+
+// ── is_low_trust_realm_inferred_credential_source ──────────────────────────
+
+#[test]
+fn low_trust_sources_are_recognised() {
+    use super::is_low_trust_realm_inferred_credential_source;
+    let low_trust = [
+        "description_field",
+        "autologon_registry",
+        "sysvol_script",
+        "user_description_leak",
+        "netexec_password",
+        "ldap_description",
+    ];
+    for src in &low_trust {
+        assert!(
+            is_low_trust_realm_inferred_credential_source(src),
+            "{src} should be low-trust"
+        );
+    }
+}
+
+#[test]
+fn high_trust_sources_are_not_recognised() {
+    use super::is_low_trust_realm_inferred_credential_source;
+    let high_trust = [
+        "secretsdump",
+        "kerberoast",
+        "asrep_roast",
+        "lsassy",
+        "certipy_auth",
+        "impacket",
+        "",
+    ];
+    for src in &high_trust {
+        assert!(
+            !is_low_trust_realm_inferred_credential_source(src),
+            "{src} should not be low-trust"
+        );
     }
 }

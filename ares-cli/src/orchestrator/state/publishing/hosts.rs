@@ -23,8 +23,7 @@ impl SharedState {
     /// FQDN can take precedence later.
     ///
     /// When the hostname is a valid AD FQDN (e.g. `dc01.contoso.local`), the
-    /// domain suffix is automatically extracted and added to `state.domains`
-    /// (matches Python's `add_host()` behavior).
+    /// domain suffix is automatically extracted and added to `state.domains`.
     pub async fn publish_host(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
@@ -38,9 +37,9 @@ impl SharedState {
         if host.hostname.contains('.') && !looks_like_real_domain(&host.hostname) {
             host.hostname = String::new();
         }
-        // Some upstream parsers (esp. Python tool output stringifying `None`)
-        // emit literal placeholder strings as the hostname. These are never a
-        // real machine name — clear them so the display falls back to IP-only
+        // Some upstream parsers emit literal placeholder strings as the
+        // hostname (e.g., `"None"` stringified). These are never a real
+        // machine name — clear them so the display falls back to IP-only
         // instead of `none / <ip>`.
         if matches!(
             host.hostname.as_str(),
@@ -80,7 +79,7 @@ impl SharedState {
             }
         }
 
-        // Auto-extract domain from FQDN hostname (matches Python add_host).
+        // Auto-extract domain from FQDN hostname.
         // e.g. "dc02.child.contoso.local" → "child.contoso.local". Routed
         // through the candidate-domain pipeline: a hostname split alone is
         // weak evidence and won't reach `state.domains` unless a stronger
@@ -988,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_host_drops_placeholder_hostnames() {
-        // Upstream Python tool output stringifies `None` into the hostname
+        // Upstream tool output sometimes stringifies `None` into the hostname
         // field. Without clearing them the display shows e.g. `none / <ip>`.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();

@@ -404,9 +404,6 @@ pub async fn auto_credential_expansion(
             // (exact match or child-of). Cross-forest PTH secretsdump fails
             // at DRSUAPI with `rpc_s_access_denied` and burns a
             // CredentialInflight slot plus ~30k LLM tokens per failed attempt.
-            // The password-cred path above already filters this way; the hash
-            // path was missing the gate, dispatching foreign-forest creds
-            // against unrelated DCs.
             {
                 if !dispatcher.is_technique_allowed("secretsdump") {
                     // Strategy excludes secretsdump — skip hash-based expansion too.
@@ -637,7 +634,7 @@ mod tests {
                 .map(|fqdn| fqdn.to_lowercase())
                 .unwrap_or(raw_lower.clone())
         } else {
-            raw_lower.clone()
+            raw_lower
         };
         assert_eq!(resolved, "child.contoso.local");
 
@@ -649,7 +646,7 @@ mod tests {
                 .map(|fqdn| fqdn.to_lowercase())
                 .unwrap_or(fqdn_lower.clone())
         } else {
-            fqdn_lower.clone()
+            fqdn_lower
         };
         assert_eq!(resolved2, "contoso.local");
 
@@ -661,7 +658,7 @@ mod tests {
                 .map(|fqdn| fqdn.to_lowercase())
                 .unwrap_or(unknown_lower.clone())
         } else {
-            unknown_lower.clone()
+            unknown_lower
         };
         assert_eq!(resolved3, "unknown");
     }
@@ -780,7 +777,7 @@ mod tests {
             id: format!("pth_{}", hash.username),
             username: hash.username.clone(),
             password: hash.hash_value.clone(),
-            domain: hash.domain.clone(),
+            domain: hash.domain,
             source: "hash_pth".to_string(),
             discovered_at: None,
             is_admin: false,
@@ -962,7 +959,7 @@ mod tests {
                 .map(|fqdn| fqdn.to_lowercase())
                 .unwrap_or(raw_lower.clone())
         } else {
-            raw_lower.clone()
+            raw_lower
         };
         assert_eq!(resolved, "contoso.local");
     }

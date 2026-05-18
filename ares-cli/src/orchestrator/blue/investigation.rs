@@ -15,7 +15,8 @@ use ares_core::state::blue_task_queue::{BlueTaskQueue, BlueTaskResult};
 use ares_core::state::{BlueStateReader, BlueStateWriter, RedisStateReader};
 use ares_llm::tool_registry::blue::BlueAgentRole;
 use ares_llm::{
-    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, LlmProvider, LoopEndReason, ToolDispatcher,
+    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, LlmProvider, LoopEndReason,
+    RunAgentLoopParams, ToolDispatcher,
 };
 
 use super::callbacks::BlueCallbackHandler;
@@ -164,18 +165,18 @@ pub async fn run_investigation(
     ));
 
     // Run the orchestrator agent loop
-    let outcome = run_agent_loop(
-        provider.as_ref(),
+    let outcome = run_agent_loop(RunAgentLoopParams {
+        provider: provider.as_ref(),
         dispatcher,
-        &config,
-        &system_prompt,
-        &task_prompt,
-        role.as_str(),
-        &investigation.investigation_id,
-        &tools,
-        Some(callback_handler),
-        None,
-    )
+        config: &config,
+        system_prompt: &system_prompt,
+        task_prompt: &task_prompt,
+        role: role.as_str(),
+        task_id: &investigation.investigation_id,
+        tools: &tools,
+        callback_handler: Some(callback_handler),
+        hostname_map: None,
+    })
     .await;
 
     let investigation_outcome = process_outcome(&outcome, &investigation.investigation_id);
@@ -236,19 +237,20 @@ pub async fn run_investigation(
 
     // Update investigation status
     let final_status = match &investigation_outcome {
-        InvestigationOutcome::Completed { verdict, .. } => {
+        InvestigationOutcome::Completed { verdict, steps } => {
             info!(
                 investigation_id = %investigation.investigation_id,
                 verdict = %verdict,
-                steps = outcome.steps,
+                steps,
                 "Investigation completed"
             );
             "completed"
         }
-        InvestigationOutcome::Escalated { reason, .. } => {
+        InvestigationOutcome::Escalated { reason, severity } => {
             warn!(
                 investigation_id = %investigation.investigation_id,
                 reason = %reason,
+                severity = %severity,
                 "Investigation escalated"
             );
             "escalated"
@@ -383,19 +385,9 @@ pub(super) async fn generate_report(
 /// Outcome of a completed investigation.
 #[derive(Debug)]
 pub enum InvestigationOutcome {
-    Completed {
-        verdict: String,
-        #[allow(dead_code)]
-        steps: u32,
-    },
-    Escalated {
-        reason: String,
-        #[allow(dead_code)]
-        severity: String,
-    },
-    Failed {
-        error: String,
-    },
+    Completed { verdict: String, steps: u32 },
+    Escalated { reason: String, severity: String },
+    Failed { error: String },
 }
 
 fn process_outcome(outcome: &AgentLoopOutcome, investigation_id: &str) -> InvestigationOutcome {
@@ -582,6 +574,182 @@ mod tests {
                 assert_eq!(severity, "critical");
             }
             other => panic!("Expected Escalated, got {other:?}"),
+        }
+    }
+
+    fn outcome_with(reason: LoopEndReason, steps: u32) -> AgentLoopOutcome {
+        AgentLoopOutcome {
+            reason,
+            total_usage: Default::default(),
+            steps,
+            tool_calls_dispatched: 0,
+            discoveries: Vec::new(),
+            llm_findings: Vec::new(),
+            tool_outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn process_outcome_escalated_non_critical_is_high() {
+        let outcome = outcome_with(
+            LoopEndReason::RequestAssistance {
+                issue: "Suspicious 4625 cluster, need access to host logs".into(),
+                context: "".into(),
+            },
+            4,
+        );
+        match process_outcome(&outcome, "inv-x") {
+            InvestigationOutcome::Escalated { severity, .. } => assert_eq!(severity, "high"),
+            other => panic!("expected Escalated/high, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_outcome_end_turn_uses_verdict_extraction() {
+        let outcome = outcome_with(
+            LoopEndReason::EndTurn {
+                content: "Activity is benign — no follow-up required.".into(),
+            },
+            12,
+        );
+        match process_outcome(&outcome, "inv-x") {
+            InvestigationOutcome::Completed { verdict, steps } => {
+                assert_eq!(verdict, "benign");
+                assert_eq!(steps, 12);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_outcome_max_steps_max_tokens_and_budget_are_failures() {
+        let cases = [
+            (LoopEndReason::MaxSteps, "hit max steps"),
+            (LoopEndReason::MaxTokens, "hit max tokens"),
+            (
+                LoopEndReason::BudgetExceeded {
+                    reason: "input token budget exhausted".into(),
+                },
+                "budget exceeded",
+            ),
+        ];
+        for (reason, needle) in cases {
+            let out = outcome_with(reason, 7);
+            match process_outcome(&out, "inv-bx") {
+                InvestigationOutcome::Failed { error } => {
+                    let lower = error.to_lowercase();
+                    assert!(
+                        lower.contains(needle),
+                        "{lower:?} did not contain {needle:?}"
+                    );
+                    assert!(lower.contains("inv-bx"));
+                }
+                other => panic!("expected Failed for {needle}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn process_outcome_error_carries_message_through() {
+        let outcome = outcome_with(LoopEndReason::Error("redis closed".into()), 0);
+        match process_outcome(&outcome, "inv-x") {
+            InvestigationOutcome::Failed { error } => assert_eq!(error, "redis closed"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Bundled to serialise mutations to `ARES_REPORT_DIR`/`HOME` against
+    /// the rest of the binary's tests.
+    #[test]
+    fn resolves_report_dir_with_priority() {
+        const ENV_KEY: &str = "ARES_REPORT_DIR";
+        let prev_env = std::env::var(ENV_KEY).ok();
+        let prev_home = std::env::var("HOME").ok();
+        std::env::remove_var(ENV_KEY);
+
+        // Explicit wins.
+        assert_eq!(
+            resolve_report_dir(Some("/tmp/explicit")),
+            std::path::PathBuf::from("/tmp/explicit")
+        );
+
+        // Env var beats HOME fallback.
+        std::env::set_var(ENV_KEY, "/tmp/from-env");
+        assert_eq!(
+            resolve_report_dir(None),
+            std::path::PathBuf::from("/tmp/from-env")
+        );
+
+        // HOME fallback when nothing else is set.
+        std::env::remove_var(ENV_KEY);
+        std::env::set_var("HOME", "/home/probe");
+        assert_eq!(
+            resolve_report_dir(None),
+            std::path::PathBuf::from("/home/probe/.ares/reports")
+        );
+
+        // Restore.
+        match prev_env {
+            Some(v) => std::env::set_var(ENV_KEY, v),
+            None => std::env::remove_var(ENV_KEY),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    #[test]
+    fn extract_verdict_malicious_maps_to_true_positive() {
+        // "malicious" is a distinct path from "true positive" / "confirmed threat"
+        // in `extract_verdict`; verify it reaches the correct branch.
+        assert_eq!(extract_verdict("Activity is malicious"), "true_positive");
+        assert_eq!(
+            extract_verdict("The host is exhibiting malicious behaviour"),
+            "true_positive"
+        );
+    }
+
+    #[test]
+    fn extract_verdict_case_insensitive_true_positive() {
+        assert_eq!(
+            extract_verdict("Conclusion: TRUE POSITIVE indicator found"),
+            "true_positive"
+        );
+    }
+
+    #[test]
+    fn extract_verdict_confirmed_threat_maps_to_true_positive() {
+        // Ensure the "confirmed threat" path works independently of "malicious".
+        assert_eq!(
+            extract_verdict("This is a Confirmed Threat based on evidence"),
+            "true_positive"
+        );
+    }
+
+    #[test]
+    fn extract_verdict_empty_string_is_inconclusive() {
+        assert_eq!(extract_verdict(""), "inconclusive");
+    }
+
+    #[test]
+    fn process_outcome_end_turn_malicious_is_true_positive() {
+        let outcome = AgentLoopOutcome {
+            reason: LoopEndReason::EndTurn {
+                content: "The activity is malicious — host is compromised.".into(),
+            },
+            total_usage: Default::default(),
+            steps: 8,
+            tool_calls_dispatched: 3,
+            discoveries: Vec::new(),
+            llm_findings: Vec::new(),
+            tool_outputs: Vec::new(),
+        };
+        match process_outcome(&outcome, "inv-m") {
+            InvestigationOutcome::Completed { verdict, steps } => {
+                assert_eq!(verdict, "true_positive");
+                assert_eq!(steps, 8);
+            }
+            other => panic!("Expected Completed, got {other:?}"),
         }
     }
 }

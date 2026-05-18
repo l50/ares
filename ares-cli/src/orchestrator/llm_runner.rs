@@ -1,8 +1,7 @@
 //! LLM task runner — drives tasks through the Rust agent loop.
 //!
-//! Replaces the Python dreadnode Agent for LLM-driven tasks.
-//! The runner builds prompts, calls the LLM, dispatches tool calls to
-//! Python workers via Redis, and handles callbacks in Rust.
+//! Builds prompts, calls the LLM, dispatches tool calls to workers via Redis,
+//! and handles callbacks in Rust.
 
 use std::sync::{Arc, OnceLock};
 
@@ -14,7 +13,7 @@ use ares_llm::prompt::StateSnapshot;
 use ares_llm::tool_registry::{self, AgentRole};
 use ares_llm::{
     run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, HostnameMap, LlmProvider,
-    LoopEndReason, ToolDispatcher,
+    LoopEndReason, RunAgentLoopParams, ToolDispatcher,
 };
 
 use crate::orchestrator::state::SharedState;
@@ -81,9 +80,8 @@ impl LlmTaskRunner {
 
     /// Execute a task through the LLM agent loop.
     ///
-    /// This is the main entry point called by the orchestrator when
-    /// a task should be driven by the LLM rather than pushed to a
-    /// Python worker's full agent loop.
+    /// Main entry point when a task should be driven by the LLM directly
+    /// rather than pushed through a worker's full agent loop.
     pub async fn execute_task(
         &self,
         task_type: &str,
@@ -148,18 +146,18 @@ impl LlmTaskRunner {
         };
 
         // 6. Run the agent loop
-        let outcome = run_agent_loop(
-            self.provider.as_ref(),
-            Arc::clone(&self.dispatcher),
-            &self.config,
-            &system_prompt,
-            &task_prompt,
-            role_str,
+        let outcome = run_agent_loop(RunAgentLoopParams {
+            provider: self.provider.as_ref(),
+            dispatcher: Arc::clone(&self.dispatcher),
+            config: &self.config,
+            system_prompt: &system_prompt,
+            task_prompt: &task_prompt,
+            role: role_str,
             task_id,
-            &tools,
-            self.callback_handler.get().cloned(),
+            tools: &tools,
+            callback_handler: self.callback_handler.get().cloned(),
             hostname_map,
-        )
+        })
         .await;
 
         log_outcome(task_id, &outcome);

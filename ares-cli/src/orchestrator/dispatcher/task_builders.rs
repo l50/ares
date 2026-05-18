@@ -102,8 +102,8 @@ fn select_exploit_auth(
 ///
 /// These run pre-auth (against the network stack of the DC, or via NTLM relay)
 /// and would be incorrectly deferred by the credential gate. Kept narrow on
-/// purpose — adding to this list bypasses the gate and reintroduces the
-/// wrong-realm dispatch failure mode if the vuln actually does need auth.
+/// purpose — adding a vuln that actually requires auth bypasses the gate and
+/// produces wrong-realm dispatch failures.
 fn vuln_type_is_preauth(vtype: &str) -> bool {
     matches!(
         vtype.to_ascii_lowercase().as_str(),
@@ -160,7 +160,7 @@ impl Dispatcher {
 
     /// Submit a recon task.
     ///
-    /// Guards (mirroring Python's `request_recon` in `routing.py`):
+    /// Guards:
     /// 1. Skip entirely if domain admin has been achieved
     /// 2. Skip nmap tasks if all targets are already in `scanned_targets`
     /// 3. Auto-dispatch nmap prerequisite before enumeration if targets not scanned
@@ -266,8 +266,8 @@ impl Dispatcher {
 
     /// Submit a low-hanging fruit credential discovery task (SYSVOL, GPP, LDAP, LAPS).
     ///
-    /// Mirrors Python's fast credential discovery dispatch: sends multiple high-success-rate
-    /// techniques in a single task so the LLM agent executes them sequentially.
+    /// Sends multiple high-success-rate techniques in a single task so the LLM
+    /// agent executes them sequentially.
     #[instrument(
         name = "automation.request_low_hanging_fruit",
         skip(self, credential),
@@ -808,8 +808,6 @@ mod tests {
 
         let auth = select_exploit_auth(&state, None, "");
 
-        // Legacy behavior preserved: when caller doesn't specify a domain,
-        // any non-delegation credential is acceptable.
         assert_eq!(auth.credential.as_ref().unwrap().username, "alice");
     }
 
@@ -855,7 +853,7 @@ mod tests {
 
     #[test]
     fn matches_domain_false_when_neither_matches() {
-        // The bug fix: a cred existed but for the wrong realm, so the exploit
+        // A cred for the wrong realm must NOT satisfy the gate: the exploit
         // should be deferred, not dispatched with a wrong-realm cred attached.
         let auth = ExploitAuth {
             credential: Some(make_cred("alice", "contoso.local")),
@@ -870,7 +868,7 @@ mod tests {
             credential: Some(make_cred("alice", "contoso.local")),
             hash: None,
         };
-        // Empty target = no domain constraint = legacy behavior.
+        // Empty target = no domain constraint, any auth matches.
         assert!(auth.matches_domain(""));
     }
 
@@ -973,5 +971,22 @@ mod tests {
         assert!(!is_acl_style_vuln_type("constrained_delegation"));
         assert!(!is_acl_style_vuln_type("kerberoast"));
         assert!(!is_acl_style_vuln_type(""));
+    }
+
+    #[test]
+    fn is_acl_style_vuln_type_matches_membership_variants() {
+        assert!(is_acl_style_vuln_type("self_membership"));
+        assert!(is_acl_style_vuln_type("write_membership"));
+        assert!(is_acl_style_vuln_type("addmember"));
+        assert!(is_acl_style_vuln_type("addself"));
+        assert!(is_acl_style_vuln_type("AddMember"));
+        assert!(is_acl_style_vuln_type("acl_addmember_administrators"));
+    }
+
+    #[test]
+    fn is_acl_style_vuln_type_genericwrite_variant() {
+        assert!(is_acl_style_vuln_type("genericwrite"));
+        assert!(is_acl_style_vuln_type("GenericWrite"));
+        assert!(is_acl_style_vuln_type("acl_genericwrite_dc01"));
     }
 }

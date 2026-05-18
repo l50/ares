@@ -182,7 +182,7 @@ pub(crate) fn resolve_admin_username(state: &StateInner, domain: &str) -> String
 }
 
 /// Monitors for krbtgt hash and triggers golden ticket forging.
-/// Interval: 30s. Matches Python `_auto_golden_ticket`.
+/// Interval: 30s.
 ///
 /// Multi-domain: a single op routinely captures krbtgt for >1 domain (child
 /// then parent via ExtraSid; both forests via inter-realm forge). Each
@@ -269,12 +269,9 @@ async fn try_forge_golden_ticket(dispatcher: &Arc<Dispatcher>, domain: &str) {
         }
     }
 
-    let domain_sid = match inputs.domain_sid.clone() {
-        Some(sid) => sid,
-        None => {
-            warn!(domain = %domain, "Cannot resolve domain SID — skipping golden ticket");
-            return;
-        }
+    let Some(domain_sid) = inputs.domain_sid.clone() else {
+        warn!(domain = %domain, "Cannot resolve domain SID — skipping golden ticket");
+        return;
     };
 
     let admin_username = {

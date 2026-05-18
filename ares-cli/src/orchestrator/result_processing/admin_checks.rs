@@ -127,15 +127,7 @@ pub(crate) fn extract_ip_from_line(line: &str) -> Option<String> {
 /// Drives the SID extraction path so the same caller produces the same input
 /// regardless of which output convention the tool used. Pure — no Redis, no
 /// dispatcher.
-#[cfg(test)]
 pub(crate) fn collect_payload_text_parts(payload: &Value) -> Vec<String> {
-    collect_payload_text_parts_with_policy(payload, true)
-}
-
-fn collect_payload_text_parts_with_policy(
-    payload: &Value,
-    include_legacy_scalar_outputs: bool,
-) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(arr) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
         for item in arr {
@@ -146,31 +138,15 @@ fn collect_payload_text_parts_with_policy(
             }
         }
     }
-    if include_legacy_scalar_outputs {
-        for key in &["tool_output", "output"] {
-            if let Some(s) = payload.get(*key).and_then(|v| v.as_str()) {
-                parts.push(s.to_string());
-            }
-        }
-    }
     parts
 }
 
 /// Scan trusted tool-output text fields for a "golden ticket saved" marker.
 ///
-/// Walks `tool_outputs` (string OR `{output: string}` form), then
-/// legacy worker `tool_output` / `output`. Agent-completion `summary` and
-/// `has_golden_ticket: true` are intentionally ignored.
-#[cfg(test)]
+/// Walks `tool_outputs` (string OR `{output: string}` form). Agent-completion
+/// `summary` and `has_golden_ticket: true` are intentionally ignored.
 pub(crate) fn payload_contains_golden_ticket_marker(payload: &Value) -> bool {
-    payload_contains_golden_ticket_marker_with_policy(payload, true)
-}
-
-fn payload_contains_golden_ticket_marker_with_policy(
-    payload: &Value,
-    include_legacy_scalar_outputs: bool,
-) -> bool {
-    collect_payload_text_parts_with_policy(payload, include_legacy_scalar_outputs)
+    collect_payload_text_parts(payload)
         .into_iter()
         .any(|text| has_golden_ticket_indicator(&text))
 }
@@ -270,7 +246,6 @@ pub(crate) async fn check_golden_ticket_completion(
     payload: &Value,
     task_id: &str,
     task_domain: Option<&str>,
-    include_legacy_scalar_outputs: bool,
     dispatcher: &Arc<Dispatcher>,
 ) {
     if !task_id.contains("exploit") && !task_id.contains("golden") {
@@ -279,7 +254,7 @@ pub(crate) async fn check_golden_ticket_completion(
     // Per-domain dedup happens after we resolve `domain` below — a forge
     // for one domain must not block recording another (multi-domain ops
     // routinely capture krbtgt for parent + child or both forests).
-    if !payload_contains_golden_ticket_marker_with_policy(payload, include_legacy_scalar_outputs) {
+    if !payload_contains_golden_ticket_marker(payload) {
         return;
     }
     let mut domain = String::new();
@@ -355,9 +330,8 @@ pub(crate) async fn check_golden_ticket_completion(
 
 pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher: &Arc<Dispatcher>) {
     for line in text.lines() {
-        let (domain, username) = match parse_pwned_line(line) {
-            Some(pair) => pair,
-            None => continue,
+        let Some((domain, username)) = parse_pwned_line(line) else {
+            continue;
         };
         info!(username = %username, domain = %domain, "Pwn3d! detected -- upgrading credential to admin");
         let upgraded = {
@@ -442,10 +416,9 @@ pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher:
 pub(crate) async fn extract_and_cache_domain_sid(
     payload: &Value,
     task_domain: Option<&str>,
-    include_legacy_scalar_outputs: bool,
     dispatcher: &Arc<Dispatcher>,
 ) {
-    let text_parts = collect_payload_text_parts_with_policy(payload, include_legacy_scalar_outputs);
+    let text_parts = collect_payload_text_parts(payload);
     if text_parts.is_empty() {
         return;
     }
@@ -458,19 +431,14 @@ pub(crate) async fn extract_and_cache_domain_sid(
     // foreign-security-principal SIDs that *look* like domain SIDs but are
     // actually `<sid>-<rid>` entries from a different forest. Caching a
     // regex-truncated FSP SID against the task's payload domain misforges
-    // every downstream golden / inter-realm ticket — caused op-20260429-164553
-    // to forge a TGT for contoso.local with a bogus ExtraSid that the
-    // parent KDC rejected with rpc_s_access_denied.
+    // every downstream golden / inter-realm ticket.
     //
     // lsaquery is the primary unauth path for cross-forest target SID discovery
     // — it routinely succeeds against null sessions where impacket-lookupsid
-    // gets STATUS_ACCESS_DENIED. op-20260429-181500 discovered fabrikam's SID via
-    // lsaquery but failed to cache it (only lookupsid was wired up), so the
-    // subsequent forge_inter_realm_and_dump fired with has_target_sid=false
-    // and produced no krbtgt extraction.
-    let (sid, lsaquery_flat) = match parse_sid_from_combined_text(&combined) {
-        Some(p) => p,
-        None => return,
+    // gets STATUS_ACCESS_DENIED, so both parsers must be wired or the forge
+    // fires with has_target_sid=false.
+    let Some((sid, lsaquery_flat)) = parse_sid_from_combined_text(&combined) else {
+        return;
     };
 
     // Resolve the FQDN this SID belongs to. Anchor preference order:
@@ -480,9 +448,7 @@ pub(crate) async fn extract_and_cache_domain_sid(
     // 2. Trusted task domain captured from pending-task params before
     //    `complete_task` removed the entry. This is the orchestrator's own
     //    target realm, not an LLM-authored payload field.
-    // 3. Legacy payload `domain` field — only for non-rust-llm-runner paths
-    //    where the result payload itself is still the tool transport.
-    // 4. State's primary domain — last resort, only when nothing else applies.
+    // 3. State's primary domain — last resort, only when nothing else applies.
     let parsed_flat = lsaquery_flat.or_else(|| {
         ares_core::parsing::extract_domain_sid_and_flat_name(&combined).map(|(flat, _)| flat)
     });
@@ -491,8 +457,8 @@ pub(crate) async fn extract_and_cache_domain_sid(
         if let Some(flat) = parsed_flat.as_deref() {
             resolve_flat_to_fqdn(flat, &state).or_else(|| {
                 // Flat name parsed but unmapped — refuse to cache. Caching
-                // against the payload's domain here is exactly the bug we
-                // are trying to avoid.
+                // against the payload's domain would re-introduce the
+                // wrong-domain SID poisoning this whole function guards against.
                 warn!(
                     flat_name = %flat,
                     sid = %sid,
@@ -501,28 +467,14 @@ pub(crate) async fn extract_and_cache_domain_sid(
                 None
             })
         } else {
-            // No flat name in output. Fall back to trusted task domain,
-            // then legacy payload domain (if allowed), then primary.
             task_domain
                 .map(|d| d.to_lowercase())
                 .filter(|d| is_valid_domain_fqdn(d))
-                .or_else(|| {
-                    include_legacy_scalar_outputs
-                        .then(|| {
-                            payload
-                                .get("domain")
-                                .and_then(|v| v.as_str())
-                                .map(|d| d.to_lowercase())
-                                .filter(|d| is_valid_domain_fqdn(d))
-                        })
-                        .flatten()
-                })
                 .or_else(|| state.domains.first().map(|d| d.to_lowercase()))
         }
     };
-    let domain = match domain {
-        Some(d) => d,
-        None => return,
+    let Some(domain) = domain else {
+        return;
     };
     let already_cached = {
         let state = dispatcher.state.read().await;
@@ -808,16 +760,68 @@ mod tests {
         assert!(extract_ip_from_line("version 1.2.3 released").is_none());
     }
 
+    // ── is_valid_domain_fqdn ──────────────────────────────────────────
+
+    #[test]
+    fn valid_fqdn_accepts_standard_domain() {
+        assert!(is_valid_domain_fqdn("contoso.local"));
+        assert!(is_valid_domain_fqdn("fabrikam.local"));
+        assert!(is_valid_domain_fqdn("child.contoso.local"));
+    }
+
+    #[test]
+    fn valid_fqdn_rejects_empty_string() {
+        assert!(!is_valid_domain_fqdn(""));
+    }
+
+    #[test]
+    fn valid_fqdn_rejects_no_dot() {
+        // A flat name (e.g. "CONTOSO") has no dot — not a valid FQDN.
+        assert!(!is_valid_domain_fqdn("CONTOSO"));
+        assert!(!is_valid_domain_fqdn("localonly"));
+    }
+
+    #[test]
+    fn valid_fqdn_rejects_strings_with_spaces() {
+        assert!(!is_valid_domain_fqdn("contoso .local"));
+        assert!(!is_valid_domain_fqdn("192.168.58.30 - dc01"));
+    }
+
+    #[test]
+    fn valid_fqdn_rejects_strings_with_colons_or_slashes() {
+        assert!(!is_valid_domain_fqdn("http://contoso.local"));
+        assert!(!is_valid_domain_fqdn("contoso:local"));
+    }
+
+    #[test]
+    fn valid_fqdn_rejects_ip_like_strings() {
+        // First label is all digits → looks like an IP, not a domain.
+        assert!(!is_valid_domain_fqdn("192.168.58.10"));
+        assert!(!is_valid_domain_fqdn("10.0.0.1"));
+    }
+
+    #[test]
+    fn valid_fqdn_rejects_leading_dot() {
+        // First label is empty → ".contoso.local" is malformed.
+        assert!(!is_valid_domain_fqdn(".contoso.local"));
+    }
+
+    #[test]
+    fn valid_fqdn_accepts_domain_with_hyphens_and_underscores() {
+        assert!(is_valid_domain_fqdn("my-domain.local"));
+        assert!(is_valid_domain_fqdn("_kerberos.contoso.local"));
+    }
+
     // ── collect_payload_text_parts ─────────────────────────────────────
 
     #[test]
-    fn collect_text_parts_gathers_string_fields() {
+    fn collect_text_parts_ignores_top_level_scalar_fields() {
         let p = json!({
             "tool_output": "alpha",
             "output": "beta",
             "summary": "ignored",
         });
-        assert_eq!(collect_payload_text_parts(&p), vec!["alpha", "beta"]);
+        assert!(collect_payload_text_parts(&p).is_empty());
     }
 
     #[test]
@@ -850,12 +854,12 @@ mod tests {
         });
         assert_eq!(
             collect_payload_text_parts(&p),
-            vec!["bare-string", "from-object", "scalar"]
+            vec!["bare-string", "from-object"]
         );
     }
 
     #[test]
-    fn collect_text_parts_policy_can_ignore_scalar_fields() {
+    fn collect_text_parts_ignores_scalar_fields() {
         let p = json!({
             "tool_output": "scalar",
             "output": "also-scalar",
@@ -865,7 +869,7 @@ mod tests {
             ],
         });
         assert_eq!(
-            collect_payload_text_parts_with_policy(&p, false),
+            collect_payload_text_parts(&p),
             vec!["bare-string", "from-object"]
         );
     }
@@ -912,21 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn gt_marker_in_tool_output_field() {
+    fn gt_marker_ignores_scalar_tool_output_field() {
         let p = json!({
             "tool_output": "Saving ticket in foo.ccache",
         });
-        assert!(payload_contains_golden_ticket_marker(&p));
-    }
-
-    #[test]
-    fn gt_marker_policy_ignores_scalar_fields_when_disabled() {
-        let p = json!({
-            "tool_output": "Saving ticket in foo.ccache",
-        });
-        assert!(!payload_contains_golden_ticket_marker_with_policy(
-            &p, false
-        ));
+        assert!(!payload_contains_golden_ticket_marker(&p));
     }
 
     #[test]

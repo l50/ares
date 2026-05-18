@@ -331,9 +331,9 @@ async fn run_inner() -> Result<()> {
                 }
             }
 
-            // Seed placeholder hosts for ALL target IPs (matches Python startup).
-            // This ensures all IPs appear in the host list even before recon runs,
-            // and detect_dc() on service results can trigger domain extraction.
+            // Seed placeholder hosts for ALL target IPs so they appear in the
+            // host list before recon runs and detect_dc() on service results
+            // can trigger domain extraction.
             {
                 let host_key = format!(
                     "{}:{}:{}",
@@ -399,6 +399,9 @@ async fn run_inner() -> Result<()> {
     let registry = AgentRegistry::new();
     let throttler = Arc::new(Throttler::new(config.clone(), tracker.clone()));
     let deferred = Arc::new(DeferredQueue::new(queue.clone(), config.clone()));
+    if let Err(e) = deferred.reconcile_total().await {
+        warn!(err = %e, "Deferred queue counter reconcile failed at startup");
+    }
 
     // Priority: ARES_LLM_MODEL env var > config YAML agents.orchestrator.model
     let model_spec = std::env::var("ARES_LLM_MODEL").ok().or_else(|| {
@@ -477,16 +480,16 @@ async fn run_inner() -> Result<()> {
         "LLM runner initialized — Rust drives all agent loops"
     );
 
-    let dispatcher = Arc::new(Dispatcher::new(
-        queue.clone(),
-        tracker.clone(),
-        throttler.clone(),
-        deferred.clone(),
-        shared_state.clone(),
-        config.clone(),
-        ares_config.clone(),
-        llm_runner.clone(),
-    ));
+    let dispatcher = Arc::new(Dispatcher::new(dispatcher::DispatcherDeps {
+        queue: queue.clone(),
+        tracker: tracker.clone(),
+        throttler: throttler.clone(),
+        deferred: deferred.clone(),
+        state: shared_state.clone(),
+        config: config.clone(),
+        ares_config: ares_config.clone(),
+        llm_runner: llm_runner.clone(),
+    }));
 
     // Deferred initialization: the handler needs the dispatcher, which contains
     // the llm_runner, creating a circular dependency. OnceLock breaks the cycle.
@@ -835,7 +838,6 @@ async fn run_inner() -> Result<()> {
     }
 
     // Write completion metadata, status key, clear lock and active pointer.
-    // Matches Python's operation completion sequence.
     {
         let mut conn = queue.connection();
         let has_da = shared_state.read().await.has_domain_admin;

@@ -25,7 +25,9 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use ares_core::nats::{self, NatsBroker};
 use ares_core::telemetry::propagation::set_span_parent;
-use ares_core::telemetry::spans::{trace_discovery, AgentSpanBuilder, SpanKind, Team};
+use ares_core::telemetry::spans::{
+    trace_discovery, AgentSpanBuilder, SpanKind, Team, TraceDiscoveryParams,
+};
 use ares_core::telemetry::target::{extract_target_info, infer_target_type_from_info};
 
 use crate::worker::config::WorkerConfig;
@@ -109,12 +111,9 @@ pub async fn run_tool_exec_loop(
             }
         };
 
-        let msg = match next {
-            Some(m) => m,
-            None => {
-                warn!("Tool executor: subscription closed, exiting");
-                return Ok(());
-            }
+        let Some(msg) = next else {
+            warn!("Tool executor: subscription closed, exiting");
+            return Ok(());
         };
 
         let request: ToolExecRequest = match serde_json::from_slice(&msg.payload) {
@@ -169,9 +168,9 @@ pub async fn run_tool_exec_loop(
     }
 }
 
-/// Build the error response sent when a tool was previously found to be
-/// unavailable on this worker (binary missing). Surfaced as a free function
-/// so the wording stays in lock-step with tests.
+/// Build the error response for a tool marked unavailable on this worker
+/// (binary missing). Surfaced as a free function so the wording stays in
+/// lock-step with tests.
 fn unavailable_tool_response(tool_name: &str, call_id: &str) -> ToolExecResponse {
     ToolExecResponse {
         call_id: call_id.to_string(),
@@ -305,17 +304,17 @@ async fn execute_and_respond(
 
             if let Some(ref disc) = discoveries {
                 for (disc_type, _count) in count_discovery_entries(disc) {
-                    let span = trace_discovery(
-                        &disc_type,
-                        &request.tool_name,
-                        di.target_user.as_deref(),
-                        None,
-                        di.target_ip.as_deref(),
-                        di.target_fqdn.as_deref(),
-                        dt,
-                        request.operation_id.as_deref(),
-                        Some(request.task_id.as_str()),
-                    );
+                    let span = trace_discovery(TraceDiscoveryParams {
+                        discovery_type: &disc_type,
+                        source_agent: &request.tool_name,
+                        target_user: di.target_user.as_deref(),
+                        target_domain: None,
+                        target_ip: di.target_ip.as_deref(),
+                        target_fqdn: di.target_fqdn.as_deref(),
+                        target_type: dt,
+                        operation_id: request.operation_id.as_deref(),
+                        task_id: Some(request.task_id.as_str()),
+                    });
                     let _guard = span.enter();
                 }
             }

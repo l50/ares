@@ -64,17 +64,14 @@ pub(crate) async fn query_dc_domain(ip: &str) -> Option<String> {
     ];
 
     let addr = format!("{ip}:389");
-    let mut stream = match tokio::time::timeout(
+    let Ok(Ok(mut stream)) = tokio::time::timeout(
         std::time::Duration::from_millis(1000),
         tokio::net::TcpStream::connect(&addr),
     )
     .await
-    {
-        Ok(Ok(s)) => s,
-        _ => {
-            warn!(ip = %ip, "LDAP rootDSE: connection failed");
-            return None;
-        }
+    else {
+        warn!(ip = %ip, "LDAP rootDSE: connection failed");
+        return None;
     };
 
     if stream.write_all(ldap_request).await.is_err() {
@@ -205,8 +202,6 @@ pub(crate) async fn discover_dc_domains(
 }
 
 /// Write initial operation metadata to Redis so workers can discover the operation.
-///
-/// Mirrors the Python `_initialize_state_and_persist()` in `_orchestrator.py`.
 pub(crate) async fn bootstrap_meta(queue: &TaskQueue, config: &OrchestratorConfig) -> Result<()> {
     use chrono::Utc;
 
@@ -254,7 +249,6 @@ pub(crate) async fn bootstrap_meta(queue: &TaskQueue, config: &OrchestratorConfi
     // Set active operation pointer for worker discovery
     let _: () = conn.set("ares:op:active", &config.operation_id).await?;
 
-    // Write operation status key (matches Python's status tracking)
     ares_core::state::set_operation_status(&mut conn, &config.operation_id, "running").await?;
 
     // Store the LLM model name for worker discovery and recovery

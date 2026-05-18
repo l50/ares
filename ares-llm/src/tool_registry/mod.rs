@@ -2,7 +2,7 @@
 //!
 //! Provides JSON Schema definitions for tools available to each agent role.
 //! Callback tools (task_complete, request_assistance) are handled directly
-//! in Rust without dispatching to Python workers.
+//! without dispatching to workers.
 
 mod acl;
 #[cfg(feature = "blue")]
@@ -333,7 +333,9 @@ pub fn tools_for_role(role: AgentRole) -> Vec<ToolDefinition> {
 /// This is used when the YAML config specifies which tools a role should have.
 /// Returns only the tools whose names appear in `capabilities`.
 pub fn tools_for_capabilities(capabilities: &[String]) -> Vec<ToolDefinition> {
-    let all_tools: Vec<ToolDefinition> = [
+    // Dedup by name — same tool may appear in multiple roles
+    let mut seen = std::collections::HashSet::new();
+    let mut matched: Vec<ToolDefinition> = [
         recon::tool_definitions(),
         credential_access::tool_definitions(),
         cracker::tool_definitions(),
@@ -346,15 +348,9 @@ pub fn tools_for_capabilities(capabilities: &[String]) -> Vec<ToolDefinition> {
     ]
     .into_iter()
     .flatten()
+    .filter(|t| capabilities.iter().any(|c| c == &t.name))
+    .filter(|t| seen.insert(t.name.clone()))
     .collect();
-
-    // Dedup by name — same tool may appear in multiple roles
-    let mut seen = std::collections::HashSet::new();
-    let mut matched: Vec<ToolDefinition> = all_tools
-        .into_iter()
-        .filter(|t| capabilities.iter().any(|c| c == &t.name))
-        .filter(|t| seen.insert(t.name.clone()))
-        .collect();
 
     // Always include reporting + callback tools
     matched.extend(reporting::tool_definitions());
@@ -653,7 +649,6 @@ mod tests {
         assert!(names.contains(&"ldap_search_descriptions"));
         assert!(names.contains(&"username_as_password"));
         assert!(names.contains(&"password_spray"));
-        // Previously missing tools now included via netexec_tools
         assert!(names.contains(&"password_policy"));
         assert!(names.contains(&"laps_dump"));
         assert!(names.contains(&"gpp_password_finder"));
@@ -953,9 +948,8 @@ mod tests {
                 BlueAgentRole::EscalationTriage,
             ] {
                 let tools = blue_tools_for_role(role);
-                let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
                 assert!(
-                    !names.contains(&"add_lateral_connection"),
+                    !tools.iter().any(|t| t.name == "add_lateral_connection"),
                     "{:?} should NOT have add_lateral_connection",
                     role
                 );

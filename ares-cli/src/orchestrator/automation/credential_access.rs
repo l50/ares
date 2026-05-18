@@ -435,7 +435,7 @@ pub(crate) fn build_common_spray_payload(
 }
 
 /// Complex credential access automation: kerberoast, AS-REP roast, password spray.
-/// Interval: 15s + Notify wake. Matches Python `_auto_credential_access`.
+/// Interval: 15s + Notify wake.
 pub async fn auto_credential_access(
     dispatcher: Arc<Dispatcher>,
     mut shutdown: watch::Receiver<bool>,
@@ -667,8 +667,8 @@ pub async fn auto_credential_access(
             }
         }
 
-        // Mirrors Python's fast credential discovery — dispatches high-success-rate
-        // techniques that find hardcoded/stored passwords in Active Directory.
+        // Fast credential discovery — dispatch high-success-rate techniques that
+        // find hardcoded/stored passwords in Active Directory.
         let low_hanging_work: Vec<LowHangingWorkItem> = {
             let state = dispatcher.state.read().await;
             let max = if dispatcher.config.strategy.is_comprehensive() {

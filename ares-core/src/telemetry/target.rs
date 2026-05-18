@@ -1,7 +1,7 @@
 //! Target extraction and classification for span attributes.
 //!
-//! Mirrors Python's `tracing.py` logic for extracting target info from tool
-//! call arguments and inferring target type from hostnames.
+//! Extracts target info from tool call arguments and infers target type from
+//! hostnames.
 
 /// Extracted target information from tool call arguments.
 #[derive(Debug, Default)]
@@ -13,7 +13,6 @@ pub struct ToolTargetInfo {
 
 /// Extract target IP, FQDN, and username from tool call arguments JSON.
 ///
-/// Matches Python's extraction logic in `red_agents.py`:
 /// - IP: `target_ip`, `target`, `host`, `ip` (if it looks like an IP)
 /// - FQDN: `target_fqdn`, `target`, `host`, `hostname` (if it looks like an FQDN)
 /// - User: `username`, `user`, `target_user`
@@ -25,9 +24,8 @@ pub struct ToolTargetInfo {
 pub fn extract_target_info(arguments: &serde_json::Value) -> ToolTargetInfo {
     let mut info = ToolTargetInfo::default();
 
-    let obj = match arguments.as_object() {
-        Some(o) => o,
-        None => return info,
+    let Some(obj) = arguments.as_object() else {
+        return info;
     };
 
     // Extract IP — sanitize multi-token values first
@@ -67,7 +65,6 @@ pub fn extract_target_info(arguments: &serde_json::Value) -> ToolTargetInfo {
 
 /// Infer target type from a hostname or FQDN.
 ///
-/// Matches Python's `infer_target_type()`:
 /// - `dc*` prefix -> `"domain_controller"`
 /// - `sql*`, `db*`, `mssql*`, `database*` prefix -> `"sql_server"`
 /// - `web*`, `www*`, `iis*`, `apache*`, `nginx*` prefix -> `"web_server"`

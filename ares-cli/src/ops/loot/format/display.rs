@@ -121,8 +121,8 @@ pub(super) fn print_loot_human(
         &state.netbios_to_fqdn,
         &state.domain_controllers,
     );
-    let dcs: Vec<_> = merged_hosts.iter().filter(|h| h.is_dc).collect();
-    println!("Hosts ({}, {} DCs):", merged_hosts.len(), dcs.len());
+    let dc_count = merged_hosts.iter().filter(|h| h.is_dc).count();
+    println!("Hosts ({}, {} DCs):", merged_hosts.len(), dc_count);
     for host in &merged_hosts {
         let mut parts = Vec::new();
         if !host.hostname.is_empty() {
@@ -1597,10 +1597,8 @@ mod tests {
 
     #[test]
     fn build_domain_achievements_skips_workgroup_pseudo_domain() {
-        // Old loot row from before the upstream parsers learned to drop
-        // workgroup pseudo-domains: an attacker-box krbtgt entry tagged with
-        // the auto-generated WIN-XXX...wgrp.local string. The achievements
-        // rollup must NOT promote it to a "compromised domain" (DA).
+        // Workgroup pseudo-domain (auto-generated WIN-XXX...wgrp.local) on a
+        // krbtgt entry must NOT be promoted to a "compromised domain" (DA).
         let state = empty_state();
         let hashes = vec![
             make_hash("krbtgt", "win-abcdefghijk.wgrp.local", "ntlm"),

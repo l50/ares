@@ -45,7 +45,7 @@ const TASK_STATUS_TTL_SECS: u64 = 60 * 60 * 24;
 ///
 /// Construction is exercised by tests; production red-team dispatch goes through
 /// the in-process LLM runner instead, so the bin build sees this as unused.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMessage {
     pub task_id: String,
@@ -59,7 +59,7 @@ pub struct TaskMessage {
     pub callback_queue: Option<String>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn default_priority() -> i32 {
     5
 }
@@ -108,11 +108,6 @@ pub type TaskQueue = TaskQueueCore<ConnectionManager>;
 
 /// Single long-lived JetStream consumer that drains every `ares.tasks.results.*`
 /// subject and stashes parsed results in a per-`task_id` cache.
-///
-/// Replaces the old per-poll ephemeral-consumer pattern, which collided with
-/// the WorkQueue retention policy on `ARES_TASKS` (one consumer per filter
-/// subject, max) and produced steady-state `create ephemeral result consumer`
-/// failures while the orchestrator polled.
 struct ResultDemux {
     cache: Arc<Mutex<HashMap<String, TaskResult>>>,
 }
@@ -226,7 +221,7 @@ impl TaskQueue {
 ///
 /// Pulled out so the wire shape (priority → subject mapping, callback queue
 /// generation, default field values) can be unit-tested without a broker.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_task_message(
     task_id: &str,
     task_type: &str,
@@ -252,7 +247,7 @@ pub(crate) fn build_task_message(
 /// Priority ≤ 2 publishes to the urgent subject so workers that bind two
 /// consumers can prefer urgent work; everything else goes to the normal
 /// subject.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn task_subject_for_priority(target_role: &str, priority: i32) -> String {
     if priority <= 2 {
         nats::urgent_task_subject(target_role)
@@ -262,7 +257,6 @@ pub(crate) fn task_subject_for_priority(target_role: &str, priority: i32) -> Str
 }
 
 /// Lifecycle status string written to Redis after a result is published.
-#[allow(dead_code)]
 pub(crate) const fn final_status_for(success: bool) -> &'static str {
     if success {
         "completed"
@@ -272,12 +266,12 @@ pub(crate) const fn final_status_for(success: bool) -> &'static str {
 }
 
 // The generic impl exposes both the production NATS path and a Redis-only
-// path used by unit tests with a mock connection. Some methods are only
-// exercised in the test build; allow that on the impl as a whole.
-#[allow(dead_code)]
+// path used by unit tests with a mock connection. The `submit_task` helper
+// is gated to `cfg(test)` since production red-team dispatch runs in-process.
 impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
     /// Construct from a Redis backend only — used by unit tests that don't
     /// exercise queue methods. Queue methods will return an error.
+    #[cfg(test)]
     pub fn from_connection(conn: C) -> Self {
         Self {
             conn,
@@ -310,6 +304,7 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
     ///
     /// Priority ≤ 2 publishes to `ares.tasks.urgent.{role}`, otherwise
     /// `ares.tasks.{role}`. Workers bind two consumers and prefer urgent.
+    #[cfg(test)]
     pub async fn submit_task(
         &self,
         task_type: &str,
@@ -344,19 +339,6 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
         info!(task_id = %task_id, subject = %subject, priority, "Task submitted");
         self.set_task_status(&task_id, "pending").await?;
         Ok(task_id)
-    }
-
-    /// Non-destructive peek: try to pull a result without consuming it.
-    ///
-    /// JetStream WorkQueue retention removes a message on ack, so we never
-    /// "peek without consuming" — we treat any returned result as "pending"
-    /// and return it through `check_result` next time. To preserve the old
-    /// semantic (peek → bool, then consume separately), this method always
-    /// returns `false` and callers should use `check_result` directly.
-    ///
-    /// Kept for API compatibility with the previous Redis implementation.
-    pub async fn has_pending_result(&self, _task_id: &str) -> Result<bool> {
-        Ok(false)
     }
 
     /// Non-blocking check for a task result.
@@ -441,6 +423,7 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
     }
 
     /// Write heartbeat for an agent (with TTL so stale entries self-expire).
+    #[cfg(test)]
     pub async fn send_heartbeat(
         &self,
         agent: &str,
@@ -568,6 +551,7 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn get_task_status(&self, task_id: &str) -> Result<Option<String>> {
         let key = Self::task_status_key(task_id);
         let mut conn = self.conn.clone();
@@ -808,16 +792,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("NATS"));
-    }
-
-    #[tokio::test]
-    async fn has_pending_result_always_false() {
-        // Documented "always returns false" semantic kept for API compat with
-        // the old Redis implementation.
-        let q = mock_queue();
-        for tid in ["t1", "t2", "anything"] {
-            assert!(!q.has_pending_result(tid).await.unwrap());
-        }
     }
 
     #[tokio::test]

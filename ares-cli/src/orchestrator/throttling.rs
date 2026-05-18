@@ -1,16 +1,16 @@
 //! Rate limiting and concurrency control.
 //!
-//! Mirrors the Python `ares.core.dispatcher.throttling.ThrottlingMixin`.
-//!
 //! Three layers of throttling:
 //! 1. **Per-role semaphores** — limits how many tasks one role can have in-flight.
 //! 2. **Global LLM concurrency** — soft cap + 1.5x hard cap before deferring.
 //! 3. **Dispatch delay** — minimum interval between consecutive submissions.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -62,12 +62,12 @@ pub enum ThrottleDecision {
     Wait(std::time::Duration),
 }
 
-/// Concurrency controller that mirrors the Python throttling logic.
+/// Concurrency controller — three layers (per-role, global LLM, dispatch delay).
 pub struct Throttler {
     config: Arc<OrchestratorConfig>,
     tracker: ActiveTaskTracker,
     /// Per-role semaphores (lazily populated, used in tests).
-    #[allow(dead_code)]
+    #[cfg(test)]
     role_semaphores: tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
     /// Timestamp of the last successful dispatch.
     last_dispatch: tokio::sync::Mutex<Instant>,
@@ -82,6 +82,7 @@ impl Throttler {
         Self {
             config,
             tracker,
+            #[cfg(test)]
             role_semaphores: tokio::sync::Mutex::new(HashMap::new()),
             last_dispatch: tokio::sync::Mutex::new(Instant::now()),
             rate_limit_errors: tokio::sync::Mutex::new(0),
@@ -194,9 +195,9 @@ impl Throttler {
     pub async fn record_rate_limit_error(&self) {
         let mut errors = self.rate_limit_errors.lock().await;
         *errors += 1;
-        let threshold = 3_u32; // matches Python get_rate_limit_threshold default
+        let threshold = 3_u32;
         if *errors >= threshold {
-            let backoff_secs = 30_u64; // matches Python get_rate_limit_backoff default
+            let backoff_secs = 30_u64;
             let mut bo = self.backoff_until.lock().await;
             *bo = Some(Instant::now() + std::time::Duration::from_secs(backoff_secs));
             warn!(

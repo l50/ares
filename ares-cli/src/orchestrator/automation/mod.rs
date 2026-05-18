@@ -8,16 +8,12 @@
 //!   2. Take a read lock, collect new work items
 //!   3. Release lock, submit tasks via the dispatcher
 //!   4. Mark items as processed (write lock + Redis persist)
-//!
-//! This mirrors the Python `_orchestrator.py` background tasks but eliminates
-//! all threading hacks since tokio tasks are truly concurrent.
 
 mod acl;
 mod acl_discovery;
 mod adcs;
 mod adcs_exploitation;
 mod bloodhound;
-mod certifried;
 mod certipy_auth;
 mod coercion;
 mod crack;
@@ -82,7 +78,6 @@ pub use adcs::auto_adcs_enumeration;
 pub use adcs_exploitation::auto_adcs_exploitation;
 pub(crate) use adcs_exploitation::EXPLOITABLE_ESC_TYPES;
 pub use bloodhound::auto_bloodhound;
-pub use certifried::auto_certifried;
 pub use certipy_auth::auto_certipy_auth;
 pub use coercion::auto_coercion;
 pub use crack::auto_crack_dispatch;
