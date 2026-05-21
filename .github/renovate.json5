@@ -69,6 +69,21 @@
       automergeType: 'pr',
     },
     {
+      description: 'Auto merge non-major Rust, Ansible Galaxy, and pre-commit updates',
+      matchManagers: [
+        'cargo',
+        'galaxy',
+        'galaxy-collection',
+        'pre-commit',
+      ],
+      matchUpdateTypes: [
+        'patch',
+        'minor',
+      ],
+      automerge: true,
+      automergeType: 'pr',
+    },
+    {
       description: 'Group opentelemetry-rust monorepo with tracing-opentelemetry so version bumps land together (tracing-opentelemetry pins a specific opentelemetry minor version, so they must update atomically)',
       matchPackageNames: [
         'opentelemetry',
