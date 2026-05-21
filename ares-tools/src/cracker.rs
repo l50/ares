@@ -7,6 +7,8 @@ use crate::args::{optional_bool, optional_i64, optional_str, required_str};
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
+mod remote;
+
 /// Default wordlists tried in order.
 const DEFAULT_WORDLISTS: &[&str] = &[
     "/usr/share/wordlists/rockyou.txt",
@@ -88,6 +90,10 @@ fn capitalize(s: &str) -> String {
 /// Tries multiple wordlists in order (rockyou, seclists). When `use_dynamic_wordlist`
 /// is true (default), also prepends a username-derived candidate list.
 pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
+    if let Some(url) = remote::service_url() {
+        return remote::crack(args, &url).await;
+    }
+
     let hash_value = required_str(args, "hash_value")?;
     let explicit_wordlist = optional_str(args, "wordlist_path");
     let explicit_rules = optional_str(args, "rules_file");
