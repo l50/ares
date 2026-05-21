@@ -8,6 +8,15 @@ on:
       - 'warpgate-templates/**'
       - 'ansible/**'
       - '.github/workflows/build-and-push-templates.yaml'
+      # Template images bake the Rust `ares` binary from these crates;
+      # rebuild when their source changes too.
+      - 'ares-cli/**'
+      - 'ares-core/**'
+      - 'ares-llm/**'
+      - 'ares-rust/**'
+      - 'ares-tools/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
   workflow_dispatch:
     inputs:
       template_filter:
