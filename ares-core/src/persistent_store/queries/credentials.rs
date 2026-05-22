@@ -1,6 +1,7 @@
 //! Credential and hash search queries across all operations.
 
 use anyhow::Result;
+use sqlx::AssertSqlSafe;
 
 use super::rows::{CredentialRow, HashRow};
 use super::HistoricalQueryService;
@@ -198,17 +199,19 @@ impl HistoricalQueryService {
             );
 
             // Bind dynamically — sqlx doesn't support dynamic binds easily,
-            // so we use query_scalar pattern with explicit bind count
+            // so we use query_scalar pattern with explicit bind count.
+            // SQL is built from static fragments plus $N placeholder indices only;
+            // user-controlled values are passed via .bind() — safe to assert.
             match bind_values.len() {
                 1 => {
-                    sqlx::query_as::<_, HashRow>(&sql)
+                    sqlx::query_as::<_, HashRow>(AssertSqlSafe(sql))
                         .bind(&bind_values[0])
                         .bind(limit)
                         .fetch_all(&self.pool)
                         .await?
                 }
                 2 => {
-                    sqlx::query_as::<_, HashRow>(&sql)
+                    sqlx::query_as::<_, HashRow>(AssertSqlSafe(sql))
                         .bind(&bind_values[0])
                         .bind(&bind_values[1])
                         .bind(limit)
@@ -216,7 +219,7 @@ impl HistoricalQueryService {
                         .await?
                 }
                 3 => {
-                    sqlx::query_as::<_, HashRow>(&sql)
+                    sqlx::query_as::<_, HashRow>(AssertSqlSafe(sql))
                         .bind(&bind_values[0])
                         .bind(&bind_values[1])
                         .bind(&bind_values[2])

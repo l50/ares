@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
+use sqlx::AssertSqlSafe;
 
 use super::connect_postgres;
 use super::types::CostRow;
@@ -36,7 +37,7 @@ pub(crate) async fn history_cost(
     bind_idx += 1;
     query.push_str(&format!(" ORDER BY started_at DESC LIMIT ${bind_idx}"));
 
-    let mut q = sqlx::query_as::<_, CostRow>(&query);
+    let mut q = sqlx::query_as::<_, CostRow>(AssertSqlSafe(query));
 
     if let Some(ref d) = domain {
         q = q.bind(format!("%{d}%"));
