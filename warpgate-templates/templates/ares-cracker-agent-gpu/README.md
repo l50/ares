@@ -30,13 +30,13 @@ This image is built on the NVIDIA CUDA runtime image and supports:
 To run the container with GPU access:
 
 ```bash
-docker run --gpus all -it ghcr.io/dreadnode/ares-cracker-agent-gpu:latest
+docker run --gpus all -it ghcr.io/l50/ares-cracker-agent-gpu:latest
 ```
 
 Or with specific GPUs:
 
 ```bash
-docker run --gpus '"device=0,1"' -it ghcr.io/dreadnode/ares-cracker-agent-gpu:latest
+docker run --gpus '"device=0,1"' -it ghcr.io/l50/ares-cracker-agent-gpu:latest
 ```
 
 ### Verifying GPU Access
@@ -95,11 +95,11 @@ export GITHUB_TOKEN="your-github-token"
 
 warpgate build --template ares-cracker-agent-gpu \
   --arch amd64 \
-  --registry ghcr.io/dreadnode \
+  --registry ghcr.io/l50 \
   --tag latest \
   --push \
-  --cache-from type=registry,ref=ghcr.io/dreadnode/ares-cracker-agent-gpu:buildcache-amd64 \
-  --cache-to type=registry,ref=ghcr.io/dreadnode/ares-cracker-agent-gpu:buildcache-amd64,mode=max
+  --cache-from type=registry,ref=ghcr.io/l50/ares-cracker-agent-gpu:buildcache-amd64 \
+  --cache-to type=registry,ref=ghcr.io/l50/ares-cracker-agent-gpu:buildcache-amd64,mode=max
 ```
 
 After the build, Ares Cracker Agent GPU Docker images will be available

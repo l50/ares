@@ -2,9 +2,9 @@
 
 **Production-ready templates for building Ares red/blue team agent images and AMIs with Warpgate.**
 
-[![Validate Templates](https://github.com/dreadnode/ares/actions/workflows/validate-templates.yaml/badge.svg)](https://github.com/dreadnode/ares/actions/workflows/validate-templates.yaml)
-[![Test Template Builds](https://github.com/dreadnode/ares/actions/workflows/test-template-builds.yaml/badge.svg)](https://github.com/dreadnode/ares/actions/workflows/test-template-builds.yaml)
-[![Build and Push](https://github.com/dreadnode/ares/actions/workflows/build-and-push-templates.yaml/badge.svg)](https://github.com/dreadnode/ares/actions/workflows/build-and-push-templates.yaml)
+[![Validate Templates](https://github.com/l50/ares/actions/workflows/validate-templates.yaml/badge.svg)](https://github.com/l50/ares/actions/workflows/validate-templates.yaml)
+[![Test Template Builds](https://github.com/l50/ares/actions/workflows/test-template-builds.yaml/badge.svg)](https://github.com/l50/ares/actions/workflows/test-template-builds.yaml)
+[![Build and Push](https://github.com/l50/ares/actions/workflows/build-and-push-templates.yaml/badge.svg)](https://github.com/l50/ares/actions/workflows/build-and-push-templates.yaml)
 
 ---
 
@@ -35,7 +35,7 @@ warpgate build templates/ares-base/warpgate.yaml --arch amd64
 # Build and push a specialized agent
 warpgate build templates/ares-recon-agent/warpgate.yaml \
   --arch amd64,arm64 \
-  --registry ghcr.io/dreadnode \
+  --registry ghcr.io/l50 \
   --push
 ```
 
@@ -102,7 +102,7 @@ warpgate build templates/ares-recon-agent/warpgate.yaml --arch amd64,arm64
 # Build and push to a registry
 warpgate build templates/ares-cracker-agent/warpgate.yaml \
   --arch amd64,arm64 \
-  --registry ghcr.io/dreadnode \
+  --registry ghcr.io/l50 \
   --push
 ```
 
@@ -116,24 +116,24 @@ warpgate validate templates/ares-recon-agent/warpgate.yaml
 
 ```bash
 # CLI
-docker run --rm ghcr.io/dreadnode/ares-cli:latest --help
+docker run --rm ghcr.io/l50/ares-cli:latest --help
 
 # Orchestrator (entrypoint: ares orchestrator)
-docker run -it ghcr.io/dreadnode/ares-orchestrator:latest
+docker run -it ghcr.io/l50/ares-orchestrator:latest
 
 # Worker (entrypoint: ares worker)
-docker run -it ghcr.io/dreadnode/ares-worker:latest
+docker run -it ghcr.io/l50/ares-worker:latest
 
 # Recon agent
-docker run -it ghcr.io/dreadnode/ares-recon-agent:latest \
+docker run -it ghcr.io/l50/ares-recon-agent:latest \
   netexec smb 192.168.1.0/24 -u user -p password
 
 # CPU cracking
-docker run -it ghcr.io/dreadnode/ares-cracker-agent:latest \
+docker run -it ghcr.io/l50/ares-cracker-agent:latest \
   hashcat -m 1000 -a 0 hashes.txt /usr/share/wordlists/rockyou.txt
 
 # GPU cracking (requires NVIDIA Container Toolkit)
-docker run --rm --gpus all ghcr.io/dreadnode/ares-cracker-agent-gpu:latest \
+docker run --rm --gpus all ghcr.io/l50/ares-cracker-agent-gpu:latest \
   hashcat -m 1000 -a 0 hashes.txt rockyou.txt
 ```
 
@@ -170,7 +170,7 @@ base:
 sources:
   - name: ares
     git:
-      repository: https://github.com/dreadnode/ares.git
+      repository: https://github.com/l50/ares.git
       ref: main
       auth:
         token: ${GITHUB_TOKEN}
@@ -226,8 +226,8 @@ warpgate-templates/
 ## Documentation
 
 - **[Warpgate](https://github.com/cowdogmoo/warpgate)** - Build engine and CLI
-- **[Ares](https://github.com/dreadnode/ares)** - The Ares red/blue team framework
-- **[Issues](https://github.com/dreadnode/ares/issues)** - Bug reports and feature requests
+- **[Ares](https://github.com/l50/ares)** - The Ares red/blue team framework
+- **[Issues](https://github.com/l50/ares/issues)** - Bug reports and feature requests
 
 ---
 

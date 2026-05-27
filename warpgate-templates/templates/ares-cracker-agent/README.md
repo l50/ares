@@ -65,13 +65,13 @@ After building the Docker image, you can push it to GHCR:
 
 ```bash
 # Tag the image
-docker tag ares-cracker-agent:latest ghcr.io/dreadnode/ares-cracker-agent:latest
+docker tag ares-cracker-agent:latest ghcr.io/l50/ares-cracker-agent:latest
 
 # Authenticate with GHCR
 echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
 
 # Push the image
-docker push ghcr.io/dreadnode/ares-cracker-agent:latest
+docker push ghcr.io/l50/ares-cracker-agent:latest
 ```
 
 ---
@@ -133,7 +133,7 @@ GPU-enabled image:
 warpgate build --template ares-worker-gpu
 
 # Run with GPU access
-docker run --gpus all -it ghcr.io/dreadnode/ares-worker-gpu:latest
+docker run --gpus all -it ghcr.io/l50/ares-worker-gpu:latest
 ```
 
 See the [ares-worker-gpu](../ares-worker-gpu/README.md) templatefor full GPU configuration and usage details.

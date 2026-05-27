@@ -62,13 +62,13 @@ After building the Docker image, you can push it to GHCR:
 
 ```bash
 # Tag the image
-docker tag ares-cli:latest ghcr.io/dreadnode/ares-cli:latest
+docker tag ares-cli:latest ghcr.io/l50/ares-cli:latest
 
 # Authenticate with GHCR
 echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
 
 # Push the image
-docker push ghcr.io/dreadnode/ares-cli:latest
+docker push ghcr.io/l50/ares-cli:latest
 ```
 
 ---

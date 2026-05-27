@@ -418,7 +418,7 @@ jobs:
 
   # ===========================================================================
   # Phase 2: Build dependent templates
-  # These templates use base images from our registry (ghcr.io/dreadnode/*)
+  # These templates use base images from our registry (ghcr.io/l50/*)
   # If their base template was changed in this PR, load it from artifacts
   # ===========================================================================
   test-build-dependent:
