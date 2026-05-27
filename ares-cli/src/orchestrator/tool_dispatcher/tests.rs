@@ -702,3 +702,44 @@ fn tool_exec_result_from_response_preserves_error_string() {
     assert_eq!(r.error.as_deref(), Some("connection refused"));
     assert!(r.discoveries.is_none());
 }
+
+#[test]
+fn tool_timeout_for_slow_recon_tools_lifts_above_small_default() {
+    use std::time::Duration;
+    // Regression for the 2026-05-26 timeout: an operator who overrode the
+    // dispatcher default down (or any future code path that supplies a small
+    // value) must still get a generous per-tool floor for nmap / smb_*.
+    let tiny = Duration::from_secs(60);
+    assert_eq!(
+        tool_timeout_for("nmap_scan", tiny),
+        Duration::from_secs(30 * 60)
+    );
+    assert_eq!(
+        tool_timeout_for("smb_sweep", tiny),
+        Duration::from_secs(20 * 60)
+    );
+    assert_eq!(
+        tool_timeout_for("password_spray", tiny),
+        Duration::from_secs(20 * 60)
+    );
+}
+
+#[test]
+fn tool_timeout_for_unlisted_tool_uses_default() {
+    use std::time::Duration;
+    let default = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
+    assert_eq!(tool_timeout_for("whoami", default), default);
+    assert_eq!(tool_timeout_for("nslookup", default), default);
+}
+
+#[test]
+fn tool_timeout_floor_never_lowers_a_higher_caller_default() {
+    use std::time::Duration;
+    // If the dispatcher default is already above the per-tool floor (which is
+    // the case for `smb_sweep` and the in-tree `DEFAULT_TOOL_TIMEOUT_SECS`),
+    // we must not silently lower it. The floor is a minimum, not a cap.
+    let default = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
+    assert_eq!(tool_timeout_for("smb_sweep", default), default);
+    let huge = Duration::from_secs(60 * 60);
+    assert_eq!(tool_timeout_for("nmap_scan", huge), huge);
+}

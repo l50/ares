@@ -149,14 +149,32 @@ pub struct NatsBroker {
     jetstream: JetStreamContext,
 }
 
+/// Default `request_timeout` applied to the underlying `async-nats` client.
+///
+/// `async-nats` defaults this to 10s, which is far too short for our tool
+/// dispatch path: an `nmap` full-port scan against a Windows DC routinely
+/// takes 60-180s, and `password_spray` can queue behind an auth throttle.
+/// Per-call timeouts are still enforced by the dispatcher
+/// (`tokio::time::timeout` around `client.request`), so the only thing this
+/// value controls is the *upper bound* the NATS client will wait before
+/// surfacing `request timed out: deadline has elapsed`. Set it well above
+/// the longest individual tool timeout the dispatcher will impose.
+const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
+
 impl NatsBroker {
     /// Connect to NATS at the given URL (e.g. `nats://nats.attack-simulation.svc:4222`).
     pub async fn connect(url: &str) -> Result<Self> {
-        let client = async_nats::connect(url)
+        let client = async_nats::ConnectOptions::new()
+            .request_timeout(Some(Duration::from_secs(CLIENT_REQUEST_TIMEOUT_SECS)))
+            .connect(url)
             .await
             .with_context(|| format!("Failed to connect to NATS at {url}"))?;
         let jetstream = jetstream::new(client.clone());
-        info!(url, "Connected to NATS");
+        info!(
+            url,
+            request_timeout_secs = CLIENT_REQUEST_TIMEOUT_SECS,
+            "Connected to NATS"
+        );
         Ok(Self { client, jetstream })
     }
 

@@ -248,6 +248,33 @@ fn uses_max_completion_tokens(model: &str) -> bool {
     model.starts_with("gpt-5")
 }
 
+/// Heuristically detect OpenAI 403 messages that are caused by the API key's
+/// organization not being allowlisted for the requested model. Restricted
+/// models like `gpt-5.2` raise this on the *first* call, so catching it
+/// cheaply lets the orchestrator fail fast with a useful hint instead of
+/// letting every queued task tip over with the same opaque error.
+pub(crate) fn is_org_restricted_message(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("do not have access to the organization")
+        || lower.contains("must be verified to use the model")
+        || lower.contains("not have access to model")
+        || lower.contains("project does not have access")
+}
+
+/// Append a one-line operator hint to org-restricted / auth errors so the
+/// failure log immediately points at the likely cause (wrong model default or
+/// missing `OPENAI_ORG_ID`). Kept best-effort: if the upstream message
+/// already contains a usable pointer, we don't duplicate it.
+pub(crate) fn augment_org_hint(message: &str, model: &str) -> String {
+    let already_hinted = message.contains("OPENAI_ORG_ID") || message.contains("ARES_LLM_MODEL");
+    if already_hinted {
+        return message.to_string();
+    }
+    format!(
+        "{message} [model={model} — check OPENAI_ORG_ID and that your org is allowlisted for this model, or set ARES_LLM_MODEL to a widely-available alternative such as openai/gpt-4o-mini]"
+    )
+}
+
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn chat(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
@@ -327,7 +354,15 @@ impl LlmProvider for OpenAiProvider {
 
             return Err(match status.as_u16() {
                 429 => LlmError::RateLimited { retry_after_ms },
-                401 => LlmError::AuthError(message),
+                // 401 = bad/missing API key. 403 with org-restriction phrasing
+                // means the key is valid but the org isn't allowlisted for the
+                // requested model (typical for `gpt-5.2` and other restricted
+                // models). Surface both as AuthError so callers fail fast with
+                // a clearer message instead of treating it as a generic 4xx.
+                401 => LlmError::AuthError(augment_org_hint(&message, &request.model)),
+                403 if is_org_restricted_message(&message) => {
+                    LlmError::AuthError(augment_org_hint(&message, &request.model))
+                }
                 _ => LlmError::ApiError {
                     status: status.as_u16(),
                     message,
@@ -468,5 +503,46 @@ mod tests {
         assert!(uses_max_completion_tokens("gpt-5.2"));
         assert!(uses_max_completion_tokens("openai/gpt-5.2"));
         assert!(!uses_max_completion_tokens("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn detects_org_restricted_messages() {
+        // Real 403 string observed when running against a non-allowlisted org.
+        assert!(is_org_restricted_message(
+            "You do not have access to the organization tied to the API key."
+        ));
+        // Verified-org wording for gated models (currently surfaces on gpt-5.2).
+        assert!(is_org_restricted_message(
+            "Your organization must be verified to use the model `gpt-5.2`."
+        ));
+        // Project-level access denial (project-scoped API keys).
+        assert!(is_org_restricted_message(
+            "This project does not have access to model `gpt-5.2`."
+        ));
+        // Unrelated 4xx must not be classified as org-restricted.
+        assert!(!is_org_restricted_message(
+            "Invalid request: temperature out of range"
+        ));
+        assert!(!is_org_restricted_message("Rate limit exceeded"));
+    }
+
+    #[test]
+    fn augment_org_hint_adds_actionable_pointers() {
+        let augmented = augment_org_hint(
+            "You do not have access to the organization tied to the API key.",
+            "gpt-5.2",
+        );
+        assert!(augmented.contains("OPENAI_ORG_ID"));
+        assert!(augmented.contains("ARES_LLM_MODEL"));
+        assert!(augmented.contains("gpt-5.2"));
+    }
+
+    #[test]
+    fn augment_org_hint_is_idempotent() {
+        // If the upstream message already mentions one of our pointers (e.g.
+        // operator already saw the augmented message once and re-raised it),
+        // we don't double up.
+        let pre_augmented = "Some upstream wrapper said: set OPENAI_ORG_ID";
+        assert_eq!(augment_org_hint(pre_augmented, "gpt-5.2"), pre_augmented,);
     }
 }

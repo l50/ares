@@ -113,9 +113,23 @@ struct ResultDemux {
 }
 
 impl ResultDemux {
+    /// Deterministic durable name for the orchestrator's result-demux pull
+    /// consumer on `ARES_TASKS`. Using a fixed name (rather than an ephemeral
+    /// consumer) gives us a handle to delete any leftover instance from a
+    /// previous orchestrator incarnation before re-creating ours — a fresh
+    /// orchestrator otherwise hits `JetStream error: filtered consumer not
+    /// unique on workqueue stream (code 400, error code 10100)` on restart.
+    const DURABLE_NAME: &'static str = "ares-orch-result-demux";
+
     /// Create the consumer and spawn the drain loop. Lives for the lifetime
     /// of the process; the spawned task only exits if the JetStream message
     /// stream ends (which only happens on shutdown / connection loss).
+    ///
+    /// On `ARES_TASKS` (a WorkQueue stream) JetStream enforces that no two
+    /// consumers share a filter. A prior orchestrator pod that crashed (OOM,
+    /// SIGKILL, or eviction) leaves its consumer behind, and re-creating ours
+    /// fails. To stay idempotent on restart we delete any pre-existing
+    /// consumer with our durable name before creating a fresh one.
     async fn start(nats: &NatsBroker) -> Result<Arc<Self>> {
         use async_nats::jetstream::consumer::pull::Config as PullConfig;
         use async_nats::jetstream::consumer::{AckPolicy, Consumer};
@@ -126,10 +140,44 @@ impl ResultDemux {
             .await
             .with_context(|| format!("get_stream({})", nats::TASKS_STREAM))?;
 
+        // Best-effort: delete any leftover consumer from a previous incarnation.
+        // `delete_consumer` returns `ConsumerError::NotFound` on a clean stream;
+        // that's the happy path on first boot.
+        match stream.delete_consumer(Self::DURABLE_NAME).await {
+            Ok(_) => {
+                info!(
+                    durable = Self::DURABLE_NAME,
+                    "Deleted stale result-demux consumer from previous orchestrator incarnation"
+                );
+            }
+            Err(e) => {
+                // Anything other than "not found" is logged but not fatal — if
+                // the next create call still trips the uniqueness check we'll
+                // surface that error to the caller.
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("not found") || msg.contains("consumer not found") {
+                    // Nothing to clean up; normal first-boot path.
+                } else {
+                    warn!(
+                        durable = Self::DURABLE_NAME,
+                        err = %e,
+                        "Failed to delete prior result-demux consumer (continuing — create_consumer will surface the real error if any)"
+                    );
+                }
+            }
+        }
+
         let filter = format!("{}.>", nats::TASK_RESULT_SUBJECT_PREFIX);
         let cfg = PullConfig {
+            durable_name: Some(Self::DURABLE_NAME.to_string()),
+            name: Some(Self::DURABLE_NAME.to_string()),
             filter_subject: filter.clone(),
             ack_policy: AckPolicy::Explicit,
+            // Bound how long a stale consumer can linger if we fail to clean
+            // it up on shutdown (best-effort delete above can race a pod kill).
+            // After 5 minutes of no pull requests, JetStream evicts it on its
+            // own and the next orchestrator can take over without manual fix-up.
+            inactive_threshold: Duration::from_secs(5 * 60),
             ..Default::default()
         };
         let consumer: Consumer<PullConfig> = stream
