@@ -4,12 +4,30 @@
 # Reference: https://www.netexec.wiki/getting-started/installation/installation-on-unix
 
 - name: Install pipx via apt (Debian/Ubuntu)
-  ansible.builtin.apt:
-    name:
-      - pipx
-    state: present
   become: true
   when: ansible_facts['os_family'] == 'Debian'
+  block:
+    - name: Refresh apt cache before pipx install
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install pipx via apt
+      ansible.builtin.apt:
+        name:
+          - pipx
+        state: present
+  rescue:
+    # Kali rolling mirrors occasionally serve a Packages index that references
+    # .deb files already pruned from the pool, causing 404s on dependency
+    # downloads. Refresh once more and retry with --fix-missing to skip
+    # any still-stale references.
+    - name: Retry apt update after mirror miss
+      ansible.builtin.command: apt-get update  # noqa: command-instead-of-module
+      changed_when: true
+
+    - name: Retry pipx install with --fix-missing
+      ansible.builtin.command: apt-get install -y --fix-missing --no-install-recommends pipx  # noqa: command-instead-of-module
+      changed_when: true
 
 - name: Add pipx bin to system PATH via profile.d
   ansible.builtin.copy:
