@@ -189,7 +189,9 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
                 .context("ToolDispatcher requires NATS broker")?;
             let client = nats.client().clone();
 
-            let timeout = self.tool_timeout;
+            // Promote slow tools (nmap, smb_*, password_spray, etc.) above the
+            // shared default; everything else uses the configured tool_timeout.
+            let timeout = super::tool_timeout_for(&call.name, self.tool_timeout);
             let response_msg = match tokio::time::timeout(
                 timeout,
                 client.request(subject.clone(), Bytes::from(payload)),

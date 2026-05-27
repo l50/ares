@@ -58,10 +58,15 @@ async fn main() {
 
     // ── Initialize telemetry before using tracing macros ──
     // Skip for orchestrator/worker subcommands — they init their own telemetry
-    // with the correct service name.
+    // with the correct service name. The subcommand can appear anywhere in argv
+    // because clap allows global flags (e.g. `--redis-url <url>`) to precede
+    // it, so we scan rather than checking `args().nth(1)`. If we mis-detect, the
+    // telemetry init in ares-core is idempotent (`try_init`-based) and the
+    // redundant call returns a no-op guard, but mis-detection still bakes the
+    // wrong service name into spans for the entire process lifetime.
     let is_service_subcommand = std::env::args()
-        .nth(1)
-        .is_some_and(|a| a == "orchestrator" || a == "worker");
+        .skip(1)
+        .any(|a| a == "orchestrator" || a == "worker");
     let _telemetry = if !is_service_subcommand {
         Some(ares_core::telemetry::init_telemetry(
             ares_core::telemetry::TelemetryConfig::new("ares-cli")

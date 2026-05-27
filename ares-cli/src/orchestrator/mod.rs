@@ -425,6 +425,21 @@ async fn run_inner() -> Result<()> {
     let (provider, model_name) =
         ares_llm::create_provider(&model_spec).context("Failed to create LLM provider")?;
 
+    // Fail fast on org/auth misconfigurations before queueing any tasks. A
+    // typical pitfall: `gpt-5.2` defaults are org-allowlisted at OpenAI, so
+    // submitting a multi-host op against a non-allowlisted key would silently
+    // burn through dispatch → LLM → 403 on every single task. A single
+    // pre-flight call surfaces the error once, with a hint pointing at
+    // `OPENAI_ORG_ID` / `ARES_LLM_MODEL`.
+    if let Err(e) = preflight_llm_provider(provider.as_ref(), &model_name).await {
+        error!(
+            model = %model_name,
+            "LLM preflight failed: {e:#} — aborting startup. Set ARES_LLM_MODEL to a widely-available model (e.g. openai/gpt-4o-mini) or ensure the org tied to the API key has access to this model."
+        );
+        return Err(e.context(format!("LLM preflight failed for model '{model_name}'")));
+    }
+    info!(model = %model_name, "LLM preflight ok");
+
     // Credential auth throttle — prevents AD account lockout by rate-limiting
     // auth-bearing tool calls per credential. Max 3 attempts per 30s window.
     // AD lockout: 3 bad attempts / 30 min. With multiple concurrent agents,
@@ -889,6 +904,40 @@ async fn run_inner() -> Result<()> {
 
     info!("ares-orchestrator stopped");
     Ok(())
+}
+
+/// Issue a minimal LLM chat request to verify the API key + model + org
+/// permissions are good before queueing any tasks. We send a 1-token "ping"
+/// so the call is cheap; the response content is discarded. A non-retryable
+/// error (auth, org-restricted model, bad model name) aborts startup; a
+/// retryable error (network, 5xx, rate limit) is treated as a transient
+/// upstream blip and only warns.
+async fn preflight_llm_provider(
+    provider: &dyn ares_llm::LlmProvider,
+    model_name: &str,
+) -> Result<()> {
+    use ares_llm::{ChatMessage, LlmError, LlmRequest, Role};
+
+    // If the operator explicitly opts out (air-gapped tests, recorded
+    // fixtures), skip the network call.
+    if std::env::var("ARES_LLM_PREFLIGHT_SKIP").as_deref() == Ok("1") {
+        info!("ARES_LLM_PREFLIGHT_SKIP=1; skipping LLM preflight ping");
+        return Ok(());
+    }
+
+    let mut req = LlmRequest::new(model_name);
+    req.max_tokens = 1;
+    req.messages.push(ChatMessage::text(Role::User, "ping"));
+
+    match provider.chat(&req).await {
+        Ok(_) => Ok(()),
+        Err(LlmError::AuthError(msg)) => Err(anyhow::anyhow!("authentication failed: {msg}")),
+        Err(e) if !e.is_retryable() => Err(anyhow::anyhow!("LLM provider rejected preflight: {e}")),
+        Err(e) => {
+            warn!(err = %e, "LLM preflight returned a retryable error; continuing startup");
+            Ok(())
+        }
+    }
 }
 
 /// Run in blue-only mode: just the investigation poller, no red team.
