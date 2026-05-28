@@ -350,7 +350,10 @@
       failed_when: coercion_tools_coerce_help_runs.rc != 0
       loop:
         - /usr/local/bin/petitpotam
-        - /usr/local/bin/coercer
+        # Coercer lives at /usr/local/bin on pip installs (Ubuntu) but at
+        # /usr/bin when installed from apt (Kali), so use the path that
+        # `which coercer` actually resolved above instead of hard-coding it.
+        - "{{ coercion_tools_coercer_check.stdout | default('coercer', true) }}"
         - /usr/local/bin/dfscoerce
         - /usr/local/bin/printerbug
       when:
