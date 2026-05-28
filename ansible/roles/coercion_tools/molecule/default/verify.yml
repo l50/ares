@@ -316,6 +316,49 @@
         - /usr/local/bin/impacket-ntlmrelayx
       when: coercion_tools_install_ntlmrelayx | default(true)
 
+    # Regression guard for petitpotam / coercer / dfscoerce / printerbug:
+    # petitpotam.py upstream uses `#!/usr/bin/python3` (system interpreter)
+    # and imports impacket.version. On Debian trixie the only system-wide
+    # impacket is the 0.10.0 transitive dep that pip pulls in for the
+    # coercer package, and impacket/version.py crashes on `import
+    # pkg_resources` because setuptools isn't installed for the system
+    # Python. Asserting --help exits 0 catches that regression class for
+    # every coercion-side coerce entrypoint, not just the impacket ones.
+    - name: Read first line of /usr/local/bin/petitpotam to confirm bash wrapper
+      ansible.builtin.command: head -n 1 /usr/local/bin/petitpotam
+      register: coercion_tools_petitpotam_shebang
+      changed_when: false
+      when: coercion_tools_install_petitpotam | default(true)
+
+    - name: Assert /usr/local/bin/petitpotam is a bash wrapper (not a symlink to the raw .py)
+      ansible.builtin.assert:
+        that:
+          - "'#!/bin/bash' in coercion_tools_petitpotam_shebang.stdout"
+        fail_msg: >-
+          /usr/local/bin/petitpotam has shebang
+          '{{ coercion_tools_petitpotam_shebang.stdout }}' — expected
+          '#!/bin/bash'. A symlink to the upstream petitpotam.py runs under
+          the system Python, which on Debian trixie crashes with
+          ModuleNotFoundError: pkg_resources at import time.
+        success_msg: "/usr/local/bin/petitpotam is a venv-aware bash wrapper"
+      when: coercion_tools_install_petitpotam | default(true)
+
+    - name: Run --help on coercion entrypoints to catch import-time crashes
+      ansible.builtin.command: "{{ item }} --help"
+      register: coercion_tools_coerce_help_runs
+      changed_when: false
+      failed_when: coercion_tools_coerce_help_runs.rc != 0
+      loop:
+        - /usr/local/bin/petitpotam
+        - /usr/local/bin/coercer
+        - /usr/local/bin/dfscoerce
+        - /usr/local/bin/printerbug
+      when:
+        - coercion_tools_install_petitpotam | default(true)
+        - coercion_tools_install_coercer | default(true)
+        - coercion_tools_install_dfscoerce | default(true)
+        - coercion_tools_install_krbrelayx | default(true)
+
     - name: Verify dfscoerce is installed
       ansible.builtin.stat:
         path: "{{ coercion_tools_dfscoerce_install_dir }}/dfscoerce.py"
