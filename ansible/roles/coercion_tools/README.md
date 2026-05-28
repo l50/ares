@@ -126,7 +126,8 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Clone PetitPotam from GitHub (ly4k's improved version)** (ansible.builtin.git) - Conditional
 - **Make petitpotam.py executable** (ansible.builtin.file) - Conditional
-- **Create symlink for PetitPotam** (ansible.builtin.file) - Conditional
+- **Remove any pre-existing PetitPotam wrapper or symlink** (ansible.builtin.file) - Conditional
+- **Install venv-aware bash wrapper for PetitPotam** (ansible.builtin.copy) - Conditional
 - **Clone krbrelayx from GitHub** (ansible.builtin.git) - Conditional
 - **Configure git to ignore filemode changes in krbrelayx repo** (ansible.builtin.command) - Conditional
 - **Create virtual environment for krbrelayx** (ansible.builtin.command) - Conditional
