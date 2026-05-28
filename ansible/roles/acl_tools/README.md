@@ -32,7 +32,6 @@ Install and configure Active Directory ACL exploitation tools for Ares agents
 | `acl_tools_ubuntu_packages.7` | str | <code>samba-common-bin</code> | No description |
 | `acl_tools_install_bloodyad` | bool | <code>True</code> | No description |
 | `acl_tools_bloodyad_package` | str | <code>bloodyAD</code> | No description |
-| `acl_tools_bloodyad_apt_package` | str | <code>bloodyad</code> | No description |
 | `acl_tools_install_pywhisker` | bool | <code>True</code> | No description |
 | `acl_tools_pywhisker_package` | str | <code>pywhisker</code> | No description |
 | `acl_tools_install_dacledit` | bool | <code>True</code> | No description |
@@ -89,7 +88,6 @@ Install and configure Active Directory ACL exploitation tools for Ares agents
 - **Check if samba-common-bin package is available** (ansible.builtin.command) - Conditional
 - **Install samba-common-bin when rpcclient is still missing** (ansible.builtin.apt) - Conditional
 - **Install Impacket from source for dacledit** (ansible.builtin.include_tasks) - Conditional
-- **Install bloodyAD via apt (Kali)** (ansible.builtin.apt) - Conditional
 - **Check if bloodyAD is already installed** (ansible.builtin.command) - Conditional
 - **Install bloodyAD via pip** (ansible.builtin.pip) - Conditional
 - **Check if pywhisker is already installed** (ansible.builtin.command) - Conditional
