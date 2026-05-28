@@ -271,6 +271,97 @@
         success_msg: "ntlmrelayx wrapper is available at /usr/local/bin/ntlmrelayx"
       when: coercion_tools_install_ntlmrelayx | default(true)
 
+    # Regression guard: if these scripts ever revert to raw Python copies with a
+    # `#!/usr/bin/python3` shebang, they will crash with `ModuleNotFoundError:
+    # No module named 'pkg_resources'` on Debian trixie (Python 3.13). The
+    # wrappers must be bash dispatchers that invoke the impacket venv Python.
+    - name: Read first line of /usr/local/bin/ntlmrelayx.py to confirm bash wrapper
+      ansible.builtin.command: head -n 1 /usr/local/bin/ntlmrelayx.py
+      register: coercion_tools_ntlmrelayx_py_shebang
+      changed_when: false
+      when: coercion_tools_install_ntlmrelayx | default(true)
+
+    - name: Assert /usr/local/bin/ntlmrelayx.py is a bash wrapper (not a raw Python copy)
+      ansible.builtin.assert:
+        that:
+          - "'#!/bin/bash' in coercion_tools_ntlmrelayx_py_shebang.stdout"
+        fail_msg: >-
+          /usr/local/bin/ntlmrelayx.py has shebang
+          '{{ coercion_tools_ntlmrelayx_py_shebang.stdout }}' — expected
+          '#!/bin/bash'. A raw Python copy here will crash on Python 3.13 with
+          ModuleNotFoundError: pkg_resources and break the entire coerce -> relay
+          chain.
+        success_msg: "/usr/local/bin/ntlmrelayx.py is a venv-aware bash wrapper"
+      when: coercion_tools_install_ntlmrelayx | default(true)
+
+    # Functional smoke test: actually invoke the impacket entrypoints. This is
+    # the assertion that catches the pkg_resources regression — a raw copy
+    # would exit non-zero immediately on Python 3.13.
+    - name: Run --help on representative impacket entrypoints to catch import-time crashes
+      ansible.builtin.command: "{{ item }} --help"
+      register: coercion_tools_impacket_help_runs
+      changed_when: false
+      failed_when: coercion_tools_impacket_help_runs.rc != 0
+      loop:
+        - /usr/local/bin/ntlmrelayx.py
+        - /usr/local/bin/secretsdump.py
+        - /usr/local/bin/psexec.py
+        - /usr/local/bin/smbexec.py
+        - /usr/local/bin/wmiexec.py
+        - /usr/local/bin/mssqlclient.py
+        - /usr/local/bin/GetUserSPNs.py
+        - /usr/local/bin/GetNPUsers.py
+        - /usr/local/bin/rbcd.py
+        - /usr/local/bin/addcomputer.py
+        - /usr/local/bin/impacket-ntlmrelayx
+      when: coercion_tools_install_ntlmrelayx | default(true)
+
+    # Regression guard for petitpotam / coercer / dfscoerce / printerbug:
+    # petitpotam.py upstream uses `#!/usr/bin/python3` (system interpreter)
+    # and imports impacket.version. On Debian trixie the only system-wide
+    # impacket is the 0.10.0 transitive dep that pip pulls in for the
+    # coercer package, and impacket/version.py crashes on `import
+    # pkg_resources` because setuptools isn't installed for the system
+    # Python. Asserting --help exits 0 catches that regression class for
+    # every coercion-side coerce entrypoint, not just the impacket ones.
+    - name: Read first line of /usr/local/bin/petitpotam to confirm bash wrapper
+      ansible.builtin.command: head -n 1 /usr/local/bin/petitpotam
+      register: coercion_tools_petitpotam_shebang
+      changed_when: false
+      when: coercion_tools_install_petitpotam | default(true)
+
+    - name: Assert /usr/local/bin/petitpotam is a bash wrapper (not a symlink to the raw .py)
+      ansible.builtin.assert:
+        that:
+          - "'#!/bin/bash' in coercion_tools_petitpotam_shebang.stdout"
+        fail_msg: >-
+          /usr/local/bin/petitpotam has shebang
+          '{{ coercion_tools_petitpotam_shebang.stdout }}' — expected
+          '#!/bin/bash'. A symlink to the upstream petitpotam.py runs under
+          the system Python, which on Debian trixie crashes with
+          ModuleNotFoundError: pkg_resources at import time.
+        success_msg: "/usr/local/bin/petitpotam is a venv-aware bash wrapper"
+      when: coercion_tools_install_petitpotam | default(true)
+
+    - name: Run --help on coercion entrypoints to catch import-time crashes
+      ansible.builtin.command: "{{ item }} --help"
+      register: coercion_tools_coerce_help_runs
+      changed_when: false
+      failed_when: coercion_tools_coerce_help_runs.rc != 0
+      loop:
+        - /usr/local/bin/petitpotam
+        # Coercer lives at /usr/local/bin on pip installs (Ubuntu) but at
+        # /usr/bin when installed from apt (Kali), so use the path that
+        # `which coercer` actually resolved above instead of hard-coding it.
+        - "{{ coercion_tools_coercer_check.stdout | default('coercer', true) }}"
+        - /usr/local/bin/dfscoerce
+        - /usr/local/bin/printerbug
+      when:
+        - coercion_tools_install_petitpotam | default(true)
+        - coercion_tools_install_coercer | default(true)
+        - coercion_tools_install_dfscoerce | default(true)
+        - coercion_tools_install_krbrelayx | default(true)
+
     - name: Verify dfscoerce is installed
       ansible.builtin.stat:
         path: "{{ coercion_tools_dfscoerce_install_dir }}/dfscoerce.py"

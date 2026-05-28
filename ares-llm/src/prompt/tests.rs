@@ -122,6 +122,72 @@ fn generate_coercion_prompt() {
 }
 
 #[test]
+fn generate_coercion_prompt_ntlm_relay_ldap_instructs_to_start_listener() {
+    // Regression: every auto_ntlm_relay dispatch silently became a no-op
+    // because the coercion prompt never rendered `technique` / `relay_target`,
+    // so the LLM ran PetitPotam alone and never spawned ntlmrelayx.
+    // Prompt MUST now name the listener tool AND the relay destination.
+    let payload = serde_json::json!({
+        "technique": "ntlm_relay_ldap",
+        "relay_target": "192.168.58.20",
+        "listener_ip": "192.168.58.100",
+        "coercion_source": "192.168.58.10",
+    });
+    let prompt = generate_task_prompt("coercion", "task-relay", &payload, None).unwrap();
+    assert!(
+        prompt.contains("ntlmrelayx_to_ldaps"),
+        "must name the LDAPS relay tool"
+    );
+    assert!(
+        prompt.contains("192.168.58.20"),
+        "must include the relay destination"
+    );
+    assert!(
+        prompt.contains("192.168.58.10"),
+        "must include the coercion source (the machine to coerce)"
+    );
+    assert!(
+        prompt.contains("BEFORE coercing"),
+        "must instruct listener-first ordering"
+    );
+}
+
+#[test]
+fn generate_coercion_prompt_ntlm_relay_mssql_instructs_mssql_relay() {
+    // The MSSQL relay path: mssql_access + smb_signing_disabled on the
+    // same host. Prompt must instruct the LLM to point ntlmrelayx at
+    // mssql://target and use xp_cmdshell post-relay.
+    let payload = serde_json::json!({
+        "technique": "ntlm_relay_mssql",
+        "relay_target": "192.168.58.22",
+        "mssql_target": "192.168.58.22",
+        "listener_ip": "192.168.58.100",
+        "coercion_source": "192.168.58.10",
+    });
+    let prompt = generate_task_prompt("coercion", "task-mssql", &payload, None).unwrap();
+    assert!(prompt.contains("mssql://192.168.58.22"));
+    assert!(prompt.contains("xp_cmdshell"));
+}
+
+#[test]
+fn generate_coercion_prompt_ntlm_relay_adcs_uses_combined_tool() {
+    // ADCS ESC8 should route through the combined `relay_and_coerce`
+    // primitive — it already wires both sides correctly and the
+    // certificate is decoded by the worker.
+    let payload = serde_json::json!({
+        "technique": "ntlm_relay_adcs",
+        "relay_target": "192.168.58.30",
+        "ca_name": "contoso-CA",
+        "domain": "contoso.local",
+        "listener_ip": "192.168.58.100",
+        "coercion_source": "192.168.58.10",
+    });
+    let prompt = generate_task_prompt("coercion", "task-esc8", &payload, None).unwrap();
+    assert!(prompt.contains("relay_and_coerce"));
+    assert!(prompt.contains("192.168.58.30"));
+}
+
+#[test]
 fn generate_privesc_prompt() {
     let payload = serde_json::json!({
         "technique": "find_delegation",

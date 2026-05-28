@@ -88,13 +88,17 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Check if we need to install or reinstall impacket** (ansible.builtin.set_fact)
 - **Create impacket virtual environment** (ansible.builtin.command) - Conditional
 - **Install impacket from source** (ansible.builtin.pip) - Conditional
+- **Upgrade pycryptodome in impacket venv (CVE fix - GHSA-j225-cvw7-qrx7)** (ansible.builtin.pip) - Conditional
 - **Check if impacket is correctly installed in venv** (ansible.builtin.command)
 - **Make impacket example scripts executable** (ansible.builtin.shell)
 - **Check if \_\_init\_\_.py exists in impacket/examples** (ansible.builtin.stat)
 - **Create \_\_init\_\_.py in impacket/examples to make it a proper Python package** (ansible.builtin.copy) - Conditional
 - **Check system impacket version (Kali)** (ansible.builtin.command) - Conditional
 - **Install source impacket into system Python (Kali apt netexec needs it system-wide)** (ansible.builtin.pip) - Conditional
-- **Create symlinks for impacket scripts (impacket-* style for Kali compatibility)** (ansible.builtin.shell)
+- **Enumerate impacket example scripts** (ansible.builtin.find)
+- **Fail loudly if impacket examples were not found** (ansible.builtin.assert)
+- **Install venv-aware bash wrappers for impacket example scripts (no .py suffix)** (ansible.builtin.copy)
+- **Install venv-aware bash wrappers for impacket example scripts (.py suffix)** (ansible.builtin.copy)
 - **Verify impacket regsecrets module is available** (ansible.builtin.command)
 - **Report impacket installation status** (ansible.builtin.debug)
 
@@ -107,6 +111,9 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Remove conflicting python3-responder package on Kali** (ansible.builtin.apt) - Conditional
 - **Install Kali-specific poisoning tools (includes responder from apt)** (ansible.builtin.apt) - Conditional
 - **Install Ubuntu-compatible dependencies** (ansible.builtin.apt) - Conditional
+- **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
+- **Check if Coercer is already installed** (ansible.builtin.command) - Conditional
+- **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Install Impacket from source for ntlmrelayx** (ansible.builtin.include_tasks) - Conditional
 - **Check for ntlmrelayx.py wrapper** (ansible.builtin.stat) - Conditional
 - **Create ntlmrelayx wrapper script** (ansible.builtin.copy) - Conditional
@@ -117,12 +124,11 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Create symlink for Responder** (ansible.builtin.file) - Conditional
 - **Install mitm6 via pipx** (ansible.builtin.include_tasks) - Conditional
 - **Install mitm6 via apt (Kali)** (ansible.builtin.apt) - Conditional
-- **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
-- **Check if Coercer is already installed** (ansible.builtin.command) - Conditional
-- **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Clone PetitPotam from GitHub (ly4k's improved version)** (ansible.builtin.git) - Conditional
 - **Make petitpotam.py executable** (ansible.builtin.file) - Conditional
-- **Create symlink for PetitPotam** (ansible.builtin.file) - Conditional
+- **Stat existing PetitPotam launcher** (ansible.builtin.stat) - Conditional
+- **Remove legacy PetitPotam symlink so the wrapper can replace it** (ansible.builtin.file) - Conditional
+- **Install venv-aware bash wrapper for PetitPotam** (ansible.builtin.copy) - Conditional
 - **Clone krbrelayx from GitHub** (ansible.builtin.git) - Conditional
 - **Configure git to ignore filemode changes in krbrelayx repo** (ansible.builtin.command) - Conditional
 - **Create virtual environment for krbrelayx** (ansible.builtin.command) - Conditional
