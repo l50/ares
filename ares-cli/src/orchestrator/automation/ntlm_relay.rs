@@ -1308,8 +1308,10 @@ mod tests {
         let shared = SharedState::new("test".into());
         {
             let mut s = shared.write().await;
-            s.discovered_vulnerabilities
-                .insert("v_mssql".into(), make_mssql_vuln("v_mssql", "192.168.58.22"));
+            s.discovered_vulnerabilities.insert(
+                "v_mssql".into(),
+                make_mssql_vuln("v_mssql", "192.168.58.22"),
+            );
             s.discovered_vulnerabilities
                 .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
             s.domain_controllers
@@ -1334,8 +1336,10 @@ mod tests {
         let shared = SharedState::new("test".into());
         {
             let mut s = shared.write().await;
-            s.discovered_vulnerabilities
-                .insert("v_mssql".into(), make_mssql_vuln("v_mssql", "192.168.58.22"));
+            s.discovered_vulnerabilities.insert(
+                "v_mssql".into(),
+                make_mssql_vuln("v_mssql", "192.168.58.22"),
+            );
             s.discovered_vulnerabilities
                 .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
             s.mark_processed(DEDUP_SET, "mssql_relay:192.168.58.22".into());
@@ -1357,8 +1361,10 @@ mod tests {
         let shared = SharedState::new("test".into());
         {
             let mut s = shared.write().await;
-            s.discovered_vulnerabilities
-                .insert("v_mssql".into(), make_mssql_vuln("v_mssql", "192.168.58.22"));
+            s.discovered_vulnerabilities.insert(
+                "v_mssql".into(),
+                make_mssql_vuln("v_mssql", "192.168.58.22"),
+            );
             s.discovered_vulnerabilities
                 .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
             s.exploited_vulnerabilities.insert("v_smb".into());
