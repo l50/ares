@@ -79,6 +79,18 @@ pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
                 "technique": "dns_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
+                "instructions": format!(
+                    "DNS enumeration for `{}` against DC `{}`. Make AT MOST \
+                     TWO tool calls — typically (1) a DNS zone-transfer / AXFR \
+                     attempt and (2) an SRV record query for `_ldap._tcp.{}`. \
+                     Cap each at ~60s. As soon as either returns (success or \
+                     refused), call `task_complete`. Do NOT retry zone \
+                     transfers, do NOT brute-force subdomains, do NOT \
+                     perform general recon — this domain is already deduped \
+                     so re-dispatching is impossible and looping here only \
+                     burns the operation budget.",
+                    item.domain, item.dc_ip, item.domain
+                ),
             });
 
             if let Some(ref cred) = item.credential {
