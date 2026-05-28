@@ -82,16 +82,12 @@
     - acl_tools_install_dacledit
     - acl_tools_impacket_from_source
 
-- name: Install bloodyAD via apt (Kali)
-  ansible.builtin.apt:
-    name: "{{ acl_tools_bloodyad_apt_package }}"
-    state: present
-  become: true
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - ansible_facts['distribution'] == 'Kali'
-    - acl_tools_install_bloodyad
-
+# bloodyAD is installed from pip on every Debian-family host, including Kali.
+# Kali's apt `bloodyad` package ships a self-contained venv whose bundled
+# cryptography fails to import on current Kali (Python 3.13), and it only
+# exposes a lowercase `bloodyad` launcher while ares-tools invokes `bloodyAD`.
+# The pip install gives a working /usr/local/bin/bloodyAD on Kali and Ubuntu
+# alike (same approach pywhisker already uses below).
 - name: Check if bloodyAD is already installed
   ansible.builtin.command: pip3 show bloodyAD
   register: acl_tools_bloodyad_check
@@ -99,7 +95,6 @@
   failed_when: false
   when:
     - ansible_facts['os_family'] == 'Debian'
-    - ansible_facts['distribution'] != 'Kali'
     - acl_tools_install_bloodyad
 
 - name: Install bloodyAD via pip
@@ -112,7 +107,6 @@
   become: true
   when:
     - ansible_facts['os_family'] == 'Debian'
-    - ansible_facts['distribution'] != 'Kali'
     - acl_tools_install_bloodyad
     - acl_tools_bloodyad_check.rc != 0
 

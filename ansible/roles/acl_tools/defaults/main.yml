@@ -13,7 +13,6 @@ acl_tools_ubuntu_packages:
 # bloodyAD configuration (ACL exploitation framework)
 acl_tools_install_bloodyad: true
 acl_tools_bloodyad_package: "bloodyAD"
-acl_tools_bloodyad_apt_package: "bloodyad"
 
 # Pywhisker configuration (shadow credentials manipulation)
 acl_tools_install_pywhisker: true
