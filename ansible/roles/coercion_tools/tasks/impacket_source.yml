@@ -85,6 +85,14 @@
   register: coercion_tools_impacket_install
   when: coercion_tools_needs_impacket_install | bool
 
+- name: Upgrade pycryptodome in impacket venv (CVE fix - GHSA-j225-cvw7-qrx7)
+  ansible.builtin.pip:
+    name: "pycryptodome>=3.19.1"
+    virtualenv: "{{ coercion_tools_impacket_venv }}"
+    state: latest
+  become: true
+  when: coercion_tools_needs_impacket_install | bool
+
 - name: Check if impacket is correctly installed in venv
   ansible.builtin.command: "{{ coercion_tools_impacket_venv }}/bin/python -c \"import impacket; print(impacket.__file__)\""
   register: coercion_tools_impacket_import_check
@@ -133,25 +141,50 @@
     - (coercion_tools_system_impacket_version.stdout | default('0.0.0', true)) is version('0.13.0', '<')
       or coercion_tools_impacket_clone.changed | default(false)
 
-- name: Create symlinks for impacket scripts (impacket-* style for Kali compatibility)
-  ansible.builtin.shell: |
-    for script in {{ coercion_tools_impacket_install_dir }}/examples/*.py; do
-      script_name=$(basename "$script" .py)
-      # Create wrapper scripts that use the impacket venv Python
-      printf '%s\n' '#!/bin/bash' \
-        "exec {{ coercion_tools_impacket_venv }}/bin/python \"$script\" \"\$@\"" \
-        > "/usr/local/bin/impacket-$script_name"
-      chmod +x "/usr/local/bin/impacket-$script_name"
+- name: Enumerate impacket example scripts
+  ansible.builtin.find:
+    paths: "{{ coercion_tools_impacket_install_dir }}/examples"
+    patterns: "*.py"
+    file_type: file
+  register: coercion_tools_impacket_examples
 
-      printf '%s\n' '#!/bin/bash' \
-        "exec {{ coercion_tools_impacket_venv }}/bin/python \"$script\" \"\$@\"" \
-        > "/usr/local/bin/${script_name}.py"
-      chmod +x "/usr/local/bin/${script_name}.py"
-    done
-  args:
-    executable: /bin/bash
+- name: Fail loudly if impacket examples were not found
+  ansible.builtin.assert:
+    that:
+      - coercion_tools_impacket_examples.files | length > 0
+    fail_msg: >-
+      No impacket example scripts found under
+      {{ coercion_tools_impacket_install_dir }}/examples — clone likely
+      failed or the upstream layout changed. Refusing to continue so the
+      coercion image cannot ship with broken or missing ntlmrelayx wrappers.
+
+# Always (re)write the bash wrappers. Both /usr/local/bin/<tool>.py and
+# /usr/local/bin/impacket-<tool> must dispatch through the impacket venv
+# so the tools never inherit the system Python (which on Debian trixie /
+# Python 3.13 lacks pkg_resources and crashes immediately).
+- name: Install venv-aware bash wrappers for impacket example scripts (no .py suffix)
+  ansible.builtin.copy:
+    dest: "/usr/local/bin/impacket-{{ (item.path | basename | splitext)[0] }}"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      exec "{{ coercion_tools_impacket_venv }}/bin/python" "{{ item.path }}" "$@"
   become: true
-  changed_when: false
+  loop: "{{ coercion_tools_impacket_examples.files }}"
+  loop_control:
+    label: "impacket-{{ (item.path | basename | splitext)[0] }}"
+
+- name: Install venv-aware bash wrappers for impacket example scripts (.py suffix)
+  ansible.builtin.copy:
+    dest: "/usr/local/bin/{{ item.path | basename }}"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      exec "{{ coercion_tools_impacket_venv }}/bin/python" "{{ item.path }}" "$@"
+  become: true
+  loop: "{{ coercion_tools_impacket_examples.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
 
 - name: Verify impacket regsecrets module is available
   ansible.builtin.command: "{{ coercion_tools_impacket_venv }}/bin/python -c \"from impacket.examples import regsecrets; print('regsecrets module OK')\""

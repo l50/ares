@@ -88,13 +88,17 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Check if we need to install or reinstall impacket** (ansible.builtin.set_fact)
 - **Create impacket virtual environment** (ansible.builtin.command) - Conditional
 - **Install impacket from source** (ansible.builtin.pip) - Conditional
+- **Upgrade pycryptodome in impacket venv (CVE fix - GHSA-j225-cvw7-qrx7)** (ansible.builtin.pip) - Conditional
 - **Check if impacket is correctly installed in venv** (ansible.builtin.command)
 - **Make impacket example scripts executable** (ansible.builtin.shell)
 - **Check if \_\_init\_\_.py exists in impacket/examples** (ansible.builtin.stat)
 - **Create \_\_init\_\_.py in impacket/examples to make it a proper Python package** (ansible.builtin.copy) - Conditional
 - **Check system impacket version (Kali)** (ansible.builtin.command) - Conditional
 - **Install source impacket into system Python (Kali apt netexec needs it system-wide)** (ansible.builtin.pip) - Conditional
-- **Create symlinks for impacket scripts (impacket-* style for Kali compatibility)** (ansible.builtin.shell)
+- **Enumerate impacket example scripts** (ansible.builtin.find)
+- **Fail loudly if impacket examples were not found** (ansible.builtin.assert)
+- **Install venv-aware bash wrappers for impacket example scripts (no .py suffix)** (ansible.builtin.copy)
+- **Install venv-aware bash wrappers for impacket example scripts (.py suffix)** (ansible.builtin.copy)
 - **Verify impacket regsecrets module is available** (ansible.builtin.command)
 - **Report impacket installation status** (ansible.builtin.debug)
 
