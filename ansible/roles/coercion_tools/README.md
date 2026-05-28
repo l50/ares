@@ -111,6 +111,9 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Remove conflicting python3-responder package on Kali** (ansible.builtin.apt) - Conditional
 - **Install Kali-specific poisoning tools (includes responder from apt)** (ansible.builtin.apt) - Conditional
 - **Install Ubuntu-compatible dependencies** (ansible.builtin.apt) - Conditional
+- **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
+- **Check if Coercer is already installed** (ansible.builtin.command) - Conditional
+- **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Install Impacket from source for ntlmrelayx** (ansible.builtin.include_tasks) - Conditional
 - **Check for ntlmrelayx.py wrapper** (ansible.builtin.stat) - Conditional
 - **Create ntlmrelayx wrapper script** (ansible.builtin.copy) - Conditional
@@ -121,12 +124,10 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Create symlink for Responder** (ansible.builtin.file) - Conditional
 - **Install mitm6 via pipx** (ansible.builtin.include_tasks) - Conditional
 - **Install mitm6 via apt (Kali)** (ansible.builtin.apt) - Conditional
-- **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
-- **Check if Coercer is already installed** (ansible.builtin.command) - Conditional
-- **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Clone PetitPotam from GitHub (ly4k's improved version)** (ansible.builtin.git) - Conditional
 - **Make petitpotam.py executable** (ansible.builtin.file) - Conditional
-- **Remove any pre-existing PetitPotam wrapper or symlink** (ansible.builtin.file) - Conditional
+- **Stat existing PetitPotam launcher** (ansible.builtin.stat) - Conditional
+- **Remove legacy PetitPotam symlink so the wrapper can replace it** (ansible.builtin.file) - Conditional
 - **Install venv-aware bash wrapper for PetitPotam** (ansible.builtin.copy) - Conditional
 - **Clone krbrelayx from GitHub** (ansible.builtin.git) - Conditional
 - **Configure git to ignore filemode changes in krbrelayx repo** (ansible.builtin.command) - Conditional
