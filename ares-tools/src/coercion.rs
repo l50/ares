@@ -609,6 +609,12 @@ impl CoerceProcs for RealCoerceProcs {
             cmd.arg(a);
         }
         cmd.current_dir(cwd).stdin(Stdio::null());
+        // Match `CommandBuilder` semantics: on tokio's `timeout` firing the
+        // inner `output()` future is dropped, which drops the `Child` — without
+        // `kill_on_drop` that's a no-op and we leak the child. Matters most for
+        // long-running coercion bins (PetitPotam, Coercer) and the relay tool
+        // wrappers that route here.
+        cmd.kill_on_drop(true);
         let timeout = Duration::from_secs(timeout_secs);
         match tokio::time::timeout(timeout, cmd.output()).await {
             Ok(Ok(out)) => append_output(coerce_log, header, &out).await,
