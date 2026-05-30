@@ -513,6 +513,9 @@ async fn run_inner() -> Result<()> {
             .with_dispatcher(dispatcher.clone()),
     );
     llm_runner.set_callback_handler(callback_handler);
+    // Per-task activity heartbeats: each LLM response touches the running task
+    // so stale-eviction keys on inactivity, not total runtime.
+    llm_runner.set_active_task_tracker(tracker.clone());
     info!("Orchestrator callback handler wired (query + dispatch tools)");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

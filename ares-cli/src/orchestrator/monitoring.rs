@@ -316,8 +316,9 @@ async fn cleanup_stale_tasks(
             }
         }
 
-        let age_secs = task.submitted_at.elapsed().as_secs();
-        let reason = format!("stale task evicted after {age_secs}s without a result");
+        let inactive_secs = task.last_activity.elapsed().as_secs();
+        let reason =
+            format!("stale task evicted after {inactive_secs}s without progress (no LLM activity)");
 
         if let Err(e) = queue.set_task_status(&task.task_id, "failed").await {
             warn!(

@@ -12,10 +12,12 @@ use ares_llm::prompt::templates;
 use ares_llm::prompt::StateSnapshot;
 use ares_llm::tool_registry::{self, AgentRole};
 use ares_llm::{
-    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, HostnameMap, LlmProvider,
-    LoopEndReason, RunAgentLoopParams, ToolDispatcher,
+    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, CallbackResult,
+    HostnameMap, LlmProvider, LoopEndReason, RunAgentLoopParams, TokenUsage, ToolCall,
+    ToolDispatcher, ToolExecResult,
 };
 
+use crate::orchestrator::routing::ActiveTaskTracker;
 use crate::orchestrator::state::SharedState;
 
 /// Drives LLM-powered tasks through the Rust agent loop.
@@ -37,6 +39,10 @@ pub struct LlmTaskRunner {
     /// Deferred callback handler — set after construction to break the
     /// `LlmTaskRunner → Dispatcher → LlmTaskRunner` circular dependency.
     callback_handler: OnceLock<Arc<dyn CallbackHandler>>,
+    /// Deferred handle to the active-task tracker. When set, each LLM response
+    /// touches the running task so the staleness sweep keys eviction on
+    /// inactivity rather than total runtime. Optional (unset in tests).
+    active_task_tracker: OnceLock<ActiveTaskTracker>,
 }
 
 impl LlmTaskRunner {
@@ -61,6 +67,7 @@ impl LlmTaskRunner {
             technique_priorities,
             listener_ip,
             callback_handler: OnceLock::new(),
+            active_task_tracker: OnceLock::new(),
         }
     }
 
@@ -71,6 +78,13 @@ impl LlmTaskRunner {
     /// `Dispatcher`, which itself holds an `Arc<LlmTaskRunner>`.
     pub fn set_callback_handler(&self, handler: Arc<dyn CallbackHandler>) {
         let _ = self.callback_handler.set(handler);
+    }
+
+    /// Set the active-task tracker after construction (interior mutability via
+    /// `OnceLock`). Enables per-task activity heartbeats: each LLM response
+    /// touches the task so a slow-but-progressing agent loop isn't stale-evicted.
+    pub fn set_active_task_tracker(&self, tracker: ActiveTaskTracker) {
+        let _ = self.active_task_tracker.set(tracker);
     }
 
     /// Get a reference to the tool dispatcher for direct tool calls.
@@ -145,17 +159,49 @@ impl LlmTaskRunner {
             }
         };
 
-        // 6. Run the agent loop
+        // 6. Run the agent loop.
+        //
+        // Wrap the shared callback handler AND the tool dispatcher so every
+        // forward-progress signal bumps this task's activity timestamp on the
+        // tracker. Two sources of progress:
+        //   * Each LLM response   → wrapped CallbackHandler::on_token_usage
+        //   * Each tool dispatch  → wrapped ToolDispatcher::dispatch_tool
+        // Together they cover the whole agent step (LLM thinking + tool work).
+        // Without the dispatcher wrapper, a multi-minute tool call (slow LDAP
+        // query, big nmap sweep) would emit no on_token_usage signal and the
+        // staleness sweep would evict a perfectly healthy task at 300s.
+        // A loop wedged inside a *single* tool call that itself runs past the
+        // timeout will still be reaped — exactly the intended signal.
+        let (callback_handler, dispatcher): (Option<Arc<dyn CallbackHandler>>, Arc<dyn ToolDispatcher>) =
+            match self.active_task_tracker.get() {
+                Some(tracker) => (
+                    Some(Arc::new(TaskActivityCallbackHandler {
+                        inner: self.callback_handler.get().cloned(),
+                        tracker: tracker.clone(),
+                        task_id: task_id.to_string(),
+                    })),
+                    Arc::new(TaskActivityToolDispatcher {
+                        inner: Arc::clone(&self.dispatcher),
+                        tracker: tracker.clone(),
+                        task_id: task_id.to_string(),
+                    }),
+                ),
+                None => (
+                    self.callback_handler.get().cloned(),
+                    Arc::clone(&self.dispatcher),
+                ),
+            };
+
         let outcome = run_agent_loop(RunAgentLoopParams {
             provider: self.provider.as_ref(),
-            dispatcher: Arc::clone(&self.dispatcher),
+            dispatcher,
             config: &self.config,
             system_prompt: &system_prompt,
             task_prompt: &task_prompt,
             role: role_str,
             task_id,
             tools: &tools,
-            callback_handler: self.callback_handler.get().cloned(),
+            callback_handler,
             hostname_map,
         })
         .await;
@@ -163,6 +209,74 @@ impl LlmTaskRunner {
         log_outcome(task_id, &outcome);
 
         Ok(outcome)
+    }
+}
+
+/// Per-task wrapper around the shared [`CallbackHandler`] that records forward
+/// progress on the [`ActiveTaskTracker`].
+///
+/// `on_token_usage` fires after each LLM response, so touching the task there
+/// gives the staleness sweep an activity signal: a healthy-but-slow loop keeps
+/// resetting its clock and survives, while a loop wedged inside a single tool
+/// call emits no token usage, never touches, and is correctly reaped. All other
+/// callback behavior is delegated unchanged to the wrapped handler.
+struct TaskActivityCallbackHandler {
+    inner: Option<Arc<dyn CallbackHandler>>,
+    tracker: ActiveTaskTracker,
+    task_id: String,
+}
+
+#[async_trait::async_trait]
+impl CallbackHandler for TaskActivityCallbackHandler {
+    async fn handle_callback(&self, call: &ToolCall) -> Option<Result<CallbackResult>> {
+        match &self.inner {
+            Some(h) => h.handle_callback(call).await,
+            None => None,
+        }
+    }
+
+    fn is_callback(&self, tool_name: &str) -> bool {
+        self.inner
+            .as_ref()
+            .map(|h| h.is_callback(tool_name))
+            .unwrap_or(false)
+    }
+
+    async fn on_token_usage(&self, usage: &TokenUsage, model: &str) {
+        self.tracker.touch(&self.task_id).await;
+        if let Some(h) = &self.inner {
+            h.on_token_usage(usage, model).await;
+        }
+    }
+}
+
+/// Per-task wrapper around the shared [`ToolDispatcher`] that bookends every
+/// tool dispatch with an activity touch on the [`ActiveTaskTracker`].
+///
+/// Touches *before* the inner dispatch so that picking a tool counts as
+/// progress (the agent decided what to do), and *after* it returns so that the
+/// result landing also counts. A tool call that runs longer than the staleness
+/// window with no internal heartbeat will still trip eviction — that's the
+/// intended single-tool-wedge signal — but ordinary multi-second tool work no
+/// longer reaps the parent task during the gap between LLM responses.
+struct TaskActivityToolDispatcher {
+    inner: Arc<dyn ToolDispatcher>,
+    tracker: ActiveTaskTracker,
+    task_id: String,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for TaskActivityToolDispatcher {
+    async fn dispatch_tool(
+        &self,
+        role: &str,
+        task_id: &str,
+        call: &ToolCall,
+    ) -> Result<ToolExecResult> {
+        self.tracker.touch(&self.task_id).await;
+        let result = self.inner.dispatch_tool(role, task_id, call).await;
+        self.tracker.touch(&self.task_id).await;
+        result
     }
 }
 

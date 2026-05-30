@@ -14,6 +14,13 @@ pub struct ActiveTask {
     pub task_type: String,
     pub role: String,
     pub submitted_at: std::time::Instant,
+    /// Last forward-progress timestamp — bumped via [`ActiveTaskTracker::touch`]
+    /// on each LLM response. The staleness sweep ([`ActiveTaskTracker::stale_tasks`])
+    /// evicts on inactivity here, not total runtime (`submitted_at`), so a
+    /// slow-but-progressing agent loop (a reasoning model taking minutes per
+    /// step) isn't killed mid-flight and its in-flight credential slot reclaimed
+    /// out from under it.
+    pub last_activity: std::time::Instant,
     /// `"user@domain"` when the task is gated by `CredentialInflight`. The
     /// caller that successfully removes this task from the tracker is
     /// responsible for releasing the corresponding slot. Carrying it on the
@@ -71,6 +78,17 @@ impl ActiveTaskTracker {
         }
     }
 
+    /// Record forward progress for a tracked task, resetting its staleness
+    /// clock. Called on each LLM response (via the per-task activity callback)
+    /// so an actively-working agent loop is not evicted by [`Self::stale_tasks`].
+    /// No-op if the task is no longer tracked (already completed or evicted).
+    pub async fn touch(&self, task_id: &str) {
+        let mut inner = self.inner.lock().await;
+        if let Some(task) = inner.tasks.get_mut(task_id) {
+            task.last_activity = std::time::Instant::now();
+        }
+    }
+
     /// Number of active tasks for a role.
     pub async fn count_for_role(&self, role: &str) -> usize {
         let inner = self.inner.lock().await;
@@ -99,14 +117,17 @@ impl ActiveTaskTracker {
         inner.tasks.keys().cloned().collect()
     }
 
-    /// Get tasks older than `age` that have not received a result.
+    /// Get tasks that have made no forward progress for `max_age` and have not
+    /// received a result. Eviction is keyed on `last_activity` (bumped by
+    /// [`Self::touch`]), not `submitted_at`, so a long-but-actively-progressing
+    /// agent loop survives while a genuinely wedged one is still reaped.
     pub async fn stale_tasks(&self, max_age: std::time::Duration) -> Vec<ActiveTask> {
         let inner = self.inner.lock().await;
         let cutoff = std::time::Instant::now() - max_age;
         inner
             .tasks
             .values()
-            .filter(|t| t.submitted_at < cutoff)
+            .filter(|t| t.last_activity < cutoff)
             .cloned()
             .collect()
     }
@@ -144,6 +165,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 credential_key: None,
             })
             .await;
@@ -180,6 +202,7 @@ mod tests {
                     task_type: task_type.into(),
                     role: role.into(),
                     submitted_at: std::time::Instant::now(),
+                    last_activity: std::time::Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -199,6 +222,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now() - std::time::Duration::from_secs(120),
+                last_activity: std::time::Instant::now() - std::time::Duration::from_secs(120),
                 credential_key: None,
             })
             .await;
@@ -209,6 +233,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 credential_key: None,
             })
             .await;
@@ -221,6 +246,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn touch_resets_staleness() {
+        let tracker = ActiveTaskTracker::new();
+
+        // A task submitted long ago whose last activity is also stale: without
+        // a touch it would be evicted by the staleness sweep.
+        tracker
+            .add(ActiveTask {
+                task_id: "slow".into(),
+                task_type: "recon".into(),
+                role: "recon".into(),
+                submitted_at: std::time::Instant::now() - std::time::Duration::from_secs(600),
+                last_activity: std::time::Instant::now() - std::time::Duration::from_secs(600),
+                credential_key: None,
+            })
+            .await;
+
+        // Confirm it is stale before any progress signal.
+        assert_eq!(
+            tracker
+                .stale_tasks(std::time::Duration::from_secs(300))
+                .await
+                .len(),
+            1,
+            "task with old last_activity should be stale"
+        );
+
+        // An LLM step lands → touch resets the activity clock. The task has now
+        // been running 600s total but just made progress, so it must NOT evict.
+        tracker.touch("slow").await;
+        assert!(
+            tracker
+                .stale_tasks(std::time::Duration::from_secs(300))
+                .await
+                .is_empty(),
+            "a freshly-touched task must not be evicted regardless of total runtime"
+        );
+
+        // Touch on an unknown task is a harmless no-op.
+        tracker.touch("does-not-exist").await;
+    }
+
+    #[tokio::test]
     async fn task_ids_collected() {
         let tracker = ActiveTaskTracker::new();
         tracker
@@ -229,6 +296,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 credential_key: None,
             })
             .await;
@@ -238,6 +306,7 @@ mod tests {
                 task_type: "exploit".into(),
                 role: "privesc".into(),
                 submitted_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 credential_key: None,
             })
             .await;
@@ -257,6 +326,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 credential_key: None,
             })
             .await;
