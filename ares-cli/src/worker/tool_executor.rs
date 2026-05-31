@@ -17,6 +17,7 @@
 //!
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -69,7 +70,7 @@ struct ToolExecResponse {
 /// goes to exactly one worker. Replies on the request's reply inbox.
 pub async fn run_tool_exec_loop(
     config: &WorkerConfig,
-    _conn: redis::aio::ConnectionManager,
+    conn: redis::aio::ConnectionManager,
     nats: NatsBroker,
     status_tx: tokio::sync::watch::Sender<WorkerStatus>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -157,9 +158,15 @@ pub async fn run_tool_exec_loop(
         let reply_to = msg.reply.clone();
         let client_for_reply = client.clone();
 
-        execute_and_respond(client_for_reply, reply_to, &request, &mut unavailable_tools)
-            .instrument(exec_span)
-            .await;
+        execute_and_respond(
+            client_for_reply,
+            reply_to,
+            &request,
+            &mut unavailable_tools,
+            conn.clone(),
+        )
+        .instrument(exec_span)
+        .await;
 
         let _ = status_tx.send(WorkerStatus {
             status: "idle".to_string(),
@@ -262,11 +269,49 @@ fn build_error_response(call_id: &str, err_str: String) -> ToolExecResponse {
 }
 
 /// Execute a tool call and reply on the NATS inbox.
+/// Poll the parent task's status in Redis and return as soon as it leaves the
+/// alive set (`in_progress` / `running`). Companion to the `tokio::select` in
+/// [`execute_and_respond`]: when this future resolves, the dispatch arm is
+/// dropped and tokio's `kill_on_drop(true)` on any spawned tool child (e.g.
+/// `impacket-ntlmrelayx` from `ares-tools/coercion.rs`) reaps the worker-side
+/// process, freeing its listener sockets. Without this the dispatch keeps
+/// awaiting forever and the tool stays orphaned across orchestrator restarts —
+/// the long-standing `RELAY_BIND_BUSY` pattern.
+///
+/// Polling cadence is 5s — one Redis `GET` per cycle, bounding the orphan
+/// window to ~5s after the orchestrator marks the task non-running. Transient
+/// Redis errors and missing keys are deliberately treated as "still alive" so a
+/// blip can't accidentally cancel a healthy tool mid-execution.
+async fn poll_parent_task_cancelled(mut conn: redis::aio::ConnectionManager, task_id: String) {
+    let key = format!("ares:task_status:{task_id}");
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    // Skip the immediate first tick so we don't race a fresh dispatch whose
+    // status key the orchestrator hasn't written yet.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let val: redis::RedisResult<Option<String>> =
+            redis::cmd("GET").arg(&key).query_async(&mut conn).await;
+        match val {
+            // Substring check, not full JSON parse — the status field is a
+            // short literal and this runs on every in-flight tool every 5s.
+            Ok(Some(v))
+                if !v.contains(r#""status":"in_progress""#)
+                    && !v.contains(r#""status":"running""#) =>
+            {
+                return;
+            }
+            _ => continue,
+        }
+    }
+}
+
 async fn execute_and_respond(
     client: async_nats::Client,
     reply_to: Option<async_nats::Subject>,
     request: &ToolExecRequest,
     unavailable_tools: &mut std::collections::HashSet<String>,
+    conn: redis::aio::ConnectionManager,
 ) {
     if unavailable_tools.contains(&request.tool_name) {
         debug!(
@@ -289,7 +334,20 @@ async fn execute_and_respond(
     let di = extract_target_info(&request.arguments);
     let dt = infer_target_type_from_info(&di);
 
-    let response = match ares_tools::dispatch(&request.tool_name, &request.arguments).await {
+    // Race the tool dispatch against the parent task's status in Redis. When the
+    // orchestrator stale-evicts (or otherwise terminates) the task, this select
+    // returns immediately, the dispatch future is dropped, and tokio's
+    // `kill_on_drop(true)` on the child process inside the tool (e.g.
+    // `impacket-ntlmrelayx` in ares-tools/coercion.rs) SIGKILLs the spawned
+    // process — closing its listener sockets. Without this race the dispatch
+    // future would keep awaiting indefinitely after the parent task is dead,
+    // and the tool would hold its sockets until the worker pod restarted —
+    // the orphan pattern in [[project_orphan_tool_processes]].
+    let dispatch_fut = ares_tools::dispatch(&request.tool_name, &request.arguments);
+    let cancel_fut = poll_parent_task_cancelled(conn, request.task_id.clone());
+    let response = tokio::select! {
+        biased; // poll the dispatch first when both are ready
+        res = dispatch_fut => match res {
         Ok(output) => {
             let raw = output.combined_raw();
             let combined = output.combined();
@@ -337,6 +395,19 @@ async fn execute_and_respond(
                 "Tool execution failed"
             );
             build_error_response(&request.call_id, err_str)
+        }
+        },
+        _ = cancel_fut => {
+            warn!(
+                tool = %request.tool_name,
+                call_id = %request.call_id,
+                task_id = %request.task_id,
+                "Parent task no longer in_progress — dropping dispatch (kill_on_drop reaps any spawned child)"
+            );
+            build_error_response(
+                &request.call_id,
+                "cancelled: parent task no longer in_progress".to_string(),
+            )
         }
     };
 
