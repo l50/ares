@@ -172,25 +172,27 @@ impl LlmTaskRunner {
         // staleness sweep would evict a perfectly healthy task at 300s.
         // A loop wedged inside a *single* tool call that itself runs past the
         // timeout will still be reaped — exactly the intended signal.
-        let (callback_handler, dispatcher): (Option<Arc<dyn CallbackHandler>>, Arc<dyn ToolDispatcher>) =
-            match self.active_task_tracker.get() {
-                Some(tracker) => (
-                    Some(Arc::new(TaskActivityCallbackHandler {
-                        inner: self.callback_handler.get().cloned(),
-                        tracker: tracker.clone(),
-                        task_id: task_id.to_string(),
-                    })),
-                    Arc::new(TaskActivityToolDispatcher {
-                        inner: Arc::clone(&self.dispatcher),
-                        tracker: tracker.clone(),
-                        task_id: task_id.to_string(),
-                    }),
-                ),
-                None => (
-                    self.callback_handler.get().cloned(),
-                    Arc::clone(&self.dispatcher),
-                ),
-            };
+        let (callback_handler, dispatcher): (
+            Option<Arc<dyn CallbackHandler>>,
+            Arc<dyn ToolDispatcher>,
+        ) = match self.active_task_tracker.get() {
+            Some(tracker) => (
+                Some(Arc::new(TaskActivityCallbackHandler {
+                    inner: self.callback_handler.get().cloned(),
+                    tracker: tracker.clone(),
+                    task_id: task_id.to_string(),
+                })),
+                Arc::new(TaskActivityToolDispatcher {
+                    inner: Arc::clone(&self.dispatcher),
+                    tracker: tracker.clone(),
+                    task_id: task_id.to_string(),
+                }),
+            ),
+            None => (
+                self.callback_handler.get().cloned(),
+                Arc::clone(&self.dispatcher),
+            ),
+        };
 
         let outcome = run_agent_loop(RunAgentLoopParams {
             provider: self.provider.as_ref(),
