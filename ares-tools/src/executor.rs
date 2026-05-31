@@ -114,6 +114,13 @@ impl CommandBuilder {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        // Without this, dropping the `Child` on timeout (below) is a no-op on
+        // the process — long-running tools (impacket-ntlmrelayx, certipy,
+        // Responder) keep running forever holding listener sockets. With it,
+        // the OS sends SIGKILL the moment the Child is dropped, which closes
+        // every fd the process held and frees the port.
+        cmd.kill_on_drop(true);
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn '{}' — is it installed?", self.program))?;
@@ -130,6 +137,9 @@ impl CommandBuilder {
         // task drops the `Child`, which sends SIGKILL on Unix.
         let timeout = self.timeout;
         let handle = tokio::spawn(async move { child.wait_with_output().await });
+        // The handle gets moved into `timeout` below; keep a separate abort
+        // token so the timeout branch can still cancel the spawned wait.
+        let abort = handle.abort_handle();
 
         let join_result = tokio::time::timeout(timeout, handle).await;
 
@@ -156,11 +166,20 @@ impl CommandBuilder {
             }
             Ok(Ok(Err(e))) => Err(anyhow::anyhow!("command execution failed: {e}")),
             Ok(Err(e)) => Err(anyhow::anyhow!("task join error: {e}")),
-            Err(_) => Err(anyhow::anyhow!(
-                "command timed out after {:?}: {}",
-                timeout,
-                display_cmd
-            )),
+            Err(_) => {
+                // Without the abort, the timeout branch only drops the
+                // `JoinHandle` — and in tokio, dropping a `JoinHandle` leaves
+                // the task running detached. The spawned `wait_with_output`
+                // future would keep holding the `Child` forever, defeating
+                // `kill_on_drop`. Aborting drops the inner future, which drops
+                // the `Child`, which (with `kill_on_drop`) SIGKILLs the process.
+                abort.abort();
+                Err(anyhow::anyhow!(
+                    "command timed out after {:?}: {}",
+                    timeout,
+                    display_cmd
+                ))
+            }
         }
     }
 }
