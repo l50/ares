@@ -165,8 +165,8 @@ pub async fn run_tool_exec_loop(
             &mut unavailable_tools,
             conn.clone(),
         )
-            .instrument(exec_span)
-            .await;
+        .instrument(exec_span)
+        .await;
 
         let _ = status_tx.send(WorkerStatus {
             status: "idle".to_string(),
