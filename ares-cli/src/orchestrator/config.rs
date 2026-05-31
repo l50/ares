@@ -189,7 +189,14 @@ impl OrchestratorConfig {
         let deferred_poll_interval_secs = parse_env("ARES_DEFERRED_POLL_INTERVAL_SECS", 10);
         let max_tasks_per_role = parse_env("ARES_MAX_TASKS_PER_ROLE", 3);
         let dispatch_delay_ms = parse_env("ARES_DISPATCH_DELAY_MS", 200);
-        let stale_task_timeout_secs = parse_env("ARES_STALE_TASK_TIMEOUT_SECS", 300);
+        // 900s (15min) — gpt-5.2 reasoning agent loops with batches of parallel
+        // tool calls (LDAP, nmap, certipy) routinely span several minutes
+        // without an LLM response in between. With activity-based eviction
+        // already touching on each LLM response AND tool dispatch boundary
+        // (see ActiveTaskTracker::touch), a longer window covers the
+        // long-single-tool-batch case until heartbeat-during-dispatch lands.
+        // Worker death is detected separately via the ares:heartbeat:* keys.
+        let stale_task_timeout_secs = parse_env("ARES_STALE_TASK_TIMEOUT_SECS", 900);
         let deferred_task_max_age_secs = parse_env("ARES_DEFERRED_TASK_MAX_AGE_SECS", 300);
         let max_deferred_per_type = parse_env("ARES_MAX_DEFERRED_PER_TYPE", 50);
         let max_deferred_total = parse_env("ARES_MAX_DEFERRED_TOTAL", 200);

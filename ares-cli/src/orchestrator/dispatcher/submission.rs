@@ -314,6 +314,7 @@ impl Dispatcher {
                 task_type: task_type.to_string(),
                 role: target_role.to_string(),
                 submitted_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 credential_key: cred_key.clone(),
             })
             .await;

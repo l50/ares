@@ -361,6 +361,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -381,6 +382,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -402,6 +404,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -424,6 +427,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -447,6 +451,7 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -473,6 +478,7 @@ mod tests {
                     task_type: "exploit".into(),
                     role: "privesc".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -496,6 +502,7 @@ mod tests {
                     task_type: "exploit".into(),
                     role: "privesc".into(),
                     submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
