@@ -23,10 +23,15 @@ metadata:
 name: ares-attack-box-proxmox
 version: latest
 
-# No `base:` block: warpgate's proxmox target carries its own source via
-# `targets[].source_template_name`, and the validator (>= the fix in
-# templates/config_validator.go) treats a proxmox-only build as
-# self-sourced.
+# The Proxmox target clones from `targets[].source_template_name`, so
+# `base.image` is unused at build time. Warpgate v4.7.0's validator still
+# requires either `base.image` or `base.ami_filters` for non-Dockerfile
+# builds, so a sentinel value is set here. Remove this block once CI
+# upgrades to a warpgate version that recognizes Proxmox targets as
+# self-sourced (see CowDogMoo/warpgate feat/proxmox @ e45d0cc).
+base:
+  image: proxmox-clone-placeholder
+  pull: false
 
 sources:
   # Use the in-repo ansible/ tree directly so builds match the working copy
