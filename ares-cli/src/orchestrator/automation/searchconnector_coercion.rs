@@ -94,10 +94,14 @@ pub async fn auto_searchconnector_coercion(
             continue;
         }
 
-        let listener = match dispatcher.config.listener_ip.as_deref() {
-            Some(ip) => ip.to_string(),
-            None => continue,
-        };
+        // Empty when no explicit ARES_LISTENER_IP is configured — the
+        // coercion worker derives its own egress IP at execution time. See
+        // sibling note in ntlm_relay.rs::auto_ntlm_relay.
+        let listener = dispatcher
+            .config
+            .listener_ip
+            .clone()
+            .unwrap_or_default();
 
         let work: Vec<SearchConnectorWork> = {
             let state = dispatcher.state.read().await;

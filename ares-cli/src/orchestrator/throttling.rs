@@ -116,6 +116,30 @@ impl Throttler {
         let max_tasks = self.config.max_concurrent_tasks;
         let hard_cap = self.config.hard_cap();
 
+        // Per-role hard ceiling — applies before any global cap check. One
+        // role cannot hold more than `max_tasks_per_role` LLM slots, even
+        // when the global tracker is below the soft cap. Without this, a
+        // role with long-running tool calls (coercion blocking on
+        // ntlmrelayx for 600s) keeps accumulating slots while shorter-task
+        // roles churn through theirs, eventually saturating the global cap
+        // and forcing recon/lateral into the deferred queue where they
+        // stale-evict before running. Critical-path and always-bypass
+        // task types are exempt — those exist precisely to punch through
+        // congestion.
+        if !self.is_always_bypass(task_type) && !self.is_critical_path(task_type, payload) {
+            let role_count = self.tracker.count_for_role(target_role).await;
+            if role_count >= self.config.max_tasks_per_role {
+                debug!(
+                    role = target_role,
+                    role_count,
+                    cap = self.config.max_tasks_per_role,
+                    task_type,
+                    "Per-role cap: deferring task"
+                );
+                return ThrottleDecision::Defer;
+            }
+        }
+
         if llm_count >= hard_cap {
             // Always-bypass tasks (acl_chain_step) skip even the bypass-cap.
             // Stale exploit-task buildup must not block the ACL exploitation
@@ -155,22 +179,15 @@ impl Throttler {
             return ThrottleDecision::Defer;
         }
 
-        if llm_count >= max_tasks {
-            let role_count = self.tracker.count_for_role(target_role).await;
-            let min_per_role = self.config.max_tasks_per_role;
-            if role_count < min_per_role {
-                info!(
-                    llm_count,
-                    max_tasks,
-                    role = target_role,
-                    role_count,
-                    "Soft cap: allowing — role below minimum"
-                );
-                return ThrottleDecision::Allow;
-            }
-            debug!(llm_count, max_tasks, task_type, "Soft cap: deferring task");
-            return ThrottleDecision::Defer;
-        }
+        // No separate soft-cap branch: the per-role ceiling above already
+        // enforces fairness across roles, and the hard-cap branch handles
+        // overall saturation. Any candidate that reaches here is below both
+        // the role ceiling AND the global hard cap — allow it, subject only
+        // to the dispatch-delay rate-limit below. The old "soft cap" branch
+        // used `max_tasks_per_role` as a minimum floor; that semantic is
+        // now subsumed by the ceiling (same value, opposite direction:
+        // allow iff role_count < cap).
+        let _ = max_tasks;
 
         {
             let last = self.last_dispatch.lock().await;
@@ -511,6 +528,61 @@ mod tests {
         assert_eq!(
             t.check("exploit", "privesc", Some(&payload)).await,
             ThrottleDecision::Defer
+        );
+    }
+
+    #[tokio::test]
+    async fn per_role_cap_defers_with_global_headroom() {
+        // max_tasks_per_role=3 in make_config. Even though global is below
+        // the soft cap (8), a role already at 3 must defer.
+        let (t, tracker) = make_throttler(8);
+        for i in 0..3 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("c{i}"),
+                    task_type: "coercion".into(),
+                    role: "coercion".into(),
+                    submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+        assert_eq!(
+            t.check("coercion", "coercion", None).await,
+            ThrottleDecision::Defer,
+            "role at cap should defer even with global headroom"
+        );
+        // Different role still has headroom.
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Allow,
+            "different role should still be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_role_cap_bypassed_by_critical_path() {
+        // Critical-path task types must punch through the per-role cap —
+        // forest-pivot vulns can't be parked behind a saturated role queue.
+        let (t, tracker) = make_throttler(8);
+        for i in 0..5 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("p{i}"),
+                    task_type: "exploit".into(),
+                    role: "privesc".into(),
+                    submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+        let payload = json!({"vuln_type": "forest_trust_escalation"});
+        assert_eq!(
+            t.check("exploit", "privesc", Some(&payload)).await,
+            ThrottleDecision::Allow,
+            "critical-path vuln should bypass per-role cap"
         );
     }
 

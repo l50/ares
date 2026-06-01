@@ -160,9 +160,18 @@ impl CommandBuilder {
         // every fd the process held and frees the port.
         cmd.kill_on_drop(true);
 
+        // Put the child in its own process group (PGID == child PID). On
+        // timeout we send SIGKILL to the *negative* PID, which signals the
+        // entire group — without this, tools like ntlmrelayx that fork relay
+        // listeners survive: kill_on_drop reaps only the direct child, and
+        // grandchildren keep the bound socket and orphan the port (the
+        // RELAY_BIND_BUSY pattern documented at the worker tool_executor).
+        cmd.process_group(0);
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn '{}' — is it installed?", self.program))?;
+        let child_pid = child.id();
 
         if let Some(data) = &self.stdin_data {
             use tokio::io::AsyncWriteExt;
@@ -206,12 +215,33 @@ impl CommandBuilder {
             Ok(Ok(Err(e))) => Err(anyhow::anyhow!("command execution failed: {e}")),
             Ok(Err(e)) => Err(anyhow::anyhow!("task join error: {e}")),
             Err(_) => {
-                // Without the abort, the timeout branch only drops the
-                // `JoinHandle` — and in tokio, dropping a `JoinHandle` leaves
-                // the task running detached. The spawned `wait_with_output`
-                // future would keep holding the `Child` forever, defeating
-                // `kill_on_drop`. Aborting drops the inner future, which drops
-                // the `Child`, which (with `kill_on_drop`) SIGKILLs the process.
+                // Two cleanups, in order:
+                //
+                // 1. SIGKILL the whole process group via `killpg`. The child
+                //    was placed in its own group (PGID == child PID) via
+                //    `process_group(0)`. Signalling `-pid` reaches every
+                //    descendant — without this, ntlmrelayx's forked relay
+                //    listener (or certipy's helper shells) survive the kill
+                //    of the direct child and keep their listener socket
+                //    bound, producing the RELAY_BIND_BUSY orphan pattern.
+                //
+                // 2. Abort the join handle. Without this, dropping the handle
+                //    only detaches the task — the spawned `wait_with_output`
+                //    future would keep holding the `Child` forever, defeating
+                //    `kill_on_drop`. Aborting drops the inner future, which
+                //    drops the `Child`, which (with `kill_on_drop`) SIGKILLs
+                //    the parent — redundant with step 1 for the parent but
+                //    necessary to free the resources our Rust code holds.
+                if let Some(pid) = child_pid {
+                    // SAFETY: libc::kill with a negative PID signals the
+                    // process group whose leader has that PID. `pid` was
+                    // obtained from a child we just spawned in its own
+                    // group; sending SIGKILL to the group cannot affect
+                    // ourselves or any unrelated process.
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
                 abort.abort();
                 Err(anyhow::anyhow!(
                     "command timed out after {:?}: {}",

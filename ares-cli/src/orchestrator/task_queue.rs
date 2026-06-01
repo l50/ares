@@ -533,6 +533,14 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
     // === Task status tracking ==============================================
 
     /// Update only status + timestamps; preserves any existing fields.
+    ///
+    /// Refuses to create a record from scratch — if no prior entry exists
+    /// (i.e. `set_task_status_full` never ran for this task_id), this call
+    /// is a no-op-with-warning. Reason: `TaskStatusRecord` requires
+    /// `operation_id`, and this method has no way to know it. Writing a
+    /// partial JSON without `operation_id` produces a record that the
+    /// `ares ops tasks` reader silently skips on deserialize failure,
+    /// making the task invisible to operators while it churns.
     pub async fn set_task_status(&self, task_id: &str, status: &str) -> Result<()> {
         let key = Self::task_status_key(task_id);
         let mut conn = self.conn.clone();
@@ -544,9 +552,23 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
                 None
             }
         };
-        let mut payload: serde_json::Value = existing
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(existing_str) = existing else {
+            warn!(
+                task_id,
+                status,
+                "set_task_status: no prior record (set_task_status_full never ran or its \
+                 write failed); skipping rather than writing an operation_id-less stub \
+                 that `ares ops tasks` would silently drop"
+            );
+            return Ok(());
+        };
+        let mut payload: serde_json::Value = match serde_json::from_str(&existing_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(task_id, err = %e, "set_task_status: existing record is malformed JSON; skipping");
+                return Ok(());
+            }
+        };
 
         let now = Utc::now().to_rfc3339();
         payload["task_id"] = serde_json::json!(task_id);
@@ -695,14 +717,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_task_status_creates_record() {
+    async fn set_task_status_without_prior_record_is_noop() {
+        // The reader requires operation_id; this method has no way to know it,
+        // so creating from scratch would write an unreadable stub. Verify the
+        // new noop-with-warning behavior.
         let q = mock_queue();
         q.set_task_status("task-1", "pending").await.unwrap();
+        assert!(q.get_task_status("task-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_task_status_updates_after_seed() {
+        let q = mock_queue();
+        q.set_task_status_full("task-1", "pending", "op-1", "scanner", "recon", None)
+            .await
+            .unwrap();
+        q.set_task_status("task-1", "in_progress").await.unwrap();
 
         let raw = q.get_task_status("task-1").await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["task_id"], "task-1");
-        assert_eq!(v["status"], "pending");
+        assert_eq!(v["status"], "in_progress");
+        assert_eq!(v["operation_id"], "op-1");
         assert!(v.get("updated_at").is_some());
     }
 
@@ -725,6 +761,9 @@ mod tests {
     #[tokio::test]
     async fn set_task_status_completed_adds_ended_at() {
         let q = mock_queue();
+        q.set_task_status_full("task-1", "in_progress", "op-1", "scanner", "recon", None)
+            .await
+            .unwrap();
         q.set_task_status("task-1", "completed").await.unwrap();
         let raw = q.get_task_status("task-1").await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -735,6 +774,9 @@ mod tests {
     #[tokio::test]
     async fn set_task_status_failed_adds_ended_at() {
         let q = mock_queue();
+        q.set_task_status_full("task-1", "in_progress", "op-1", "scanner", "recon", None)
+            .await
+            .unwrap();
         q.set_task_status("task-1", "failed").await.unwrap();
         let raw = q.get_task_status("task-1").await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -907,7 +949,9 @@ mod tests {
         let mut c = q.connection();
         let _: () = c.set_ex::<_, _, ()>("x", "y", 30).await.unwrap();
         // queue still works after caller used the cloned conn
-        q.set_task_status("after", "pending").await.unwrap();
+        q.set_task_status_full("after", "pending", "op-1", "scanner", "recon", None)
+            .await
+            .unwrap();
         let raw = q.get_task_status("after").await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["status"], "pending");
@@ -916,6 +960,10 @@ mod tests {
     #[tokio::test]
     async fn set_task_status_pending_does_not_set_started_or_ended() {
         let q = mock_queue();
+        q.set_task_status_full("t1", "pending", "op-1", "scanner", "recon", None)
+            .await
+            .unwrap();
+        // Re-stamp pending — should preserve absence of started_at/ended_at.
         q.set_task_status("t1", "pending").await.unwrap();
         let raw = q.get_task_status("t1").await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -927,6 +975,9 @@ mod tests {
     #[tokio::test]
     async fn set_task_status_in_progress_does_not_overwrite_started_at() {
         let q = mock_queue();
+        q.set_task_status_full("t1", "pending", "op-1", "scanner", "recon", None)
+            .await
+            .unwrap();
         // First in_progress sets started_at
         q.set_task_status("t1", "in_progress").await.unwrap();
         let raw1 = q.get_task_status("t1").await.unwrap().unwrap();
