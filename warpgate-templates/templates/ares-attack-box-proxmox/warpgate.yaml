@@ -18,20 +18,14 @@ metadata:
     - acl
     - coercion
   requires:
-    warpgate: '>=4.7.0'
+    warpgate: '>=4.8.0'
 
 name: ares-attack-box-proxmox
 version: latest
 
-# The Proxmox target clones from `targets[].source_template_name`, so
-# `base.image` is unused at build time. Warpgate v4.7.0's validator still
-# requires either `base.image` or `base.ami_filters` for non-Dockerfile
-# builds, so a sentinel value is set here. Remove this block once CI
-# upgrades to a warpgate version that recognizes Proxmox targets as
-# self-sourced (see CowDogMoo/warpgate feat/proxmox @ e45d0cc).
-base:
-  image: proxmox-clone-placeholder
-  pull: false
+# No `base:` block: the Proxmox target carries its own source via
+# `targets[].source_template_name`. Warpgate >= v4.8.0 treats a
+# proxmox-only build as self-sourced and skips the base.image requirement.
 
 sources:
   # Use the in-repo ansible/ tree directly so builds match the working copy
