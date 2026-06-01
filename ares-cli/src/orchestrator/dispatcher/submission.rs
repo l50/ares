@@ -330,8 +330,14 @@ impl Dispatcher {
 
         self.throttler.record_dispatch().await;
 
-        // Set initial task status with full metadata
-        let _ = self
+        // Set initial task status with full metadata. We log on failure but
+        // don't abort the dispatch — the task is already in flight via the
+        // tracker. A silent swallow here was the root of `ares ops tasks`
+        // returning empty: if this write fails, the *only* record of the
+        // task that includes `operation_id` never lands, and later writes
+        // via `set_task_status` (which only knows the task_id) produce
+        // records without `operation_id` that the reader filters out.
+        if let Err(e) = self
             .queue
             .set_task_status_full(
                 &task_id,
@@ -341,7 +347,16 @@ impl Dispatcher {
                 task_type,
                 Some(&payload),
             )
-            .await;
+            .await
+        {
+            warn!(
+                task_id = %task_id,
+                task_type,
+                role = target_role,
+                err = %e,
+                "Failed to write initial task status — task will be invisible to `ares ops tasks`"
+            );
+        }
 
         // Persist pending task to Redis HASH for recovery
         let now = Utc::now();

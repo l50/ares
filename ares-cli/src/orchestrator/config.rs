@@ -176,10 +176,14 @@ impl OrchestratorConfig {
         // Resolve strategy from env vars + JSON payload + YAML config
         let strategy = Strategy::resolve(json_value.as_ref(), yaml);
 
-        // Listener IP: explicit env var, or auto-detect from first target IP.
-        let listener_ip = env::var("ARES_LISTENER_IP")
-            .ok()
-            .or_else(|| detect_local_ip(target_ips.first().map(|s| s.as_str())));
+        // Listener IP: ONLY honored from an explicit env var. Auto-detecting
+        // from the orchestrator's egress was wrong — the orchestrator and the
+        // coercion worker run on different pods with different IPs, so the
+        // auto-detected value was never bindable on the worker and forced
+        // resolve_listener_ip in ares-tools::coercion to substitute on every
+        // call. Workers now derive their own egress IP at tool-execution time
+        // when no explicit override is set.
+        let listener_ip = env::var("ARES_LISTENER_IP").ok();
 
         let max_concurrent_tasks = parse_env("ARES_MAX_CONCURRENT_TASKS", 12);
         let heartbeat_interval_secs = parse_env("ARES_HEARTBEAT_INTERVAL_SECS", 30);
@@ -272,22 +276,6 @@ fn parse_credential_spec(spec: &str, default_domain: &str) -> Option<InitialCred
         password: password.to_string(),
         domain: domain.to_string(),
     })
-}
-
-/// Auto-detect the local IP by opening a UDP socket aimed at the first target.
-/// This never sends traffic — the OS resolves which interface would route to the
-/// target and we read the bound local address.
-fn detect_local_ip(target: Option<&str>) -> Option<String> {
-    let dest = target.unwrap_or("8.8.8.8");
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect(format!("{dest}:53")).ok()?;
-    let addr = socket.local_addr().ok()?;
-    let ip = addr.ip().to_string();
-    // Reject loopback — not useful as a relay listener
-    if ip.starts_with("127.") {
-        return None;
-    }
-    Some(ip)
 }
 
 /// Parse an environment variable into a numeric type, falling back to `default`.
@@ -458,21 +446,6 @@ mod tests {
         assert!(parse_credential_spec("admin:@contoso.local", "").is_none());
         // Empty password without domain
         assert!(parse_credential_spec("admin:", "").is_none());
-    }
-
-    #[test]
-    fn detect_local_ip_returns_some() {
-        // Uses 8.8.8.8 as default destination — should resolve to a local interface
-        // unless we're running in a network-less sandbox.
-        let ip = detect_local_ip(None);
-        if let Some(ref addr) = ip {
-            assert!(!addr.starts_with("127."), "Should reject loopback: {addr}");
-        }
-        // Also test with an explicit target
-        let ip2 = detect_local_ip(Some("192.168.58.10"));
-        if let Some(ref addr) = ip2 {
-            assert!(!addr.starts_with("127."));
-        }
     }
 
     #[test]

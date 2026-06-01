@@ -20,20 +20,42 @@ use crate::args::{optional_bool, optional_str, required_str};
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
-/// Resolve a listener / attacker IP supplied by the orchestrator to one that is
-/// actually bound on THIS worker pod. The orchestrator computes `listener_ip`
-/// from its own egress (config.rs::detect_local_ip) and stamps that into every
-/// coercion payload — but the coercion worker often runs on a different pod
-/// with a different IP. When a coerced DC is told to authenticate to the
-/// orchestrator's IP, no listener is there to catch it (ERROR_BAD_NETPATH).
+/// Resolve the listener / attacker IP for a coercion call. The orchestrator
+/// no longer auto-detects its own egress (which was wrong: the orchestrator
+/// and coercion worker run on different k8s pods with different IPs).
+/// Instead, the worker is the source of truth — it derives its own egress IP
+/// at tool-execution time using the route-trick on 8.8.8.8:53. An explicit
+/// `supplied` value still overrides, but must be bindable on this worker.
 ///
 /// Behavior:
-/// - If `supplied` IS a local interface IP, return it unchanged.
-/// - Otherwise, pick the worker's egress IP via the standard route-trick and
-///   log a warning so the misconfig is visible. Returns `Err` only when the
-///   worker has no usable non-loopback IP at all.
+/// - Empty `supplied`: derive worker egress IP silently — the expected path.
+/// - Non-empty `supplied` that IS local: use it as-is.
+/// - Non-empty `supplied` that is NOT local: derive and warn (real misconfig
+///   — operator set ARES_LISTENER_IP to something this worker can't bind).
 fn resolve_listener_ip(supplied: &str) -> Result<String> {
     use std::net::{IpAddr, UdpSocket};
+
+    let derive = || -> Result<String> {
+        let sock =
+            UdpSocket::bind("0.0.0.0:0").context("resolve_listener_ip: bind 0.0.0.0:0 failed")?;
+        sock.connect("8.8.8.8:53")
+            .context("resolve_listener_ip: connect to 8.8.8.8:53 failed")?;
+        let local = sock
+            .local_addr()
+            .context("resolve_listener_ip: local_addr failed")?;
+        let resolved = local.ip().to_string();
+        if resolved.starts_with("127.") {
+            anyhow::bail!(
+                "resolve_listener_ip: no usable non-loopback IP available on this worker"
+            );
+        }
+        Ok(resolved)
+    };
+
+    if supplied.is_empty() {
+        return derive();
+    }
+
     let parsed: Option<IpAddr> = supplied.parse().ok();
     let is_local = match parsed {
         Some(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() => {
@@ -45,24 +67,12 @@ fn resolve_listener_ip(supplied: &str) -> Result<String> {
         return Ok(supplied.to_string());
     }
 
-    let sock =
-        UdpSocket::bind("0.0.0.0:0").context("resolve_listener_ip: bind 0.0.0.0:0 failed")?;
-    sock.connect("8.8.8.8:53")
-        .context("resolve_listener_ip: connect to 8.8.8.8:53 failed")?;
-    let local = sock
-        .local_addr()
-        .context("resolve_listener_ip: local_addr failed")?;
-    let resolved = local.ip().to_string();
-    if resolved.starts_with("127.") {
-        anyhow::bail!(
-            "supplied listener IP ({supplied}) is not local on this worker and no usable \
-             non-loopback IP is available. Set ARES_LISTENER_IP per coercion pod."
-        );
-    }
+    let resolved = derive()?;
     warn!(
         supplied = %supplied,
         substituted = %resolved,
-        "coercion: supplied listener IP is not local; substituting this worker's egress IP"
+        "coercion: supplied listener IP is not local on this worker; substituting egress IP \
+         (set ARES_LISTENER_IP per worker if you need a specific value)"
     );
     Ok(resolved)
 }
