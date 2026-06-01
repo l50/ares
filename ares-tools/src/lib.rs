@@ -15,6 +15,7 @@ pub mod credential_access;
 pub mod credentials;
 pub mod executor;
 pub mod filter;
+pub mod kerberos_skew;
 pub mod lateral;
 pub mod parsers;
 pub mod privesc;

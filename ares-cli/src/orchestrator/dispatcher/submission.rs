@@ -168,9 +168,18 @@ impl Dispatcher {
                 Ok(SubmissionOutcome::Deferred)
             }
             Ok(false) => {
+                // Dropped here means dropped — this code path does NOT auto-retry.
+                // The originating automation may try again on its next tick, but
+                // if every same-priority task in the queue is also a duplicate of
+                // a long-running in-flight task, the cycle repeats. Bumping
+                // ARES_MAX_DEFERRED_PER_TYPE / ARES_MAX_DEFERRED_TOTAL absorbs
+                // bursty cross-fire from multiple automations targeting the
+                // same credential.
                 warn!(
                     task_type,
-                    target_role, "Deferred queue full, task dropped (will retry next tick)"
+                    target_role,
+                    "Deferred queue full; task dropped. Raise ARES_MAX_DEFERRED_PER_TYPE \
+                     / ARES_MAX_DEFERRED_TOTAL if this persists."
                 );
                 Ok(SubmissionOutcome::Dropped)
             }
