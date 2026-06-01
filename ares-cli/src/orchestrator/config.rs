@@ -198,8 +198,17 @@ impl OrchestratorConfig {
         // Worker death is detected separately via the ares:heartbeat:* keys.
         let stale_task_timeout_secs = parse_env("ARES_STALE_TASK_TIMEOUT_SECS", 900);
         let deferred_task_max_age_secs = parse_env("ARES_DEFERRED_TASK_MAX_AGE_SECS", 300);
-        let max_deferred_per_type = parse_env("ARES_MAX_DEFERRED_PER_TYPE", 50);
-        let max_deferred_total = parse_env("ARES_MAX_DEFERRED_TOTAL", 200);
+        // Bumped from 50/200 — three automations
+        // (auto_local_admin_secretsdump, auto_credential_expansion,
+        // auto_credential_access) cross-fire on the same (cred,target) and
+        // saturate the per-type cap in ~60s. Tasks above the cap were
+        // permanently dropped ("Deferred queue full, task dropped") despite
+        // the misleading "will retry next tick" log — the automation only
+        // re-dispatches on its own interval, so a saturated queue meant the
+        // first successful win silently stalled the whole credential pivot.
+        // 500/2000 absorbs the cross-fire and is still trivial RAM in Redis.
+        let max_deferred_per_type = parse_env("ARES_MAX_DEFERRED_PER_TYPE", 500);
+        let max_deferred_total = parse_env("ARES_MAX_DEFERRED_TOTAL", 2000);
 
         Ok(Self {
             redis_url,

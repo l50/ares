@@ -139,6 +139,29 @@
   become: true
   when: privesc_tools_install_krbrelayup
 
+- name: Install mono-runtime to execute KrbRelayUp.exe on Linux
+  ansible.builtin.apt:
+    name: mono-runtime
+    state: present
+    update_cache: true
+  become: true
+  when:
+    - privesc_tools_install_krbrelayup
+    - ansible_os_family == 'Debian'
+
+# The Rust tool wrapper invokes the binary as `KrbRelayUp` (no .exe). Create a
+# tiny shim on PATH so `which KrbRelayUp` resolves and the privesc agent's
+# `tools_for_role` availability check passes. The shim shells out via mono.
+- name: Install KrbRelayUp shim on PATH
+  ansible.builtin.copy:
+    dest: /usr/local/bin/KrbRelayUp
+    mode: '0755'
+    content: |
+      #!/usr/bin/env bash
+      exec mono "{{ privesc_tools_krbrelayup_install_dir }}/KrbRelayUp.exe" "$@"
+  become: true
+  when: privesc_tools_install_krbrelayup
+
 # SharpGPOAbuse (clone from byronkg's fork which includes precompiled binary)
 - name: Clone SharpGPOAbuse from GitHub
   ansible.builtin.git:

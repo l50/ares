@@ -175,6 +175,8 @@ Install and configure privilege escalation tools for Ares agents
 - **Clone SweetPotato from GitHub** (ansible.builtin.git) - Conditional
 - **Create KrbRelayUp directory** (ansible.builtin.file) - Conditional
 - **Download KrbRelayUp** (ansible.builtin.get_url) - Conditional
+- **Install mono-runtime to execute KrbRelayUp.exe on Linux** (ansible.builtin.apt) - Conditional
+- **Install KrbRelayUp shim on PATH** (ansible.builtin.copy) - Conditional
 - **Clone SharpGPOAbuse from GitHub** (ansible.builtin.git) - Conditional
 - **Create Seatbelt directory** (ansible.builtin.file) - Conditional
 - **Download Seatbelt** (ansible.builtin.get_url) - Conditional

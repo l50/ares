@@ -8,6 +8,16 @@ use crate::ToolOutput;
 /// Default timeout for tool execution (2 minutes).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// True if the named tool binary performs Kerberos AS/TGS exchanges and
+/// therefore needs the clock-skew shim auto-applied. Covers certipy and the
+/// impacket scripts that do PKINIT / TGT / TGS-REP work. Pure name match —
+/// non-Kerberos impacket tools (rpcdump, samrdump, etc.) get the shim too
+/// since it's inert when the offset env var is unset, and listing only the
+/// strictly-needed binaries would drift as new impacket scripts are added.
+fn needs_kerberos_skew_shim(program: &str) -> bool {
+    program == "certipy" || program.starts_with("impacket-")
+}
+
 /// Builder for constructing and executing subprocess commands with timeout support.
 pub struct CommandBuilder {
     program: String,
@@ -20,14 +30,22 @@ pub struct CommandBuilder {
 
 impl CommandBuilder {
     pub fn new(program: &str) -> Self {
-        Self {
+        let mut b = Self {
             program: program.to_string(),
             args: Vec::new(),
             env_vars: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             stdin_data: None,
             cwd: None,
+        };
+        // Auto-apply the Kerberos clock-skew shim for any binary that opens
+        // a KDC handshake. Inert when ARES_KERBEROS_TIME_OFFSET_SECS is unset
+        // or 0, so it costs nothing for envs with synced clocks. Saves every
+        // call-site from remembering `.with_kerberos_skew_shim()`.
+        if needs_kerberos_skew_shim(program) {
+            b = b.with_kerberos_skew_shim();
         }
+        b
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -64,6 +82,27 @@ impl CommandBuilder {
 
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_vars.push((key.into(), value.into()));
+        self
+    }
+
+    /// Opt this subprocess into the Kerberos clock-skew shim. Prepends the
+    /// shim directory to PYTHONPATH and propagates `ARES_KERBEROS_TIME_OFFSET_SECS`
+    /// from the parent env if set. Inert when the offset env var is unset or 0,
+    /// so it's safe to leave on every Kerberos-using tool invocation. See
+    /// `crate::kerberos_skew` for the mechanism.
+    pub fn with_kerberos_skew_shim(mut self) -> Self {
+        match crate::kerberos_skew::build_pythonpath_with_shim() {
+            Ok(pp) => {
+                self.env_vars.push(("PYTHONPATH".to_string(), pp));
+                if let Ok(off) = std::env::var(crate::kerberos_skew::SKEW_ENV_VAR) {
+                    self.env_vars
+                        .push((crate::kerberos_skew::SKEW_ENV_VAR.to_string(), off));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "kerberos skew shim install failed; subprocess will run without offset");
+            }
+        }
         self
     }
 
