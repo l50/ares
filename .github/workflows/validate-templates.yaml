@@ -115,6 +115,13 @@ jobs:
           AZURE_GALLERY_NAME: placeholder-gallery
           AZURE_IDENTITY_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/placeholder-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/placeholder-uami
           AZURE_VM_SIZE: Standard_D4s_v3
+          PROXMOX_NODE: placeholder-node
+          PROXMOX_SOURCE_TEMPLATE: placeholder-template
+          PROXMOX_STORAGE: placeholder-storage
+          PROXMOX_POOL: ''
+          PROXMOX_CI_PASSWORD: placeholder
+          PROXMOX_CI_SSH_KEY: placeholder
+          PROXMOX_SSH_PRIVATE_KEY: placeholder
         run: |
           failed=0
           while IFS= read -r template; do
