@@ -34,7 +34,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name (e.g. contoso.local)"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -136,7 +136,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -162,7 +162,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -188,7 +188,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -214,7 +214,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -240,7 +240,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -296,7 +296,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -322,7 +322,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target domain name"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
         ToolDefinition {
@@ -386,7 +386,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Maximum directory depth to spider"
                     }
                 },
-                "required": ["target", "username", "password", "domain"]
+                "required": ["target", "username", "domain"]
             }),
         },
     ]

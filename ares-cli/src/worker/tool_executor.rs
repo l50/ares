@@ -334,6 +334,36 @@ async fn execute_and_respond(
     let di = extract_target_info(&request.arguments);
     let dt = infer_target_type_from_info(&di);
 
+    // Resolve secret material (password/hash/aes_key/ticket/SIDs) from operation
+    // state. The LLM names principals (`username`, `domain`) but never secrets;
+    // the resolver fills credential-shaped fields from Redis right before
+    // dispatch. May redirect the tool to a `*_kerberos` variant for cross-forest
+    // coercion. Without this call the NATS worker would fire `ares_tools::dispatch`
+    // with whatever the LLM sent — usually no creds, since the dispatch
+    // prompt template tells the LLM not to pass them.
+    let mut resolved_args = request.arguments.clone();
+    let mut resolver_conn = conn.clone();
+    let resolved_tool_name = match crate::worker::credential_resolver::resolve_credentials(
+        &mut resolver_conn,
+        request.operation_id.as_deref(),
+        &request.tool_name,
+        &mut resolved_args,
+    )
+    .await
+    {
+        Ok(Some(redirected)) => redirected,
+        Ok(None) => request.tool_name.clone(),
+        Err(e) => {
+            warn!(
+                tool = %request.tool_name,
+                call_id = %request.call_id,
+                err = %e,
+                "credential_resolver failed — proceeding with LLM-supplied arguments"
+            );
+            request.tool_name.clone()
+        }
+    };
+
     // Race the tool dispatch against the parent task's status in Redis. When the
     // orchestrator stale-evicts (or otherwise terminates) the task, this select
     // returns immediately, the dispatch future is dropped, and tokio's
@@ -343,7 +373,7 @@ async fn execute_and_respond(
     // future would keep awaiting indefinitely after the parent task is dead,
     // and the tool would hold its sockets until the worker pod restarted —
     // the orphan pattern in [[project_orphan_tool_processes]].
-    let dispatch_fut = ares_tools::dispatch(&request.tool_name, &request.arguments);
+    let dispatch_fut = ares_tools::dispatch(&resolved_tool_name, &resolved_args);
     let cancel_fut = poll_parent_task_cancelled(conn, request.task_id.clone());
     let response = tokio::select! {
         biased; // poll the dispatch first when both are ready
@@ -355,9 +385,9 @@ async fn execute_and_respond(
             let exit_code = output.exit_code;
 
             let discoveries = discoveries_or_none(ares_tools::parsers::parse_tool_output(
-                &request.tool_name,
+                &resolved_tool_name,
                 &raw,
-                &request.arguments,
+                &resolved_args,
             ));
 
             if let Some(ref disc) = discoveries {
