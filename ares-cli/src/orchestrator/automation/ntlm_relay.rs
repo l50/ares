@@ -51,11 +51,7 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
         // ares-tools::coercion::resolve_listener_ip at execution time. Don't
         // gate dispatch on the orchestrator having a listener IP, because in
         // the common k8s deployment it doesn't and shouldn't (different pod).
-        let listener = dispatcher
-            .config
-            .listener_ip
-            .clone()
-            .unwrap_or_default();
+        let listener = dispatcher.config.listener_ip.clone().unwrap_or_default();
 
         let work: Vec<RelayWork> = {
             let state = dispatcher.state.read().await;
