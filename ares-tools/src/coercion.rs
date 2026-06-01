@@ -45,8 +45,8 @@ fn resolve_listener_ip(supplied: &str) -> Result<String> {
         return Ok(supplied.to_string());
     }
 
-    let sock = UdpSocket::bind("0.0.0.0:0")
-        .context("resolve_listener_ip: bind 0.0.0.0:0 failed")?;
+    let sock =
+        UdpSocket::bind("0.0.0.0:0").context("resolve_listener_ip: bind 0.0.0.0:0 failed")?;
     sock.connect("8.8.8.8:53")
         .context("resolve_listener_ip: connect to 8.8.8.8:53 failed")?;
     let local = sock

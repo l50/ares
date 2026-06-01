@@ -93,8 +93,7 @@ impl CommandBuilder {
     pub fn with_kerberos_skew_shim(mut self) -> Self {
         match crate::kerberos_skew::build_pythonpath_with_shim() {
             Ok(pp) => {
-                self.env_vars
-                    .push(("PYTHONPATH".to_string(), pp));
+                self.env_vars.push(("PYTHONPATH".to_string(), pp));
                 if let Ok(off) = std::env::var(crate::kerberos_skew::SKEW_ENV_VAR) {
                     self.env_vars
                         .push((crate::kerberos_skew::SKEW_ENV_VAR.to_string(), off));
