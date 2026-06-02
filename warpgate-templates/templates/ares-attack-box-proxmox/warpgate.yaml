@@ -40,8 +40,14 @@ provisioners:
   # default user, so commands that touch system paths use sudo.
   - type: shell
     inline:
-      - sudo apt-get update
-      - sudo apt-get install -y --no-install-recommends ca-certificates git procps sudo python3-apt python3-pip python3-venv pipx
+      # Wait for cloud-init + apt-daily to release the apt-lists and dpkg
+      # locks — warpgate SSHes in fast enough to race them on fresh clones.
+      # cloud-init status --wait blocks until cloud-init finishes; the fuser
+      # loop also covers apt-daily timer activity that runs after that.
+      - sudo cloud-init status --wait >/dev/null 2>&1 || true
+      - sudo bash -c 'for i in $(seq 1 300); do fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 2; done'
+      - sudo apt-get -o DPkg::Lock::Timeout=300 update
+      - sudo apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends ca-certificates git procps sudo python3-apt python3-pip python3-venv pipx
       - 'sudo sed -i ''s|^PATH="|PATH="/root/.local/bin:/root/.cargo/bin:|'' /etc/environment || echo ''PATH="/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'' | sudo tee /etc/environment'
       - sudo pipx install --force --global uv
       - sudo pipx install --force --global ansible-core
@@ -61,7 +67,7 @@ provisioners:
   - type: shell
     inline:
       - sudo PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
-      - 'GPU=${CRACKING_TOOLS_GPU_SUPPORT:-false}; sudo HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=${GPU} -e cracking_tools_hashcat_from_source=${GPU} -e cracking_tools_nvidia_opencl_icd=${GPU}'
+      - 'GPU=${CRACKING_TOOLS_GPU_SUPPORT:-false}; sudo HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cloud_provider=proxmox -e cracking_tools_gpu_support=${GPU} -e cracking_tools_hashcat_from_source=${GPU} -e cracking_tools_nvidia_opencl_icd=${GPU} -e cracking_tools_install_nvidia_driver=${GPU} -e cracking_tools_install_cuda_toolkit=${GPU}'
 
   # NVIDIA driver + CUDA toolkit (only when GPU support requested). Requires
   # the Proxmox host to be passing through a GPU (PCIe passthrough) for the

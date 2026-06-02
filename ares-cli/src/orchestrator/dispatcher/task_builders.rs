@@ -661,6 +661,21 @@ impl Dispatcher {
                 "password": credential.password,
                 "domain": credential.domain,
             },
+            "bind_domain": credential.domain,
+            "instructions": concat!(
+                "Enumerate SMB shares on target_ip using the provided credential.\n\n",
+                "AUTHENTICATION: SMB binds against the credential's HOME domain, not the target host's domain. ",
+                "Always pass `domain=<credential.domain>` (i.e. the `bind_domain` field) to enumerate_shares. ",
+                "Do NOT use a domain inferred from the target host's FQDN — that produces ",
+                "STATUS_LOGON_FAILURE silently and returns an empty share list. ",
+                "If the credential.domain is `north.sevenkingdoms.local` and the target host is in ",
+                "`sevenkingdoms.local`, authenticate as user@north.sevenkingdoms.local — the share ",
+                "enumeration still works across forest/child trust as long as the bind domain is the user's home.\n\n",
+                "For each share found, register it via the appropriate state-write tool ",
+                "(host_ip, share_name, permissions). Pay attention to non-default shares ",
+                "(anything beyond ADMIN$/C$/IPC$/NETLOGON/SYSVOL) — they often hold credentials, ",
+                "scripts, or sensitive data."
+            ),
         });
         self.throttled_submit("recon", "recon", payload, 5).await
     }
