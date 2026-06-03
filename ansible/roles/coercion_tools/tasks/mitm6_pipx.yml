@@ -25,7 +25,7 @@
 - name: Create symlink for mitm6 in /usr/local/bin
   ansible.builtin.file:
     src: "{{ base_pipx_bin_path }}/mitm6"
-    dest: /usr/local/bin/mitm6
+    dest: /usr/bin/mitm6
     state: link
     force: true
   become: true

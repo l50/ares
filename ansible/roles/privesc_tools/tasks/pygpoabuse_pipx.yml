@@ -25,7 +25,7 @@
 - name: Create pygpoabuse symlink in /usr/local/bin
   ansible.builtin.file:
     src: "{{ base_pipx_bin_path }}/pygpoabuse"
-    dest: /usr/local/bin/pygpoabuse
+    dest: /usr/bin/pygpoabuse
     state: link
     force: true
   become: true

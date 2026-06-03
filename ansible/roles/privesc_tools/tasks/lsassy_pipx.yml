@@ -25,7 +25,7 @@
 - name: Create symlink for lsassy in /usr/local/bin
   ansible.builtin.file:
     src: "{{ base_pipx_bin_path }}/lsassy"
-    dest: /usr/local/bin/lsassy
+    dest: /usr/bin/lsassy
     state: link
     force: true
   become: true
