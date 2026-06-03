@@ -485,6 +485,37 @@ pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
     let attempts_used = optional_i64(args, "attempts_used_per_account").unwrap_or(0);
     let acknowledge_no_policy = optional_bool(args, "acknowledge_no_policy").unwrap_or(false);
 
+    // AS-REP-first gate: refuse to spray until asrep_roast has been attempted
+    // at least once for this domain in this op. Without this the LLM
+    // routinely burns 70+ low-EV spray calls before ever trying the
+    // zero-cred high-EV asrep_roast primitive — which is the actual path
+    // to a foothold on default-config AD ranges (GOAD, BadBlood, vagrant).
+    // The flag is written by `asrep_roast` at the end of every invocation
+    // (success or error — what matters is that the no-cred path was tried).
+    let flag = crate::credential_access::kerberos::asrep_attempted_flag_path(domain);
+    if !flag.exists() {
+        return Ok(ToolOutput {
+            stdout: format!(
+                "REFUSED: password_spray is gated until asrep_roast has been \
+                 attempted for domain '{domain}'. \n\
+                 \n\
+                 Call asrep_roast FIRST. Suggested invocation (zero credentials \
+                 required, default wordlist):\n\
+                 \x20 asrep_roast(dc_ip='{target}', domain='{domain}', \
+                 users_file='/usr/share/seclists/Usernames/Names/names.txt')\n\
+                 \n\
+                 If asrep_roast returns any $krb5asrep$ hashes, hand them to \
+                 the cracker tool — one cracked hash typically unlocks an \
+                 authenticated foothold which makes spray unnecessary. Only \
+                 after asrep_roast has run (success or not) will password_spray \
+                 be permitted for this domain."
+            ),
+            stderr: String::new(),
+            exit_code: Some(1),
+            success: false,
+        });
+    }
+
     if let Some(refusal) =
         check_spray_budget(lockout_threshold, attempts_used, acknowledge_no_policy)
     {
@@ -649,6 +680,31 @@ pub async fn username_as_password(args: &Value) -> Result<ToolOutput> {
     let users_file = optional_str(args, "users_file");
     let domain = required_str(args, "domain")?;
     let excluded_users = optional_str(args, "excluded_users").unwrap_or("");
+
+    // Same AS-REP-first gate as password_spray. username_as_password is the
+    // other low-EV-without-asrep tool the LLM reaches for on cold targets.
+    let flag = crate::credential_access::kerberos::asrep_attempted_flag_path(domain);
+    if !flag.exists() {
+        return Ok(ToolOutput {
+            stdout: format!(
+                "REFUSED: username_as_password is gated until asrep_roast has \
+                 been attempted for domain '{domain}'. \n\
+                 \n\
+                 Call asrep_roast FIRST (zero credentials required):\n\
+                 \x20 asrep_roast(dc_ip='{target}', domain='{domain}', \
+                 users_file='/usr/share/seclists/Usernames/Names/names.txt')\n\
+                 \n\
+                 AS-REP roast on a wordlist enumerates users implicitly and \
+                 yields crackable hashes for any pre-auth-disabled account — \
+                 strictly higher EV than testing user=pass against unknown \
+                 accounts. After asrep_roast has run once, this tool will \
+                 be permitted again."
+            ),
+            stderr: String::new(),
+            exit_code: Some(1),
+            success: false,
+        });
+    }
 
     // Use provided file or generate a default wordlist. Caller-supplied
     // wordlists are filtered to drop AD built-in always-disabled accounts so
@@ -1009,6 +1065,14 @@ mod tests {
         }
     }
 
+    /// Touch the AS-REP-attempted flag so the gate at the top of
+    /// `password_spray` / `username_as_password` lets the test exercise
+    /// the post-gate logic (lockout budget, executor invocation, etc.).
+    fn mark_asrep_for_test(domain: &str) {
+        let path = super::super::kerberos::asrep_attempted_flag_path(domain);
+        let _ = std::fs::write(path, b"1");
+    }
+
     // --- password_spray ---
 
     #[test]
@@ -1339,6 +1403,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_spray_with_file_executes() {
+        mark_asrep_for_test("contoso.local");
         mock::push(mock::success());
         let args = json!({
             "target": "192.168.58.1", "password": "P@ss",
@@ -1351,6 +1416,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_spray_refuses_without_policy() {
+        mark_asrep_for_test("contoso.local");
         // No mock pushed — if the gate fails to short-circuit, executor errors
         // (and the test would fail with a different assertion).
         let args = json!({
@@ -1368,6 +1434,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_spray_refuses_when_budget_exhausted() {
+        mark_asrep_for_test("contoso.local");
         let args = json!({
             "target": "192.168.58.1", "password": "P@ss",
             "domain": "contoso.local",
@@ -1385,6 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_spray_acknowledge_no_policy_overrides() {
+        mark_asrep_for_test("contoso.local");
         mock::push(mock::success());
         let args = json!({
             "target": "192.168.58.1", "password": "P@ss",
@@ -1397,6 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_spray_threshold_zero_means_no_lockout() {
+        mark_asrep_for_test("contoso.local");
         mock::push(mock::success());
         let args = json!({
             "target": "192.168.58.1", "password": "P@ss",
@@ -1406,6 +1475,31 @@ mod tests {
         });
         let out = super::password_spray(&args).await.unwrap();
         assert!(out.success, "threshold=0 means no lockout policy in AD");
+    }
+
+    #[tokio::test]
+    async fn password_spray_refuses_when_asrep_not_attempted() {
+        // Use a fresh domain so no prior test set the flag for it.
+        let domain = "asrep-gate-test.example";
+        let _ = std::fs::remove_file(
+            super::super::kerberos::asrep_attempted_flag_path(domain),
+        );
+        let args = json!({
+            "target": "192.168.58.1", "password": "P@ss",
+            "domain": domain,
+            "acknowledge_no_policy": true
+        });
+        let out = super::password_spray(&args).await.unwrap();
+        assert!(!out.success, "spray must refuse before asrep_roast");
+        assert!(
+            out.stdout.contains("REFUSED: password_spray is gated"),
+            "expected gate refusal, got: {}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("asrep_roast(dc_ip="),
+            "refusal must include a callable asrep_roast example"
+        );
     }
 
     #[test]
@@ -1506,12 +1600,31 @@ mod tests {
 
     #[tokio::test]
     async fn username_as_password_with_file_executes() {
+        mark_asrep_for_test("contoso.local");
         mock::push(mock::success());
         let args = json!({
             "target": "192.168.58.1", "domain": "contoso.local",
             "users_file": "/tmp/users.txt"
         });
         assert!(super::username_as_password(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn username_as_password_refuses_when_asrep_not_attempted() {
+        let domain = "asrep-gate-uap.example";
+        let _ = std::fs::remove_file(
+            super::super::kerberos::asrep_attempted_flag_path(domain),
+        );
+        let args = json!({
+            "target": "192.168.58.1", "domain": domain
+        });
+        let out = super::username_as_password(&args).await.unwrap();
+        assert!(!out.success, "username_as_password must refuse before asrep_roast");
+        assert!(
+            out.stdout.contains("REFUSED: username_as_password is gated"),
+            "expected gate refusal, got: {}",
+            out.stdout
+        );
     }
 
     #[test]
