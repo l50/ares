@@ -1481,9 +1481,7 @@ mod tests {
     async fn password_spray_refuses_when_asrep_not_attempted() {
         // Use a fresh domain so no prior test set the flag for it.
         let domain = "asrep-gate-test.example";
-        let _ = std::fs::remove_file(
-            super::super::kerberos::asrep_attempted_flag_path(domain),
-        );
+        let _ = std::fs::remove_file(super::super::kerberos::asrep_attempted_flag_path(domain));
         let args = json!({
             "target": "192.168.58.1", "password": "P@ss",
             "domain": domain,
@@ -1612,16 +1610,18 @@ mod tests {
     #[tokio::test]
     async fn username_as_password_refuses_when_asrep_not_attempted() {
         let domain = "asrep-gate-uap.example";
-        let _ = std::fs::remove_file(
-            super::super::kerberos::asrep_attempted_flag_path(domain),
-        );
+        let _ = std::fs::remove_file(super::super::kerberos::asrep_attempted_flag_path(domain));
         let args = json!({
             "target": "192.168.58.1", "domain": domain
         });
         let out = super::username_as_password(&args).await.unwrap();
-        assert!(!out.success, "username_as_password must refuse before asrep_roast");
         assert!(
-            out.stdout.contains("REFUSED: username_as_password is gated"),
+            !out.success,
+            "username_as_password must refuse before asrep_roast"
+        );
+        assert!(
+            out.stdout
+                .contains("REFUSED: username_as_password is gated"),
             "expected gate refusal, got: {}",
             out.stdout
         );
