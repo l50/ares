@@ -105,7 +105,7 @@
     # netexec is installed via `pipx install --global`, so its venv lives
     # under PIPX_GLOBAL_VENVS (typically /opt/pipx/venvs). Try the global
     # path first, then fall back to the per-user path for compatibility
-    # with hosts where --global is unsupported or wasn't used.
+    # with hosts where --global is unsupported or was not used.
     for value in PIPX_GLOBAL_VENVS PIPX_LOCAL_VENVS; do
       VENVS=$(pipx environment --value "$value" 2>/dev/null || true)
       if [ -n "$VENVS" ] && [ -d "$VENVS/netexec" ]; then
