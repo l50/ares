@@ -29,21 +29,37 @@ pub(super) fn try_generate(
         (
             "asrep_roast",
             format!(
-                "asrep_roast(dc_ip='{dc_ip}', domain='{domain}') \
-                 - find users without Kerberos pre-auth"
+                "asrep_roast - MANDATORY FIRST ACTION, DO THIS BEFORE \
+                 ANYTHING ELSE. AS-REP roast yields crackable $krb5asrep$ \
+                 hashes for any account with Kerberos pre-auth disabled \
+                 — zero credentials required, highest-EV cold-start move. \
+                 Default lab builds (GOAD, BadBlood, vagrant) always have \
+                 ≥1 vulnerable account.\n\
+                 \x20  Cold-start (no users known yet):\n\
+                 \x20    asrep_roast(dc_ip='{dc_ip}', domain='{domain}', users_file='/usr/share/seclists/Usernames/Names/names.txt')\n\
+                 \x20  If first wordlist empty, retry with broader lists:\n\
+                 \x20    asrep_roast(dc_ip='{dc_ip}', domain='{domain}', users_file='/usr/share/seclists/Usernames/top-usernames-shortlist.txt')\n\
+                 \x20    asrep_roast(dc_ip='{dc_ip}', domain='{domain}', users_file='/usr/share/seclists/Usernames/cirt-default-usernames.txt')\n\
+                 \x20  Once any users are known (from kerberos_user_enum_noauth or LDAP), prefer that list:\n\
+                 \x20    asrep_roast(dc_ip='{dc_ip}', domain='{domain}', known_users=['user1','user2',...])\n\
+                 \x20  Hand any $krb5asrep$ hash to the cracker immediately — one cracked hash = authenticated foothold."
             ),
         ),
         (
             "username_as_password",
             format!(
                 "username_as_password(target='{dc_ip}', domain='{domain}') \
-                 - test if users have username=password (e.g., testuser:testuser)"
+                 - test if users have username=password (e.g., testuser:testuser). \
+                 LOW priority: only run AFTER asrep_roast has been attempted on at least one wordlist."
             ),
         ),
         (
             "password_spray",
             format!(
-                "password_spray - YOU MUST CALL ONCE PER PASSWORD:\n\
+                "password_spray - LOW priority without known users. DO NOT call this \
+                 until asrep_roast has been attempted at least once. Sprays against \
+                 unknown users burn dispatch budget with near-zero yield. After asrep_roast \
+                 has run, call ONCE PER PASSWORD:\n\
                  \x20  Standard: password_spray(target='{dc_ip}', domain='{domain}', password='Password1')\n\
                  \x20  Standard: password_spray(target='{dc_ip}', domain='{domain}', password='Welcome1')\n\
                  \x20  Standard: password_spray(target='{dc_ip}', domain='{domain}', password='Passw0rd!')\n\
@@ -55,7 +71,9 @@ pub(super) fn try_generate(
             "kerberos_user_enum_noauth",
             format!(
                 "kerberos_user_enum_noauth(dc_ip='{dc_ip}', domain='{domain}') \
-                 - enumerate valid usernames via Kerberos"
+                 - enumerate valid usernames via Kerberos error codes. Run AFTER asrep_roast \
+                 (asrep_roast on a wordlist already discovers users implicitly), then re-run \
+                 asrep_roast with the discovered names."
             ),
         ),
     ]

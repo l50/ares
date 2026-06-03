@@ -53,6 +53,9 @@ includes:
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
       ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
       LOKI_URL: '{{.LOKI_URL}}'
+  proxmox:
+    taskfile: .taskfiles/proxmox/Taskfile.yaml
+    optional: true
   blue:
     taskfile: .taskfiles/blue/Taskfile.yaml
     optional: true

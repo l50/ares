@@ -114,7 +114,33 @@ pub async fn asrep_roast(args: &Value) -> Result<ToolOutput> {
         let _ = std::fs::remove_file(&path);
     }
 
+    // Mark that asrep_roast has been attempted for this op/domain so the
+    // password_spray gate can let subsequent sprays through. Touched
+    // regardless of result.is_ok() — even an errored attempt means we tried
+    // the no-cred path first, which is the planner discipline we want to
+    // enforce. See `asrep_attempted_flag_path` / the gate in `password_spray`.
+    let _ = touch_asrep_attempted_flag(domain);
+
     result
+}
+
+/// Path to the file-based flag recording that AS-REP roast has been
+/// attempted for `(op_id, domain)` in the current orchestrator process.
+/// Used to gate `password_spray` so the LLM cannot skip the highest-EV
+/// cold-start primitive in favor of low-yield spray when no credentials
+/// are known yet.
+pub(crate) fn asrep_attempted_flag_path(domain: &str) -> std::path::PathBuf {
+    // Tools and orchestrator run in the same process under
+    // ARES_TOOL_DISPATCH=local; per-PID scoping keeps the flag from leaking
+    // across orch restarts (which start a fresh op life-cycle).
+    let pid = std::process::id();
+    let dom = domain.to_lowercase().replace('/', "_");
+    std::path::PathBuf::from(format!("/tmp/ares_asrep_attempted_{pid}_{dom}"))
+}
+
+fn touch_asrep_attempted_flag(domain: &str) -> std::io::Result<()> {
+    let path = asrep_attempted_flag_path(domain);
+    std::fs::write(&path, b"1")
 }
 
 /// Common AD usernames for unauthenticated Kerberos enumeration.

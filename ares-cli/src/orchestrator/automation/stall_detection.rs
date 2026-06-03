@@ -952,8 +952,15 @@ mod tests {
         assert_eq!(p["target_ip"], "192.168.58.10");
         assert_eq!(p["domain"], "contoso.local");
         let instructions = p["instructions"].as_str().expect("instructions");
+        // Cold-start instructions must name the asrep_roast tool by name and
+        // direct the agent to seclists wordlists. Older revisions also
+        // mentioned `kerbrute`; the asrep-first rewrite folds that fallback
+        // into the kerberos_user_enum_noauth step, so the assertion below
+        // checks the stable signals instead.
+        assert!(instructions.contains("asrep_roast"));
         assert!(instructions.contains("seclists"));
-        assert!(instructions.contains("kerbrute"));
+        assert!(instructions.contains("kerberos_user_enum_noauth"));
+        assert!(instructions.contains("MANDATORY FIRST ACTION"));
     }
 
     fn ctx(

