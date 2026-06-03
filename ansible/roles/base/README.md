@@ -93,6 +93,9 @@ Base requirements for Ares AI agents
 - **Install pipx via apt (Debian/Ubuntu)** (block) - Conditional
 - **Refresh apt cache before pipx install** (ansible.builtin.apt)
 - **Install pipx via apt** (ansible.builtin.apt)
+- **Check pipx version after apt install** (ansible.builtin.command)
+- **Check whether pip supports --break-system-packages** (ansible.builtin.command) - Conditional
+- **Upgrade pipx to a version supporting --global (>= 1.5.0)** (ansible.builtin.pip) - Conditional
 - **Add pipx bin to system PATH via profile.d** (ansible.builtin.copy)
 - **Verify pipx installation** (ansible.builtin.command)
 - **Display pipx version** (ansible.builtin.debug)

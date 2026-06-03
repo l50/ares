@@ -121,13 +121,13 @@
       when: recon_tools_enum4linuxng_pipx_check.rc != 0
 
     - name: Check if enum4linux-ng is already installed via pipx
-      ansible.builtin.command: pipx list
+      ansible.builtin.command: pipx list --global
       register: recon_tools_enum4linuxng_pipx_list
       changed_when: false
 
     - name: Install enum4linux-ng via pipx
       ansible.builtin.command: >-
-        pipx install "{{ recon_tools_enum4linuxng_install_source }}"
+        pipx install --global "{{ recon_tools_enum4linuxng_install_source }}"
       register: recon_tools_enum4linuxng_pipx_install
       changed_when: "'installed package' in recon_tools_enum4linuxng_pipx_install.stdout"
       environment:
@@ -226,13 +226,13 @@
       when: recon_tools_adidnsdump_pipx_check.rc != 0
 
     - name: Check if adidnsdump is already installed via pipx
-      ansible.builtin.command: pipx list
+      ansible.builtin.command: pipx list --global
       register: recon_tools_adidnsdump_pipx_list
       changed_when: false
 
     - name: Install adidnsdump via pipx
       ansible.builtin.command: >-
-        pipx install "{{ recon_tools_adidnsdump_install_source
+        pipx install --global "{{ recon_tools_adidnsdump_install_source
         | default(recon_tools_adidnsdump_package) }}"
       register: recon_tools_adidnsdump_pipx_install
       changed_when: "'installed package' in recon_tools_adidnsdump_pipx_install.stdout"

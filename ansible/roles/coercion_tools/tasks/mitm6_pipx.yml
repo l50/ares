@@ -3,7 +3,7 @@
 # This eliminates netifaces compilation issues and dependency conflicts
 
 - name: Check if mitm6 is already installed via pipx
-  ansible.builtin.command: pipx list
+  ansible.builtin.command: pipx list --global
   register: coercion_tools_mitm6_pipx_list
   changed_when: false
   failed_when: false
@@ -12,7 +12,7 @@
     HOME: /root
 
 - name: Install mitm6 via pipx
-  ansible.builtin.command: pipx install mitm6
+  ansible.builtin.command: pipx install --global mitm6
   register: coercion_tools_mitm6_pipx_install
   changed_when: "'installed package mitm6' in coercion_tools_mitm6_pipx_install.stdout"
   failed_when: false
@@ -25,7 +25,7 @@
 - name: Create symlink for mitm6 in /usr/local/bin
   ansible.builtin.file:
     src: "{{ base_pipx_bin_path }}/mitm6"
-    dest: /usr/local/bin/mitm6
+    dest: /usr/bin/mitm6
     state: link
     force: true
   become: true

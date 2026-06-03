@@ -3,7 +3,7 @@
 # This eliminates netaddr version conflicts with Kali apt packages
 
 - name: Check if lsassy is already installed via pipx
-  ansible.builtin.command: pipx list
+  ansible.builtin.command: pipx list --global
   register: credential_access_tools_lsassy_pipx_list
   changed_when: false
   failed_when: false
@@ -12,7 +12,7 @@
     HOME: /root
 
 - name: Install lsassy via pipx
-  ansible.builtin.command: pipx install lsassy
+  ansible.builtin.command: pipx install --global lsassy
   register: credential_access_tools_lsassy_pipx_install
   changed_when: "'installed package lsassy' in credential_access_tools_lsassy_pipx_install.stdout"
   failed_when: false
@@ -25,7 +25,7 @@
 - name: Create symlink for lsassy in /usr/local/bin
   ansible.builtin.file:
     src: "{{ base_pipx_bin_path }}/lsassy"
-    dest: /usr/local/bin/lsassy
+    dest: /usr/bin/lsassy
     state: link
     force: true
   become: true
