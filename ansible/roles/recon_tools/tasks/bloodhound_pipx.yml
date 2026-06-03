@@ -3,7 +3,7 @@
 # This prevents conflicts with other tools that depend on impacket
 
 - name: Check if bloodhound-python is already installed via pipx
-  ansible.builtin.command: pipx list
+  ansible.builtin.command: pipx list --global
   register: recon_tools_bloodhound_pipx_list
   changed_when: false
   failed_when: false
@@ -12,7 +12,7 @@
     HOME: /root
 
 - name: Install bloodhound-python via pipx
-  ansible.builtin.command: pipx install bloodhound
+  ansible.builtin.command: pipx install --global bloodhound
   register: recon_tools_bloodhound_pipx_install
   changed_when: "'installed package bloodhound' in recon_tools_bloodhound_pipx_install.stdout"
   failed_when: false

@@ -49,14 +49,20 @@ provisioners:
       - sudo apt-get -o DPkg::Lock::Timeout=300 update
       - sudo apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends ca-certificates git procps sudo python3-apt python3-pip python3-venv pipx
       - 'sudo sed -i ''s|^PATH="|PATH="/root/.local/bin:/root/.cargo/bin:|'' /etc/environment || echo ''PATH="/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'' | sudo tee /etc/environment'
-      - sudo pipx install --force --global uv
-      - sudo pipx install --force --global ansible-core
+      # No --force: a pre-warmed base template may already have these
+      # installed, and `pipx install --force` calls `uv venv` which refuses
+      # to overwrite an existing venv ("A virtual environment already exists
+      # at: ."). Plain `install` is a no-op when already present.
+      - sudo pipx install --global uv
+      - sudo pipx install --global ansible-core
       - sudo pipx ensurepath --global
 
   # Copy the in-repo ansible/ subtree (the dreadnode.nimbus_range collection)
   # into the build VM. Keeps the `nimbus_range` name because the collection
-  # is published as `dreadnode.nimbus_range`.
+  # is published as `dreadnode.nimbus_range`. `sudo: true` lets warpgate
+  # write into /root via `sudo tar -xf -` on the remote.
   - type: file
+    sudo: true
     source: ${sources.ansible}
     destination: /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
 

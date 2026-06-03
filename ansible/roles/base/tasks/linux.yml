@@ -89,8 +89,12 @@
 - name: Set base tool paths for dependent roles
   ansible.builtin.set_fact:
     base_rust_bin_path: "/root/.cargo/bin"
-    base_pipx_bin_path: "/root/.local/bin"
-    base_pipx_venv_path: "/root/.local/pipx/venvs"
+    # pipx --global places apps under /usr/local/bin and venvs under
+    # /opt/pipx/venvs. Using these instead of /root/.local/* makes the
+    # tools accessible to non-root users (e.g., kali) as well, since
+    # /root is mode 0700.
+    base_pipx_bin_path: "/usr/local/bin"
+    base_pipx_venv_path: "/opt/pipx/venvs"
     cacheable: yes
 
 - name: Check pip version

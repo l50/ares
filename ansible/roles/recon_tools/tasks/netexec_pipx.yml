@@ -56,7 +56,7 @@
     - recon_tools_pipx_recheck.rc | default(1) != 0
 
 - name: Check if NetExec is already installed via pipx
-  ansible.builtin.command: pipx list
+  ansible.builtin.command: pipx list --global
   register: recon_tools_pipx_list
   changed_when: false
   failed_when: false
@@ -67,7 +67,7 @@
 
 - name: Install NetExec via pipx from GitHub
   ansible.builtin.command: >
-    pipx install git+{{ recon_tools_netexec_repo }}
+    pipx install --global git+{{ recon_tools_netexec_repo }}
   register: recon_tools_netexec_pipx_install
   changed_when: "'installed package netexec' in recon_tools_netexec_pipx_install.stdout"
   failed_when: false
