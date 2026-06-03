@@ -102,15 +102,25 @@
 - name: Discover pipx venvs directory
   ansible.builtin.shell: |
     set -o pipefail
-    # Use pipx environment to find actual venvs path (varies by version/distro)
-    VENVS=$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null || true)
-    if [ -z "$VENVS" ] || [ ! -d "$VENVS" ]; then
-      # Fallback: check known locations
-      for d in /root/.local/share/pipx/venvs /root/.local/pipx/venvs; do
-        if [ -d "$d/netexec" ]; then VENVS="$d"; break; fi
-      done
-    fi
-    echo "${VENVS:-NOT_FOUND}"
+    # netexec is installed via `pipx install --global`, so its venv lives
+    # under PIPX_GLOBAL_VENVS (typically /opt/pipx/venvs). Try the global
+    # path first, then fall back to the per-user path for compatibility
+    # with hosts where --global is unsupported or wasn't used.
+    for value in PIPX_GLOBAL_VENVS PIPX_LOCAL_VENVS; do
+      VENVS=$(pipx environment --value "$value" 2>/dev/null || true)
+      if [ -n "$VENVS" ] && [ -d "$VENVS/netexec" ]; then
+        echo "$VENVS"
+        exit 0
+      fi
+    done
+    # Fallback: check known locations
+    for d in /opt/pipx/venvs /root/.local/share/pipx/venvs /root/.local/pipx/venvs; do
+      if [ -d "$d/netexec" ]; then
+        echo "$d"
+        exit 0
+      fi
+    done
+    echo "NOT_FOUND"
   args:
     executable: /bin/bash
   register: recon_tools_pipx_venvs_dir
