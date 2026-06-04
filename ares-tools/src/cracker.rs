@@ -85,6 +85,62 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Probe `hashcat -I` to learn whether a usable backend exists.
+///
+/// Returns `Ok(())` if hashcat is installed and reports at least one compute
+/// backend, `Err(reason)` otherwise. Spawn failures (ENOENT), nonzero exits,
+/// and "no devices" output are all surfaced as the reason string.
+async fn probe_hashcat() -> Result<(), String> {
+    let out = crate::executor::CommandBuilder::new("hashcat")
+        .arg("-I")
+        .timeout_secs(5)
+        .execute()
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("failed to spawn") {
+                "hashcat binary not in PATH".to_string()
+            } else {
+                format!("hashcat probe failed: {msg}")
+            }
+        })?;
+    if !out.success {
+        return Err(format!(
+            "hashcat -I exited {:?}: {}",
+            out.exit_code,
+            out.stderr.lines().next().unwrap_or("").trim()
+        ));
+    }
+    // `hashcat -I` lists a "Backend Device ID" section per compute target.
+    // Absence means hashcat ran but has nothing to crack with.
+    if out.stdout.to_lowercase().contains("backend device id") {
+        Ok(())
+    } else {
+        Err("hashcat present but no compute backend available".into())
+    }
+}
+
+/// Return cached probe result; runs `probe_hashcat` at most once per process.
+#[cfg(not(test))]
+async fn ensure_hashcat_available() -> Result<(), String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Result<(), String>> = OnceLock::new();
+    if let Some(r) = CACHE.get() {
+        return r.clone();
+    }
+    let r = probe_hashcat().await;
+    let _ = CACHE.set(r.clone());
+    r
+}
+
+/// Tests mock `CommandBuilder::execute()` directly, so skip the probe to
+/// avoid every existing test having to push a probe response. The probe
+/// itself is covered by dedicated tests against `probe_hashcat`.
+#[cfg(test)]
+async fn ensure_hashcat_available() -> Result<(), String> {
+    Ok(())
+}
+
 /// Crack a hash using hashcat with a wordlist attack.
 ///
 /// Tries multiple wordlists in order (rockyou, seclists). When `use_dynamic_wordlist`
@@ -92,6 +148,19 @@ fn capitalize(s: &str) -> String {
 pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
     if let Some(url) = remote::service_url() {
         return remote::crack(args, &url).await;
+    }
+
+    if let Err(reason) = ensure_hashcat_available().await {
+        return Ok(ToolOutput {
+            stdout: String::new(),
+            stderr: format!(
+                "hashcat unavailable: {reason}. \
+                 Set HASHCAT_SERVICE_URL and HASHCAT_TOKEN to delegate to a remote backend, \
+                 or install hashcat locally with a working compute device."
+            ),
+            exit_code: Some(127),
+            success: false,
+        });
     }
 
     let hash_value = required_str(args, "hash_value")?;
@@ -498,5 +567,40 @@ mod tests {
             "known_usernames": ["admin"]
         });
         assert!(crack_with_john(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_hashcat_ok_when_backend_listed() {
+        mock::push(ToolOutput {
+            stdout: "OpenCL Info:\n  Backend Device ID #1\n    Type: GPU".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        });
+        assert!(probe_hashcat().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_hashcat_err_when_no_backend_listed() {
+        mock::push(ToolOutput {
+            stdout: "hashcat (v6.2.6) starting in benchmark mode\n".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        });
+        let err = probe_hashcat().await.unwrap_err();
+        assert!(err.contains("no compute backend"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn probe_hashcat_err_on_nonzero_exit() {
+        mock::push(ToolOutput {
+            stdout: String::new(),
+            stderr: "No devices found/left.".into(),
+            exit_code: Some(255),
+            success: false,
+        });
+        let err = probe_hashcat().await.unwrap_err();
+        assert!(err.contains("exited"), "got: {err}");
     }
 }
