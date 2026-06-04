@@ -191,12 +191,24 @@ pub(crate) async fn check_domain_admin_indicators(payload: &Value, dispatcher: &
         info!("Domain Admin achieved!");
     }
     if !already_da {
-        // Emit Domain Admin timeline event
-        let da_domain = {
+        // Emit Domain Admin timeline event ONLY when publish_hash hasn't
+        // already covered it via a krbtgt arrival. publish_hash emits a
+        // per-domain DA event for every newly dominated domain (the
+        // authoritative source) — firing here too produces a duplicate for
+        // the first DA. This branch remains as a fallback for LLM-only DA
+        // indicators that arrive before any krbtgt hash.
+        let (da_domain, krbtgt_already_recorded) = {
             let state = dispatcher.state.read().await;
-            state.domains.first().cloned().unwrap_or_default()
+            let da_domain = state.domains.first().cloned().unwrap_or_default();
+            let has_krbtgt = state
+                .hashes
+                .iter()
+                .any(|h| h.username.eq_ignore_ascii_case("krbtgt"));
+            (da_domain, has_krbtgt)
         };
-        create_domain_admin_timeline_event(dispatcher, &da_domain, path.as_deref()).await;
+        if !krbtgt_already_recorded {
+            create_domain_admin_timeline_event(dispatcher, &da_domain, path.as_deref()).await;
+        }
         let (domain, dc_target) = {
             let state = dispatcher.state.read().await;
             let domain = state.domains.first().cloned().unwrap_or_default();

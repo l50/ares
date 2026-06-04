@@ -74,7 +74,11 @@ repos:
     hooks:
       - id: cargo-fmt
         name: Rust format check
-        entry: cargo fmt --all
+        # --check exits non-zero on diff (matches CI behavior). Plain
+        # `cargo fmt --all` silently rewrites files and exits 0, so a
+        # local commit could slip through with formatting drift that CI
+        # then rejects.
+        entry: cargo fmt --all -- --check
         language: system
         files: '\.rs$'
         pass_filenames: false

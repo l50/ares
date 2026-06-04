@@ -288,39 +288,46 @@ impl SharedState {
                 // vuln when the krbtgt domain resolved to a known DC — otherwise we
                 // emit a `dc_secretsdump on ` finding with empty target/domain.
                 let dc_target = state.domain_controllers.get(&krbtgt_domain).cloned();
+                let need_global_da_set = !state.has_domain_admin && newly_dominated.is_some();
+                drop(state);
 
-                // Auto-set domain admin when the first krbtgt NTLM hash arrives.
-                if !state.has_domain_admin {
-                    let da_domain = krbtgt_domain.clone();
-                    drop(state);
+                // Emit a per-domain DA timeline event for every newly dominated
+                // domain. Previously gated on the global `has_domain_admin`
+                // bool, which suppressed the event for the 2nd+ domain in a
+                // multi-forest op (e.g. cross-domain credential reuse landing
+                // krbtgt on a second forest after DA was already set).
+                if let Some(da_domain) = newly_dominated.as_ref() {
+                    let path_str = "secretsdump → krbtgt NTLM hash";
+                    let techniques = vec!["T1003.006".to_string(), "T1078.002".to_string()];
+                    let event_id =
+                        format!("evt-da-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+                    let event = serde_json::json!({
+                        "id": event_id,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "source": "domain_admin",
+                        "description": format!(
+                            "CRITICAL: Domain Admin achieved for {da_domain} via {path_str}",
+                        ),
+                        "mitre_techniques": techniques,
+                    });
+                    let _ = self
+                        .persist_timeline_event(queue, &event, &techniques)
+                        .await;
+                }
+
+                // Auto-set the global has_domain_admin flag once, the first
+                // time any domain is dominated. Per-domain bookkeeping
+                // (timeline event, dominated_domains set, vuln) is handled
+                // independently above/below so it scales to N domains.
+                if need_global_da_set {
                     let path = Some("secretsdump → krbtgt NTLM hash".to_string());
-                    if let Err(e) = self.set_domain_admin(queue, path.clone()).await {
+                    if let Err(e) = self.set_domain_admin(queue, path).await {
                         tracing::warn!(err = %e, "Failed to auto-set domain admin from krbtgt hash");
                     } else {
                         tracing::info!(
                             "🎯 Domain Admin auto-set from krbtgt NTLM hash in publish_hash"
                         );
-                        // Emit DA timeline event
-                        let techniques = vec!["T1003.006".to_string(), "T1078.002".to_string()];
-                        let event_id =
-                            format!("evt-da-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                        let event = serde_json::json!({
-                            "id": event_id,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                            "source": "domain_admin",
-                            "description": format!(
-                                "CRITICAL: Domain Admin achieved for {} via {}",
-                                da_domain,
-                                path.as_deref().unwrap_or("krbtgt hash")
-                            ),
-                            "mitre_techniques": techniques,
-                        });
-                        let _ = self
-                            .persist_timeline_event(queue, &event, &techniques)
-                            .await;
                     }
-                } else {
-                    drop(state);
                 }
 
                 // Mirror in-memory `dominated_domains` to a Redis SET so
@@ -879,6 +886,64 @@ mod tests {
                 .await
                 .unwrap();
         assert!(members.contains("contoso.local"));
+    }
+
+    #[tokio::test]
+    async fn publish_krbtgt_hash_emits_da_timeline_event_for_second_domain() {
+        // Regression: with two domains compromised in one op (e.g. cross-forest
+        // credential reuse landing krbtgt on a second forest), the attack
+        // path used to show only the FIRST DA — the second was gated out by
+        // `if !has_domain_admin`. Both compromises must now appear.
+        use redis::AsyncCommands;
+
+        let state = SharedState::new("op-multi".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("fabrikam.local".to_string());
+        }
+
+        let krbtgt_a = make_hash("krbtgt", "contoso.local", "NTLM", NTLM_HASH_A);
+        let other = "31d6cfe0d16ae931b73c59d7e0c089c0"; // pragma: allowlist secret
+        let krbtgt_b = make_hash("krbtgt", "fabrikam.local", "NTLM", other);
+
+        state.publish_hash(&q, krbtgt_a).await.unwrap();
+        state.publish_hash(&q, krbtgt_b).await.unwrap();
+
+        let mut conn = q.connection();
+        let entries: Vec<String> = conn
+            .lrange("ares:op:op-multi:timeline", 0, -1)
+            .await
+            .unwrap();
+        let descriptions: Vec<String> = entries
+            .iter()
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter_map(|v| {
+                v.get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        let contoso_da = descriptions
+            .iter()
+            .any(|d| d.contains("Domain Admin achieved for contoso.local"));
+        let fabrikam_da = descriptions
+            .iter()
+            .any(|d| d.contains("Domain Admin achieved for fabrikam.local"));
+        assert!(
+            contoso_da,
+            "expected DA timeline event for contoso.local, got: {descriptions:?}",
+        );
+        assert!(
+            fabrikam_da,
+            "expected DA timeline event for fabrikam.local, got: {descriptions:?}",
+        );
+
+        let s = state.inner.read().await;
+        assert!(s.dominated_domains.contains("contoso.local"));
+        assert!(s.dominated_domains.contains("fabrikam.local"));
     }
 
     #[tokio::test]
