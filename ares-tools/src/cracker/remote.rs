@@ -232,6 +232,17 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
             success: !stage1.cracked.is_empty(),
         });
     }
+    // If stage 1 errored (submission failed or hashcat exited badly), stage 2
+    // would almost certainly repeat the same failure against the same service.
+    // Surface the error now rather than doubling the noise in the transcript.
+    if stage1.terminal_status == "error" {
+        return Ok(ToolOutput {
+            stdout: transcript,
+            stderr: last_error.unwrap_or_default(),
+            exit_code: Some(1),
+            success: false,
+        });
+    }
 
     // Stage 2: rules pass against remaining budget.
     let elapsed = overall_started.elapsed().as_secs();

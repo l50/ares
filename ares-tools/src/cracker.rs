@@ -112,8 +112,11 @@ async fn probe_hashcat() -> Result<(), String> {
         ));
     }
     // `hashcat -I` lists a "Backend Device ID" section per compute target.
-    // Absence means hashcat ran but has nothing to crack with.
-    if out.stdout.to_lowercase().contains("backend device id") {
+    // Absence means hashcat ran but has nothing to crack with. Check both
+    // streams — current hashcat (7.x) prints to stdout, but past versions
+    // and forks have routed -I diagnostics through stderr.
+    let combined = format!("{}{}", out.stdout, out.stderr).to_lowercase();
+    if combined.contains("backend device id") {
         Ok(())
     } else {
         Err("hashcat present but no compute backend available".into())
@@ -121,6 +124,12 @@ async fn probe_hashcat() -> Result<(), String> {
 }
 
 /// Return cached probe result; runs `probe_hashcat` at most once per process.
+///
+/// Result is sticky for the lifetime of the process — a negative probe will
+/// not be re-checked even if hashcat is installed or fixed later. This is
+/// intentional for long-lived orchestrators (attacker agents): operators
+/// restart the process after env changes. If you need to re-probe without
+/// restarting, this needs a different cache strategy.
 #[cfg(not(test))]
 async fn ensure_hashcat_available() -> Result<(), String> {
     use std::sync::OnceLock;
@@ -590,6 +599,19 @@ mod tests {
         });
         let err = probe_hashcat().await.unwrap_err();
         assert!(err.contains("no compute backend"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn probe_hashcat_ok_when_backend_on_stderr() {
+        // Belt-and-suspenders: a hashcat variant that routes -I to stderr
+        // should still pass the probe.
+        mock::push(ToolOutput {
+            stdout: String::new(),
+            stderr: "Metal Info:\n  Backend Device ID #1\n    Type: GPU".into(),
+            exit_code: Some(0),
+            success: true,
+        });
+        assert!(probe_hashcat().await.is_ok());
     }
 
     #[tokio::test]
