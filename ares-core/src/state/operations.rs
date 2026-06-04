@@ -158,7 +158,9 @@ pub async fn extend_operation_retention(
         for key in keys {
             match conn.expire::<_, i64>(&key, ttl_secs).await {
                 Ok(_) => updated += 1,
-                Err(e) => tracing::debug!(key = %key, err = %e, "EXPIRE failed during retention extension"),
+                Err(e) => {
+                    tracing::debug!(key = %key, err = %e, "EXPIRE failed during retention extension")
+                }
             }
         }
         cursor = next_cursor;
