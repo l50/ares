@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn format_result_stdout_leads_with_unambiguous_success_header() {
-        let cracked = vec!["$krb5tgs$23$*jon.snow$REALM$spn*$xyz:iknownothing".to_string()];
+        let cracked = vec!["$krb5tgs$23$*alice$REALM$spn*$xyz:P@ssw0rd1!".to_string()];
         let transcript = "--- crackd stage 1 (wordlist=rockyou.txt, status=done) ---\nSession..........: crackd-abc\n";
         let out = format_result_stdout(&cracked, transcript, "wordlist=rockyou.txt");
         assert!(
@@ -361,7 +361,7 @@ mod tests {
             "got: {out}"
         );
         assert!(
-            out.contains("Cracked credentials:\n  $krb5tgs$23$*jon.snow$REALM$spn*$xyz:iknownothing\n"),
+            out.contains("Cracked credentials:\n  $krb5tgs$23$*alice$REALM$spn*$xyz:P@ssw0rd1!\n"),
             "must list the cracked entry up front"
         );
         // Transcript and raw potfile still present for debugging

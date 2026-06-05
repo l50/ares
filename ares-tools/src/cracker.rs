@@ -677,16 +677,16 @@ mod tests {
     fn extract_cracked_lines_picks_up_hashcat_show_format() {
         // hashcat --show prints "hash:plaintext" entries followed by metadata.
         let show = "\
-$krb5tgs$23$*jon.snow$NORTH.SEVENKINGDOMS.LOCAL$spn*$abc:iknownothing
-$krb5tgs$23$*sql_svc$NORTH.SEVENKINGDOMS.LOCAL$spn*$def:MyStr0ngP@ss
+$krb5tgs$23$*alice$CONTOSO.LOCAL$spn*$abc:P@ssw0rd1!
+$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$spn*$def:Summer2024!
 
 Session..........: hashcat
 Status...........: Cracked
 ";
         let lines = extract_cracked_lines(show);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with(":iknownothing"));
-        assert!(lines[1].ends_with(":MyStr0ngP@ss"));
+        assert!(lines[0].ends_with(":P@ssw0rd1!"));
+        assert!(lines[1].ends_with(":Summer2024!"));
     }
 
     #[test]

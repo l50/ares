@@ -1572,7 +1572,7 @@ contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:222222222222222
     #[test]
     fn looks_like_ip_pub_accepts_valid() {
         assert!(looks_like_ip_pub("192.168.58.10"));
-        assert!(looks_like_ip_pub("10.0.0.1"));
+        assert!(looks_like_ip_pub("1.1.1.1"));
     }
 
     #[test]
