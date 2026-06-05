@@ -331,16 +331,58 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
         .execute()
         .await?;
 
-    // Combine all output so the caller can see the full run
+    // Combine all output so the caller can see the full run.
+    // Prepend an unambiguous result header so the LLM agent can attribute
+    // the cracked password to crack_with_hashcat (local) without having to
+    // infer it from interleaved stage output.
+    let cracked = extract_cracked_lines(&show_result.stdout);
+    let header = result_header("crack_with_hashcat (local hashcat)", &cracked);
     Ok(ToolOutput {
         stdout: format!(
-            "{all_output}\n--- hashcat --show ---\n{}",
+            "{header}\n{all_output}\n--- hashcat --show ---\n{}",
             show_result.stdout
         ),
         stderr: show_result.stderr,
         exit_code: show_result.exit_code,
-        success: show_result.success,
+        success: !cracked.is_empty(),
     })
+}
+
+/// Extract `hash:plaintext` (or `user:plaintext:...`) cracked entries from
+/// hashcat/john `--show` output, dropping status lines and summary trailers.
+fn extract_cracked_lines(show_stdout: &str) -> Vec<String> {
+    show_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && l.contains(':')
+                // hashcat status block: "Session..........: hashcat"
+                && !l.contains("..........")
+                // john summary: "1 password hash cracked, 0 left"
+                && !l.ends_with("left")
+                && !l.contains("password hash")
+        })
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Build the unambiguous SUCCESS/RESULT banner the LLM agent sees first.
+fn result_header(tool_label: &str, cracked: &[String]) -> String {
+    if cracked.is_empty() {
+        format!("RESULT: {tool_label} — 0 hash(es) cracked")
+    } else {
+        let mut out = format!(
+            "SUCCESS: {tool_label} — {} hash(es) cracked\nCracked credentials:\n",
+            cracked.len()
+        );
+        for line in cracked {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
 }
 
 /// Crack a hash using John the Ripper with a wordlist attack.
@@ -438,11 +480,16 @@ pub async fn crack_with_john(args: &Value) -> Result<ToolOutput> {
     }
     let show_result = show_cmd.timeout_secs(30).execute().await?;
 
+    let cracked = extract_cracked_lines(&show_result.stdout);
+    let header = result_header("crack_with_john (local)", &cracked);
     Ok(ToolOutput {
-        stdout: format!("{all_output}\n--- john --show ---\n{}", show_result.stdout),
+        stdout: format!(
+            "{header}\n{all_output}\n--- john --show ---\n{}",
+            show_result.stdout
+        ),
         stderr: show_result.stderr,
         exit_code: show_result.exit_code,
-        success: show_result.success,
+        success: !cracked.is_empty(),
     })
 }
 
@@ -624,5 +671,47 @@ mod tests {
         });
         let err = probe_hashcat().await.unwrap_err();
         assert!(err.contains("exited"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_cracked_lines_picks_up_hashcat_show_format() {
+        // hashcat --show prints "hash:plaintext" entries followed by metadata.
+        let show = "\
+$krb5tgs$23$*jon.snow$NORTH.SEVENKINGDOMS.LOCAL$spn*$abc:iknownothing
+$krb5tgs$23$*sql_svc$NORTH.SEVENKINGDOMS.LOCAL$spn*$def:MyStr0ngP@ss
+
+Session..........: hashcat
+Status...........: Cracked
+";
+        let lines = extract_cracked_lines(show);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with(":iknownothing"));
+        assert!(lines[1].ends_with(":MyStr0ngP@ss"));
+    }
+
+    #[test]
+    fn extract_cracked_lines_drops_john_summary() {
+        let show = "\
+admin:Password1:1001:aad3b435:31d6cfe0::
+1 password hash cracked, 0 left
+";
+        let lines = extract_cracked_lines(show);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("admin:Password1:"));
+    }
+
+    #[test]
+    fn result_header_success_names_tool_and_lists_creds() {
+        let cracked = vec!["hash1:pw1".to_string(), "hash2:pw2".to_string()];
+        let h = result_header("crack_with_hashcat (local hashcat)", &cracked);
+        assert!(h.starts_with("SUCCESS: crack_with_hashcat (local hashcat) — 2 hash(es) cracked"));
+        assert!(h.contains("  hash1:pw1\n"));
+        assert!(h.contains("  hash2:pw2\n"));
+    }
+
+    #[test]
+    fn result_header_empty_says_zero() {
+        let h = result_header("crack_with_john (local)", &[]);
+        assert!(h.starts_with("RESULT: crack_with_john (local) — 0 hash(es) cracked"));
     }
 }

@@ -249,3 +249,7 @@
 - name: Install wordlists
   ansible.builtin.include_tasks: wordlists.yml
   when: cracking_tools_install_wordlists
+
+- name: Configure remote crackd client
+  ansible.builtin.include_tasks: crackd_client.yml
+  when: cracking_tools_install_crackd_client | bool
