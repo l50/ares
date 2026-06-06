@@ -15,7 +15,7 @@
 
 - name: Fetch crackd bearer token from 1Password
   ansible.builtin.set_fact:
-    _crackd_token: >-
+    cracking_tools_crackd_token: >-
       {{ lookup('community.general.onepassword', cracking_tools_crackd_op_path) }}
   delegate_to: localhost
   become: false
