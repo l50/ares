@@ -172,7 +172,7 @@ tasks:
   # ============================================================================
 
   submit:
-    desc: "Submit a fresh op against DEFAULT_IPS (override IPS=, DOMAIN=, MODEL=)"
+    desc: "Submit a fresh op against DEFAULT_IPS (override IPS=, DOMAIN=, MODEL=); waits up to 15s to confirm dispatcher claimed it"
     silent: true
     vars:
       IPS: '{{.IPS | default .DEFAULT_IPS}}'
@@ -187,13 +187,30 @@ tasks:
         # `ops submit` does an LLM preflight that requires OPENAI_API_KEY in
         # the env, but the kali user can't read /etc/default/ares (mode 0600
         # root). Source it via sudo so the key reaches the submit process.
-        ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
+        SUBMIT_OUT=$(ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
           "sudo bash -c 'set -a; source {{.REMOTE_ENV_FILE}}; set +a; \
              ARES_REDIS_URL=redis://localhost:6379 ares ops submit \
              {{.TARGET_LABEL}} {{.DOMAIN}} \
              --ips {{.IPS}} \
              --pin-active \
-             --model {{.MODEL}}'" 2>&1 | tail -3
+             --model {{.MODEL}}'" 2>&1)
+        echo "$SUBMIT_OUT" | tail -3
+        OP_ID=$(echo "$SUBMIT_OUT" | grep -oE 'op-[0-9]{8}-[0-9]{6}' | tail -1)
+        if [ -z "$OP_ID" ]; then exit 0; fi
+        # Healthcheck: confirm the dispatcher wrapper actually claimed this op
+        # (writes "Starting operation: <id>" to dispatch.log). Silent submit +
+        # wedged dispatcher has happened in the field — this surfaces it
+        # within ~15s instead of letting the user discover empty loot later.
+        for i in 1 2 3 4 5 6 7; do
+          sleep 2
+          if ssh -o ConnectTimeout=8 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
+              "sudo grep -qF 'Starting operation: $OP_ID' /var/log/ares/dispatch.log 2>/dev/null"; then
+            echo -e "{{.SUCCESS}} Dispatcher claimed $OP_ID (took ~$((i*2))s)"
+            exit 0
+          fi
+        done
+        echo -e "{{.WARN}} Dispatcher did NOT claim $OP_ID within 15s — likely a stale wrapper."
+        echo -e "{{.WARN}} Run: task proxmox:deploy:restart  to clear it, then resubmit."
 
   stop:
     desc: "Stop the latest op and kill the orchestrator (dispatcher stays up)"
@@ -208,11 +225,12 @@ tasks:
         EOF
 
   loot:
-    desc: "Dump current op loot (override WATCH=5 for live watch)"
+    desc: "Dump op loot (defaults to latest; pass OP_ID=op-... to target a specific op; WATCH=5 for live watch)"
     silent: true
     vars:
       WATCH: '{{.WATCH | default ""}}'
       DIFF: '{{.DIFF | default ""}}'
+      OP_ID: '{{.OP_ID | default ""}}'
     cmds:
       - |
         IP="{{.ATTACKER_IP}}"
@@ -220,8 +238,13 @@ tasks:
         FLAGS=""
         [ -n "{{.WATCH}}" ] && FLAGS="$FLAGS --watch {{.WATCH}}"
         [ -n "{{.DIFF}}" ] && FLAGS="$FLAGS --diff"
+        if [ -n "{{.OP_ID}}" ]; then
+          SELECTOR="{{.OP_ID}}"
+        else
+          SELECTOR="--latest"
+        fi
         ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
-          "ARES_REDIS_URL=redis://localhost:6379 ares ops loot --latest $FLAGS"
+          "ARES_REDIS_URL=redis://localhost:6379 ares ops loot $SELECTOR $FLAGS"
 
   runtime:
     desc: "Show current op runtime stats (vulns, creds, hashes, tokens, cost)"
