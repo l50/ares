@@ -46,8 +46,14 @@ fn service_token() -> Result<String> {
 }
 
 fn http_client() -> reqwest::Client {
+    // Drop pooled connections aggressively. uvicorn's default `--timeout-keep-alive`
+    // is 5s and our POLL_INTERVAL_SECS is also 5s — perfect race for reqwest to
+    // reuse a connection the server has just closed, surfacing as a misleading
+    // "crackd: failed to GET /jobs/{id}". 3s keeps short-lived pooling for
+    // cascade stages while guaranteeing we never hand out a stale socket.
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(3))
         .build()
         .unwrap_or_default()
 }
