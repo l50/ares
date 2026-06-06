@@ -87,7 +87,7 @@ Add to `~/.config/warpgate/config.yaml`:
 
 ```yaml
 proxmox:
-  endpoint: https://pve.example.com:8006/api2/json
+  endpoint: https://pve.contoso.local:8006/api2/json
   api_token_id: warpgate@pve!builder
   # api_token is read from $PROXMOX_API_TOKEN below — do not put it here
 ```

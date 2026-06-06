@@ -65,8 +65,22 @@ Install and configure password cracking tools for Ares agents
 | `cracking_tools_nvidia_cuda_toolkit_packages` | list | <code>&#91;&#93;</code> | No description |
 | `cracking_tools_nvidia_cuda_toolkit_packages.0` | str | <code>nvidia-cuda-toolkit</code> | No description |
 | `cracking_tools_update_cache` | bool | <code>True</code> | No description |
+| `cracking_tools_install_crackd_client` | bool | <code>False</code> | No description |
+| `cracking_tools_crackd_url` | str | <code></code> | No description |
+| `cracking_tools_crackd_op_path` | str | <code></code> | No description |
+| `cracking_tools_crackd_systemd_unit` | str | <code>ares@.service</code> | No description |
 
 ## Tasks
+
+### crackd_client.yml
+
+
+- **Validate crackd client config** (ansible.builtin.assert)
+- **Fetch crackd bearer token from 1Password** (ansible.builtin.set_fact)
+- **Ensure /etc/ares directory exists** (ansible.builtin.file)
+- **Render /etc/ares/secrets.env** (ansible.builtin.template)
+- **Ensure systemd drop-in dir for {{ cracking_tools_crackd_systemd_unit }}** (ansible.builtin.file)
+- **Install systemd drop-in that loads /etc/ares/secrets.env** (ansible.builtin.copy)
 
 ### hashcat.yml
 
@@ -127,6 +141,7 @@ Install and configure password cracking tools for Ares agents
 - **Install hashcat** (ansible.builtin.include_tasks) - Conditional
 - **Install John the Ripper** (ansible.builtin.include_tasks) - Conditional
 - **Install wordlists** (ansible.builtin.include_tasks) - Conditional
+- **Configure remote crackd client** (ansible.builtin.include_tasks) - Conditional
 
 ### main.yml
 

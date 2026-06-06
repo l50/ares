@@ -1,0 +1,63 @@
+---
+# Configure this host to delegate hashcat to a remote crackd service.
+# Renders /etc/ares/secrets.env (HASHCAT_SERVICE_URL + HASHCAT_TOKEN) and
+# wires it into the ares worker systemd unit via a drop-in. Token is
+# pulled from 1Password at play time — never stored in this repo.
+
+- name: Validate crackd client config
+  ansible.builtin.assert:
+    that:
+      - cracking_tools_crackd_url | length > 0
+      - cracking_tools_crackd_op_path | length > 0
+    fail_msg: >-
+      cracking_tools_install_crackd_client is true but
+      cracking_tools_crackd_url and/or cracking_tools_crackd_op_path are unset.
+
+- name: Fetch crackd bearer token from 1Password
+  ansible.builtin.set_fact:
+    cracking_tools_crackd_token: >-
+      {{ lookup('community.general.onepassword', cracking_tools_crackd_op_path) }}
+  delegate_to: localhost
+  become: false
+  no_log: true
+  run_once: true
+
+- name: Ensure /etc/ares directory exists
+  ansible.builtin.file:
+    path: /etc/ares
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render /etc/ares/secrets.env
+  ansible.builtin.template:
+    src: crackd_secrets.env.j2
+    dest: /etc/ares/secrets.env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart ares workers
+
+- name: Ensure systemd drop-in dir for {{ cracking_tools_crackd_systemd_unit }}
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ cracking_tools_crackd_systemd_unit }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install systemd drop-in that loads /etc/ares/secrets.env
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ cracking_tools_crackd_systemd_unit }}.d/10-crackd.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by dreadnode.nimbus_range.cracking_tools (crackd_client task).
+      [Service]
+      EnvironmentFile=-/etc/ares/secrets.env
+  notify:
+    - Reload systemd
+    - Restart ares workers

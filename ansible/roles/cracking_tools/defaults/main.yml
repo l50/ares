@@ -82,3 +82,18 @@ cracking_tools_nvidia_cuda_toolkit_packages:
   - nvidia-cuda-toolkit
 
 cracking_tools_update_cache: true
+
+# Remote crackd client config (HASHCAT_SERVICE_URL/HASHCAT_TOKEN).
+# Enable per-host to point the local cracker worker at a remote hashcat
+# service instead of failing GPU init on hosts without a usable backend.
+# See ares-tools/src/cracker/remote.rs for the client contract.
+cracking_tools_install_crackd_client: false
+cracking_tools_crackd_url: ""
+# 1Password lookup path for the bearer token, e.g.
+# "op://<vault>/<item>/credential"
+# Note: item titles in op:// references cannot contain parens or other
+# special characters — use a slug-style title.
+cracking_tools_crackd_op_path: ""
+# systemd unit family that should receive the env file via drop-in.
+# attacker-1 uses templated ares@<role>.service workers.
+cracking_tools_crackd_systemd_unit: "ares@.service"

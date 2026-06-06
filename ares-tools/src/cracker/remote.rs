@@ -223,9 +223,10 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
     }
     if !stage1.cracked.is_empty() || stage1.timed_out {
         return Ok(ToolOutput {
-            stdout: format!(
-                "{transcript}--- crackd potfile ---\n{}",
-                stage1.cracked.join("\n")
+            stdout: format_result_stdout(
+                &stage1.cracked,
+                &transcript,
+                &format!("wordlist={wordlist}"),
             ),
             stderr: last_error.unwrap_or_default(),
             exit_code: Some(if !stage1.cracked.is_empty() { 0 } else { 124 }),
@@ -288,11 +289,44 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
         1
     };
     Ok(ToolOutput {
-        stdout: format!("{transcript}--- crackd potfile ---\n{}", cracked.join("\n")),
+        stdout: format_result_stdout(
+            &cracked,
+            &transcript,
+            &format!("wordlist={wordlist}, rules={rules_name}"),
+        ),
         stderr: last_error.unwrap_or_default(),
         exit_code: Some(exit_code),
         success,
     })
+}
+
+/// Render the crack_with_hashcat stdout with an unambiguous leading header.
+///
+/// The header names the tool and backend ("crack_with_hashcat via remote
+/// crackd") and lists the cracked `hash:plaintext` lines up front so the
+/// LLM cannot mis-attribute the result to another backend later. The full
+/// stage transcript and raw potfile follow for debugging.
+fn format_result_stdout(cracked: &[String], transcript: &str, attempt_desc: &str) -> String {
+    let header = if cracked.is_empty() {
+        format!(
+            "RESULT: crack_with_hashcat via remote crackd — 0 hashes cracked ({attempt_desc})\n"
+        )
+    } else {
+        let mut out = format!(
+            "SUCCESS: crack_with_hashcat via remote crackd — {} hash(es) cracked ({attempt_desc})\nCracked credentials:\n",
+            cracked.len(),
+        );
+        for line in cracked {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    };
+    format!(
+        "{header}\n{transcript}--- crackd potfile ---\n{}",
+        cracked.join("\n")
+    )
 }
 
 #[cfg(test)]
@@ -313,6 +347,34 @@ mod tests {
         assert_eq!(json["rules"], "best66.rule");
         assert_eq!(json["wordlist"], "rockyou.txt");
         assert!(json.get("mask").is_none());
+    }
+
+    #[test]
+    fn format_result_stdout_leads_with_unambiguous_success_header() {
+        let cracked = vec!["$krb5tgs$23$*alice$REALM$spn*$xyz:P@ssw0rd1!".to_string()];
+        let transcript = "--- crackd stage 1 (wordlist=rockyou.txt, status=done) ---\nSession..........: crackd-abc\n";
+        let out = format_result_stdout(&cracked, transcript, "wordlist=rockyou.txt");
+        assert!(
+            out.starts_with(
+                "SUCCESS: crack_with_hashcat via remote crackd — 1 hash(es) cracked (wordlist=rockyou.txt)"
+            ),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("Cracked credentials:\n  $krb5tgs$23$*alice$REALM$spn*$xyz:P@ssw0rd1!\n"),
+            "must list the cracked entry up front"
+        );
+        // Transcript and raw potfile still present for debugging
+        assert!(out.contains("--- crackd stage 1"));
+        assert!(out.contains("--- crackd potfile ---"));
+    }
+
+    #[test]
+    fn format_result_stdout_empty_when_no_cracks() {
+        let out = format_result_stdout(&[], "transcript\n", "wordlist=rockyou.txt");
+        assert!(out.starts_with(
+            "RESULT: crack_with_hashcat via remote crackd — 0 hashes cracked (wordlist=rockyou.txt)"
+        ));
     }
 
     #[test]

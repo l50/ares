@@ -1582,7 +1582,7 @@ mod tests {
             Self {
                 state: Mutex::new(FakeState {
                     is_local_ip: true,
-                    local_ips: vec!["10.0.0.1".into()],
+                    local_ips: vec!["192.168.58.5".into()],
                     binaries_present: ["petitpotam".to_string()].into_iter().collect(),
                     relay_early_exit: None,
                     relay_initial_log: Vec::new(),
@@ -1824,7 +1824,7 @@ mod tests {
         // task was rejected because the supplied IP didn't match the worker.
         let fake = FakeCoerceProcs::new()
             .with_local_ip(false)
-            .with_local_ips(vec!["10.0.0.99".into()]);
+            .with_local_ips(vec!["192.168.58.99".into()]);
         let out = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
             .await
             .expect("substitute and proceed");

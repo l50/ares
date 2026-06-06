@@ -1,0 +1,15 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart ares workers
+  # Restart every running ares@<role>.service instance so the new
+  # EnvironmentFile is loaded. No-op if none are active.
+  ansible.builtin.shell: |
+    set -eo pipefail
+    units=$(systemctl list-units --type=service --state=loaded --no-legend 'ares@*.service' | awk '{print $1}')
+    if [ -n "$units" ]; then
+      systemctl restart $units
+    fi
+  changed_when: true

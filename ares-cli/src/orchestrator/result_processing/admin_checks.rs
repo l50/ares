@@ -809,7 +809,7 @@ mod tests {
     fn valid_fqdn_rejects_ip_like_strings() {
         // First label is all digits → looks like an IP, not a domain.
         assert!(!is_valid_domain_fqdn("192.168.58.10"));
-        assert!(!is_valid_domain_fqdn("10.0.0.1"));
+        assert!(!is_valid_domain_fqdn("1.1.1.1"));
     }
 
     #[test]
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn valid_fqdn_accepts_domain_with_hyphens_and_underscores() {
-        assert!(is_valid_domain_fqdn("my-domain.local"));
+        assert!(is_valid_domain_fqdn("my-org.contoso.local"));
         assert!(is_valid_domain_fqdn("_kerberos.contoso.local"));
     }
 
