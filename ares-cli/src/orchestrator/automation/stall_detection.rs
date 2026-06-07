@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::dispatcher::{Dispatcher, SubmissionOutcome};
 use crate::orchestrator::state::*;
 
 /// Collect the set of lowercased domains that have at least one pending
@@ -216,6 +216,172 @@ pub(crate) struct StallContext {
     pub lhf_max: usize,
 }
 
+/// Why a stall-recovery branch produced zero dispatchable actions this round.
+///
+/// Surfaced in the stall-recovery WARN so the next operator can fix data
+/// (clear a dedup, add a DC, enable a technique) instead of guessing why the
+/// auto-recovery is silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchSkipReason {
+    /// A precondition gate (`has_users` / `has_creds` / `has_dcs`) was false.
+    PreconditionUnmet { needs: &'static str },
+    /// The technique is disabled in the operation strategy.
+    TechniqueNotAllowed { technique: &'static str },
+    /// State had candidates but every one was filtered out.
+    AllCandidatesFiltered {
+        considered: usize,
+        dedup_skipped: usize,
+        dominated: usize,
+        delegation_blocked: usize,
+        missing_dc: usize,
+        empty_creds: usize,
+    },
+    /// Branch is intentionally suppressed because another branch owns recovery
+    /// for the current state shape (e.g. cold-start skipped when users/creds
+    /// exist).
+    SuppressedByState { reason: &'static str },
+}
+
+impl BranchSkipReason {
+    pub(crate) fn as_log_str(&self) -> String {
+        match self {
+            BranchSkipReason::PreconditionUnmet { needs } => {
+                format!("precondition_unmet:{needs}")
+            }
+            BranchSkipReason::TechniqueNotAllowed { technique } => {
+                format!("technique_not_allowed:{technique}")
+            }
+            BranchSkipReason::AllCandidatesFiltered {
+                considered,
+                dedup_skipped,
+                dominated,
+                delegation_blocked,
+                missing_dc,
+                empty_creds,
+            } => format!(
+                "all_filtered(considered={considered},dedup_skipped={dedup_skipped},\
+                 dominated={dominated},delegation_blocked={delegation_blocked},\
+                 missing_dc={missing_dc},empty_creds={empty_creds})"
+            ),
+            BranchSkipReason::SuppressedByState { reason } => {
+                format!("suppressed:{reason}")
+            }
+        }
+    }
+}
+
+/// Result of planning a single tick of stall recovery: the actions to attempt
+/// AND a per-branch explanation for every branch that produced zero actions.
+///
+/// `Spray`, `LowHanging`, and `ColdStart` are independent branches; each gets
+/// at most one entry in `branch_skips` per tick when it could not contribute.
+#[derive(Debug, Default)]
+pub(crate) struct StallPlan {
+    pub actions: Vec<RecoveryAction>,
+    pub branch_skips: Vec<(ActionKind, BranchSkipReason)>,
+}
+
+/// Inspect spray candidate selection and explain why an empty result is empty.
+///
+/// `select_stall_spray_work` filters silently; this walker counts each
+/// rejection bucket so the stall WARN can surface the actionable cause.
+fn diagnose_empty_spray(state: &StateInner, recovery_attempts: u32) -> BranchSkipReason {
+    let delegation_domains = domains_with_pending_delegation(state);
+    let mut considered = 0usize;
+    let mut dedup_skipped = 0usize;
+    let mut dominated = 0usize;
+    let mut delegation_blocked = 0usize;
+    for domain in state.domain_controllers.keys() {
+        considered += 1;
+        if state.is_domain_dominated(domain) {
+            dominated += 1;
+            continue;
+        }
+        if delegation_domains.contains(&domain.to_lowercase()) {
+            delegation_blocked += 1;
+            continue;
+        }
+        let key = stall_spray_dedup_key(domain, recovery_attempts);
+        if state.is_processed(DEDUP_PASSWORD_SPRAY, &key) {
+            dedup_skipped += 1;
+        }
+    }
+    BranchSkipReason::AllCandidatesFiltered {
+        considered,
+        dedup_skipped,
+        dominated,
+        delegation_blocked,
+        missing_dc: 0,
+        empty_creds: 0,
+    }
+}
+
+/// Inspect LHF candidate selection and explain why an empty result is empty.
+///
+/// Mirror of `select_stall_lhf_work` filters: empty domain/password, dominated
+/// domain, dedup-already-marked, no DC resolvable for the cred's domain.
+fn diagnose_empty_lhf(state: &StateInner, recovery_attempts: u32) -> BranchSkipReason {
+    let mut considered = 0usize;
+    let mut dedup_skipped = 0usize;
+    let mut dominated = 0usize;
+    let mut missing_dc = 0usize;
+    let mut empty_creds = 0usize;
+    for cred in &state.credentials {
+        considered += 1;
+        if cred.domain.is_empty() || cred.password.is_empty() {
+            empty_creds += 1;
+            continue;
+        }
+        let cred_domain = cred.domain.to_lowercase();
+        if state.is_domain_dominated(&cred_domain) {
+            dominated += 1;
+            continue;
+        }
+        if resolve_stall_dc_ip(state, &cred_domain).is_none() {
+            missing_dc += 1;
+            continue;
+        }
+        let key = stall_lhf_dedup_key(&cred_domain, &cred.username, recovery_attempts);
+        if state.is_processed(DEDUP_EXPANSION_CREDS, &key) {
+            dedup_skipped += 1;
+        }
+    }
+    BranchSkipReason::AllCandidatesFiltered {
+        considered,
+        dedup_skipped,
+        dominated,
+        delegation_blocked: 0,
+        missing_dc,
+        empty_creds,
+    }
+}
+
+/// Inspect cold-start candidate selection and explain why an empty result is empty.
+fn diagnose_empty_cold_start(state: &StateInner, recovery_attempts: u32) -> BranchSkipReason {
+    let mut considered = 0usize;
+    let mut dedup_skipped = 0usize;
+    let mut dominated = 0usize;
+    for domain in state.domain_controllers.keys() {
+        considered += 1;
+        if state.is_domain_dominated(domain) {
+            dominated += 1;
+            continue;
+        }
+        let key = stall_cold_start_dedup_key(domain, recovery_attempts);
+        if state.is_processed(DEDUP_STALL_COLD_START, &key) {
+            dedup_skipped += 1;
+        }
+    }
+    BranchSkipReason::AllCandidatesFiltered {
+        considered,
+        dedup_skipped,
+        dominated,
+        delegation_blocked: 0,
+        missing_dc: 0,
+        empty_creds: 0,
+    }
+}
+
 /// Build the prioritized list of stall-recovery actions for this tick.
 ///
 /// Pure function: no I/O, no Dispatcher. Inspects state + gates and returns
@@ -224,53 +390,141 @@ pub(crate) struct StallContext {
 /// Order: spray → low-hanging-fruit → cold-start. Cold-start only fires
 /// when both `has_users` and `has_creds` are false (otherwise the other
 /// two branches own the recovery).
+///
+/// Convenience wrapper around `plan_stall_recovery_diagnostic` that drops the
+/// per-branch skip reasons. Most callers should prefer the diagnostic variant
+/// so they can surface why a branch contributed nothing. Retained for tests
+/// that don't need the diagnostic field.
+#[cfg(test)]
 pub(crate) fn plan_stall_recovery(
     state: &StateInner,
     recovery_attempts: u32,
     ctx: &StallContext,
 ) -> Vec<RecoveryAction> {
-    let mut plan = Vec::new();
+    plan_stall_recovery_diagnostic(state, recovery_attempts, ctx).actions
+}
 
-    if ctx.has_users && ctx.has_dcs && ctx.allow_password_spray {
-        for (domain, dc_ip) in select_stall_spray_work(state, recovery_attempts) {
-            let dedup_key = stall_spray_dedup_key(&domain, recovery_attempts);
-            plan.push(RecoveryAction {
-                kind: ActionKind::Spray,
-                domain,
-                dc_ip,
-                dedup_key,
-                dedup_set: DEDUP_PASSWORD_SPRAY,
-                cred: None,
-            });
+/// Diagnostic variant of `plan_stall_recovery`: returns the actions AND a
+/// per-branch explanation for every branch that produced zero actions.
+///
+/// This is the path the live stall-recovery loop uses so the WARN line can
+/// surface the gate that excluded each candidate (precondition unmet,
+/// technique disabled, all candidates filtered with per-filter counts, or
+/// branch intentionally suppressed). Mirrors the diagnostic-lift contract:
+/// when no action dispatches, the operator must be able to read the log and
+/// know what to fix (data, config, dedup) instead of guessing.
+pub(crate) fn plan_stall_recovery_diagnostic(
+    state: &StateInner,
+    recovery_attempts: u32,
+    ctx: &StallContext,
+) -> StallPlan {
+    let mut plan = StallPlan::default();
+
+    // Spray branch
+    if !ctx.has_users || !ctx.has_dcs {
+        plan.branch_skips.push((
+            ActionKind::Spray,
+            BranchSkipReason::PreconditionUnmet {
+                needs: "has_users && has_dcs",
+            },
+        ));
+    } else if !ctx.allow_password_spray {
+        plan.branch_skips.push((
+            ActionKind::Spray,
+            BranchSkipReason::TechniqueNotAllowed {
+                technique: "password_spray",
+            },
+        ));
+    } else {
+        let work = select_stall_spray_work(state, recovery_attempts);
+        if work.is_empty() {
+            plan.branch_skips.push((
+                ActionKind::Spray,
+                diagnose_empty_spray(state, recovery_attempts),
+            ));
+        } else {
+            for (domain, dc_ip) in work {
+                let dedup_key = stall_spray_dedup_key(&domain, recovery_attempts);
+                plan.actions.push(RecoveryAction {
+                    kind: ActionKind::Spray,
+                    domain,
+                    dc_ip,
+                    dedup_key,
+                    dedup_set: DEDUP_PASSWORD_SPRAY,
+                    cred: None,
+                });
+            }
         }
     }
 
-    if ctx.has_creds && ctx.has_dcs {
-        for (key, dc_ip, domain, cred) in
-            select_stall_lhf_work(state, recovery_attempts, ctx.lhf_max)
-        {
-            plan.push(RecoveryAction {
-                kind: ActionKind::LowHanging,
-                domain,
-                dc_ip,
-                dedup_key: key,
-                dedup_set: DEDUP_EXPANSION_CREDS,
-                cred: Some(cred),
-            });
+    // Low-hanging-fruit branch
+    if !ctx.has_creds || !ctx.has_dcs {
+        plan.branch_skips.push((
+            ActionKind::LowHanging,
+            BranchSkipReason::PreconditionUnmet {
+                needs: "has_creds && has_dcs",
+            },
+        ));
+    } else {
+        let work = select_stall_lhf_work(state, recovery_attempts, ctx.lhf_max);
+        if work.is_empty() {
+            plan.branch_skips.push((
+                ActionKind::LowHanging,
+                diagnose_empty_lhf(state, recovery_attempts),
+            ));
+        } else {
+            for (key, dc_ip, domain, cred) in work {
+                plan.actions.push(RecoveryAction {
+                    kind: ActionKind::LowHanging,
+                    domain,
+                    dc_ip,
+                    dedup_key: key,
+                    dedup_set: DEDUP_EXPANSION_CREDS,
+                    cred: Some(cred),
+                });
+            }
         }
     }
 
-    if !ctx.has_users && !ctx.has_creds && ctx.has_dcs && ctx.allow_asrep_roast {
-        for (domain, dc_ip) in select_stall_cold_start_work(state, recovery_attempts) {
-            let dedup_key = stall_cold_start_dedup_key(&domain, recovery_attempts);
-            plan.push(RecoveryAction {
-                kind: ActionKind::ColdStart,
-                domain,
-                dc_ip,
-                dedup_key,
-                dedup_set: DEDUP_STALL_COLD_START,
-                cred: None,
-            });
+    // Cold-start branch (only fires when both users and creds are absent)
+    if ctx.has_users || ctx.has_creds {
+        plan.branch_skips.push((
+            ActionKind::ColdStart,
+            BranchSkipReason::SuppressedByState {
+                reason: "users_or_creds_present",
+            },
+        ));
+    } else if !ctx.has_dcs {
+        plan.branch_skips.push((
+            ActionKind::ColdStart,
+            BranchSkipReason::PreconditionUnmet { needs: "has_dcs" },
+        ));
+    } else if !ctx.allow_asrep_roast {
+        plan.branch_skips.push((
+            ActionKind::ColdStart,
+            BranchSkipReason::TechniqueNotAllowed {
+                technique: "asrep_roast",
+            },
+        ));
+    } else {
+        let work = select_stall_cold_start_work(state, recovery_attempts);
+        if work.is_empty() {
+            plan.branch_skips.push((
+                ActionKind::ColdStart,
+                diagnose_empty_cold_start(state, recovery_attempts),
+            ));
+        } else {
+            for (domain, dc_ip) in work {
+                let dedup_key = stall_cold_start_dedup_key(&domain, recovery_attempts);
+                plan.actions.push(RecoveryAction {
+                    kind: ActionKind::ColdStart,
+                    domain,
+                    dc_ip,
+                    dedup_key,
+                    dedup_set: DEDUP_STALL_COLD_START,
+                    cred: None,
+                });
+            }
         }
     }
 
@@ -376,27 +630,56 @@ impl StallTracker {
 /// stall-recovery dispatch loop. Production wires this through
 /// `DispatcherStallAdapter`; tests pin a hand-rolled fake to drive every
 /// branch without a real Dispatcher.
+///
+/// Submitters return a `SubmissionOutcome` instead of `Option<String>` so the
+/// dispatch loop can tell `Submitted` (counted as a dispatch + dedup mark)
+/// from `Deferred` (work landed in the deferred queue and will be picked up
+/// when a worker frees) from `Dropped` (lost — no role mapping or queue full,
+/// surfaced in the stall WARN so the operator knows the round produced
+/// nothing actionable).
 #[async_trait]
 pub(crate) trait StallRecoveryAdapter: Send + Sync {
-    async fn submit_spray(&self, domain: &str, dc_ip: &str) -> Result<Option<String>>;
+    async fn submit_spray(&self, domain: &str, dc_ip: &str) -> Result<SubmissionOutcome>;
     async fn submit_lhf(
         &self,
         dc_ip: &str,
         domain: &str,
         cred: &ares_core::models::Credential,
-    ) -> Result<Option<String>>;
-    async fn submit_cold_start(&self, domain: &str, dc_ip: &str) -> Result<Option<String>>;
+    ) -> Result<SubmissionOutcome>;
+    async fn submit_cold_start(&self, domain: &str, dc_ip: &str) -> Result<SubmissionOutcome>;
     async fn mark_dedup(&self, set: &'static str, key: String);
 }
 
-/// Execute a planned set of recovery actions, returning the count that
-/// produced a task dispatch. Errors and `Ok(None)` outcomes are logged but
-/// otherwise ignored; only successful submissions update the dedup ledger.
+/// Per-action breakdown of how `execute_recovery_actions` resolved one tick.
+/// Surfaced in the stall WARN so an operator can see whether a recovery round
+/// produced zero dispatches because the planner skipped every branch or
+/// because the throttler/queue absorbed every submission.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionReport {
+    pub dispatched: usize,
+    pub deferred: usize,
+    pub dropped: usize,
+    pub errors: usize,
+}
+
+impl ExecutionReport {
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> usize {
+        self.dispatched + self.deferred + self.dropped + self.errors
+    }
+}
+
+/// Execute a planned set of recovery actions and report per-outcome counts.
+///
+/// Only `Submitted` outcomes update the dedup ledger so a deferred or dropped
+/// task can be re-considered on the next tick. The report distinguishes
+/// `deferred` (in the deferred queue) from `dropped` (gone) so the stall WARN
+/// can explain why a round produced zero dispatched actions.
 pub(crate) async fn execute_recovery_actions<A: StallRecoveryAdapter + ?Sized>(
     adapter: &A,
     plan: Vec<RecoveryAction>,
-) -> usize {
-    let mut dispatched = 0usize;
+) -> ExecutionReport {
+    let mut report = ExecutionReport::default();
 
     for action in plan {
         let (result, label) = match action.kind {
@@ -425,37 +708,82 @@ pub(crate) async fn execute_recovery_actions<A: StallRecoveryAdapter + ?Sized>(
         };
 
         match result {
-            Ok(Some(task_id)) => {
+            Ok(SubmissionOutcome::Submitted(task_id)) => {
                 info!(
                     task_id = %task_id,
                     domain = %action.domain,
                     branch = %label,
                     "Stall recovery dispatched"
                 );
-                dispatched += 1;
+                report.dispatched += 1;
                 adapter.mark_dedup(action.dedup_set, action.dedup_key).await;
             }
-            Ok(None) => {}
-            Err(e) => warn!(err = %e, branch = %label, "Stall recovery dispatch failed"),
+            Ok(SubmissionOutcome::Deferred) => {
+                info!(
+                    domain = %action.domain,
+                    branch = %label,
+                    "Stall recovery submission deferred (queued; worker capacity reached)"
+                );
+                report.deferred += 1;
+            }
+            Ok(SubmissionOutcome::Dropped) => {
+                warn!(
+                    domain = %action.domain,
+                    branch = %label,
+                    "Stall recovery submission dropped (queue full or no role mapping)"
+                );
+                report.dropped += 1;
+            }
+            Err(e) => {
+                warn!(err = %e, branch = %label, "Stall recovery dispatch failed");
+                report.errors += 1;
+            }
         }
     }
 
-    dispatched
+    report
+}
+
+/// Build the low-hanging-fruit payload exactly as
+/// `Dispatcher::request_low_hanging_fruit` does. Kept inline here so the
+/// production adapter can route through `throttled_submit_outcome` and
+/// surface `Deferred` vs `Dropped` to the stall WARN.
+fn build_lhf_payload(
+    target_ip: &str,
+    domain: &str,
+    credential: &ares_core::models::Credential,
+) -> Value {
+    json!({
+        "techniques": [
+            "sysvol_script_search",
+            "gpp_password_finder",
+            "ldap_search_descriptions",
+            "laps_dump",
+        ],
+        "reason": "low_hanging_fruit",
+        "target_ip": target_ip,
+        "domain": domain,
+        "credential": {
+            "username": credential.username,
+            "password": credential.password,
+            "domain": credential.domain,
+        },
+    })
 }
 
 /// Production adapter wiring `auto_stall_detection` to a live `Dispatcher`.
 /// Each method is a thin delegate — the testable orchestration lives in
-/// `plan_stall_recovery` and `execute_recovery_actions`.
+/// `plan_stall_recovery_diagnostic` and `execute_recovery_actions`.
 struct DispatcherStallAdapter<'a> {
     dispatcher: &'a Arc<Dispatcher>,
 }
 
 #[async_trait]
 impl<'a> StallRecoveryAdapter for DispatcherStallAdapter<'a> {
-    async fn submit_spray(&self, domain: &str, dc_ip: &str) -> Result<Option<String>> {
+    async fn submit_spray(&self, domain: &str, dc_ip: &str) -> Result<SubmissionOutcome> {
         let payload = build_spray_payload(domain, dc_ip);
         self.dispatcher
-            .throttled_submit("credential_access", "credential_access", payload, 7)
+            .throttled_submit_outcome("credential_access", "credential_access", payload, 7)
             .await
     }
     async fn submit_lhf(
@@ -463,15 +791,16 @@ impl<'a> StallRecoveryAdapter for DispatcherStallAdapter<'a> {
         dc_ip: &str,
         domain: &str,
         cred: &ares_core::models::Credential,
-    ) -> Result<Option<String>> {
+    ) -> Result<SubmissionOutcome> {
+        let payload = build_lhf_payload(dc_ip, domain, cred);
         self.dispatcher
-            .request_low_hanging_fruit(dc_ip, domain, cred, 6)
+            .throttled_submit_outcome("credential_access", "credential_access", payload, 6)
             .await
     }
-    async fn submit_cold_start(&self, domain: &str, dc_ip: &str) -> Result<Option<String>> {
+    async fn submit_cold_start(&self, domain: &str, dc_ip: &str) -> Result<SubmissionOutcome> {
         let payload = build_cold_start_payload(domain, dc_ip);
         self.dispatcher
-            .throttled_submit("credential_access", "credential_access", payload, 7)
+            .throttled_submit_outcome("credential_access", "credential_access", payload, 7)
             .await
     }
     async fn mark_dedup(&self, set: &'static str, key: String) {
@@ -558,21 +887,35 @@ pub async fn auto_stall_detection(
                 allow_asrep_roast: dispatcher.is_technique_allowed("asrep_roast"),
                 lhf_max: 2,
             };
-            plan_stall_recovery(&state, attempt, &ctx)
+            plan_stall_recovery_diagnostic(&state, attempt, &ctx)
         };
 
-        let dispatched = execute_recovery_actions(&adapter, plan).await;
+        let planned = plan.actions.len();
+        let branch_skips = plan.branch_skips.clone();
+        let report = execute_recovery_actions(&adapter, plan.actions).await;
 
-        if dispatched > 0 {
+        if report.dispatched > 0 {
             info!(
                 stall_duration_secs = tracker.stall_duration_secs(),
                 cred_count,
                 hash_count,
                 recovery_attempt = attempt,
-                dispatched,
+                dispatched = report.dispatched,
+                deferred = report.deferred,
+                dropped = report.dropped,
+                errors = report.errors,
                 "Operation stall detected — fallback actions dispatched"
             );
         } else {
+            // No actions made it to a worker. Surface BOTH the per-branch
+            // skip reasons (why the planner produced zero / few actions) AND
+            // the submission breakdown (whether the throttler deferred or
+            // dropped any submitted action). This is the diagnostic lift the
+            // stall-recovery contract requires: the operator must be able to
+            // read the WARN and tell whether to fix data (clear a dedup, add
+            // a DC), config (enable a technique), or capacity (worker pool /
+            // deferred queue size) — not guess.
+            let skip_reasons = format_branch_skips(&branch_skips);
             warn!(
                 stall_duration_secs = tracker.stall_duration_secs(),
                 cred_count,
@@ -581,10 +924,35 @@ pub async fn auto_stall_detection(
                 has_users,
                 has_creds,
                 has_dcs,
+                planned,
+                deferred = report.deferred,
+                dropped = report.dropped,
+                errors = report.errors,
+                branch_skips = %skip_reasons,
                 "Operation stall detected — no fallback branch dispatched this round"
             );
         }
     }
+}
+
+/// Format per-branch skip reasons for the stall WARN as a compact string the
+/// log aggregator can grep. Empty input renders as `"none"`.
+pub(crate) fn format_branch_skips(skips: &[(ActionKind, BranchSkipReason)]) -> String {
+    if skips.is_empty() {
+        return "none".to_string();
+    }
+    skips
+        .iter()
+        .map(|(kind, reason)| {
+            let kind_str = match kind {
+                ActionKind::Spray => "spray",
+                ActionKind::LowHanging => "lhf",
+                ActionKind::ColdStart => "cold_start",
+            };
+            format!("{kind_str}={}", reason.as_log_str())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -1150,10 +1518,16 @@ mod tests {
 
     /// Hand-rolled fake adapter for testing `execute_recovery_actions`.
     /// Records every call and returns scripted outcomes per action kind.
+    #[derive(Clone)]
+    enum ScriptedOutcome {
+        Ok(SubmissionOutcome),
+        Err(String),
+    }
+
     struct FakeAdapter {
-        spray_outcome: Mutex<Result<Option<String>, String>>,
-        lhf_outcome: Mutex<Result<Option<String>, String>>,
-        cold_start_outcome: Mutex<Result<Option<String>, String>>,
+        spray_outcome: Mutex<ScriptedOutcome>,
+        lhf_outcome: Mutex<ScriptedOutcome>,
+        cold_start_outcome: Mutex<ScriptedOutcome>,
         spray_calls: Mutex<Vec<(String, String)>>,
         lhf_calls: Mutex<Vec<(String, String, String)>>,
         cold_start_calls: Mutex<Vec<(String, String)>>,
@@ -1163,36 +1537,42 @@ mod tests {
     impl FakeAdapter {
         fn new() -> Self {
             Self {
-                spray_outcome: Mutex::new(Ok(Some("spray-task".into()))),
-                lhf_outcome: Mutex::new(Ok(Some("lhf-task".into()))),
-                cold_start_outcome: Mutex::new(Ok(Some("cs-task".into()))),
+                spray_outcome: Mutex::new(ScriptedOutcome::Ok(SubmissionOutcome::Submitted(
+                    "spray-task".into(),
+                ))),
+                lhf_outcome: Mutex::new(ScriptedOutcome::Ok(SubmissionOutcome::Submitted(
+                    "lhf-task".into(),
+                ))),
+                cold_start_outcome: Mutex::new(ScriptedOutcome::Ok(SubmissionOutcome::Submitted(
+                    "cs-task".into(),
+                ))),
                 spray_calls: Mutex::new(Vec::new()),
                 lhf_calls: Mutex::new(Vec::new()),
                 cold_start_calls: Mutex::new(Vec::new()),
                 dedup_marks: Mutex::new(Vec::new()),
             }
         }
-        fn set_spray(&self, r: Result<Option<String>, String>) {
+        fn set_spray(&self, r: ScriptedOutcome) {
             *self.spray_outcome.lock().unwrap() = r;
         }
-        fn set_lhf(&self, r: Result<Option<String>, String>) {
+        fn set_lhf(&self, r: ScriptedOutcome) {
             *self.lhf_outcome.lock().unwrap() = r;
         }
-        fn set_cold_start(&self, r: Result<Option<String>, String>) {
+        fn set_cold_start(&self, r: ScriptedOutcome) {
             *self.cold_start_outcome.lock().unwrap() = r;
         }
     }
 
     #[async_trait]
     impl StallRecoveryAdapter for FakeAdapter {
-        async fn submit_spray(&self, domain: &str, dc_ip: &str) -> Result<Option<String>> {
+        async fn submit_spray(&self, domain: &str, dc_ip: &str) -> Result<SubmissionOutcome> {
             self.spray_calls
                 .lock()
                 .unwrap()
                 .push((domain.to_string(), dc_ip.to_string()));
             match self.spray_outcome.lock().unwrap().clone() {
-                Ok(v) => Ok(v),
-                Err(e) => Err(anyhow::anyhow!(e)),
+                ScriptedOutcome::Ok(v) => Ok(v),
+                ScriptedOutcome::Err(e) => Err(anyhow::anyhow!(e)),
             }
         }
         async fn submit_lhf(
@@ -1200,25 +1580,25 @@ mod tests {
             dc_ip: &str,
             domain: &str,
             cred: &ares_core::models::Credential,
-        ) -> Result<Option<String>> {
+        ) -> Result<SubmissionOutcome> {
             self.lhf_calls.lock().unwrap().push((
                 dc_ip.to_string(),
                 domain.to_string(),
                 cred.username.clone(),
             ));
             match self.lhf_outcome.lock().unwrap().clone() {
-                Ok(v) => Ok(v),
-                Err(e) => Err(anyhow::anyhow!(e)),
+                ScriptedOutcome::Ok(v) => Ok(v),
+                ScriptedOutcome::Err(e) => Err(anyhow::anyhow!(e)),
             }
         }
-        async fn submit_cold_start(&self, domain: &str, dc_ip: &str) -> Result<Option<String>> {
+        async fn submit_cold_start(&self, domain: &str, dc_ip: &str) -> Result<SubmissionOutcome> {
             self.cold_start_calls
                 .lock()
                 .unwrap()
                 .push((domain.to_string(), dc_ip.to_string()));
             match self.cold_start_outcome.lock().unwrap().clone() {
-                Ok(v) => Ok(v),
-                Err(e) => Err(anyhow::anyhow!(e)),
+                ScriptedOutcome::Ok(v) => Ok(v),
+                ScriptedOutcome::Err(e) => Err(anyhow::anyhow!(e)),
             }
         }
         async fn mark_dedup(&self, set: &'static str, key: String) {
@@ -1262,8 +1642,11 @@ mod tests {
     #[tokio::test]
     async fn execute_recovery_actions_empty_plan_zero_dispatched() {
         let fake = FakeAdapter::new();
-        let n = execute_recovery_actions(&fake, vec![]).await;
-        assert_eq!(n, 0);
+        let report = execute_recovery_actions(&fake, vec![]).await;
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred, 0);
+        assert_eq!(report.dropped, 0);
+        assert_eq!(report.errors, 0);
         assert!(fake.dedup_marks.lock().unwrap().is_empty());
     }
 
@@ -1271,8 +1654,8 @@ mod tests {
     async fn execute_recovery_actions_dispatches_spray_and_marks_dedup() {
         let fake = FakeAdapter::new();
         let plan = vec![spray_action("contoso.local", "192.168.58.10", 1)];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 1);
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 1);
         let calls = fake.spray_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "contoso.local");
@@ -1286,8 +1669,8 @@ mod tests {
     async fn execute_recovery_actions_dispatches_lhf_and_passes_cred() {
         let fake = FakeAdapter::new();
         let plan = vec![lhf_action("contoso.local", "192.168.58.10", "alice", 1)];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 1);
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 1);
         let calls = fake.lhf_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "192.168.58.10");
@@ -1301,8 +1684,8 @@ mod tests {
     async fn execute_recovery_actions_dispatches_cold_start_and_marks_dedup() {
         let fake = FakeAdapter::new();
         let plan = vec![cold_start_action("fabrikam.local", "192.168.58.40", 3)];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 1);
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 1);
         let calls = fake.cold_start_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "fabrikam.local");
@@ -1312,23 +1695,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_recovery_actions_skips_dedup_on_ok_none() {
+    async fn execute_recovery_actions_counts_deferred_separately_from_dispatched() {
         let fake = FakeAdapter::new();
-        fake.set_spray(Ok(None));
+        fake.set_spray(ScriptedOutcome::Ok(SubmissionOutcome::Deferred));
         let plan = vec![spray_action("contoso.local", "192.168.58.10", 1)];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 0);
+        let report = execute_recovery_actions(&fake, plan).await;
+        // The diagnostic lift: Deferred is now visible to callers so the stall
+        // WARN can surface it instead of collapsing to "no fallback dispatched".
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(report.dropped, 0);
         assert_eq!(fake.spray_calls.lock().unwrap().len(), 1);
+        // Deferred must NOT mark dedup — the deferred queue retry needs the
+        // action eligible next tick.
         assert!(fake.dedup_marks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn execute_recovery_actions_skips_dedup_on_error() {
+    async fn execute_recovery_actions_counts_dropped_separately_from_dispatched() {
         let fake = FakeAdapter::new();
-        fake.set_lhf(Err("dispatch boom".into()));
+        fake.set_lhf(ScriptedOutcome::Ok(SubmissionOutcome::Dropped));
         let plan = vec![lhf_action("contoso.local", "192.168.58.10", "alice", 1)];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 0);
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.dropped, 1);
+        assert!(fake.dedup_marks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_recovery_actions_counts_errors_separately_from_dispatched() {
+        let fake = FakeAdapter::new();
+        fake.set_lhf(ScriptedOutcome::Err("dispatch boom".into()));
+        let plan = vec![lhf_action("contoso.local", "192.168.58.10", "alice", 1)];
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.errors, 1);
         assert!(fake.dedup_marks.lock().unwrap().is_empty());
     }
 
@@ -1340,8 +1741,8 @@ mod tests {
             lhf_action("contoso.local", "192.168.58.10", "alice", 1),
             cold_start_action("fabrikam.local", "192.168.58.40", 1),
         ];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 3);
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 3);
         assert_eq!(fake.spray_calls.lock().unwrap().len(), 1);
         assert_eq!(fake.lhf_calls.lock().unwrap().len(), 1);
         assert_eq!(fake.cold_start_calls.lock().unwrap().len(), 1);
@@ -1349,17 +1750,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_recovery_actions_partial_success_counts_only_dispatched() {
+    async fn execute_recovery_actions_partial_success_counts_each_outcome_separately() {
         let fake = FakeAdapter::new();
-        fake.set_spray(Ok(None));
-        fake.set_cold_start(Err("boom".into()));
+        fake.set_spray(ScriptedOutcome::Ok(SubmissionOutcome::Deferred));
+        fake.set_cold_start(ScriptedOutcome::Err("boom".into()));
         let plan = vec![
             spray_action("contoso.local", "192.168.58.10", 1),
             lhf_action("contoso.local", "192.168.58.10", "alice", 1),
             cold_start_action("fabrikam.local", "192.168.58.40", 1),
         ];
-        let n = execute_recovery_actions(&fake, plan).await;
-        assert_eq!(n, 1);
+        let report = execute_recovery_actions(&fake, plan).await;
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.deferred, 1);
+        assert_eq!(report.dropped, 0);
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.total(), 3);
         let marks = fake.dedup_marks.lock().unwrap();
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].0, DEDUP_EXPANSION_CREDS);
@@ -1377,5 +1782,319 @@ mod tests {
         let sets: Vec<&str> = marks.iter().map(|(s, _)| *s).collect();
         assert!(sets.contains(&DEDUP_PASSWORD_SPRAY));
         assert!(sets.contains(&DEDUP_STALL_COLD_START));
+    }
+
+    // -- Diagnostic plan tests ------------------------------------------------
+    //
+    // Live bug: the auto_stall_detection WARN repeated for hours with
+    // has_creds=true, has_dcs=true but "no fallback branch dispatched" because
+    // the LHF branch silently produced zero candidates (every cred had no
+    // resolvable DC, every cred was an unsalted hash with empty plaintext, or
+    // every dedup key was already marked). These tests pin the new
+    // diagnostic-lift contract: every branch that contributes zero actions
+    // emits an actionable BranchSkipReason explaining why.
+
+    #[test]
+    fn diagnostic_plan_reports_precondition_skip_for_each_branch() {
+        let s = StateInner::new("op".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, false, false, true, true, 2));
+        assert!(plan.actions.is_empty());
+        // All three branches must report a precondition-unmet skip when state
+        // has nothing — that way the operator sees explicit reasons not silence.
+        let kinds: Vec<&ActionKind> = plan.branch_skips.iter().map(|(k, _)| k).collect();
+        assert!(kinds.contains(&&ActionKind::Spray));
+        assert!(kinds.contains(&&ActionKind::LowHanging));
+        assert!(kinds.contains(&&ActionKind::ColdStart));
+        for (_, reason) in &plan.branch_skips {
+            assert!(matches!(reason, BranchSkipReason::PreconditionUnmet { .. }));
+        }
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_technique_not_allowed_for_spray() {
+        let mut s = StateInner::new("op".into());
+        s.users.push(ares_core::models::User {
+            username: "alice".into(),
+            domain: "contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: String::new(),
+        });
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(true, false, true, false, true, 2));
+        let spray_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::Spray)
+            .expect("spray skip present");
+        assert!(matches!(
+            spray_skip.1,
+            BranchSkipReason::TechniqueNotAllowed {
+                technique: "password_spray"
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_technique_not_allowed_for_cold_start() {
+        let mut s = StateInner::new("op".into());
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, false, true, true, false, 2));
+        let cs_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::ColdStart)
+            .expect("cold-start skip present");
+        assert!(matches!(
+            cs_skip.1,
+            BranchSkipReason::TechniqueNotAllowed {
+                technique: "asrep_roast"
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_cold_start_suppressed_when_users_present() {
+        let mut s = StateInner::new("op".into());
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(true, false, true, false, true, 2));
+        let cs_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::ColdStart)
+            .expect("cold-start skip present");
+        assert!(matches!(
+            cs_skip.1,
+            BranchSkipReason::SuppressedByState {
+                reason: "users_or_creds_present"
+            }
+        ));
+    }
+
+    /// The live bug shape: creds exist but every cred has an empty password
+    /// (only hashes), so LHF silently selects zero work. Confirm the new
+    /// diagnostic surfaces `empty_creds` so the operator can crack a hash
+    /// instead of staring at a useless WARN.
+    #[test]
+    fn diagnostic_plan_reports_empty_creds_when_only_hashes_present() {
+        let mut s = StateInner::new("op".into());
+        // Two "credentials" that are really just username placeholders for
+        // hashes (no plaintext). This is the cred_count=2/hash_count=4 shape
+        // from the live log.
+        s.credentials.push(make_cred("alice", "", "contoso.local"));
+        s.credentials.push(make_cred("bob", "", "contoso.local"));
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, true, true, false, false, 2));
+        assert!(plan.actions.is_empty());
+        let lhf_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::LowHanging)
+            .expect("lhf skip present");
+        match &lhf_skip.1 {
+            BranchSkipReason::AllCandidatesFiltered {
+                considered,
+                empty_creds,
+                ..
+            } => {
+                assert_eq!(*considered, 2);
+                assert_eq!(*empty_creds, 2);
+            }
+            other => panic!("expected AllCandidatesFiltered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_missing_dc_for_lhf_cred() {
+        let mut s = StateInner::new("op".into());
+        // Credential is for a domain whose DC isn't in the state map.
+        s.credentials
+            .push(make_cred("alice", "Pw", "fabrikam.local"));
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, true, true, false, false, 2));
+        let lhf_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::LowHanging)
+            .expect("lhf skip present");
+        match &lhf_skip.1 {
+            BranchSkipReason::AllCandidatesFiltered {
+                considered,
+                missing_dc,
+                ..
+            } => {
+                assert_eq!(*considered, 1);
+                assert_eq!(*missing_dc, 1);
+            }
+            other => panic!("expected AllCandidatesFiltered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_dominated_for_lhf_cred() {
+        let mut s = StateInner::new("op".into());
+        s.credentials
+            .push(make_cred("alice", "Pw", "contoso.local"));
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        s.dominated_domains.insert("contoso.local".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, true, true, false, false, 2));
+        let lhf_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::LowHanging)
+            .expect("lhf skip present");
+        match &lhf_skip.1 {
+            BranchSkipReason::AllCandidatesFiltered {
+                considered,
+                dominated,
+                ..
+            } => {
+                assert_eq!(*considered, 1);
+                assert_eq!(*dominated, 1);
+            }
+            other => panic!("expected AllCandidatesFiltered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_dedup_skipped_for_lhf_when_already_marked() {
+        let mut s = StateInner::new("op".into());
+        s.credentials
+            .push(make_cred("alice", "Pw", "contoso.local"));
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let key = stall_lhf_dedup_key("contoso.local", "alice", 1);
+        s.mark_processed(DEDUP_EXPANSION_CREDS, key);
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, true, true, false, false, 2));
+        let lhf_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::LowHanging)
+            .expect("lhf skip present");
+        match &lhf_skip.1 {
+            BranchSkipReason::AllCandidatesFiltered {
+                considered,
+                dedup_skipped,
+                ..
+            } => {
+                assert_eq!(*considered, 1);
+                assert_eq!(*dedup_skipped, 1);
+            }
+            other => panic!("expected AllCandidatesFiltered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnostic_plan_reports_delegation_blocked_for_spray() {
+        let mut s = StateInner::new("op".into());
+        s.users.push(ares_core::models::User {
+            username: "alice".into(),
+            domain: "contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: String::new(),
+        });
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let v = make_vuln_with_domain("v1", "constrained_delegation", "contoso.local");
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(true, false, true, true, false, 2));
+        let spray_skip = plan
+            .branch_skips
+            .iter()
+            .find(|(k, _)| *k == ActionKind::Spray)
+            .expect("spray skip present");
+        match &spray_skip.1 {
+            BranchSkipReason::AllCandidatesFiltered {
+                considered,
+                delegation_blocked,
+                ..
+            } => {
+                assert_eq!(*considered, 1);
+                assert_eq!(*delegation_blocked, 1);
+            }
+            other => panic!("expected AllCandidatesFiltered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnostic_plan_dispatches_lhf_when_state_supports_it_and_lists_other_skips() {
+        let mut s = StateInner::new("op".into());
+        s.credentials
+            .push(make_cred("alice", "Pw", "contoso.local"));
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let plan = plan_stall_recovery_diagnostic(&s, 1, &ctx(false, true, true, false, false, 2));
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].kind, ActionKind::LowHanging);
+        // Spray + cold-start both skipped, both with explicit reasons.
+        let kinds: Vec<&ActionKind> = plan.branch_skips.iter().map(|(k, _)| k).collect();
+        assert!(kinds.contains(&&ActionKind::Spray));
+        assert!(kinds.contains(&&ActionKind::ColdStart));
+    }
+
+    #[test]
+    fn format_branch_skips_empty_renders_none() {
+        assert_eq!(format_branch_skips(&[]), "none");
+    }
+
+    #[test]
+    fn format_branch_skips_renders_kind_prefix_per_entry() {
+        let skips = vec![
+            (
+                ActionKind::Spray,
+                BranchSkipReason::TechniqueNotAllowed {
+                    technique: "password_spray",
+                },
+            ),
+            (
+                ActionKind::LowHanging,
+                BranchSkipReason::AllCandidatesFiltered {
+                    considered: 2,
+                    dedup_skipped: 0,
+                    dominated: 0,
+                    delegation_blocked: 0,
+                    missing_dc: 0,
+                    empty_creds: 2,
+                },
+            ),
+        ];
+        let s = format_branch_skips(&skips);
+        assert!(s.contains("spray=technique_not_allowed:password_spray"));
+        assert!(s.contains("lhf=all_filtered("));
+        assert!(s.contains("empty_creds=2"));
+    }
+
+    #[test]
+    fn branch_skip_reason_as_log_str_renders_each_variant() {
+        assert_eq!(
+            BranchSkipReason::PreconditionUnmet { needs: "x" }.as_log_str(),
+            "precondition_unmet:x"
+        );
+        assert_eq!(
+            BranchSkipReason::TechniqueNotAllowed { technique: "t" }.as_log_str(),
+            "technique_not_allowed:t"
+        );
+        assert_eq!(
+            BranchSkipReason::SuppressedByState { reason: "r" }.as_log_str(),
+            "suppressed:r"
+        );
+        let s = BranchSkipReason::AllCandidatesFiltered {
+            considered: 3,
+            dedup_skipped: 1,
+            dominated: 0,
+            delegation_blocked: 0,
+            missing_dc: 2,
+            empty_creds: 0,
+        }
+        .as_log_str();
+        assert!(s.contains("considered=3"));
+        assert!(s.contains("missing_dc=2"));
     }
 }
