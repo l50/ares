@@ -287,17 +287,28 @@ async fn cleanup_stale_tasks(
     state: &SharedState,
     config: &OrchestratorConfig,
 ) -> Result<()> {
-    let llm_count = tracker.llm_task_count().await;
+    let pre_llm_count = tracker.llm_task_count().await;
     let hard_cap = config.hard_cap();
 
     // Use shorter timeout when at hard cap to break deadlock faster
-    let effective_timeout = if llm_count >= hard_cap {
+    let effective_timeout = if pre_llm_count >= hard_cap {
         config.stale_task_timeout / 2
     } else {
         config.stale_task_timeout
     };
 
-    let stale = tracker.stale_tasks(effective_timeout).await;
+    // Atomically find and remove every stale task under a single tracker lock.
+    // The previous implementation split this into `stale_tasks` (snapshot only)
+    // followed by per-task `remove` calls inside the loop body. That left the
+    // throttler observing the tasks as in-flight between the two steps and
+    // — if any per-task removal was ever skipped — leaked the in-flight slot
+    // for both `llm_task_count` and `count_for_role`, since the throttler
+    // derives both from the tracker. Symptom: the orchestrator wedges with
+    // `llm_count` frozen and the per-role budget (`ARES_MAX_TASKS_PER_ROLE`)
+    // full of phantom slots, every new dispatch deferred, and zero outbound
+    // LLM connections. Mirror the normal-completion path (`results.rs`) by
+    // doing the decrement at the same site we declare the task evicted.
+    let stale = tracker.remove_stale_tasks(effective_timeout).await;
     for task in &stale {
         warn!(
             task_id = %task.task_id,
@@ -310,10 +321,8 @@ async fn cleanup_stale_tasks(
         // still be running long after the task was declared stale, and
         // every subsequent task with the same credential gets deferred
         // until the future eventually returns.
-        if let Some(removed) = tracker.remove(&task.task_id).await {
-            if let Some(ref key) = removed.credential_key {
-                credential_inflight.release(key).await;
-            }
+        if let Some(ref key) = task.credential_key {
+            credential_inflight.release(key).await;
         }
 
         let inactive_secs = task.last_activity.elapsed().as_secs();
@@ -346,6 +355,12 @@ async fn cleanup_stale_tasks(
     }
 
     if !stale.is_empty() {
+        // Re-read llm_count AFTER the eviction so the log reflects the actual
+        // post-cleanup counter, not the snapshot captured before the loop.
+        // Operators reading "Stale task cleanup complete" need the value the
+        // throttler will use on its next `check()`, not the stale pre-cleanup
+        // value that previously appeared frozen across consecutive sweeps.
+        let llm_count = tracker.llm_task_count().await;
         info!(
             removed = stale.len(),
             llm_count, hard_cap, "Stale task cleanup complete"
