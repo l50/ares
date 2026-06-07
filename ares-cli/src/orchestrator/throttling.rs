@@ -621,4 +621,87 @@ mod tests {
         assert!(t.acquire_role_permit("recon").await.is_none());
         assert!(t.acquire_role_permit("lateral").await.is_some());
     }
+
+    #[tokio::test]
+    async fn stale_cleanup_releases_per_role_slot_for_throttler() {
+        // End-to-end: saturate the per-role cap with stale tasks, run cleanup,
+        // and verify the throttler now allows a fresh dispatch. Before the
+        // fix, the per-role counter leaked when stale eviction landed and
+        // the throttler kept returning `Defer` indefinitely — wedging the
+        // orchestrator with `llm_count` frozen and zero outbound LLM
+        // traffic.
+        let (t, tracker) = make_throttler(8);
+        let max_per_role = t.config.max_tasks_per_role; // 3 from make_throttler
+        let stale_at = std::time::Instant::now() - std::time::Duration::from_secs(600);
+        for i in 0..max_per_role {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("stuck{i}"),
+                    task_type: "recon".into(),
+                    role: "recon".into(),
+                    submitted_at: stale_at,
+                    last_activity: stale_at,
+                    credential_key: None,
+                })
+                .await;
+        }
+
+        // Confirm the wedge: with the role at cap, new recon dispatch defers.
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Defer,
+            "saturated per-role cap should defer before cleanup"
+        );
+
+        // Cleanup runs (mirrors monitoring.rs::cleanup_stale_tasks).
+        let removed = tracker
+            .remove_stale_tasks(std::time::Duration::from_secs(60))
+            .await;
+        assert_eq!(removed.len(), max_per_role);
+
+        // Throttler must now see the freed slots — Allow, not Defer.
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Allow,
+            "stale cleanup must release per-role slots so dispatch resumes"
+        );
+        assert_eq!(tracker.count_for_role("recon").await, 0);
+        assert_eq!(tracker.llm_task_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_double_call_does_not_underflow() {
+        // Defensive: cleanup called twice (or racing with the result
+        // consumer) must not underflow the per-role counter. The throttler
+        // would interpret an underflowed `usize` as a huge in-flight count
+        // and over-defer — exactly the wedge symptom we're guarding against.
+        let (t, tracker) = make_throttler(8);
+        let stale_at = std::time::Instant::now() - std::time::Duration::from_secs(600);
+        tracker
+            .add(ActiveTask {
+                task_id: "stuck".into(),
+                task_type: "recon".into(),
+                role: "recon".into(),
+                submitted_at: stale_at,
+                last_activity: stale_at,
+                credential_key: None,
+            })
+            .await;
+
+        let first = tracker
+            .remove_stale_tasks(std::time::Duration::from_secs(60))
+            .await;
+        assert_eq!(first.len(), 1);
+        let second = tracker
+            .remove_stale_tasks(std::time::Duration::from_secs(60))
+            .await;
+        assert!(second.is_empty());
+
+        assert_eq!(tracker.count_for_role("recon").await, 0);
+        assert_eq!(tracker.llm_task_count().await, 0);
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Allow
+        );
+    }
 }
