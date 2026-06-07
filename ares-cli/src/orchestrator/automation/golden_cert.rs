@@ -94,8 +94,16 @@ pub async fn auto_golden_cert(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
             }
 
             let priority = dispatcher.effective_priority("golden_cert");
+            // Route to Privesc role. CredentialAccess role's tool inventory
+            // does not include certipy_* (those live in tool_registry::privesc::adcs)
+            // — submitting here as `target_role="credential_access"` produced a
+            // loop of LLM `Assistance requested ... lacks Certipy/Impacket
+            // remote exec tools` while the orchestrator kept re-dispatching.
+            // The task_type stays "exploit" so role_for_task_type still falls
+            // through to Privesc when target_role can't be parsed for any
+            // reason; the explicit "privesc" value is the load-bearing fix.
             match dispatcher
-                .throttled_submit("exploit", "credential_access", payload, priority)
+                .throttled_submit("exploit", "privesc", payload, priority)
                 .await
             {
                 Ok(Some(task_id)) => {
