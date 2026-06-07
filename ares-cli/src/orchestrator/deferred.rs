@@ -384,9 +384,34 @@ pub fn spawn_deferred_processor(
                 warn!(err = %e, "Deferred eviction error");
             }
 
-            // Try to drain as many as possible while slots are open
+            // Drain as many deferred tasks as can be dispatched this tick.
+            //
+            // Per-credential / per-target / per-role capacity caps mean the
+            // current head item may be blocked while a lower-priority item is
+            // dispatchable. A single non-Allow result must NOT terminate the
+            // cycle — that was the wedge mode where one stuck top-of-heap
+            // task permanently blocked every other deferred task and the
+            // orchestrator silently went idle (no `Starting LLM agent loop`
+            // events, no outbound HTTPS, no auto_stall_detection signal,
+            // just `Deferred queue stale eviction` for minutes).
+            //
+            // Continue past blocked items, re-enqueueing them with their
+            // original score, and bound the cycle two ways:
+            //   - `MAX_DRAIN_ATTEMPTS` total iterations per tick (hard cap
+            //     against pathological inputs);
+            //   - a `seen` set of `score()` fingerprints, so if every queue
+            //     item is currently blocked we exit after one full pass
+            //     instead of spinning on items we've already re-enqueued.
+            const MAX_DRAIN_ATTEMPTS: u32 = 64;
             let mut dispatched = 0_u32;
+            let mut attempts = 0_u32;
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             loop {
+                if attempts >= MAX_DRAIN_ATTEMPTS {
+                    break;
+                }
+                attempts += 1;
+
                 let Some(task) = (match deferred.pop_best().await {
                     Ok(t) => t,
                     Err(e) => {
@@ -397,6 +422,16 @@ pub fn spawn_deferred_processor(
                     break; // queue empty
                 };
 
+                // Fingerprint by score (priority + enqueue_time). If we pop
+                // a task we already re-enqueued during this cycle, every
+                // remaining item is also currently blocked — exit cleanly
+                // without spinning.
+                let fingerprint = task.score().to_bits();
+                if !seen.insert(fingerprint) {
+                    let _ = deferred.enqueue(&task).await;
+                    break;
+                }
+
                 // Re-check throttle before submitting
                 let decision = throttler
                     .check(&task.task_type, &task.target_role, Some(&task.payload))
@@ -404,10 +439,10 @@ pub fn spawn_deferred_processor(
 
                 match decision {
                     ThrottleDecision::Allow => {
-                        // Pre-check credential concurrency to avoid a hot
-                        // re-enqueue loop: submit_to_llm would re-defer the
-                        // task if the credential is at capacity, but this
-                        // drain loop would immediately pop it again.
+                        // Per-credential concurrency cap. If the cred is at
+                        // capacity, skip THIS task (re-enqueue) and try the
+                        // next deferred item — a task with a different cred
+                        // or no cred may still be dispatchable.
                         if let Some(cred_key) =
                             crate::orchestrator::dispatcher::credential_key_from_payload(
                                 &task.payload,
@@ -415,7 +450,7 @@ pub fn spawn_deferred_processor(
                         {
                             if !dispatcher.credential_inflight.can_acquire(&cred_key).await {
                                 let _ = deferred.enqueue(&task).await;
-                                break;
+                                continue;
                             }
                         }
 
@@ -439,23 +474,25 @@ pub fn spawn_deferred_processor(
                                 );
                             }
                             Ok(None) => {
-                                // Credential concurrency block or no role mapping.
-                                // Task may have been re-enqueued by submit_to_llm;
-                                // break to avoid hot loop.
-                                break;
+                                // Credential concurrency / role-mapping miss
+                                // inside do_submit. submit_to_llm may have
+                                // re-enqueued; either way, move on.
+                                continue;
                             }
                             Err(e) => {
                                 warn!(err = %e, "Failed to dispatch deferred task");
-                                // Re-enqueue so it is not lost
+                                // Re-enqueue so it is not lost, then move on.
                                 let _ = deferred.enqueue(&task).await;
-                                break;
+                                continue;
                             }
                         }
                     }
                     ThrottleDecision::Defer | ThrottleDecision::Wait(_) => {
-                        // Put it back; stop draining since capacity is full.
+                        // Throttler refused THIS task; a different task_type
+                        // / role may still have capacity. Put it back and
+                        // try the next deferred item.
                         let _ = deferred.enqueue(&task).await;
-                        break;
+                        continue;
                     }
                 }
             }
@@ -662,5 +699,51 @@ mod tests {
         };
         // Score only depends on priority and time, not task type
         assert_eq!(t1.score(), t2.score());
+    }
+
+    // --- drain-loop fingerprint invariants ---------------------------
+    //
+    // The deferred-drain loop in `start_deferred_processor` uses
+    // `task.score().to_bits()` as a HashSet fingerprint to detect when it
+    // has cycled back to a task it already re-enqueued this tick (the
+    // signal that the entire queue is currently blocked). These tests pin
+    // the score → fingerprint behavior the drain relies on; if a future
+    // change to `score()` makes the fingerprint non-deterministic or
+    // non-unique, the drain regresses to the old wedge mode where a
+    // single stuck head item blocks every lower-priority task.
+
+    #[test]
+    fn score_fingerprint_is_stable_across_calls() {
+        let t = make_task(2, 1700000000.5);
+        assert_eq!(t.score().to_bits(), t.score().to_bits());
+    }
+
+    #[test]
+    fn score_fingerprint_distinguishes_priorities() {
+        let high = make_task(1, 1000.0);
+        let low = make_task(5, 1000.0);
+        assert_ne!(high.score().to_bits(), low.score().to_bits());
+    }
+
+    #[test]
+    fn score_fingerprint_distinguishes_enqueue_times() {
+        let earlier = make_task(3, 1000.000);
+        let later = make_task(3, 1000.500);
+        assert_ne!(earlier.score().to_bits(), later.score().to_bits());
+    }
+
+    #[test]
+    fn score_fingerprint_hashset_detects_cycle_after_one_pass() {
+        // Replays the drain-loop seen-set semantics: if we re-enqueue and
+        // then re-pop a task with the same score within the same cycle,
+        // the HashSet insert must return false so the drain exits cleanly.
+        let t = make_task(4, 1234.5);
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let fp = t.score().to_bits();
+        assert!(seen.insert(fp), "first sighting must be a fresh insert");
+        assert!(
+            !seen.insert(fp),
+            "re-popping the same fingerprint must be the cycle-detected signal"
+        );
     }
 }
