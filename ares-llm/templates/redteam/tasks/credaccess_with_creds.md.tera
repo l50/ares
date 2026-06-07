@@ -8,20 +8,27 @@ Auth: {{ cred_capability }} (auto-resolved at dispatch — do NOT pass password/
 Task ID: {{ task_id }}
 
 **CRITICAL: YOU MUST EXECUTE THESE TECHNIQUES IN ORDER:**
-**DO NOT run smb_sweep, kerberos_user_enum, or other recon first!**
+**Your FIRST tool call must be technique #1 below.**
+**No exploration, no warm-up, no "let me check first" — call the assigned tool immediately with the parameters shown.**
 **These techniques are FAST (~2-5 seconds each) and HIGH VALUE.**
 
 {{ instructions_text }}
 
 **WORKFLOW:**
-1. Execute EACH technique above in order - they are FAST
-2. Report ANY credentials found immediately
-3. Only after completing ALL assigned techniques, mark task complete
+1. Call technique #1 above as your first tool call. Use the exact signature shown.
+2. Then call technique #2, #3, etc., in order — they are FAST.
+3. Report ANY credentials found immediately.
+4. Only after completing ALL assigned techniques, mark task complete.
 
-**DO NOT:**
-- Run smb_sweep (wastes 5+ minutes)
-- Run kerberos_user_enum_noauth (not your job)
-- Do additional recon before completing assigned techniques
+**DO NOT call any of these BEFORE the assigned techniques — they will burn the task budget on dead-end exploration:**
+- `smb_sweep` (wastes 5+ minutes)
+- `kerberos_user_enum_noauth` (not your job — different agent)
+- `smbexec`, `wmiexec`, `psexec` (lateral movement; this cred may lack local admin even when it has DCSync rights — secretsdump is the correct path)
+- `evil_winrm` (interactive shell; same lateral-movement trap)
+- `nmap_scan`, `smb_signing_check`, `port_scan` (recon — not your job)
+- `ldap_search`, `ldap_search_descriptions` (unless one of these IS in your assigned techniques list above)
+- `enumerate_domain_trusts`, `bloodhound` (recon — not your job)
+- Any other tool not in your assigned techniques list. The dispatcher already picked the highest-EV technique for this credential; second-guessing it costs time and tokens.
 {% if state_context %}
 
 ## Current Operation State
