@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -21,6 +21,40 @@ use ares_llm::ToolCall;
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
+
+/// Upper bound on how long a `trust_follow:<src>:<user>$` dedup entry can
+/// remain marked-processed without the spawned forge actually running before
+/// the next tick sweeps it and lets a later tick re-dispatch.
+///
+/// `auto_trust_follow` marks dedup *before* spawning the dispatch (to win the
+/// 30s tick race against double-firing while the forge is in flight). If
+/// anything between the mark and the spawn body's `dispatch_tool().await`
+/// silently fails — a dropped tracing event, a runtime cancellation, a panic
+/// that doesn't reach the parent — the dedup persists and the cross-forest
+/// pivot is permanently lost for the op. 3 min comfortably exceeds the
+/// observed `forge_inter_realm_and_dump` runtime (typically 20-60s) without
+/// stalling recovery for too long.
+const FORGE_STALENESS_LIMIT: Duration = Duration::from_secs(180);
+
+/// Drop any `trust_follow` dedup entries whose in-flight heartbeat has
+/// exceeded [`FORGE_STALENESS_LIMIT`]. Mutates `state` in place and returns
+/// the cleared keys so the caller can also unpersist them from Redis.
+///
+/// Split out as a pure helper so the staleness logic can be unit-tested
+/// without spinning up a full `Dispatcher` / Redis fixture.
+fn sweep_stale_forge_in_flight(state: &mut StateInner) -> Vec<String> {
+    let stale: Vec<String> = state
+        .forge_in_flight
+        .iter()
+        .filter(|(_, started)| started.elapsed() >= FORGE_STALENESS_LIMIT)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in &stale {
+        state.forge_in_flight.remove(key);
+        state.unmark_processed(DEDUP_TRUST_FOLLOW, key);
+    }
+    stale
+}
 
 /// Build a vuln_id for child-to-parent escalation.
 fn child_to_parent_vuln_id(child_domain: &str, parent_domain: &str) -> String {
@@ -519,6 +553,28 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
         }
         if *shutdown.borrow() {
             break;
+        }
+
+        // Sweep stale forge_in_flight entries before doing real work this
+        // tick. The pre-spawn `mark_processed` at the cross-forest forge site
+        // is correct under normal conditions (it stops the next 30s tick from
+        // double-firing while the forge is running) but it leaves a permanent
+        // mark if the spawn never actually runs the tool. Without this sweep,
+        // a single dropped spawn kills the cross-forest pivot for the rest of
+        // the op even though the trust key sits in state ready to use.
+        let stale = {
+            let mut state = dispatcher.state.write().await;
+            sweep_stale_forge_in_flight(&mut state)
+        };
+        for key in stale {
+            let _ = dispatcher
+                .state
+                .unpersist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &key)
+                .await;
+            warn!(
+                dedup_key = %key,
+                "Cleared stale trust_follow dedup mark — forge_in_flight exceeded staleness limit without dispatch completing"
+            );
         }
 
         // Auto-enumerate trusts when DA is achieved
@@ -1977,12 +2033,17 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             );
 
             // Mark dedup BEFORE spawning so the next 30s tick doesn't
-            // re-dispatch the same trust while the forge is running.
-            dispatcher
-                .state
-                .write()
-                .await
-                .mark_processed(DEDUP_TRUST_FOLLOW, item.dedup_key.clone());
+            // re-dispatch the same trust while the forge is running. Also
+            // record the mark timestamp in `forge_in_flight` so the staleness
+            // sweep at the top of each tick can recover from the case where
+            // the spawn never actually runs the tool.
+            {
+                let mut state = dispatcher.state.write().await;
+                state.mark_processed(DEDUP_TRUST_FOLLOW, item.dedup_key.clone());
+                state
+                    .forge_in_flight
+                    .insert(item.dedup_key.clone(), Instant::now());
+            }
             let _ = dispatcher
                 .state
                 .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &item.dedup_key)
@@ -2015,13 +2076,15 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     .dispatch_tool("privesc", &task_id, &call)
                     .await;
                 // Clear dedup on failure so the next 30s tick can retry once
-                // a fresh trust key, AES key, or SID becomes available.
+                // a fresh trust key, AES key, or SID becomes available. Also
+                // drop the `forge_in_flight` heartbeat so the staleness sweep
+                // doesn't double-clear after we've already cleared.
                 let clear_dedup = || async {
-                    dispatcher_bg
-                        .state
-                        .write()
-                        .await
-                        .unmark_processed(DEDUP_TRUST_FOLLOW, &dedup_key_bg);
+                    {
+                        let mut state = dispatcher_bg.state.write().await;
+                        state.forge_in_flight.remove(&dedup_key_bg);
+                        state.unmark_processed(DEDUP_TRUST_FOLLOW, &dedup_key_bg);
+                    }
                     let _ = dispatcher_bg
                         .state
                         .unpersist_dedup(&dispatcher_bg.queue, DEDUP_TRUST_FOLLOW, &dedup_key_bg)
@@ -2190,6 +2253,17 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         clear_dedup().await;
                     }
                 }
+                // Spawn body finished (any branch). Drop the heartbeat so the
+                // staleness sweep doesn't later "recover" a dispatch that
+                // already completed normally — `clear_dedup` covers the Err
+                // arm but the Ok arms (krbtgt found vs not) intentionally
+                // keep dedup MARKED and need this cleanup explicitly.
+                dispatcher_bg
+                    .state
+                    .write()
+                    .await
+                    .forge_in_flight
+                    .remove(&dedup_key_bg);
             });
         }
     }
@@ -3553,5 +3627,99 @@ mod tests {
         let (payload, method) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
         assert!(payload.is_none());
         assert_eq!(method, "none");
+    }
+
+    // --- sweep_stale_forge_in_flight -----------------------------------
+
+    /// Simulate "in flight for longer than allowed" by offsetting the start
+    /// timestamp into the past — direct Instant subtraction past program
+    /// start would panic, so use checked_sub and fall back to "now" only if
+    /// the test runner literally just booted.
+    fn stale_instant() -> Instant {
+        Instant::now()
+            .checked_sub(FORGE_STALENESS_LIMIT + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now)
+    }
+
+    #[test]
+    fn sweep_clears_stale_entry_and_unmarks_dedup() {
+        let mut s = StateInner::new("op".into());
+        let key = "trust_follow:contoso.local:fabrikam$".to_string();
+        s.mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
+        s.forge_in_flight.insert(key.clone(), stale_instant());
+
+        let cleared = sweep_stale_forge_in_flight(&mut s);
+
+        assert_eq!(cleared, vec![key.clone()]);
+        assert!(s.forge_in_flight.is_empty());
+        assert!(
+            !s.is_processed(DEDUP_TRUST_FOLLOW, &key),
+            "dedup must be unmarked so the next tick re-dispatches"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_fresh_entry_and_leaves_dedup_marked() {
+        let mut s = StateInner::new("op".into());
+        let key = "trust_follow:contoso.local:fabrikam$".to_string();
+        s.mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
+        s.forge_in_flight.insert(key.clone(), Instant::now());
+
+        let cleared = sweep_stale_forge_in_flight(&mut s);
+
+        assert!(
+            cleared.is_empty(),
+            "fresh forge_in_flight must not be swept"
+        );
+        assert_eq!(s.forge_in_flight.len(), 1);
+        assert!(s.is_processed(DEDUP_TRUST_FOLLOW, &key));
+    }
+
+    #[test]
+    fn sweep_only_touches_stale_entries() {
+        let mut s = StateInner::new("op".into());
+        let stale_key = "trust_follow:contoso.local:fabrikam$".to_string();
+        let fresh_key = "trust_follow:contoso.local:padme$".to_string();
+        s.mark_processed(DEDUP_TRUST_FOLLOW, stale_key.clone());
+        s.mark_processed(DEDUP_TRUST_FOLLOW, fresh_key.clone());
+        s.forge_in_flight.insert(stale_key.clone(), stale_instant());
+        s.forge_in_flight.insert(fresh_key.clone(), Instant::now());
+
+        let cleared = sweep_stale_forge_in_flight(&mut s);
+
+        assert_eq!(cleared, vec![stale_key.clone()]);
+        assert!(!s.is_processed(DEDUP_TRUST_FOLLOW, &stale_key));
+        assert!(
+            s.is_processed(DEDUP_TRUST_FOLLOW, &fresh_key),
+            "fresh sibling entry must keep its dedup mark"
+        );
+        assert!(s.forge_in_flight.contains_key(&fresh_key));
+    }
+
+    #[test]
+    fn sweep_no_op_when_map_empty() {
+        let mut s = StateInner::new("op".into());
+        let cleared = sweep_stale_forge_in_flight(&mut s);
+        assert!(cleared.is_empty());
+    }
+
+    #[test]
+    fn sweep_at_exactly_limit_clears() {
+        // Boundary case: an entry exactly at the staleness limit should be
+        // swept (the planner can't afford an off-by-one that keeps a doomed
+        // dispatch stuck for one more tick).
+        let mut s = StateInner::new("op".into());
+        let key = "trust_follow:contoso.local:fabrikam$".to_string();
+        s.mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
+        s.forge_in_flight.insert(
+            key.clone(),
+            Instant::now()
+                .checked_sub(FORGE_STALENESS_LIMIT)
+                .unwrap_or_else(Instant::now),
+        );
+
+        let cleared = sweep_stale_forge_in_flight(&mut s);
+
+        assert_eq!(cleared, vec![key]);
     }
 }
