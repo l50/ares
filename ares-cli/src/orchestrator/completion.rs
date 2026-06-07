@@ -22,9 +22,17 @@ use tracing::{info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::SharedState;
 
-/// Pure computation: given state fields, return undominated forest root domains.
+/// Pure computation: given state fields, return undominated domains (forest
+/// roots AND child domains) that still need their krbtgt extracted.
+///
+/// Each Active Directory domain has its own krbtgt principal; dominating a
+/// parent forest root does NOT also dominate any of its child domains, and
+/// vice versa. So the required-set is built from every discovered domain
+/// (target, trust enumeration, known DC), not collapsed to forest roots.
 ///
 /// Used by both the async `undominated_forests()` and `SharedState::snapshot()`.
+/// The historical `_forests` suffix is retained on the public name to avoid
+/// churning every call site; the semantics are "all discovered domains".
 pub fn compute_undominated_forests(
     target_domain: Option<&str>,
     first_domain: Option<&str>,
@@ -32,53 +40,47 @@ pub fn compute_undominated_forests(
     dominated_domains: &HashSet<String>,
     domain_controllers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
-    let mut required_forests: HashSet<String> = HashSet::new();
+    let mut required_domains: HashSet<String> = HashSet::new();
 
     if let Some(td) = target_domain {
         if !td.is_empty() {
-            required_forests.insert(forest_root_of(td));
+            required_domains.insert(td.to_lowercase());
         }
     }
     if let Some(fd) = first_domain {
-        required_forests.insert(forest_root_of(fd));
-    }
-
-    for trust in trusted_domains.values() {
-        if trust.is_cross_forest() {
-            required_forests.insert(forest_root_of(&trust.domain));
+        if !fd.is_empty() {
+            required_domains.insert(fd.to_lowercase());
         }
     }
 
-    // Include forest roots from all known DCs. This prevents premature
-    // completion when trust enumeration hasn't finished yet — domains
-    // discovered via recon (e.g. fabrikam.local with a known DC) are tracked
-    // as required forests even before trust relationships are enumerated.
+    // Every enumerated trust — parent/child intra-forest AND cross-forest —
+    // is a distinct domain with its own krbtgt. Owning the parent doesn't
+    // free the child (separate KDC, separate krbtgt principal) and the
+    // operator's success criterion is "all discovered domains compromised".
+    for trust in trusted_domains.values() {
+        if !trust.domain.is_empty() {
+            required_domains.insert(trust.domain.to_lowercase());
+        }
+    }
+
+    // Include every domain whose DC we've discovered. Catches both the
+    // pre-trust-enumeration case (DC discovered via recon, trust details
+    // not yet known) and child domains whose DC is known directly.
     for dc_domain in domain_controllers.keys() {
         if !dc_domain.is_empty() {
-            required_forests.insert(forest_root_of(dc_domain));
+            required_domains.insert(dc_domain.to_lowercase());
         }
     }
 
-    if required_forests.is_empty() {
+    if required_domains.is_empty() {
         return Vec::new();
     }
 
-    // Only count a domain as covering a forest root when that domain IS the
-    // forest root.  Dominating a child domain (e.g. contoso.local)
-    // does NOT mean the forest root (contoso.local) is compromised — its
-    // DC has a separate krbtgt.  The child-to-parent escalation (ExtraSid /
-    // trust key) must still happen before we declare the forest dominated.
-    let dominated_roots: HashSet<String> = dominated_domains
-        .iter()
-        .filter(|d| {
-            let root = forest_root_of(d);
-            root == d.to_lowercase()
-        })
-        .map(|d| forest_root_of(d))
-        .collect();
+    let dominated_lower: HashSet<String> =
+        dominated_domains.iter().map(|d| d.to_lowercase()).collect();
 
-    required_forests
-        .difference(&dominated_roots)
+    required_domains
+        .difference(&dominated_lower)
         .cloned()
         .collect()
 }
@@ -107,21 +109,6 @@ async fn redis_pending_red_tasks(dispatcher: &Arc<Dispatcher>) -> Result<usize, 
     );
     let mut conn = dispatcher.queue.connection();
     redis::cmd("HLEN").arg(&key).query_async(&mut conn).await
-}
-
-/// Extract forest root from a domain FQDN.
-///
-/// For `child.contoso.local` → `contoso.local`
-/// For `contoso.local` → `contoso.local`
-fn forest_root_of(domain: &str) -> String {
-    let lower = domain.to_lowercase();
-    let parts: Vec<&str> = lower.split('.').collect();
-    if parts.len() <= 2 {
-        lower
-    } else {
-        // Walk up to find the 2-part root (assumes .local/.com TLD)
-        parts[parts.len() - 2..].join(".")
-    }
 }
 
 /// Main operation completion loop.
@@ -678,21 +665,6 @@ async fn auto_submit_blue_investigation(
 mod tests {
     use super::*;
 
-    #[test]
-    fn forest_root_of_simple() {
-        assert_eq!(forest_root_of("contoso.local"), "contoso.local");
-    }
-
-    #[test]
-    fn forest_root_of_child() {
-        assert_eq!(forest_root_of("child.contoso.local"), "contoso.local");
-    }
-
-    #[test]
-    fn forest_root_of_deep_child() {
-        assert_eq!(forest_root_of("sub.child.contoso.local"), "contoso.local");
-    }
-
     fn make_trust(domain: &str, trust_type: &str) -> ares_core::models::TrustInfo {
         ares_core::models::TrustInfo {
             domain: domain.to_string(),
@@ -776,8 +748,11 @@ mod tests {
     }
 
     #[test]
-    fn undominated_child_domain_not_separate_forest() {
-        // parent_child trust should NOT add a separate required forest
+    fn undominated_parent_child_trust_makes_child_required() {
+        // Once a parent_child trust is enumerated, the child is a known
+        // distinct domain with its own krbtgt. Dominating the parent does
+        // NOT compromise the child — completion must keep running until
+        // both krbtgts are extracted.
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(
             "child.contoso.local".to_string(),
@@ -794,8 +769,58 @@ mod tests {
             &dominated,
             &dcs,
         );
-        // parent_child is NOT cross-forest, so child.contoso.local is not required
+        assert_eq!(result, vec!["child.contoso.local".to_string()]);
+    }
+
+    #[test]
+    fn undominated_parent_and_child_both_dominated_empty() {
+        // Mirror of the case above: once the child's krbtgt is also captured
+        // the required-set drains and completion is allowed to fire.
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(
+            "child.contoso.local".to_string(),
+            make_trust("child.contoso.local", "parent_child"),
+        );
+
+        let mut dominated = HashSet::new();
+        dominated.insert("contoso.local".to_string());
+        dominated.insert("child.contoso.local".to_string());
+        let dcs = std::collections::HashMap::new();
+        let result = compute_undominated_forests(
+            Some("contoso.local"),
+            Some("contoso.local"),
+            &trusted,
+            &dominated,
+            &dcs,
+        );
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn undominated_child_dc_keeps_child_required_even_without_trust() {
+        // Replays the live bug pattern: forest roots fall via direct PtH
+        // on each root DC, child DC is known via recon, but no `raise_child`
+        // ran so the child's krbtgt is still missing. Before the fix this
+        // returned empty (completion fired with the child uncompromised).
+        let trusted = std::collections::HashMap::new();
+        let mut dominated = HashSet::new();
+        dominated.insert("contoso.local".to_string());
+        dominated.insert("fabrikam.local".to_string());
+        let mut dcs = std::collections::HashMap::new();
+        dcs.insert("contoso.local".to_string(), "192.168.58.10".to_string());
+        dcs.insert(
+            "child.contoso.local".to_string(),
+            "192.168.58.11".to_string(),
+        );
+        dcs.insert("fabrikam.local".to_string(), "192.168.58.12".to_string());
+        let result = compute_undominated_forests(
+            Some("contoso.local"),
+            Some("contoso.local"),
+            &trusted,
+            &dominated,
+            &dcs,
+        );
+        assert_eq!(result, vec!["child.contoso.local".to_string()]);
     }
 
     #[test]
@@ -838,8 +863,8 @@ mod tests {
     #[test]
     fn undominated_dc_discovered_before_trust_enum() {
         // fabrikam.local DC discovered via recon but trust not yet enumerated.
-        // The DC should be included in required_forests to prevent premature
-        // completion.
+        // The DC should be included as required even before trust details land,
+        // and so should child.contoso.local because its DC was discovered too.
         let trusted = std::collections::HashMap::new();
         let mut dominated = HashSet::new();
         dominated.insert("contoso.local".to_string());
@@ -853,25 +878,17 @@ mod tests {
             &dominated,
             &dcs,
         );
-        // fabrikam.local DC is known but not dominated → should appear
-        assert_eq!(result, vec!["fabrikam.local"]);
-    }
-
-    #[test]
-    fn forest_root_of_case_insensitive() {
-        assert_eq!(forest_root_of("CONTOSO.LOCAL"), "contoso.local");
-        assert_eq!(forest_root_of("North.Contoso.Local"), "contoso.local");
-    }
-
-    #[test]
-    fn forest_root_of_single_label() {
-        // Single-label domain (unusual but should not panic)
-        assert_eq!(forest_root_of("localhost"), "localhost");
-    }
-
-    #[test]
-    fn forest_root_of_empty() {
-        assert_eq!(forest_root_of(""), "");
+        // child.contoso.local appears via first_domain, fabrikam.local via the
+        // DC map. Order is HashSet-derived so sort before comparing.
+        let mut sorted = result;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "child.contoso.local".to_string(),
+                "fabrikam.local".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -927,8 +944,11 @@ mod tests {
     }
 
     #[test]
-    fn undominated_unknown_trust_not_cross_forest() {
-        // "unknown" trust type should NOT be treated as cross-forest
+    fn undominated_trust_required_regardless_of_trust_type() {
+        // Any enumerated trust contributes a required domain — the trust_type
+        // (forest / parent_child / external / unknown) does not change the
+        // operator's success criterion: every discovered domain must be
+        // dominated before completion fires.
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(
             "fabrikam.local".to_string(),
@@ -944,8 +964,7 @@ mod tests {
             &dominated,
             &dcs,
         );
-        // "unknown" is not cross-forest, so fabrikam should NOT appear
-        assert!(result.is_empty());
+        assert_eq!(result, vec!["fabrikam.local".to_string()]);
     }
 
     #[test]
@@ -976,13 +995,15 @@ mod tests {
     }
 
     #[test]
-    fn undominated_child_trust_domain_maps_to_parent_forest() {
-        // Cross-forest trust with a child domain like "north.fabrikam.local"
-        // should map to forest root "fabrikam.local"
+    fn undominated_trust_domain_kept_verbatim_not_collapsed_to_root() {
+        // A trust entry pointing at a non-root domain (e.g. an external
+        // trust to "child.fabrikam.local") is required as-is — we do NOT
+        // collapse it to its forest root, because the child has its own
+        // krbtgt that the parent's compromise wouldn't yield.
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(
-            "north.fabrikam.local".to_string(),
-            make_trust("north.fabrikam.local", "forest"),
+            "child.fabrikam.local".to_string(),
+            make_trust("child.fabrikam.local", "forest"),
         );
 
         let mut dominated = HashSet::new();
@@ -995,7 +1016,7 @@ mod tests {
             &dominated,
             &dcs,
         );
-        assert_eq!(result, vec!["fabrikam.local"]);
+        assert_eq!(result, vec!["child.fabrikam.local".to_string()]);
     }
 
     #[test]
@@ -1030,8 +1051,11 @@ mod tests {
     }
 
     #[test]
-    fn undominated_target_and_first_same_forest() {
-        // target and first_domain in the same forest should only produce one entry
+    fn undominated_target_and_first_same_forest_are_distinct_domains() {
+        // target_domain (parent) and first_domain (child of same forest)
+        // are two distinct AD domains, each with its own krbtgt — both must
+        // appear in the required set. Sort before comparing because the
+        // result is HashSet-derived.
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
@@ -1042,8 +1066,15 @@ mod tests {
             &dominated,
             &dcs,
         );
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], "contoso.local");
+        let mut sorted = result;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "child.contoso.local".to_string(),
+                "contoso.local".to_string(),
+            ]
+        );
     }
 
     #[test]
