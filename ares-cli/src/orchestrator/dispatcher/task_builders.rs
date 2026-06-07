@@ -6,7 +6,9 @@ use tracing::{debug, info, instrument};
 
 use ares_core::models::{Credential, Hash};
 
-use crate::orchestrator::state::{StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_SCANNED_TARGETS};
+use crate::orchestrator::state::{
+    StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_LATERAL_DENIED, DEDUP_SCANNED_TARGETS,
+};
 
 use super::Dispatcher;
 
@@ -426,6 +428,38 @@ impl Dispatcher {
                     cred_user = %credential.username,
                     technique = technique,
                     "Skipping lateral — already rejected as cross-realm dead-end"
+                );
+                return Ok(None);
+            }
+
+            // Refuse if a prior lateral attempt with this credential against
+            // this target already returned a terminal denied indicator (any
+            // technique, or this specific technique). Without this guard the
+            // LLM lateral agent burns the credential's CredentialInflight slots
+            // re-trying psexec/winrm against a host where the cred has no
+            // admin, starving every higher-priority privesc/exploit task that
+            // also targets the same cred.
+            let denied_any = format!(
+                "{}@{}:{}:*",
+                credential.username.to_lowercase(),
+                credential.domain.to_lowercase(),
+                target_ip
+            );
+            let denied_specific = format!(
+                "{}@{}:{}:{}",
+                credential.username.to_lowercase(),
+                credential.domain.to_lowercase(),
+                target_ip,
+                technique
+            );
+            if state.is_processed(DEDUP_LATERAL_DENIED, &denied_any)
+                || state.is_processed(DEDUP_LATERAL_DENIED, &denied_specific)
+            {
+                debug!(
+                    target_ip = target_ip,
+                    cred_user = %credential.username,
+                    technique = technique,
+                    "Skipping lateral — credential already denied on this target"
                 );
                 return Ok(None);
             }

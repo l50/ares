@@ -1020,6 +1020,7 @@ mod tests {
             DEDUP_MSSQL_IMPERSONATION,
             DEDUP_SID_HISTORY,
             DEDUP_STALL_COLD_START,
+            DEDUP_LATERAL_DENIED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

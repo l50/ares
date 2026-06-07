@@ -30,6 +30,8 @@ Install and configure network reconnaissance tools for Ares agents
 | `recon_tools_kali_packages.5` | str | <code>whois</code> | No description |
 | `recon_tools_kali_packages.6` | str | <code>samba-common-bin</code> | No description |
 | `recon_tools_kali_packages.7` | str | <code>smbclient</code> | No description |
+| `recon_tools_kali_packages.8` | str | <code>krb5-user</code> | No description |
+| `recon_tools_kali_packages.9` | str | <code>libsasl2-modules-gssapi-mit</code> | No description |
 | `recon_tools_ubuntu_packages` | list | <code>&#91;&#93;</code> | No description |
 | `recon_tools_ubuntu_packages.0` | str | <code>nmap</code> | No description |
 | `recon_tools_ubuntu_packages.1` | str | <code>ldap-utils</code> | No description |
@@ -38,6 +40,8 @@ Install and configure network reconnaissance tools for Ares agents
 | `recon_tools_ubuntu_packages.4` | str | <code>whois</code> | No description |
 | `recon_tools_ubuntu_packages.5` | str | <code>samba-common-bin</code> | No description |
 | `recon_tools_ubuntu_packages.6` | str | <code>smbclient</code> | No description |
+| `recon_tools_ubuntu_packages.7` | str | <code>krb5-user</code> | No description |
+| `recon_tools_ubuntu_packages.8` | str | <code>libsasl2-modules-gssapi-mit</code> | No description |
 | `recon_tools_install_enum4linuxng` | bool | <code>True</code> | No description |
 | `recon_tools_enum4linuxng_install_source` | str | <code>git+https://github.com/cddmp/enum4linux-ng.git</code> | No description |
 | `recon_tools_enum4linuxng_use_pipx` | bool | <code>True</code> | No description |

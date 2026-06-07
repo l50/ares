@@ -8,6 +8,8 @@ recon_tools_kali_packages:
   - whois
   - samba-common-bin
   - smbclient  # required by enum4linux/enum4linux-ng for share enumeration
+  - krb5-user  # provides klist/kinit for cross-forest ccache inspection
+  - libsasl2-modules-gssapi-mit  # required for `ldapsearch -Y GSSAPI` over forged inter-realm ccache; without it ldapsearch errors with "no mechanism available" and the post-ticket ACL/LDAP enum path returns exit 250
 
 # Network reconnaissance tool packages (Ubuntu-compatible, no netexec in apt)
 recon_tools_ubuntu_packages:
@@ -18,6 +20,8 @@ recon_tools_ubuntu_packages:
   - whois
   - samba-common-bin  # includes rpcclient
   - smbclient  # required by enum4linux/enum4linux-ng for share enumeration
+  - krb5-user
+  - libsasl2-modules-gssapi-mit
 
 # enum4linux-ng configuration (installed via apt on Kali, pipx elsewhere)
 recon_tools_install_enum4linuxng: true

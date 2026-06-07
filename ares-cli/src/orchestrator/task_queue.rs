@@ -237,6 +237,19 @@ impl ResultDemux {
     async fn take(&self, task_id: &str) -> Option<TaskResult> {
         self.cache.lock().await.remove(task_id)
     }
+
+    /// Insert a result directly into the cache, bypassing the NATS round-trip.
+    ///
+    /// Used by `submit_to_llm`'s in-process spawn so the result reaches
+    /// `process_completed_task` even if the JetStream publish hangs on ack
+    /// or the demux drain loop is stalled. Without this fallback, every
+    /// LLM-driven follow-up (S4U → secretsdump chain, lateral-denied cache,
+    /// auto_credential_reuse, exploit vuln_id marking) silently fails to fire
+    /// and the originating task gets stale-evicted ~15 min later as if it
+    /// had hung — even though the LLM completed in seconds.
+    async fn insert(&self, task_id: &str, result: TaskResult) {
+        self.cache.lock().await.insert(task_id.to_string(), result);
+    }
 }
 
 impl TaskQueue {
@@ -400,6 +413,29 @@ impl<C: ConnectionLike + Clone + Send + Sync + 'static> TaskQueueCore<C> {
             .as_ref()
             .context("result demux not initialized (TaskQueue built without NATS)")?;
         Ok(demux.take(task_id).await)
+    }
+
+    /// Insert a result directly into the in-process cache, bypassing NATS.
+    ///
+    /// For tasks whose work happens inside the orchestrator process (LLM
+    /// agent loop spawns in `submit_to_llm`), the NATS publish + JetStream
+    /// pull round-trip is pure overhead AND a silent-failure mode: if either
+    /// `jetstream().publish()` or the ack future hangs, or the demux drain
+    /// stalls, the result never reaches `process_completed_task`, the task
+    /// pins the credential slot for the full stale-task TTL (15 min by
+    /// default), and every downstream follow-up (S4U → secretsdump chain,
+    /// lateral-denied cache, auto_credential_reuse, vuln mark_exploited)
+    /// silently no-ops.
+    ///
+    /// Caching the result directly here side-steps that entire path: the
+    /// next `check_result` for this `task_id` finds it immediately, the
+    /// result consumer wakes, and follow-ups fire. Publishing to NATS is
+    /// still attempted (so the Redis status updates land via the same code
+    /// path workers use), but it's no longer the only delivery channel.
+    pub async fn cache_result(&self, task_id: &str, result: TaskResult) {
+        if let Some(demux) = self.result_demux.as_ref() {
+            demux.insert(task_id, result).await;
+        }
     }
 
     /// Batch-check results for multiple task IDs.

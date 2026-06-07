@@ -2037,6 +2037,23 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             // record the mark timestamp in `forge_in_flight` so the staleness
             // sweep at the top of each tick can recover from the case where
             // the spawn never actually runs the tool.
+            //
+            // Four-checkpoint instrumentation (A/B/C/D) lets post-mortem
+            // pinpoint which boundary the dispatch is dying at when a forge
+            // never reaches the worker. The plan-trust-follow-staleness-sweep
+            // doc records the original failure where every precondition was
+            // met, the dedup mark landed, yet no forge log line ever appeared
+            // — there was no signal whether the loss was at the lock, the
+            // persist call, the spawn handoff, or the tool dispatcher.
+            info!(
+                task_id = %task_id,
+                trust_account = %item.hash.username,
+                source_domain = %item.source_domain,
+                target_domain = %item.target_domain,
+                dedup_key = %item.dedup_key,
+                checkpoint = "A_pre_mark",
+                "Cross-forest forge reached mark boundary (pre state.write)"
+            );
             {
                 let mut state = dispatcher.state.write().await;
                 state.mark_processed(DEDUP_TRUST_FOLLOW, item.dedup_key.clone());
@@ -2057,6 +2074,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 has_source_sid = source_domain_sid.is_some(),
                 has_target_sid = target_domain_sid.is_some(),
                 has_aes = resolved_aes_key.is_some(),
+                checkpoint = "B_post_persist_pre_spawn",
                 "Cross-forest forge dispatched (direct tool, no LLM)"
             );
 
@@ -2069,11 +2087,31 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             let trust_key_bg = item.hash.hash_value.clone();
             let aes_key_bg = resolved_aes_key.clone();
             let source_domain_sid_bg = source_domain_sid.clone();
+            let task_id_bg = task_id.clone();
             tokio::spawn(async move {
+                // First poll of the spawn body — if checkpoint B logs but C
+                // does not, the spawn was issued but never scheduled (runtime
+                // budget exhaustion, dropped task, or a tracing-layer drop
+                // between B and C that we can rule out by sampling).
+                info!(
+                    task_id = %task_id_bg,
+                    source_domain = %source_domain_bg,
+                    target_domain = %target_domain_bg,
+                    dedup_key = %dedup_key_bg,
+                    checkpoint = "C_spawn_entered",
+                    "Cross-forest forge spawn body entered (about to call dispatch_tool)"
+                );
+                info!(
+                    task_id = %task_id_bg,
+                    source_domain = %source_domain_bg,
+                    target_domain = %target_domain_bg,
+                    checkpoint = "D_dispatch_tool_call",
+                    "Cross-forest forge invoking dispatch_tool"
+                );
                 let result = dispatcher_bg
                     .llm_runner
                     .tool_dispatcher()
-                    .dispatch_tool("privesc", &task_id, &call)
+                    .dispatch_tool("privesc", &task_id_bg, &call)
                     .await;
                 // Clear dedup on failure so the next 30s tick can retry once
                 // a fresh trust key, AES key, or SID becomes available. Also
