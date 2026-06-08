@@ -1756,50 +1756,55 @@ struct PfxCapture {
     pfx_basename: String,
 }
 
-/// Walk the relay log, pair the most-recent authenticating-as-user line with
-/// the most-recent "Writing PKCS#12 certificate to <path>" line. Returns None
-/// if either marker is missing.
+/// Walk the relay log and pair each `Writing PKCS#12 certificate to <path>`
+/// line with the auth line that produced it — the most-recent
+/// authenticating-as-user line *before* the PFX write, not the most-recent
+/// overall. Returns the LAST such (user, pfx) pair seen so a long phase walk
+/// with multiple captures still surfaces the freshest one.
+///
+/// The earlier "last_user × last_pfx" form (most-recent-of-each) misfires
+/// when the relay catches incidental auth from a different machine *after*
+/// the PFX has already been written — e.g. an ntlmrelayx with
+/// `--keep-relaying` accepts a stray MEEREEN$ probe *after* writing
+/// WINTERFELL.pfx, and the final `(MEEREEN$, ./WINTERFELL.pfx)` pair fed to
+/// `certipy_auth` PKINIT-fails with KDC_ERR_C_PRINCIPAL_UNKNOWN. Pairing
+/// by line proximity (last user *before* the PKCS#12 write) keeps the
+/// principal aligned with the cert subject.
 fn extract_pfx_capture_from_log(log: &str) -> Option<PfxCapture> {
-    let mut last_user: Option<String> = None;
-    let mut last_pfx: Option<String> = None;
+    let mut current_user: Option<String> = None;
+    let mut paired: Option<PfxCapture> = None;
 
     for line in log.lines() {
         // "[*] Authenticating against http://... as DOMAIN/USER$ SUCCEED"
         // "[*] SMBD-Thread-N: Connection from DOMAIN/USER$@ip controlled, attacking..."
         // Both shapes appear depending on flow; pull the user after the slash.
         if let Some(user) = parse_relayed_user(line) {
-            last_user = Some(user);
+            current_user = Some(user);
         }
         // "[*] Writing PKCS#12 certificate to ./DC01.pfx"
         if let Some(idx) = line.find("Writing PKCS#12 certificate to ") {
             let after = &line[idx + "Writing PKCS#12 certificate to ".len()..];
             let path = after.split_whitespace().next().unwrap_or("");
             if !path.is_empty() {
-                last_pfx = Some(path.to_string());
+                let user = current_user.clone().unwrap_or_else(|| {
+                    // Fallback when no auth line preceded the write — derive
+                    // the principal from the PFX basename (ntlmrelayx names
+                    // the file after the relayed account).
+                    std::path::Path::new(path.trim_start_matches("./"))
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("relayed")
+                        .to_string()
+                });
+                paired = Some(PfxCapture {
+                    user,
+                    pfx_basename: path.to_string(),
+                });
             }
         }
     }
 
-    match (last_user, last_pfx) {
-        (Some(u), Some(p)) => Some(PfxCapture {
-            user: u,
-            pfx_basename: p,
-        }),
-        // If we got a PFX path but no user, fall back to the file's basename
-        // (ntlmrelayx names the PFX after the user).
-        (None, Some(p)) => {
-            let base = std::path::Path::new(p.trim_start_matches("./"))
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("relayed")
-                .to_string();
-            Some(PfxCapture {
-                user: base,
-                pfx_basename: p,
-            })
-        }
-        _ => None,
-    }
+    paired
 }
 
 /// Pull a relayed username out of a line that looks like
@@ -2796,6 +2801,42 @@ MIIBlahSecondCert==\n\
     fn extract_pfx_capture_returns_none_without_pfx_marker() {
         let log = "[*] (SMB): Authenticating against ... CONTOSO/DC01$@192.168.58.20 SUCCEED\n[*] auth complete";
         assert!(super::extract_pfx_capture_from_log(log).is_none());
+    }
+
+    #[test]
+    fn extract_pfx_capture_pairs_user_with_pfx_by_proximity() {
+        // Regression: when `--keep-relaying` catches a stray auth AFTER the
+        // PFX has been written, the old `last_user × last_pfx` form mispaired
+        // the cert with the late auth (e.g. WINTERFELL.pfx paired with
+        // MEEREEN$) and certipy_auth bailed with KDC_ERR_C_PRINCIPAL_UNKNOWN.
+        let log = "\
+[*] Servers started, waiting for connections\n\
+[*] (SMB): Authenticating CONTOSO/WINTERFELL$@192.168.58.11 SUCCEED\n\
+[*] GOT CERTIFICATE! ID 6\n\
+[*] Writing PKCS#12 certificate to ./WINTERFELL.pfx\n\
+[*] (SMB): Authenticating CONTOSO/MEEREEN$@192.168.58.12 SUCCEED\n\
+[*] done\n";
+        let cap = super::extract_pfx_capture_from_log(log).expect("should extract");
+        assert_eq!(
+            cap.user, "WINTERFELL$",
+            "user must be paired with the cert that was actually written, not a later stray auth"
+        );
+        assert_eq!(cap.pfx_basename, "./WINTERFELL.pfx");
+    }
+
+    #[test]
+    fn extract_pfx_capture_returns_last_pair_when_multiple_writes() {
+        // When the relay walks several coerce phases and writes more than
+        // one PFX, the LAST pair is the one the caller wants — that's the
+        // freshest, most-recently-issued cert.
+        let log = "\
+[*] (SMB): Authenticating CONTOSO/DC01$@192.168.58.10 SUCCEED\n\
+[*] Writing PKCS#12 certificate to ./DC01.pfx\n\
+[*] (SMB): Authenticating CONTOSO/DC02$@192.168.58.11 SUCCEED\n\
+[*] Writing PKCS#12 certificate to ./DC02.pfx\n";
+        let cap = super::extract_pfx_capture_from_log(log).expect("should extract");
+        assert_eq!(cap.user, "DC02$");
+        assert_eq!(cap.pfx_basename, "./DC02.pfx");
     }
 
     #[test]
