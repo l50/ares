@@ -118,6 +118,17 @@ pub struct Dispatcher {
     pub llm_runner: Arc<LlmTaskRunner>,
     /// Per-credential concurrency limiter.
     pub credential_inflight: CredentialInflight,
+    /// Host-wide serializer for ESC8/ESC11 relay-coerce chains.
+    ///
+    /// `relay_and_coerce` and the `ntlmrelayx_to_*` standalone tools all
+    /// bind port 445 on the attacker. Without serialization, two ADCS vulns
+    /// (different CAs in the same op) race the port: one wins, the other
+    /// bails with `RELAY_BIND_BUSY` and is reaped without contributing.
+    /// This semaphore (permits = 1) serializes the *spawn*, so the second
+    /// chain queues behind the first instead of crashing the dispatcher's
+    /// bind-busy retry budget. Held only across the relay+coerce phase —
+    /// the certipy_auth and DCSync follow-ups run unsynchronized.
+    pub relay_chain_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Dispatcher {
@@ -155,6 +166,7 @@ impl Dispatcher {
             llm_runner,
             // Allow up to 3 concurrent tasks per credential
             credential_inflight: CredentialInflight::new(3),
+            relay_chain_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 }
