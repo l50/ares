@@ -620,12 +620,25 @@ impl Dispatcher {
             // mirrors the slot to the tracker entry's lifetime, so a hung
             // future doesn't pin the slot indefinitely.
 
-            // Push result to the normal result queue so the result consumer picks it up
+            // In-process delivery first: drop the result straight into the
+            // demux cache so the next `consume_cycle` finds it immediately,
+            // independent of NATS. The publish round-trip below was the sole
+            // delivery path before, and any hang in `jetstream().publish()`
+            // or its ack — or a stalled demux drain — silently parked the
+            // task in the tracker until the 15-min stale evictor reaped it,
+            // by which point every follow-up (S4U chain, lateral-denied
+            // cache, vuln mark_exploited) had been quietly skipped.
+            queue.cache_result(&tid, result.clone()).await;
+
+            // Still publish to NATS so worker-style consumers (callbacks,
+            // any external observer subscribed to `task_result.*`) and the
+            // Redis status update inside send_result both happen. A failure
+            // here is now non-fatal — the in-process cache already has it.
             if let Err(e) = queue.send_result(&tid, &result).await {
                 warn!(
                     task_id = %tid,
                     err = %e,
-                    "Failed to push LLM task result to Redis"
+                    "Failed to publish LLM task result to NATS (in-process cache already populated; continuing)"
                 );
             }
         });

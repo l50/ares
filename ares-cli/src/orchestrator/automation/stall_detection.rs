@@ -540,6 +540,11 @@ const RECOVERY_COOLDOWN: Duration = Duration::from_secs(120); // 2 minutes
 /// Cap on the number of recovery rounds per op (don't spam indefinitely).
 const MAX_RECOVERY_ATTEMPTS: u32 = 10;
 
+/// Upper bound on the dynamic cooldown when zero-progress backoff kicks in.
+/// At 16 min the next attempt still re-enters within a reasonable window if
+/// state changes externally (operator injection, blue team interaction).
+const MAX_RECOVERY_COOLDOWN: Duration = Duration::from_secs(16 * 60);
+
 /// Mutable bookkeeping for the stall detector. Tracks observed progress
 /// counters and timing gates outside the Dispatcher so the gate logic can
 /// be unit-tested without async I/O or a real clock.
@@ -550,6 +555,13 @@ pub(crate) struct StallTracker {
     last_change: Instant,
     last_recovery: Instant,
     recovery_attempts: u32,
+    /// Counter of consecutive recovery rounds that produced zero new progress.
+    /// Each round that fires `note_recovery_attempt` without an intervening
+    /// `observe_progress(true)` increments this. Drives exponential cooldown
+    /// backoff so a stuck op doesn't keep re-dispatching the same fallback
+    /// branches at full cadence (every 2 min) for the full 10-attempt budget,
+    /// burning ~$1.25/min on a workload that isn't actually making progress.
+    zero_progress_streak: u32,
 }
 
 impl StallTracker {
@@ -561,6 +573,7 @@ impl StallTracker {
             last_change: now,
             last_recovery: now.checked_sub(RECOVERY_COOLDOWN).unwrap_or(now),
             recovery_attempts: 0,
+            zero_progress_streak: 0,
         }
     }
 
@@ -572,6 +585,7 @@ impl StallTracker {
             self.last_hash_count = hash_count;
             self.last_change = Instant::now();
             self.recovery_attempts = 0;
+            self.zero_progress_streak = 0;
             true
         } else {
             false
@@ -582,8 +596,20 @@ impl StallTracker {
         self.last_change.elapsed() >= STALL_THRESHOLD
     }
 
+    /// The effective cooldown for the next recovery attempt. Doubles for each
+    /// consecutive zero-progress round on top of the base cooldown, capped at
+    /// `MAX_RECOVERY_COOLDOWN` so we always retry eventually. After 1 unproductive
+    /// round the next attempt waits 4 min, 2 → 8 min, 3 → 16 min, then plateaus.
+    fn effective_cooldown(&self) -> Duration {
+        let shift = self.zero_progress_streak.min(6);
+        let scaled = RECOVERY_COOLDOWN
+            .checked_mul(1u32 << shift)
+            .unwrap_or(MAX_RECOVERY_COOLDOWN);
+        scaled.min(MAX_RECOVERY_COOLDOWN)
+    }
+
     pub(crate) fn cooldown_elapsed(&self) -> bool {
-        self.last_recovery.elapsed() >= RECOVERY_COOLDOWN
+        self.last_recovery.elapsed() >= self.effective_cooldown()
     }
 
     pub(crate) fn attempts_exhausted(&self) -> bool {
@@ -592,9 +618,14 @@ impl StallTracker {
 
     /// Record a new recovery attempt: bumps the counter, resets the cooldown,
     /// and returns the new attempt number (1-indexed).
+    ///
+    /// Also bumps `zero_progress_streak` — `observe_progress` zeros it out
+    /// when a subsequent tick finds new creds/hashes, so the streak captures
+    /// "rounds since last forward step," not "rounds since startup."
     pub(crate) fn note_recovery_attempt(&mut self) -> u32 {
         self.last_recovery = Instant::now();
         self.recovery_attempts += 1;
+        self.zero_progress_streak = self.zero_progress_streak.saturating_add(1);
         self.recovery_attempts
     }
 
@@ -863,6 +894,9 @@ pub async fn auto_stall_detection(
         }
 
         if tracker.observe_progress(cred_count, hash_count) {
+            // Forward progress: clear any stall pressure on the throttler so
+            // the per-role cap returns to the full configured value.
+            dispatcher.throttler.set_stall_pressure(0);
             continue;
         }
         if !tracker.is_stalled() {
@@ -876,6 +910,12 @@ pub async fn auto_stall_detection(
         }
 
         let attempt = tracker.note_recovery_attempt();
+        // Publish the post-bump zero-progress streak to the throttler. The
+        // throttler halves the per-role cap whenever this is >0, stopping
+        // parallel agent expansion against an op that isn't progressing.
+        dispatcher
+            .throttler
+            .set_stall_pressure(tracker.zero_progress_streak);
 
         let plan = {
             let state = dispatcher.state.read().await;
@@ -900,6 +940,8 @@ pub async fn auto_stall_detection(
                 cred_count,
                 hash_count,
                 recovery_attempt = attempt,
+                zero_progress_streak = tracker.zero_progress_streak,
+                next_cooldown_secs = tracker.effective_cooldown().as_secs(),
                 dispatched = report.dispatched,
                 deferred = report.deferred,
                 dropped = report.dropped,
@@ -1487,7 +1529,10 @@ mod tests {
         let mut t = StallTracker::new();
         t.note_recovery_attempt();
         assert!(!t.cooldown_elapsed());
-        t.rewind_last_recovery(RECOVERY_COOLDOWN + Duration::from_secs(1));
+        // First recovery attempt bumps the zero-progress streak to 1, so the
+        // effective cooldown is `RECOVERY_COOLDOWN * 2`. Rewind by that much
+        // so the cooldown actually elapses.
+        t.rewind_last_recovery(t.effective_cooldown() + Duration::from_secs(1));
         assert!(t.cooldown_elapsed());
     }
 
@@ -1506,6 +1551,63 @@ mod tests {
             t.note_recovery_attempt();
         }
         assert!(t.attempts_exhausted());
+    }
+
+    #[test]
+    fn stall_tracker_cooldown_doubles_on_each_zero_progress_round() {
+        // First round → base cooldown (2 min). The next round's wait grows
+        // exponentially with the unproductive streak: 4 → 8 → 16 → capped.
+        let mut t = StallTracker::new();
+        t.note_recovery_attempt(); // streak=1
+        assert_eq!(t.effective_cooldown(), RECOVERY_COOLDOWN * 2);
+
+        t.note_recovery_attempt(); // streak=2
+        assert_eq!(t.effective_cooldown(), RECOVERY_COOLDOWN * 4);
+
+        t.note_recovery_attempt(); // streak=3
+                                   // RECOVERY_COOLDOWN = 120s, so 120 × 2^3 = 960s, cap is 16*60 = 960s.
+                                   // Exactly at the cap.
+        assert_eq!(t.effective_cooldown(), MAX_RECOVERY_COOLDOWN);
+
+        t.note_recovery_attempt(); // streak=4
+        assert_eq!(
+            t.effective_cooldown(),
+            MAX_RECOVERY_COOLDOWN,
+            "cooldown caps at MAX_RECOVERY_COOLDOWN"
+        );
+    }
+
+    #[test]
+    fn stall_tracker_progress_resets_backoff() {
+        // A productive round must drop the streak back to zero so the next
+        // recovery (if needed) re-arms at the base cadence, not the long tail.
+        let mut t = StallTracker::new();
+        t.note_recovery_attempt();
+        t.note_recovery_attempt();
+        assert_eq!(t.effective_cooldown(), RECOVERY_COOLDOWN * 4);
+        t.observe_progress(1, 0);
+        assert_eq!(t.effective_cooldown(), RECOVERY_COOLDOWN);
+    }
+
+    #[test]
+    fn stall_tracker_backoff_keeps_cooldown_unelapsed_longer() {
+        // After 2 unproductive rounds, rewinding by the base cooldown is NOT
+        // enough — the dynamic cooldown is 4× longer. This is the whole point
+        // of the backoff: stop the orchestrator from re-firing at full cadence
+        // against a stuck op.
+        let mut t = StallTracker::new();
+        t.note_recovery_attempt();
+        t.note_recovery_attempt(); // streak=2 → 8 min cooldown
+        t.rewind_last_recovery(RECOVERY_COOLDOWN + Duration::from_secs(10));
+        assert!(
+            !t.cooldown_elapsed(),
+            "base cooldown shouldn't satisfy backoff"
+        );
+        t.rewind_last_recovery(RECOVERY_COOLDOWN * 4);
+        assert!(
+            t.cooldown_elapsed(),
+            "the full backoff window should let recovery fire again"
+        );
     }
 
     #[test]

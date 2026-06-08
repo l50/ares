@@ -6,7 +6,9 @@ use tracing::{debug, info, instrument};
 
 use ares_core::models::{Credential, Hash};
 
-use crate::orchestrator::state::{StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_SCANNED_TARGETS};
+use crate::orchestrator::state::{
+    StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_LATERAL_DENIED, DEDUP_SCANNED_TARGETS,
+};
 
 use super::Dispatcher;
 
@@ -429,6 +431,38 @@ impl Dispatcher {
                 );
                 return Ok(None);
             }
+
+            // Refuse if a prior lateral attempt with this credential against
+            // this target already returned a terminal denied indicator (any
+            // technique, or this specific technique). Without this guard the
+            // LLM lateral agent burns the credential's CredentialInflight slots
+            // re-trying psexec/winrm against a host where the cred has no
+            // admin, starving every higher-priority privesc/exploit task that
+            // also targets the same cred.
+            let denied_any = format!(
+                "{}@{}:{}:*",
+                credential.username.to_lowercase(),
+                credential.domain.to_lowercase(),
+                target_ip
+            );
+            let denied_specific = format!(
+                "{}@{}:{}:{}",
+                credential.username.to_lowercase(),
+                credential.domain.to_lowercase(),
+                target_ip,
+                technique
+            );
+            if state.is_processed(DEDUP_LATERAL_DENIED, &denied_any)
+                || state.is_processed(DEDUP_LATERAL_DENIED, &denied_specific)
+            {
+                debug!(
+                    target_ip = target_ip,
+                    cred_user = %credential.username,
+                    technique = technique,
+                    "Skipping lateral — credential already denied on this target"
+                );
+                return Ok(None);
+            }
         }
 
         // Resolve target's realm from state.hosts (FQDN suffix).
@@ -707,21 +741,32 @@ impl Dispatcher {
     }
 
     /// Submit a coercion task.
+    ///
+    /// `target_domain` is the AD realm of the box being coerced. It's plumbed
+    /// into the task payload so the credential resolver can auto-pick an
+    /// in-realm principal when the LLM forgets to set `coerce_user` — without
+    /// it the coerce goes unauthenticated and bounces off `RPC_S_ACCESS_DENIED`
+    /// on any patched DC. Pass `""` when the realm isn't known yet; the
+    /// resolver will fall back to any owned principal.
     #[instrument(
         name = "automation.request_coercion",
         skip(self),
-        fields(target_ip = %target_ip, listener_ip = %listener_ip, technique_count = techniques.len()),
+        fields(target_ip = %target_ip, listener_ip = %listener_ip, target_domain = %target_domain, technique_count = techniques.len()),
     )]
     pub async fn request_coercion(
         &self,
         target_ip: &str,
         listener_ip: &str,
         techniques: &[&str],
+        target_domain: &str,
     ) -> Result<Option<String>> {
         let payload = json!({
             "target_ip": target_ip,
             "listener_ip": listener_ip,
             "techniques": techniques,
+            "target_domain": target_domain,
+            "domain": target_domain,
+            "coerce_domain": target_domain,
         });
         self.throttled_submit("coercion", "coercion", payload, 3)
             .await

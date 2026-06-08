@@ -65,6 +65,8 @@ pub async fn process_task(
                     op_id,
                     usage.input_tokens,
                     usage.output_tokens,
+                    0, // worker-side LLM uses Anthropic claude only via blue runner;
+                    // native tool dispatch (this path) has no LLM usage to count.
                     model,
                 )
                 .await

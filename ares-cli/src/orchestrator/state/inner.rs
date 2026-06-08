@@ -712,12 +712,26 @@ impl StateInner {
     /// before going idle — DA in one forest doesn't mean we're done if cross-forest
     /// targets remain.
     pub fn all_forests_dominated(&self) -> bool {
+        // Lean completion (ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1):
+        // restrict DC-only required-set to domains we hold credentials for.
+        // Matches the semantic used by `undominated_forests()` so the
+        // automation gates (this method) and the completion loop (that
+        // function) make consistent stop decisions.
+        let lean = crate::orchestrator::completion::lean_completion_enabled();
+        let cred_domains: Option<std::collections::HashSet<String>> = lean.then(|| {
+            self.credentials
+                .iter()
+                .filter(|c| !c.domain.is_empty())
+                .map(|c| c.domain.to_lowercase())
+                .collect()
+        });
         crate::orchestrator::completion::compute_undominated_forests(
             self.target.as_ref().map(|t| t.domain.as_str()),
             self.domains.first().map(|d| d.as_str()),
             &self.trusted_domains,
             &self.dominated_domains,
             &self.domain_controllers,
+            cred_domains.as_ref(),
         )
         .is_empty()
     }
@@ -1020,6 +1034,7 @@ mod tests {
             DEDUP_MSSQL_IMPERSONATION,
             DEDUP_SID_HISTORY,
             DEDUP_STALL_COLD_START,
+            DEDUP_LATERAL_DENIED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

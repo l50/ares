@@ -126,6 +126,18 @@ struct ApiResponseFunction {
 struct ApiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// OpenAI Chat Completions reports the cached prefix size in
+    /// `prompt_tokens_details.cached_tokens`. Caching is automatic for
+    /// prefixes ≥1024 tokens; absent on responses where no cache hit
+    /// occurred or the model doesn't support it.
+    #[serde(default)]
+    prompt_tokens_details: Option<ApiUsagePromptDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct ApiUsagePromptDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -401,18 +413,31 @@ impl LlmProvider for OpenAiProvider {
             })
             .unwrap_or_default();
 
-        let usage = api_response
-            .usage
-            .map_or_else(TokenUsage::default, |u| TokenUsage {
-                input_tokens: u.prompt_tokens,
+        let usage = api_response.usage.map_or_else(TokenUsage::default, |u| {
+            // OpenAI's `prompt_tokens` is the *total* prompt count including
+            // any cached prefix. Split it so `input_tokens` carries only the
+            // fresh (uncached) portion — matches Anthropic's semantics and
+            // lets the cost estimator bill cached input at the discounted
+            // rate via `cache_read_input_tokens`.
+            let cached = u
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
+            let fresh = u.prompt_tokens.saturating_sub(cached);
+            TokenUsage {
+                input_tokens: fresh,
                 output_tokens: u.completion_tokens,
-                ..Default::default()
-            });
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: cached,
+            }
+        });
 
         let stop_reason = parse_stop_reason(choice.finish_reason.as_deref());
 
         info!(
             input_tokens = usage.input_tokens,
+            cache_read_input_tokens = usage.cache_read_input_tokens,
             output_tokens = usage.output_tokens,
             tool_calls = tool_calls.len(),
             stop = ?stop_reason,
@@ -457,6 +482,41 @@ mod tests {
         assert_eq!(parse_stop_reason(Some("stop")), StopReason::EndTurn);
         assert_eq!(parse_stop_reason(Some("tool_calls")), StopReason::ToolUse);
         assert_eq!(parse_stop_reason(Some("length")), StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn deserialize_openai_response_splits_cached_tokens() {
+        // `prompt_tokens` is the total; `prompt_tokens_details.cached_tokens`
+        // is the cached subset. Provider must split so input_tokens carries
+        // only the fresh portion.
+        let json = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 5000,
+                "completion_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 3000}
+            }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let u = resp.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 5000);
+        assert_eq!(
+            u.prompt_tokens_details.as_ref().unwrap().cached_tokens,
+            3000
+        );
+    }
+
+    #[test]
+    fn deserialize_openai_response_no_cache_details_defaults_zero() {
+        // Older responses or non-cache-eligible calls omit prompt_tokens_details.
+        let json = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let u = resp.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 100);
+        assert!(u.prompt_tokens_details.is_none());
     }
 
     #[test]

@@ -108,6 +108,20 @@ pub const DEDUP_MSSQL_IMPERSONATION: &str = "mssql_impersonation_auto";
 pub const DEDUP_SID_HISTORY: &str = "sid_history_enum";
 pub const DEDUP_STALL_COLD_START: &str = "stall_cold_start";
 
+/// Dedup for `(credential, target_ip, technique)` tuples where a lateral
+/// movement attempt returned a terminal denial (e.g. `rpc_s_access_denied`,
+/// no admin marker, `evil-winrm NoMethodError`). Populated by result
+/// processing when a `lateral_movement` task finishes with a denied
+/// indicator in any tool output; consulted by `request_lateral` to refuse
+/// resubmits that would just repeat the same failure. Distinct from
+/// `DEDUP_CROSS_REALM_LATERAL`, which captures pre-flight realm mismatches
+/// rather than observed access-denied results.
+///
+/// Key format: `"{user}@{domain}:{target_ip}:{technique}"`. A wildcard
+/// technique `"*"` is also accepted on the lookup side so a denied result
+/// from any technique blocks all further techniques for that (cred, ip).
+pub const DEDUP_LATERAL_DENIED: &str = "lateral_denied";
+
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
 
@@ -178,6 +192,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_MSSQL_IMPERSONATION,
     DEDUP_SID_HISTORY,
     DEDUP_STALL_COLD_START,
+    DEDUP_LATERAL_DENIED,
 ];
 
 #[cfg(test)]

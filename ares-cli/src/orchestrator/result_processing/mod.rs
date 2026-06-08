@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::output_extraction;
 use crate::orchestrator::results::CompletedTask;
-use crate::orchestrator::state::SharedState;
+use crate::orchestrator::state::{SharedState, DEDUP_LATERAL_DENIED};
 use crate::orchestrator::task_queue::TaskQueueCore;
 use crate::orchestrator::throttling::Throttler;
 
@@ -209,6 +209,29 @@ pub async fn process_completed_task(
     // Caches the SID for golden ticket generation without needing lookupsid.
     if let Some(ref payload) = result.result {
         extract_and_cache_domain_sid(payload, task_domain.as_deref(), dispatcher).await;
+    }
+
+    // Lateral movement denied-attempt cache. When a `lateral_movement` task
+    // ends with a tool output containing a terminal denial (`rpc_s_access_denied`,
+    // `STATUS_ACCESS_DENIED`, evil-winrm `NoMethodError`, no `(Pwn3d!)` marker
+    // after exhausting techniques) mark the (cred, target, technique) tuple so
+    // `request_lateral` and `auto_credential_expansion` refuse re-dispatches.
+    // Without this the LLM lateral agent burns the credential's CredentialInflight
+    // slots looping psexec/winrm against hosts where the cred has no admin,
+    // starving privesc/exploit tasks that need the same cred's slots.
+    if completed.task_id.starts_with("lateral_movement_")
+        || completed.task_id.starts_with("lateral_")
+    {
+        record_lateral_denied(
+            dispatcher,
+            result,
+            cred_key.as_deref(),
+            task_target_ip.as_deref(),
+            task_params_snapshot
+                .get("technique")
+                .and_then(|v| v.as_str()),
+        )
+        .await;
     }
 
     // S4U auto-chain: when a task produces a Kerberos ticket (.ccache), chain a
@@ -966,6 +989,112 @@ fn result_text_indicates_failure(result: &Option<Value>) -> bool {
         || lower.contains("rpc_s_access_denied")
 }
 
+/// Tokens whose appearance in a lateral_movement task output prove the
+/// credential has no admin / WinRM access on that target. Kept narrow on
+/// purpose — a generic `failed` substring also matches transient network
+/// errors that we *do* want to retry.
+const LATERAL_DENIED_TOKENS: &[&str] = &[
+    "rpc_s_access_denied",
+    "status_access_denied",
+    "status_logon_failure",
+    "ept_s_not_registered",
+    "admin$ not accessible",
+    "c$ not accessible",
+    "access is denied",
+    "nomethoderror",
+    "evil-winrm",
+];
+
+fn output_indicates_lateral_denied(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    LATERAL_DENIED_TOKENS.iter().any(|t| lower.contains(t))
+}
+
+/// Mark `DEDUP_LATERAL_DENIED` for a (credential, target_ip, technique) tuple
+/// when this task's result carries a terminal denial indicator. `request_lateral`
+/// consults this set to refuse re-dispatches that would just repeat the failure.
+///
+/// Marks two keys: the technique-specific one AND the `*` wildcard, so the
+/// next dispatch with any technique for the same (cred, target) is also
+/// blocked — the cred is just not admin there.
+async fn record_lateral_denied(
+    dispatcher: &Arc<Dispatcher>,
+    result: &crate::orchestrator::task_queue::TaskResult,
+    cred_key: Option<&str>,
+    target_ip: Option<&str>,
+    technique: Option<&str>,
+) {
+    let (Some(cred), Some(ip)) = (cred_key, target_ip) else {
+        return;
+    };
+    if cred.is_empty() || ip.is_empty() {
+        return;
+    }
+
+    // Scan the LLM-visible summary AND every tool output for denial tokens.
+    // Tool outputs are the authoritative ground truth; the summary is the
+    // LLM's narration, which may or may not echo the underlying error.
+    let mut denied = false;
+    if let Some(ref payload) = result.result {
+        if let Some(s) = payload.get("summary").and_then(|v| v.as_str()) {
+            if output_indicates_lateral_denied(s) {
+                denied = true;
+            }
+        }
+        if !denied {
+            if let Some(outs) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
+                for to in outs {
+                    if let Some(out) = to.get("output").and_then(|v| v.as_str()) {
+                        if output_indicates_lateral_denied(out) {
+                            denied = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !denied {
+        if let Some(err) = result.error.as_deref() {
+            if output_indicates_lateral_denied(err) {
+                denied = true;
+            }
+        }
+    }
+    if !denied {
+        return;
+    }
+
+    let wildcard_key = format!("{}:{}:*", cred.to_lowercase(), ip);
+    let specific_key = technique
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("{}:{}:{}", cred.to_lowercase(), ip, t.to_lowercase()));
+
+    {
+        let mut state = dispatcher.state.write().await;
+        state.mark_processed(DEDUP_LATERAL_DENIED, wildcard_key.clone());
+        if let Some(ref k) = specific_key {
+            state.mark_processed(DEDUP_LATERAL_DENIED, k.clone());
+        }
+    }
+    let _ = dispatcher
+        .state
+        .persist_dedup(&dispatcher.queue, DEDUP_LATERAL_DENIED, &wildcard_key)
+        .await;
+    if let Some(ref k) = specific_key {
+        let _ = dispatcher
+            .state
+            .persist_dedup(&dispatcher.queue, DEDUP_LATERAL_DENIED, k)
+            .await;
+    }
+    info!(
+        cred = %cred,
+        target_ip = %ip,
+        technique = ?technique,
+        "Recorded lateral-denied; future dispatches with this cred against this target will be skipped"
+    );
+}
+
 /// Resolve the domain for hash/credential attribution from the task's target IP.
 ///
 /// Priority:
@@ -1104,7 +1233,32 @@ async fn auto_chain_s4u_secretsdump(
     task_domain: Option<&str>,
     task_target_ip: Option<&str>,
 ) {
-    let combined = collect_result_text_parts(payload).join("\n");
+    // Search every text channel — tool_outputs, summary, result, and the
+    // LLM's narrative in llm_findings — for the `.ccache` filename.
+    // `collect_result_text_parts` reads only tool_outputs, but the LLM may
+    // call task_complete with a summary string that names the ticket
+    // (impacket's "Saving ticket in <file>" line gets reformatted into a
+    // narrative). Scanning the summary as well catches that case.
+    let mut combined = collect_result_text_parts(payload);
+    for key in &["summary", "result", "output"] {
+        if let Some(s) = payload.get(*key).and_then(|v| v.as_str()) {
+            combined.push(s.to_string());
+        }
+    }
+    if let Some(findings) = payload.get("llm_findings").and_then(|v| v.as_array()) {
+        for f in findings {
+            if let Some(s) = f.as_str() {
+                combined.push(s.to_string());
+            } else if let Some(obj) = f.as_object() {
+                for v in obj.values() {
+                    if let Some(s) = v.as_str() {
+                        combined.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let combined = combined.join("\n");
     let Some(ticket_path) = ares_llm::routing::extract_ticket_path(&combined) else {
         return;
     };

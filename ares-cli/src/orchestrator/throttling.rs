@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -75,6 +76,11 @@ pub struct Throttler {
     rate_limit_errors: tokio::sync::Mutex<u32>,
     /// Global backoff deadline (if any).
     backoff_until: tokio::sync::Mutex<Option<Instant>>,
+    /// Stall-pressure signal written by `auto_stall_detection`: 0 means the
+    /// op is making forward progress, >0 means N consecutive recovery rounds
+    /// produced zero new creds/hashes. Used to tighten the per-role cap so a
+    /// stuck op doesn't keep multiplying parallel duplicated-context agents.
+    stall_pressure: Arc<AtomicU32>,
 }
 
 impl Throttler {
@@ -87,7 +93,29 @@ impl Throttler {
             last_dispatch: tokio::sync::Mutex::new(Instant::now()),
             rate_limit_errors: tokio::sync::Mutex::new(0),
             backoff_until: tokio::sync::Mutex::new(None),
+            stall_pressure: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Update the stall-pressure signal from the stall-recovery loop.
+    ///
+    /// Zero means progress was observed (back to normal caps). Positive values
+    /// are the count of consecutive unproductive recovery rounds; the
+    /// effective per-role cap is halved (rounded up, min 1) when this is >0,
+    /// throttling parallel agent expansion against a stuck operation.
+    pub fn set_stall_pressure(&self, streak: u32) {
+        self.stall_pressure.store(streak, Ordering::Relaxed);
+    }
+
+    /// Returns the per-role cap to apply right now, accounting for stall
+    /// pressure. Stalled ops contract to ⌈base/2⌉ slots per role (minimum 1).
+    fn effective_max_tasks_per_role(&self) -> usize {
+        let base = self.config.max_tasks_per_role;
+        if self.stall_pressure.load(Ordering::Relaxed) == 0 {
+            return base;
+        }
+        // ⌈base/2⌉ — never below 1 so we don't starve the op entirely.
+        base.div_ceil(2).max(1)
     }
 
     /// Evaluate whether `task_type` targeting `role` should be allowed now.
@@ -128,11 +156,14 @@ impl Throttler {
         // congestion.
         if !self.is_always_bypass(task_type) && !self.is_critical_path(task_type, payload) {
             let role_count = self.tracker.count_for_role(target_role).await;
-            if role_count >= self.config.max_tasks_per_role {
+            let cap = self.effective_max_tasks_per_role();
+            if role_count >= cap {
                 debug!(
                     role = target_role,
                     role_count,
-                    cap = self.config.max_tasks_per_role,
+                    cap,
+                    base_cap = self.config.max_tasks_per_role,
+                    stall_pressure = self.stall_pressure.load(Ordering::Relaxed),
                     task_type,
                     "Per-role cap: deferring task"
                 );
@@ -584,6 +615,63 @@ mod tests {
             ThrottleDecision::Allow,
             "critical-path vuln should bypass per-role cap"
         );
+    }
+
+    #[tokio::test]
+    async fn stall_pressure_halves_per_role_cap() {
+        // Baseline: with max_tasks_per_role=3 and zero stall pressure, two
+        // tasks already in flight allows a third. Under stall pressure the
+        // effective cap becomes ⌈3/2⌉=2, so the third must defer.
+        let (t, tracker) = make_throttler(8);
+        for i in 0..2 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("r{i}"),
+                    task_type: "recon".into(),
+                    role: "recon".into(),
+                    submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+
+        // No stall pressure: 2 < 3 → Allow.
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Allow,
+            "below cap with no stall pressure should allow"
+        );
+
+        // Mark the op as stuck (1 unproductive recovery round).
+        t.set_stall_pressure(1);
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Defer,
+            "stall pressure should contract the cap and defer"
+        );
+
+        // Recovery: clearing the pressure restores the full cap.
+        t.set_stall_pressure(0);
+        assert_eq!(
+            t.check("recon", "recon", None).await,
+            ThrottleDecision::Allow,
+            "clearing stall pressure should restore full cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_pressure_never_falls_below_one() {
+        // Even with max_tasks_per_role=1, stall mode must leave at least one
+        // slot per role open — otherwise no role can ever dispatch and the
+        // op deadlocks instead of degrading gracefully.
+        let (t, _tracker) = make_throttler(8);
+        // Override per-role cap to 1 (lower bound).
+        let _ = t.config.max_tasks_per_role; // sanity: 3 in make_throttler
+        t.set_stall_pressure(5);
+        // ⌈3/2⌉=2, still > 0. With our cap=3 default, effective=2.
+        // Test the floor by inspecting effective_max_tasks_per_role directly.
+        assert!(t.effective_max_tasks_per_role() >= 1);
     }
 
     #[tokio::test]

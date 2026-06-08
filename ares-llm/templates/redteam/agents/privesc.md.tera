@@ -309,6 +309,21 @@ For local privilege escalation via RBCD (requires ability to add computer):
 3. Call `s4u_attack` with `impersonate="Administrator"` and `target_spn="cifs/"` followed by the local host's FQDN (the same host named in step 2).
 4. Use the resulting ticket with `psexec_kerberos` against the same host → SYSTEM.
 
+### KrbRelayUp (Member Server Local Privilege Escalation)
+When the task payload names a **member server hostname** (not a DC) and the task type is `privesc` from `auto_krbrelayup`:
+
+- `payload.hostname` is the member server you want SYSTEM on (the relay target). It is in scope even if it differs from `{{ target_domain }}` / `{{ target_dc_ip }}` — the operation may have multiple member targets and the dispatcher picked one with a domain credential available.
+- `payload.domain` is the credential's domain. Use it for any auth, not `{{ target_domain }}`.
+- The DC for `payload.domain` is whichever IP `payload.dc_ip` carries; if absent, derive it from `state.domain_controllers[payload.domain]` (or fall back to `find_dc` once).
+
+KrbRelayUp chain (4-6 tool calls):
+1. `add_computer` against `payload.dc_ip` to create a new machine account (MAQ permitting). Note the SAM name returned.
+2. `rbcd_write` setting `delegate_from=<new_machine$>` and `target_computer=payload.hostname` (write RBCD on the target itself).
+3. `s4u_attack` with `impersonate="Administrator"`, `target_spn="cifs/<payload.hostname FQDN>"`, using the new machine account creds.
+4. `psexec_kerberos` against `payload.hostname` with the resulting ticket → SYSTEM on the member.
+
+Do NOT bail with "Task payload domain/host out of operation scope" — the payload IS the scope for this task type. Only fail if `add_computer` returns MachineAccountQuota=0 or the user lacks Create-Child rights, in which case `report_privesc_failed` with `technique="krbrelayup"` and the concrete reason.
+
 ## Workflow (Efficiency-Focused)
 
 **Target: Complete exploitation in 5-10 tool calls, not 50+**

@@ -8,11 +8,13 @@
 //!
 //! | Field | Description |
 //! |-------|-------------|
-//! | `input_tokens` | Aggregate prompt tokens across all models |
+//! | `input_tokens` | Aggregate fresh (uncached) prompt tokens across all models |
 //! | `output_tokens` | Aggregate completion tokens across all models |
+//! | `cache_read_input_tokens` | Aggregate cached prompt tokens (discounted billing) |
 //! | `model` | Last model name (last-writer-wins) |
-//! | `model:{base64(name)}:input_tokens` | Per-model input tokens |
+//! | `model:{base64(name)}:input_tokens` | Per-model fresh input tokens |
 //! | `model:{base64(name)}:output_tokens` | Per-model output tokens |
+//! | `model:{base64(name)}:cache_read_input_tokens` | Per-model cached input tokens |
 //!
 //! Model names are URL-safe base64-encoded to avoid `:` / `/` collisions in
 //! Redis HASH field names.
@@ -52,43 +54,54 @@ pub struct OperationTokenUsage {
 pub struct ModelTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached prefix tokens billed at the provider's discounted rate.
+    /// OpenAI auto-caches identical ≥1024-token prefixes (50% off);
+    /// Anthropic uses explicit cache_control breakpoints (90% off).
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
 }
 
-/// Per-model pricing: (input_cost_per_million, output_cost_per_million) in USD.
+/// Per-model pricing: (input_per_million, output_per_million, cached_input_per_million) in USD.
 ///
-/// Kept in sync with common LLM provider pricing. Models not in the table
-/// are reported as "unpriced" in the breakdown.
-const MODEL_COSTS: &[(&str, f64, f64)] = &[
-    // Anthropic Claude
-    ("claude-sonnet-4-20250514", 3.0, 15.0),
-    ("claude-opus-4-20250514", 15.0, 75.0),
-    ("claude-haiku-3-5-20241022", 0.80, 4.0),
-    ("anthropic/claude-sonnet-4-20250514", 3.0, 15.0),
-    ("anthropic/claude-opus-4-20250514", 15.0, 75.0),
-    // OpenAI GPT-4.1
-    ("gpt-4.1", 2.0, 8.0),
-    ("gpt-4.1-mini", 0.40, 1.60),
-    ("gpt-4.1-nano", 0.10, 0.40),
-    ("openai/gpt-4.1", 2.0, 8.0),
-    ("openai/gpt-4.1-mini", 0.40, 1.60),
-    ("openai/gpt-4.1-nano", 0.10, 0.40),
+/// The third entry is the per-million rate for cached prompt tokens. Provider
+/// defaults today (Nov 2025):
+///   * OpenAI: 50% of input rate (auto-cache for ≥1024-token prefixes)
+///   * Anthropic: 10% of input rate (explicit cache_control)
+///   * Gemini: 25% of input rate
+///
+/// Models not in the table are reported as "unpriced" in the breakdown.
+const MODEL_COSTS: &[(&str, f64, f64, f64)] = &[
+    // Anthropic Claude — cached read at 10% of input rate.
+    ("claude-sonnet-4-20250514", 3.0, 15.0, 0.30),
+    ("claude-opus-4-20250514", 15.0, 75.0, 1.50),
+    ("claude-haiku-3-5-20241022", 0.80, 4.0, 0.08),
+    ("anthropic/claude-sonnet-4-20250514", 3.0, 15.0, 0.30),
+    ("anthropic/claude-opus-4-20250514", 15.0, 75.0, 1.50),
+    // OpenAI GPT-4.1 — cached read at 25% of input (50% off vs Chat Completions
+    // post-2024-10 cache pricing).
+    ("gpt-4.1", 2.0, 8.0, 0.50),
+    ("gpt-4.1-mini", 0.40, 1.60, 0.10),
+    ("gpt-4.1-nano", 0.10, 0.40, 0.025),
+    ("openai/gpt-4.1", 2.0, 8.0, 0.50),
+    ("openai/gpt-4.1-mini", 0.40, 1.60, 0.10),
+    ("openai/gpt-4.1-nano", 0.10, 0.40, 0.025),
     // OpenAI GPT-4o/4-turbo
-    ("gpt-4o", 2.50, 10.0),
-    ("gpt-4o-mini", 0.15, 0.60),
-    ("gpt-4-turbo", 10.0, 30.0),
-    ("openai/gpt-4o", 2.50, 10.0),
-    ("openai/gpt-4o-mini", 0.15, 0.60),
-    ("openai/gpt-4-turbo", 10.0, 30.0),
-    // OpenAI GPT-5
-    ("gpt-5", 1.25, 10.0),
-    ("gpt-5.2", 1.75, 14.0),
-    ("gpt-5-mini", 0.25, 2.0),
-    ("openai/gpt-5", 1.25, 10.0),
-    ("openai/gpt-5.2", 1.75, 14.0),
-    ("openai/gpt-5-mini", 0.25, 2.0),
-    // Google Gemini
-    ("gemini/gemini-2.5-pro", 1.25, 10.0),
-    ("gemini/gemini-2.5-flash", 0.15, 0.60),
+    ("gpt-4o", 2.50, 10.0, 1.25),
+    ("gpt-4o-mini", 0.15, 0.60, 0.075),
+    ("gpt-4-turbo", 10.0, 30.0, 5.0),
+    ("openai/gpt-4o", 2.50, 10.0, 1.25),
+    ("openai/gpt-4o-mini", 0.15, 0.60, 0.075),
+    ("openai/gpt-4-turbo", 10.0, 30.0, 5.0),
+    // OpenAI GPT-5 — cached input at ~10% of fresh input.
+    ("gpt-5", 1.25, 10.0, 0.125),
+    ("gpt-5.2", 1.75, 14.0, 0.175),
+    ("gpt-5-mini", 0.25, 2.0, 0.025),
+    ("openai/gpt-5", 1.25, 10.0, 0.125),
+    ("openai/gpt-5.2", 1.75, 14.0, 0.175),
+    ("openai/gpt-5-mini", 0.25, 2.0, 0.025),
+    // Google Gemini — context caching at ~25% of input.
+    ("gemini/gemini-2.5-pro", 1.25, 10.0, 0.3125),
+    ("gemini/gemini-2.5-flash", 0.15, 0.60, 0.0375),
 ];
 
 /// Cost breakdown for a single model.
@@ -120,8 +133,12 @@ pub fn estimate_usage_cost(
     models.sort_by_key(|(name, _)| name.to_lowercase());
 
     for (model_name, model_usage) in models {
-        if let Some((input_rate, output_rate)) = lookup_model_cost(model_name) {
+        if let Some((input_rate, output_rate, cached_rate)) = lookup_model_cost(model_name) {
+            // `input_tokens` is the fresh (uncached) portion;
+            // `cache_read_input_tokens` is billed at the provider's discounted
+            // rate. Without this split we over-bill cached prefixes by 5–10×.
             let cost = (model_usage.input_tokens as f64 * input_rate
+                + model_usage.cache_read_input_tokens as f64 * cached_rate
                 + model_usage.output_tokens as f64 * output_rate)
                 / 1_000_000.0;
             total_cost += cost;
@@ -129,7 +146,9 @@ pub fn estimate_usage_cost(
                 model: model_name.clone(),
                 input_tokens: model_usage.input_tokens,
                 output_tokens: model_usage.output_tokens,
-                total_tokens: model_usage.input_tokens + model_usage.output_tokens,
+                total_tokens: model_usage.input_tokens
+                    + model_usage.cache_read_input_tokens
+                    + model_usage.output_tokens,
                 cost,
             });
         } else {
@@ -144,18 +163,18 @@ pub fn estimate_usage_cost(
     }
 }
 
-/// Look up per-token pricing for a model.
-fn lookup_model_cost(model: &str) -> Option<(f64, f64)> {
+/// Look up per-token pricing for a model: (input, output, cached_input) per million.
+fn lookup_model_cost(model: &str) -> Option<(f64, f64, f64)> {
     let model_lower = model.to_lowercase();
-    for &(name, input, output) in MODEL_COSTS {
+    for &(name, input, output, cached) in MODEL_COSTS {
         if name == model_lower {
-            return Some((input, output));
+            return Some((input, output, cached));
         }
     }
     // Fuzzy fallback: check if model contains a known name as substring
-    for &(name, input, output) in MODEL_COSTS {
+    for &(name, input, output, cached) in MODEL_COSTS {
         if model_lower.contains(name) || name.contains(&model_lower) {
-            return Some((input, output));
+            return Some((input, output, cached));
         }
     }
     None
@@ -177,6 +196,7 @@ pub async fn increment_blue_token_usage(
     investigation_id: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_input_tokens: u64,
     model: &str,
 ) -> Result<(), redis::RedisError> {
     let key = blue_token_usage_key(investigation_id);
@@ -193,6 +213,12 @@ pub async fn increment_blue_token_usage(
             "output_tokens overflows i64",
         ))
     })?;
+    let cache_read_i64 = i64::try_from(cache_read_input_tokens).map_err(|_| {
+        redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "cache_read_input_tokens overflows i64",
+        ))
+    })?;
 
     let mut pipe = redis::pipe();
     pipe.atomic();
@@ -204,6 +230,12 @@ pub async fn increment_blue_token_usage(
         .arg(&key)
         .arg("output_tokens")
         .arg(output_i64);
+    if cache_read_i64 > 0 {
+        pipe.cmd("HINCRBY")
+            .arg(&key)
+            .arg("cache_read_input_tokens")
+            .arg(cache_read_i64);
+    }
 
     if !model.is_empty() {
         pipe.cmd("HSET").arg(&key).arg("model").arg(model);
@@ -215,6 +247,12 @@ pub async fn increment_blue_token_usage(
             .arg(&key)
             .arg(model_field(model, "output_tokens"))
             .arg(output_i64);
+        if cache_read_i64 > 0 {
+            pipe.cmd("HINCRBY")
+                .arg(&key)
+                .arg(model_field(model, "cache_read_input_tokens"))
+                .arg(cache_read_i64);
+        }
     }
 
     pipe.query_async::<()>(conn).await?;
@@ -252,6 +290,7 @@ pub async fn get_blue_token_usage(
             match token_type.as_str() {
                 "input_tokens" => entry.input_tokens = count,
                 "output_tokens" => entry.output_tokens = count,
+                "cache_read_input_tokens" => entry.cache_read_input_tokens = count,
                 _ => {}
             }
         }
@@ -291,11 +330,17 @@ fn parse_model_field(field: &str) -> Option<(String, String)> {
 /// Atomically increment token usage counters for an operation.
 ///
 /// Uses Redis HINCRBY for lock-free, crash-safe accumulation across workers.
+///
+/// `cache_read_input_tokens` is the count of prompt tokens served from the
+/// provider's prompt cache (OpenAI auto-cache or Anthropic explicit cache).
+/// These bill at a heavily discounted rate, so the estimator tracks them
+/// separately rather than rolling them into `input_tokens` and over-billing.
 pub async fn increment_token_usage(
     conn: &mut impl AsyncCommands,
     operation_id: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_input_tokens: u64,
     model: &str,
 ) -> Result<(), redis::RedisError> {
     let key = token_usage_key(operation_id);
@@ -312,6 +357,12 @@ pub async fn increment_token_usage(
             "output_tokens overflows i64",
         ))
     })?;
+    let cache_read_i64 = i64::try_from(cache_read_input_tokens).map_err(|_| {
+        redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "cache_read_input_tokens overflows i64",
+        ))
+    })?;
 
     let mut pipe = redis::pipe();
     pipe.atomic();
@@ -323,6 +374,12 @@ pub async fn increment_token_usage(
         .arg(&key)
         .arg("output_tokens")
         .arg(output_i64);
+    if cache_read_i64 > 0 {
+        pipe.cmd("HINCRBY")
+            .arg(&key)
+            .arg("cache_read_input_tokens")
+            .arg(cache_read_i64);
+    }
 
     if !model.is_empty() {
         pipe.cmd("HSET").arg(&key).arg("model").arg(model);
@@ -334,6 +391,12 @@ pub async fn increment_token_usage(
             .arg(&key)
             .arg(model_field(model, "output_tokens"))
             .arg(output_i64);
+        if cache_read_i64 > 0 {
+            pipe.cmd("HINCRBY")
+                .arg(&key)
+                .arg(model_field(model, "cache_read_input_tokens"))
+                .arg(cache_read_i64);
+        }
     }
 
     pipe.query_async::<()>(conn).await?;
@@ -369,6 +432,7 @@ pub async fn get_token_usage(
             match token_type.as_str() {
                 "input_tokens" => entry.input_tokens = count,
                 "output_tokens" => entry.output_tokens = count,
+                "cache_read_input_tokens" => entry.cache_read_input_tokens = count,
                 _ => {}
             }
         }
@@ -421,6 +485,57 @@ mod tests {
     }
 
     #[test]
+    fn estimate_usage_cost_bills_cache_reads_at_discounted_rate() {
+        // gpt-5.2: $1.75/M input, $14/M output, $0.175/M cached input.
+        // 1M fresh input × $1.75 + 1M cached input × $0.175 + 0.1M out × $14
+        // = $1.75 + $0.175 + $1.40 = $3.325. Without the cache split this
+        // would over-bill by $1.575 (1M × ($1.75 − $0.175)).
+        let usage = OperationTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            model: "openai/gpt-5.2".to_string(),
+            models: HashMap::from([(
+                "openai/gpt-5.2".to_string(),
+                ModelTokenUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 100_000,
+                    cache_read_input_tokens: 1_000_000,
+                },
+            )]),
+        };
+        let (total, breakdown, unpriced) = estimate_usage_cost(&usage);
+        assert!(unpriced.is_empty());
+        let cost = total.unwrap();
+        assert!(
+            (cost - 3.325).abs() < 0.001,
+            "expected ~$3.325, got ${cost}"
+        );
+        assert_eq!(breakdown[0].total_tokens, 2_100_000);
+    }
+
+    #[test]
+    fn estimate_usage_cost_zero_cache_matches_pre_cache_billing() {
+        // When cache_read is 0, totals match the pre-cache calculation.
+        let usage = OperationTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            model: "openai/gpt-5.2".to_string(),
+            models: HashMap::from([(
+                "openai/gpt-5.2".to_string(),
+                ModelTokenUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 100_000,
+                    cache_read_input_tokens: 0,
+                },
+            )]),
+        };
+        let (total, _, _) = estimate_usage_cost(&usage);
+        let cost = total.unwrap();
+        // 1M × $1.75 + 0.1M × $14 = $3.15
+        assert!((cost - 3.15).abs() < 0.001);
+    }
+
+    #[test]
     fn estimate_usage_cost_single_model() {
         let usage = OperationTokenUsage {
             input_tokens: 1_000_000,
@@ -431,6 +546,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 1_000_000,
                     output_tokens: 500_000,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -457,6 +573,7 @@ mod tests {
                     ModelTokenUsage {
                         input_tokens: 1_000_000,
                         output_tokens: 500_000,
+                        cache_read_input_tokens: 0,
                     },
                 ),
                 (
@@ -464,6 +581,7 @@ mod tests {
                     ModelTokenUsage {
                         input_tokens: 1_000_000,
                         output_tokens: 500_000,
+                        cache_read_input_tokens: 0,
                     },
                 ),
             ]),
@@ -490,6 +608,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -528,7 +647,7 @@ mod tests {
     #[test]
     fn lookup_model_cost_exact_match() {
         let result = lookup_model_cost("gpt-4o");
-        let (input, output) = result.expect("gpt-4o should have known cost");
+        let (input, output, _cached) = result.expect("gpt-4o should have known cost");
         assert!((input - 2.50).abs() < 0.001);
         assert!((output - 10.0).abs() < 0.001);
     }
@@ -571,6 +690,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 500_000,
                     output_tokens: 500_000,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -680,12 +800,12 @@ mod tests {
     #[test]
     fn lookup_model_cost_returns_correct_rates() {
         // gpt-4.1: $2.00/M input, $8.00/M output
-        let (input, output) = lookup_model_cost("gpt-4.1").unwrap();
+        let (input, output, _cached) = lookup_model_cost("gpt-4.1").unwrap();
         assert!((input - 2.0).abs() < 0.001);
         assert!((output - 8.0).abs() < 0.001);
 
         // gpt-4.1-nano: $0.10/M input, $0.40/M output
-        let (input, output) = lookup_model_cost("gpt-4.1-nano").unwrap();
+        let (input, output, _cached) = lookup_model_cost("gpt-4.1-nano").unwrap();
         assert!((input - 0.10).abs() < 0.001);
         assert!((output - 0.40).abs() < 0.001);
     }
@@ -727,6 +847,7 @@ mod tests {
                     ModelTokenUsage {
                         input_tokens: 1_000_000,
                         output_tokens: 500_000,
+                        cache_read_input_tokens: 0,
                     },
                 ),
                 (
@@ -734,6 +855,7 @@ mod tests {
                     ModelTokenUsage {
                         input_tokens: 1_000_000,
                         output_tokens: 500_000,
+                        cache_read_input_tokens: 0,
                     },
                 ),
             ]),
@@ -757,6 +879,7 @@ mod tests {
                     ModelTokenUsage {
                         input_tokens: 500_000,
                         output_tokens: 250_000,
+                        cache_read_input_tokens: 0,
                     },
                 ),
                 (
@@ -764,6 +887,7 @@ mod tests {
                     ModelTokenUsage {
                         input_tokens: 500_000,
                         output_tokens: 250_000,
+                        cache_read_input_tokens: 0,
                     },
                 ),
             ]),
@@ -816,6 +940,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 10000,
                     output_tokens: 5000,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -837,6 +962,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -879,6 +1005,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 1000,
                     output_tokens: 500,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -899,6 +1026,7 @@ mod tests {
                 ModelTokenUsage {
                     input_tokens: 1_000_000,
                     output_tokens: 500_000,
+                    cache_read_input_tokens: 0,
                 },
             )]),
         };
@@ -914,7 +1042,7 @@ mod tests {
     #[test]
     fn lookup_model_cost_prefixed_openai() {
         let result = lookup_model_cost("openai/gpt-4o-mini");
-        let (input, output) = result.expect("gpt-4o-mini should have known cost");
+        let (input, output, _cached) = result.expect("gpt-4o-mini should have known cost");
         assert!((input - 0.15).abs() < 0.001);
         assert!((output - 0.60).abs() < 0.001);
     }
@@ -922,7 +1050,7 @@ mod tests {
     #[test]
     fn lookup_model_cost_claude_opus() {
         let result = lookup_model_cost("claude-opus-4-20250514");
-        let (input, output) = result.expect("claude-opus should have known cost");
+        let (input, output, _cached) = result.expect("claude-opus should have known cost");
         assert!((input - 15.0).abs() < 0.001);
         assert!((output - 75.0).abs() < 0.001);
     }
@@ -930,7 +1058,7 @@ mod tests {
     #[test]
     fn lookup_model_cost_haiku() {
         let result = lookup_model_cost("claude-haiku-3-5-20241022");
-        let (input, output) = result.expect("claude-haiku should have known cost");
+        let (input, output, _cached) = result.expect("claude-haiku should have known cost");
         assert!((input - 0.80).abs() < 0.001);
         assert!((output - 4.0).abs() < 0.001);
     }

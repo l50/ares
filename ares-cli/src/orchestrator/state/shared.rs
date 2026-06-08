@@ -55,13 +55,25 @@ impl SharedState {
     pub async fn snapshot(&self) -> ares_llm::prompt::StateSnapshot {
         let s = self.inner.read().await;
 
-        // Compute undominated forests inline (avoids re-acquiring lock)
+        // Compute undominated forests inline (avoids re-acquiring lock).
+        // Lean completion (when ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1)
+        // only counts DC-discovered domains where we hold at least one
+        // credential — avoids holding the op open on unreachable child DCs.
+        let lean = crate::orchestrator::completion::lean_completion_enabled();
+        let cred_domains: Option<std::collections::HashSet<String>> = lean.then(|| {
+            s.credentials
+                .iter()
+                .filter(|c| !c.domain.is_empty())
+                .map(|c| c.domain.to_lowercase())
+                .collect()
+        });
         let undominated = crate::orchestrator::completion::compute_undominated_forests(
             s.target.as_ref().map(|t| t.domain.as_str()),
             s.domains.first().map(|d| d.as_str()),
             &s.trusted_domains,
             &s.dominated_domains,
             &s.domain_controllers,
+            cred_domains.as_ref(),
         );
 
         // Hide quarantined principals from LLM agents. A locked-out account

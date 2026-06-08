@@ -22,6 +22,13 @@ pub fn is_pass_the_hash_compatible(hash_value: &str) -> bool {
 }
 
 /// Extract a .ccache ticket path from command output.
+///
+/// The fallback character class must include `@` because impacket's `getST` /
+/// `s4u` family writes filenames like `Administrator@CIFS_dc01@REALM.ccache`
+/// and the LLM frequently mentions that filename verbatim in its summary.
+/// An overly narrow character class matched only `REALM.ccache`, which then
+/// broke the downstream `secretsdump -k -no-pass -t <file>` because the
+/// truncated path didn't exist.
 pub fn extract_ticket_path(output: &str) -> Option<String> {
     use std::sync::OnceLock;
     static SAVING_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -35,7 +42,7 @@ pub fn extract_ticket_path(output: &str) -> Option<String> {
     }
 
     let fallback_re = FALLBACK_RE
-        .get_or_init(|| regex::Regex::new(r"([A-Za-z0-9_.-]+\.ccache)").expect("valid regex"));
+        .get_or_init(|| regex::Regex::new(r"([A-Za-z0-9_.@/-]+\.ccache)").expect("valid regex"));
     if let Some(caps) = fallback_re.captures(output) {
         return Some(caps[1].to_string());
     }
@@ -123,6 +130,29 @@ mod tests {
     #[test]
     fn extract_ticket_path_none() {
         assert_eq!(extract_ticket_path("No ticket found"), None);
+    }
+
+    #[test]
+    fn extract_ticket_path_impacket_at_format() {
+        // impacket-getST and the S4U workflow write filenames of the form
+        // `<impersonated>@<SPN_underscored>@<REALM>.ccache`. The previous
+        // fallback regex excluded `@` and matched only the final
+        // `REALM.ccache` segment, breaking the downstream secretsdump
+        // because the truncated path didn't exist on disk.
+        let output = "saved ticket: admin@CIFS_dc01@CONTOSO.LOCAL.ccache.";
+        assert_eq!(
+            extract_ticket_path(output),
+            Some("admin@CIFS_dc01@CONTOSO.LOCAL.ccache".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ticket_path_absolute_path() {
+        let output = "Saving ticket in /tmp/tickets/admin@dc01.ccache";
+        assert_eq!(
+            extract_ticket_path(output),
+            Some("/tmp/tickets/admin@dc01.ccache".to_string())
+        );
     }
 
     #[test]

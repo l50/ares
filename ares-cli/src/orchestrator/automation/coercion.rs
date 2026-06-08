@@ -62,7 +62,7 @@ pub async fn auto_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
 
         for (domain, dc_ip) in work {
             match dispatcher
-                .request_coercion(&dc_ip, &listener, &["petitpotam", "printerbug"])
+                .request_coercion(&dc_ip, &listener, &["petitpotam", "printerbug"], &domain)
                 .await
             {
                 Ok(Some(task_id)) => {
