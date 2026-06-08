@@ -61,7 +61,17 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
         };
 
         if found {
-            // Extract template name if available (e.g., "Template Name : ESC1")
+            // Without a `target_ip` (neither `ca_host_ip` nor `target` was
+            // passed), the vuln_id collapses to `adcs_esc8_` and the
+            // downstream relay-chain still dispatches against it — burning
+            // the relay-chain semaphore on a vuln whose CA host is unknown.
+            // Skip these "anonymous" vulns; certipy_find without a target
+            // can't have produced exploitable enrollment context anyway.
+            if target_ip.is_empty() {
+                continue;
+            }
+
+            // Extract template name if available (e.g. "Template Name : ESC1")
             let template_name = extract_template_for_esc(output, esc_type);
 
             let mut details = json!({
@@ -310,6 +320,29 @@ mod tests {
     fn parse_certipy_empty_output() {
         let vulns = parse_certipy_find("", &json!({}));
         assert!(vulns.is_empty());
+    }
+
+    #[test]
+    fn parse_certipy_skips_vulns_when_target_unknown() {
+        // certipy_find was invoked without target/ca_host_ip — the resulting
+        // vuln_id would collapse to `adcs_esc8_` with an empty CA host, and
+        // the downstream relay-chain would burn its semaphore slot trying
+        // to exploit it. Skip these entirely.
+        let output = "[!] Vulnerabilities\nESC8 : Web enrollment + NTLM";
+        let vulns = parse_certipy_find(output, &json!({}));
+        assert!(
+            vulns.is_empty(),
+            "anonymous ESC vuln must be dropped: {vulns:?}"
+        );
+    }
+
+    #[test]
+    fn parse_certipy_keeps_vuln_when_target_known() {
+        // Same input, with a target → vuln must be emitted normally.
+        let output = "[!] Vulnerabilities\nESC8 : Web enrollment + NTLM";
+        let vulns = parse_certipy_find(output, &json!({"target": "192.168.58.10"}));
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["vuln_id"], "adcs_esc8_192.168.58.10");
     }
 
     #[test]
