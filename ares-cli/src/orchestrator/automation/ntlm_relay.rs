@@ -544,8 +544,28 @@ async fn dispatch_esc8_direct(dispatcher: &Arc<Dispatcher>, item: &RelayWork) ->
     let attacker_ip = item.listener.clone();
     let credential = item.credential.clone();
     let dedup_key = item.dedup_key.clone();
+    let relay_semaphore = dispatcher.relay_chain_semaphore.clone();
 
     tokio::spawn(async move {
+        // Serialize against auto_adcs_exploitation's relay chain. Both
+        // spawn paths dispatch `relay_and_coerce` against the same CA host
+        // when an ESC8 vuln exists — without the shared mutex one would
+        // win the host-wide port-445 lock and the other would hit
+        // `RELAY_BIND_BUSY`, burn its dedup slot, and reset to "wait for
+        // next tick". The tool's `relay_lock_wait` (120s) bridges most of
+        // the race, but the semaphore makes the queueing explicit and
+        // releases the dedup-pressure on the loser correctly.
+        let _relay_permit = match relay_semaphore.acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    task_id = %dedup_key,
+                    err = %e,
+                    "auto_ntlm_relay Esc8: failed to acquire relay_chain_semaphore — closed"
+                );
+                return;
+            }
+        };
         let cred_user = credential
             .as_ref()
             .map(|c| c.username.clone())
