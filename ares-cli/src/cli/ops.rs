@@ -56,6 +56,9 @@ pub(crate) enum OpsCommands {
         /// Use the latest operation (prefer running)
         #[arg(long)]
         latest: bool,
+        /// Watch mode: refresh every N seconds (0=off)
+        #[arg(long, default_value = "0")]
+        watch: u64,
     },
 
     /// Dump loot (users, credentials, hosts, hashes) from operation state

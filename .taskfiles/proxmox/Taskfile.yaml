@@ -247,14 +247,18 @@ tasks:
           "ARES_REDIS_URL=redis://localhost:6379 ares ops loot $SELECTOR $FLAGS"
 
   runtime:
-    desc: "Show current op runtime stats (vulns, creds, hashes, tokens, cost)"
+    desc: "Show current op runtime stats (vulns, creds, hashes, tokens, cost). Pass WATCH=N for live refresh every N seconds."
     silent: true
+    vars:
+      WATCH: '{{.WATCH | default ""}}'
     cmds:
       - |
         IP="{{.ATTACKER_IP}}"
         if [ -z "$IP" ]; then echo -e "{{.ERROR}} Could not resolve attacker IP"; exit 1; fi
+        FLAGS=""
+        [ -n "{{.WATCH}}" ] && FLAGS="$FLAGS --watch {{.WATCH}}"
         ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
-          "ARES_REDIS_URL=redis://localhost:6379 ares ops runtime --latest"
+          "ARES_REDIS_URL=redis://localhost:6379 ares ops runtime --latest $FLAGS"
 
   ops:list:
     desc: "List all ops in Redis"

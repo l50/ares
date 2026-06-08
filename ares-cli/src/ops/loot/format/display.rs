@@ -418,7 +418,7 @@ pub(super) fn print_runtime_summary(
 
 /// Priority threshold (inclusive) at or below which a vulnerability is treated
 /// as actively exploitable rather than an informational finding.
-const EXPLOITABLE_PRIORITY_MAX: i32 = 3;
+pub(crate) const EXPLOITABLE_PRIORITY_MAX: i32 = 3;
 
 /// Print vulnerabilities split into two tables: actively exploitable
 /// (priority <= EXPLOITABLE_PRIORITY_MAX) and informational findings (rest).
