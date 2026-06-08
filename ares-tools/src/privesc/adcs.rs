@@ -683,9 +683,23 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         return Ok(agent_output);
     }
     if !cwd.join(&agent_pfx).exists() {
-        anyhow::bail!(
-            "certipy req (agent enrollment) reported success but {agent_pfx} was not produced"
-        );
+        // certipy exits 0 even when the CA rejects the enrollment mid-flow
+        // (e.g. `ept_s_not_registered`, template mapping refused, web
+        // enrollment refused TCP). Surface certipy's stdout/stderr so the
+        // upstream classifier — and the operator reading logs — can see
+        // *why* the request didn't produce a PFX, instead of swallowing
+        // the context inside an anyhow error string.
+        let agent_label = format!("Agent enrollment ({agent_template})");
+        let (stdout, mut stderr) = render_chain_output(&[(&agent_label, &agent_output)]);
+        stderr.push_str(&format!(
+            "\n=== ares ===\ncertipy req (agent enrollment) reported exit 0 but {agent_pfx} was not produced — likely a CA-side enrollment failure. See stdout above."
+        ));
+        return Ok(ToolOutput {
+            stdout,
+            stderr,
+            exit_code: agent_output.exit_code,
+            success: false,
+        });
     }
 
     // `domain\\principal` form is what certipy expects for `-on-behalf-of`
@@ -722,9 +736,24 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         });
     }
     if !cwd.join(&target_pfx).exists() {
-        anyhow::bail!(
-            "certipy req (on-behalf-of) reported success but {target_pfx} was not produced"
-        );
+        // Same pattern as the agent-enrollment step above: surface both
+        // certipy invocations' output so the failure mode (CA error, RPC
+        // dead, on-behalf-of denied, etc.) is visible to the classifier.
+        let agent_label = format!("Agent enrollment ({agent_template})");
+        let on_behalf_label = format!("On-behalf-of {on_behalf_target} via {on_behalf_template}");
+        let (stdout, mut stderr) = render_chain_output(&[
+            (&agent_label, &agent_output),
+            (&on_behalf_label, &request_output),
+        ]);
+        stderr.push_str(&format!(
+            "\n=== ares ===\ncertipy req (on-behalf-of) reported exit 0 but {target_pfx} was not produced — likely a CA-side enrollment failure on the second step. See stdout above."
+        ));
+        return Ok(ToolOutput {
+            stdout,
+            stderr,
+            exit_code: request_output.exit_code,
+            success: false,
+        });
     }
 
     // certipy auth writes <subject>.ccache in CWD; clear stale .ccache to
@@ -819,7 +848,21 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
         return Ok(request_output);
     }
     if !cwd.join(&pfx_name).exists() {
-        anyhow::bail!("certipy req reported success but {pfx_name} was not produced");
+        // certipy exits 0 in some CA-error paths without producing the PFX
+        // (RPC endpoint unavailable, template mapping refused, etc.).
+        // Surface certipy's output so the upstream classifier sees the
+        // actual failure mode instead of a bare anyhow string.
+        let req_label = format!("certipy req (ESC1, upn={upn}, sid={sid})");
+        let (stdout, mut stderr) = render_chain_output(&[(&req_label, &request_output)]);
+        stderr.push_str(&format!(
+            "\n=== ares ===\ncertipy req reported exit 0 but {pfx_name} was not produced — likely a CA-side enrollment failure. See stdout above."
+        ));
+        return Ok(ToolOutput {
+            stdout,
+            stderr,
+            exit_code: request_output.exit_code,
+            success: false,
+        });
     }
 
     let auth_output = CommandBuilder::new("certipy")
