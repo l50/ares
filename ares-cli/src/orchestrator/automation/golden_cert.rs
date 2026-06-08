@@ -60,6 +60,10 @@ pub async fn auto_golden_cert(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
         for item in work {
             let mut payload = json!({
                 "technique": "golden_cert",
+                // Tag for is_critical_path() so the throttler bypasses the
+                // per-role cap. Without this, recon at priority 3/4 saturates
+                // the privesc role and golden_cert defers indefinitely.
+                "vuln_type": "adcs_esc8",
                 "ca_host": item.ca_host,
                 "ca_hostname": item.ca_hostname,
                 "domain": item.domain,

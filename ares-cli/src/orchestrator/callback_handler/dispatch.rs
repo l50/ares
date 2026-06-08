@@ -202,6 +202,33 @@ impl OrchestratorCallbackHandler {
             .or_else(|| call.arguments["domain"].as_str())
             .unwrap_or("");
 
+        // Refuse to dispatch when an ESC8/ESC11 vuln is in state. The
+        // standalone coerce task has no CA-host context and the LLM agent
+        // bails with `NO_RELAY_LISTENER` while the deterministic ADCS chain
+        // (`auto_adcs_exploitation`) owns the port-445 mutex. The
+        // `auto_coercion` interval already defers under the same condition;
+        // the LLM-initiated path was bypassing that gate. See
+        // `select_coercion_work` for the matching skip rationale.
+        let block_for_adcs = {
+            let state = dispatcher.state.read().await;
+            state.discovered_vulnerabilities.values().any(|v| {
+                let t = v.vuln_type.to_lowercase();
+                t.contains("esc8") || t.contains("esc11")
+            })
+        };
+        if block_for_adcs {
+            warn!(
+                target_ip = target_ip,
+                target_domain = target_domain,
+                "dispatch_coercion: refused — ESC8/ESC11 chain owns the coerce surface; use relay_and_coerce directly with the CA host"
+            );
+            return Ok(CallbackResult::Continue(format!(
+                "Coercion dispatch refused for {target_ip}: an ADCS ESC8/ESC11 vulnerability is being exploited by the orchestrator's relay-coerce chain. \
+                 Standalone coercion would race for port 445 and fail with NO_RELAY_LISTENER. \
+                 Use relay_and_coerce(ca_host=<CA>, coerce_target=<DC>, attacker_ip={listener_ip}) instead, or wait for the ESC8 chain to complete."
+            )));
+        }
+
         let task_id = dispatcher
             .request_coercion(target_ip, listener_ip, &techniques, target_domain)
             .await?;
