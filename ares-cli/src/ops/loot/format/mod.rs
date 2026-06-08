@@ -3,6 +3,8 @@ mod hosts;
 mod json;
 mod report_filter;
 
+pub(crate) use display::EXPLOITABLE_PRIORITY_MAX;
+
 use ares_core::models::SharedRedTeamState;
 
 use crate::dedup::{normalize_state_domains, sanitize_credentials};

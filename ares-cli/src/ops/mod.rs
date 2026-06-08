@@ -34,7 +34,8 @@ pub(crate) async fn run_ops(cmd: OpsCommands, redis_url: Option<String>) -> Resu
         OpsCommands::Runtime {
             operation_id,
             latest,
-        } => runtime::ops_runtime(redis_url, operation_id, latest).await,
+            watch,
+        } => runtime::ops_runtime(redis_url, operation_id, latest, watch).await,
         OpsCommands::Loot {
             operation_id,
             latest,

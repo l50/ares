@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use tracing::warn;
 
 use ares_core::models::Hash;
 use ares_core::state::RedisStateReader;
@@ -94,17 +95,52 @@ pub(crate) async fn ops_runtime(
     redis_url: Option<String>,
     operation_id: Option<String>,
     latest: bool,
+    watch: u64,
 ) -> Result<()> {
     let mut conn = connect_redis(redis_url).await?;
     let op_id = resolve_operation_id(&mut conn, operation_id, latest).await?;
 
-    let reader = RedisStateReader::new(op_id.clone());
+    if watch > 0 {
+        runtime_watch(&mut conn, &op_id, watch).await
+    } else {
+        print_runtime_snapshot(&mut conn, &op_id).await
+    }
+}
+
+async fn runtime_watch(
+    conn: &mut redis::aio::MultiplexedConnection,
+    op_id: &str,
+    interval: u64,
+) -> Result<()> {
+    let mut first = true;
+    loop {
+        if !first {
+            println!("\n{}", "=".repeat(60));
+        }
+        let ts = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+        println!("[watch] Refreshing every {interval}s  |  {ts}");
+        println!("{}", "=".repeat(60));
+        first = false;
+
+        if let Err(e) = print_runtime_snapshot(conn, op_id).await {
+            warn!("Runtime snapshot failed: {e}");
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+    }
+}
+
+async fn print_runtime_snapshot(
+    conn: &mut redis::aio::MultiplexedConnection,
+    op_id: &str,
+) -> Result<()> {
+    let reader = RedisStateReader::new(op_id.to_string());
     let state = reader
-        .load_state(&mut conn)
+        .load_state(conn)
         .await?
         .with_context(|| format!("No state found for operation: {op_id}"))?;
 
-    let is_running = reader.is_running(&mut conn).await?;
+    let is_running = reader.is_running(conn).await?;
     let now = Utc::now();
 
     let (runtime_seconds, status) = if let Some(completed) = state.completed_at {
@@ -133,8 +169,27 @@ pub(crate) async fn ops_runtime(
     let creds = state.all_credentials.len();
     let buckets = classify_hashes(&state.all_hashes);
     let hashes_total = buckets.total();
-    let vulns = state.discovered_vulnerabilities.len();
-    let exploited = state.exploited_vulnerabilities.len();
+
+    // Mirror the loot view's split (display.rs:EXPLOITABLE_PRIORITY_MAX): the
+    // raw map mixes a handful of real exploit primitives in with hundreds of
+    // BloodHound ACL edges, so a single "discovered" count is alarmist noise.
+    let (exploitable_ids, findings_count): (Vec<&String>, usize) = {
+        let mut ids = Vec::new();
+        let mut findings = 0usize;
+        for (id, vuln) in &state.discovered_vulnerabilities {
+            if vuln.priority <= super::loot::EXPLOITABLE_PRIORITY_MAX {
+                ids.push(id);
+            } else {
+                findings += 1;
+            }
+        }
+        (ids, findings)
+    };
+    let exploited = exploitable_ids
+        .iter()
+        .filter(|id| state.exploited_vulnerabilities.contains(**id))
+        .count();
+    let exploitable = exploitable_ids.len();
 
     println!("Credentials: {creds}");
     println!("Hashes:      {hashes_total} total");
@@ -156,13 +211,13 @@ pub(crate) async fn ops_runtime(
             }
         }
     }
-    println!("Vulns: {vulns} discovered, {exploited} exploited");
+    println!("Vulns: {exploitable} exploitable ({exploited} exploited), {findings_count} findings");
     println!();
 
     super::loot::print_runtime_summary(&state);
 
     // Token usage & estimated cost (from Redis counters set by workers)
-    match ares_core::token_usage::get_token_usage(&mut conn, &op_id).await {
+    match ares_core::token_usage::get_token_usage(conn, op_id).await {
         Ok(Some(usage)) if usage.input_tokens > 0 || usage.output_tokens > 0 => {
             let in_tok = usage.input_tokens;
             let out_tok = usage.output_tokens;
