@@ -29,27 +29,30 @@ use crate::orchestrator::state::*;
 /// Extracted from `auto_coercion` so the filter logic can be unit-tested
 /// without standing up a Dispatcher.
 pub(crate) fn select_coercion_work(state: &StateInner, listener_ip: &str) -> Vec<(String, String)> {
-    let adcs_owned: std::collections::HashSet<String> = state
-        .discovered_vulnerabilities
-        .values()
-        .filter(|v| {
-            let t = v.vuln_type.to_lowercase();
-            t.contains("esc8") || t.contains("esc11")
-        })
-        .filter_map(|v| {
-            v.details
-                .get("domain")
-                .and_then(|d| d.as_str())
-                .map(|d| d.to_lowercase())
-        })
-        .collect();
+    // If ANY ESC8/ESC11 vuln is present, defer all standalone coercion. The
+    // ADCS chain claims the port-445 mutex via `relay_chain_semaphore` and
+    // owns the coerce surface for every DC in the topology — its
+    // `pick_coerce_targets` walks the same DC IPs we'd otherwise hand to the
+    // LLM here. A more granular "skip only DCs owned by the chain" filter
+    // turned out to misfire on cross-realm topologies: the ESC8 vuln records
+    // the CA's enrollment realm in `details["domain"]` (e.g.
+    // north.sevenkingdoms.local) while the coerce-target DC's home in
+    // `domain_controllers` is the parent realm (sevenkingdoms.local), so a
+    // domain-equality test missed the overlap and the LLM coerce raced the
+    // chain anyway. Coarse-skip is the safer wire.
+    let has_adcs_vuln = state.discovered_vulnerabilities.values().any(|v| {
+        let t = v.vuln_type.to_lowercase();
+        t.contains("esc8") || t.contains("esc11")
+    });
+    if has_adcs_vuln {
+        return Vec::new();
+    }
 
     state
         .domain_controllers
         .iter()
         .filter(|(_, dc_ip)| !state.is_processed(DEDUP_COERCED_DCS, dc_ip))
         .filter(|(_, dc_ip)| dc_ip.as_str() != listener_ip)
-        .filter(|(domain, _)| !adcs_owned.contains(&domain.to_lowercase()))
         .map(|(domain, dc_ip)| (domain.clone(), dc_ip.clone()))
         .collect()
 }
@@ -195,21 +198,21 @@ mod tests {
     }
 
     #[test]
-    fn select_coercion_skips_dcs_owned_by_esc8_vuln() {
+    fn select_coercion_skips_all_when_any_esc8_vuln_present() {
         let mut s = StateInner::new("op".into());
         s.domain_controllers
             .insert("contoso.local".into(), "192.168.58.10".into());
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.40".into());
+        // ESC8 vuln's `details["domain"]` records the CA's realm (here
+        // contoso.local). Even with fabrikam DC in a different realm, the
+        // coarse skip defers all standalone coercion until the ADCS chain
+        // exhausts the port-445 mutex — the chain's `pick_coerce_targets`
+        // walks fabrikam's DC anyway as Tier 2, so the standalone LLM
+        // dispatch would race it for the same port.
         s.discovered_vulnerabilities
             .insert("v1".into(), make_esc8_vuln("v1", "contoso.local"));
-        // contoso.local DC is owned by auto_adcs_exploitation; only fabrikam
-        // should be eligible for standalone coercion.
-        let work = select_coercion_work(&s, "192.168.58.1");
-        assert_eq!(
-            work,
-            vec![("fabrikam.local".to_string(), "192.168.58.40".to_string())]
-        );
+        assert!(select_coercion_work(&s, "192.168.58.1").is_empty());
     }
 
     #[test]
@@ -224,12 +227,20 @@ mod tests {
     }
 
     #[test]
-    fn select_coercion_skip_is_case_insensitive_on_domain() {
+    fn select_coercion_skip_holds_even_when_vuln_realm_mismatches_dc_realm() {
+        // ESC8 vuln carries the CA's enrollment realm in
+        // `details["domain"]` — often the CHILD realm
+        // (north.sevenkingdoms.local) while the coerce-target DC's home in
+        // `domain_controllers` is the PARENT (sevenkingdoms.local). An
+        // earlier domain-equality skip missed this case and the standalone
+        // coerce raced the ADCS chain. The coarse skip catches it.
         let mut s = StateInner::new("op".into());
         s.domain_controllers
-            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
-        s.discovered_vulnerabilities
-            .insert("v1".into(), make_esc8_vuln("v1", "contoso.local"));
-        assert!(select_coercion_work(&s, "192.168.58.1").is_empty());
+            .insert("sevenkingdoms.local".into(), "10.1.10.10".into());
+        s.discovered_vulnerabilities.insert(
+            "v1".into(),
+            make_esc8_vuln("v1", "north.sevenkingdoms.local"),
+        );
+        assert!(select_coercion_work(&s, "10.1.10.167").is_empty());
     }
 }
