@@ -490,7 +490,8 @@ impl CallbackHandler for BlueCallbackHandler {
     }
 
     async fn on_token_usage(&self, usage: &TokenUsage, model: &str) {
-        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cache_read_input_tokens == 0
+        {
             return;
         }
         if let Ok(client) = redis::Client::open(self.redis_url.as_str()) {
@@ -500,6 +501,7 @@ impl CallbackHandler for BlueCallbackHandler {
                     &self.investigation_id,
                     usage.input_tokens.into(),
                     usage.output_tokens.into(),
+                    usage.cache_read_input_tokens.into(),
                     model,
                 )
                 .await

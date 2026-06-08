@@ -10,7 +10,12 @@ use redis::aio::ConnectionLike;
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueueCore;
 
-use super::{credential_source_trust, emit_op_state, sanitize_credential, strip_netexec_artifact};
+use ares_core::models::DomainEvidence;
+
+use super::{
+    credential_source_trust, emit_op_state, realm_source_is_authoritative, sanitize_credential,
+    strip_netexec_artifact,
+};
 
 fn is_hex32(value: &str) -> bool {
     value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
@@ -29,12 +34,13 @@ impl SharedState {
     /// Add a credential to state and Redis (with dedup).
     ///
     /// Sanitizes the credential before storage (strips "Password:" prefix, trailing
-    /// metadata, normalizes domains, rejects noise). The credential's `domain`
-    /// field is stored as-is on the credential, but is NEVER promoted into the
-    /// canonical `state.domains` registry — that registry is reserved for
-    /// authoritative recon (LDAP root DSE, DC enumeration, trust queries) so an
-    /// LLM-supplied typo like `child.contossso.com` cannot pollute the
-    /// global view.
+    /// metadata, normalizes domains, rejects noise). When the credential's source
+    /// is on the [`realm_source_is_authoritative`] allowlist (e.g. `secretsdump`,
+    /// `netexec_auth`, `kerberoast`), the realm is also promoted into
+    /// `state.domains` as [`DomainEvidence::AuthenticatedAd`]. Lower-trust
+    /// sources (description fields, SYSVOL scripts, text scrapes) are NEVER
+    /// promoted — those can carry LLM-supplied typos like
+    /// `child.contossso.com` that would otherwise pollute the global view.
     pub async fn publish_credential(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
@@ -107,29 +113,51 @@ impl SharedState {
             )
             .await;
 
-            // Warn (don't promote) when the credential's domain is unknown — this
-            // is how we surface LLM hallucinations without letting them mutate
-            // canonical state. Use NetExec-artifact-stripped form for the check.
+            // For credentials from authoritative sources (authenticated round-trip,
+            // host-pinned dump, Kerberos response), promote the realm into
+            // state.domains. For everything else (description fields, SYSVOL,
+            // text scrapes that an LLM could have typo'd), warn but don't
+            // mutate canonical state. Use NetExec-artifact-stripped form.
             let cred_domain = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
-            let mut state = self.inner.write().await;
-            if cred_domain.contains('.')
-                && !state
-                    .domains
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(&cred_domain))
-                && !state
-                    .domain_controllers
-                    .keys()
-                    .any(|d| d.eq_ignore_ascii_case(&cred_domain))
+            let source_for_promotion = cred.source.clone();
+            let username_for_warn = cred.username.clone();
+            let source_for_warn = cred.source.clone();
             {
-                tracing::warn!(
-                    domain = %cred_domain,
-                    username = %cred.username,
-                    source = %cred.source,
-                    "Credential references unknown domain — not promoting to state.domains (authoritative recon required)"
-                );
+                let mut state = self.inner.write().await;
+                state.credentials.push(cred);
             }
-            state.credentials.push(cred);
+            if cred_domain.contains('.') {
+                let already_known = {
+                    let state = self.inner.read().await;
+                    state
+                        .domains
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(&cred_domain))
+                        || state
+                            .domain_controllers
+                            .keys()
+                            .any(|d| d.eq_ignore_ascii_case(&cred_domain))
+                };
+                if !already_known {
+                    if realm_source_is_authoritative(&source_for_promotion) {
+                        let _ = self
+                            .publish_candidate_domain(
+                                queue,
+                                &cred_domain,
+                                DomainEvidence::AuthenticatedAd,
+                                None,
+                            )
+                            .await;
+                    } else {
+                        tracing::warn!(
+                            domain = %cred_domain,
+                            username = %username_for_warn,
+                            source = %source_for_warn,
+                            "Credential references unknown domain — not promoting to state.domains (low-trust source)"
+                        );
+                    }
+                }
+            }
         }
         Ok(added)
     }
@@ -211,6 +239,35 @@ impl SharedState {
             OpStateEventPayload::HashCaptured { hash: hash.clone() },
         )
         .await;
+
+        // Promote the realm into state.domains if the hash came from an
+        // authoritative source (NTDS / LSA dump, Kerberos response). Skips
+        // if the realm is empty or already known. The publish_user backfill
+        // below would re-trigger this via the user path, but doing it here
+        // covers machine-account hashes that don't get a user backfill.
+        let hash_domain_lower = hash.domain.to_lowercase();
+        if !hash_domain_lower.is_empty()
+            && hash_domain_lower.contains('.')
+            && realm_source_is_authoritative(&hash.source)
+        {
+            let already_known = {
+                let state = self.inner.read().await;
+                state
+                    .domains
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&hash_domain_lower))
+            };
+            if !already_known {
+                let _ = self
+                    .publish_candidate_domain(
+                        queue,
+                        &hash_domain_lower,
+                        DomainEvidence::AuthenticatedAd,
+                        None,
+                    )
+                    .await;
+            }
+        }
 
         // Capture identity fields before `hash` is moved into state.hashes —
         // they drive the implicit-user backfill below.
@@ -559,9 +616,11 @@ mod tests {
 
     #[tokio::test]
     async fn publish_credential_does_not_pollute_state_domains() {
-        // LLM-supplied domains must never be promoted into the canonical
-        // `state.domains` registry — otherwise a typo like
-        // `child.contossso.com` corrupts every downstream tick loop.
+        // LLM-supplied domains from low-trust sources (default `make_cred`
+        // uses `source: "test"`, not on the authoritative allowlist) must
+        // never be promoted into the canonical `state.domains` registry —
+        // otherwise a typo like `child.contossso.com` corrupts every
+        // downstream tick loop.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
@@ -575,6 +634,65 @@ mod tests {
             s.domains
         );
         assert_eq!(s.credentials.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_credential_authoritative_source_promotes_realm() {
+        // A credential from `netexec_auth` succeeded in an actual auth
+        // round-trip against a DC — the realm cannot be a typo. Promote it
+        // into state.domains so per-domain automations pick it up.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut cred = make_cred("samwell.tarly", "Heartsbane", "north.contoso.local");
+        cred.source = "netexec_auth".into();
+        state.publish_credential(&q, cred).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.iter().any(|d| d == "north.contoso.local"),
+            "authoritative-source realm should be promoted, got {:?}",
+            s.domains
+        );
+    }
+
+    #[tokio::test]
+    async fn dreadgoad_scenario_authenticated_credential_discovers_child_realm() {
+        // Third leg of the dreadgoad regression: even when host enum and
+        // user enum somehow miss a child domain, a single authenticated
+        // credential against the DC (`netexec_auth` round-trip) proves
+        // the realm exists. That cred alone must be enough.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut cred = make_cred("samwell.tarly", "Heartsbane", "north.contoso.local");
+        cred.source = "netexec_auth".into();
+        state.publish_credential(&q, cred).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.iter().any(|d| d == "north.contoso.local"),
+            "single authenticated credential should discover child realm, got {:?}",
+            s.domains
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_credential_low_trust_source_does_not_promote() {
+        // SYSVOL script content can carry typo'd realms — don't promote.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut cred = make_cred("alice", "P@ssw0rd!", "child.contossso.com");
+        cred.source = "sysvol_script".into();
+        state.publish_credential(&q, cred).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.is_empty(),
+            "low-trust source must not promote realm, got {:?}",
+            s.domains
+        );
     }
 
     #[tokio::test]
@@ -782,6 +900,25 @@ mod tests {
         let s = state.inner.read().await;
         assert_eq!(s.hashes.len(), 1);
         assert_eq!(s.hashes[0].username, "admin");
+    }
+
+    #[tokio::test]
+    async fn publish_hash_authoritative_source_promotes_realm() {
+        // A hash from secretsdump came out of the DC's NTDS — the realm
+        // cannot be a typo. Promote it into state.domains.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut hash = make_hash("krbtgt", "north.contoso.local", "NTLM", NTLM_HASH_A);
+        hash.source = "secretsdump".into();
+        state.publish_hash(&q, hash).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.iter().any(|d| d == "north.contoso.local"),
+            "secretsdump realm should be promoted, got {:?}",
+            s.domains
+        );
     }
 
     #[tokio::test]

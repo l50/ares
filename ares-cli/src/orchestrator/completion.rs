@@ -33,12 +33,23 @@ use crate::orchestrator::state::SharedState;
 /// Used by both the async `undominated_forests()` and `SharedState::snapshot()`.
 /// The historical `_forests` suffix is retained on the public name to avoid
 /// churning every call site; the semantics are "all discovered domains".
+///
+/// When `cred_domains` is `Some`, **lean completion** is enabled: domains that
+/// were discovered only through the `domain_controllers` map (i.e. an exposed
+/// DC, no explicit target/trust intent) are filtered out unless we hold at
+/// least one credential for them. This prevents the operation from holding
+/// indefinitely on child domains we have no path to compromise — the cost
+/// driver behind ops that hit 0/N domains for hours while keeping all agents
+/// alive. Lean mode is opt-in via `ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1`.
+/// When `None`, strict completion (current default) requires every discovered
+/// domain regardless of credential coverage.
 pub fn compute_undominated_forests(
     target_domain: Option<&str>,
     first_domain: Option<&str>,
     trusted_domains: &std::collections::HashMap<String, ares_core::models::TrustInfo>,
     dominated_domains: &HashSet<String>,
     domain_controllers: &std::collections::HashMap<String, String>,
+    cred_domains: Option<&HashSet<String>>,
 ) -> Vec<String> {
     let mut required_domains: HashSet<String> = HashSet::new();
 
@@ -66,10 +77,23 @@ pub fn compute_undominated_forests(
     // Include every domain whose DC we've discovered. Catches both the
     // pre-trust-enumeration case (DC discovered via recon, trust details
     // not yet known) and child domains whose DC is known directly.
+    //
+    // In lean-completion mode (`cred_domains.is_some()`), only count DC-only
+    // domains that we actually have a credential for. A discovered child DC
+    // with no creds is unreachable — the orchestrator would otherwise loop
+    // agents against it forever, burning $1+/min on a compromise it can't
+    // achieve.
     for dc_domain in domain_controllers.keys() {
-        if !dc_domain.is_empty() {
-            required_domains.insert(dc_domain.to_lowercase());
+        if dc_domain.is_empty() {
+            continue;
         }
+        let lowered = dc_domain.to_lowercase();
+        if let Some(creds) = cred_domains {
+            if !creds.contains(&lowered) {
+                continue;
+            }
+        }
+        required_domains.insert(lowered);
     }
 
     if required_domains.is_empty() {
@@ -90,15 +114,40 @@ pub fn compute_undominated_forests(
 /// Returns a list of forest root domains that still need krbtgt hashes.
 /// An empty list means all forests are dominated. Domination requires krbtgt
 /// hashes from every trusted forest, not just the initial target domain.
+///
+/// Honors `ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1` for lean completion:
+/// see `compute_undominated_forests` doc for semantics.
 pub async fn undominated_forests(state: &SharedState) -> Vec<String> {
     let inner = state.read().await;
+    let lean = lean_completion_enabled();
+    let cred_domains: Option<HashSet<String>> = lean.then(|| {
+        inner
+            .credentials
+            .iter()
+            .filter(|c| !c.domain.is_empty())
+            .map(|c| c.domain.to_lowercase())
+            .collect()
+    });
     compute_undominated_forests(
         inner.target.as_ref().map(|t| t.domain.as_str()),
         inner.domains.first().map(|d| d.as_str()),
         &inner.trusted_domains,
         &inner.dominated_domains,
         &inner.domain_controllers,
+        cred_domains.as_ref(),
     )
+}
+
+/// Whether lean completion is enabled via env var.
+///
+/// Default: false (strict — every discovered DC blocks completion). Set
+/// `ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1` to require at least one
+/// credential per child domain before it holds the operation open.
+pub fn lean_completion_enabled() -> bool {
+    std::env::var("ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Redis-authoritative count of red-team tasks still pending completion.
@@ -688,6 +737,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["contoso.local"]);
 
@@ -699,6 +749,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert!(result.is_empty());
     }
@@ -721,6 +772,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["fabrikam.local"]);
     }
@@ -743,6 +795,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert!(result.is_empty());
     }
@@ -768,6 +821,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["child.contoso.local".to_string()]);
     }
@@ -792,6 +846,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert!(result.is_empty());
     }
@@ -819,6 +874,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["child.contoso.local".to_string()]);
     }
@@ -838,6 +894,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         // Child DA does not satisfy the forest root requirement
         assert_eq!(result, vec!["contoso.local"]);
@@ -856,6 +913,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert!(result.is_empty());
     }
@@ -877,6 +935,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         // child.contoso.local appears via first_domain, fabrikam.local via the
         // DC map. Order is HashSet-derived so sort before comparing.
@@ -897,7 +956,7 @@ mod tests {
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(None, None, &trusted, &dominated, &dcs);
+        let result = compute_undominated_forests(None, None, &trusted, &dominated, &dcs, None);
         assert!(result.is_empty());
     }
 
@@ -907,7 +966,7 @@ mod tests {
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(Some(""), None, &trusted, &dominated, &dcs);
+        let result = compute_undominated_forests(Some(""), None, &trusted, &dominated, &dcs, None);
         assert!(result.is_empty());
     }
 
@@ -917,8 +976,14 @@ mod tests {
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
-        let result =
-            compute_undominated_forests(None, Some("contoso.local"), &trusted, &dominated, &dcs);
+        let result = compute_undominated_forests(
+            None,
+            Some("contoso.local"),
+            &trusted,
+            &dominated,
+            &dcs,
+            None,
+        );
         assert_eq!(result, vec!["contoso.local"]);
     }
 
@@ -938,6 +1003,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert!(result.contains(&"fabrikam.local".to_string()));
         assert!(result.contains(&"contoso.local".to_string()));
@@ -963,6 +1029,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["fabrikam.local".to_string()]);
     }
@@ -990,6 +1057,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["tailspintoys.local"]);
     }
@@ -1015,6 +1083,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result, vec!["child.fabrikam.local".to_string()]);
     }
@@ -1033,6 +1102,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert!(result.is_empty());
     }
@@ -1044,8 +1114,14 @@ mod tests {
         let mut dominated = HashSet::new();
         dominated.insert("contoso.local".to_string());
         let dcs = std::collections::HashMap::new();
-        let result =
-            compute_undominated_forests(Some("CONTOSO.LOCAL"), None, &trusted, &dominated, &dcs);
+        let result = compute_undominated_forests(
+            Some("CONTOSO.LOCAL"),
+            None,
+            &trusted,
+            &dominated,
+            &dcs,
+            None,
+        );
         // target "CONTOSO.LOCAL" lowercases to "contoso.local" which is dominated
         assert!(result.is_empty());
     }
@@ -1065,6 +1141,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         let mut sorted = result;
         sorted.sort();
@@ -1088,6 +1165,7 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
+            None,
         );
         assert_eq!(result.len(), 2);
         let mut sorted = result;

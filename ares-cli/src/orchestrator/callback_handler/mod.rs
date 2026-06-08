@@ -90,7 +90,8 @@ impl CallbackHandler for OrchestratorCallbackHandler {
     }
 
     async fn on_token_usage(&self, usage: &ares_llm::TokenUsage, model: &str) {
-        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cache_read_input_tokens == 0
+        {
             return;
         }
         if let Some(ref queue) = self.task_queue {
@@ -101,6 +102,7 @@ impl CallbackHandler for OrchestratorCallbackHandler {
                 &op_id,
                 usage.input_tokens.into(),
                 usage.output_tokens.into(),
+                usage.cache_read_input_tokens.into(),
                 model,
             )
             .await

@@ -1,10 +1,94 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 
+use ares_core::models::Hash;
 use ares_core::state::RedisStateReader;
 
 use crate::redis_conn::{connect_redis, resolve_operation_id};
 use crate::util::{format_duration, format_number};
+
+/// Per-bucket totals derived from `state.all_hashes`.
+///
+/// The raw count alone is misleading: a single DCSync against a medium AD
+/// forest dumps thousands of rows (every user, every machine account, every
+/// trust account, plus a kerberoast/AS-REP pass) — but only a small subset
+/// is directly auth-usable. Showing a single `Hashes: N` number lets a
+/// kerberoast-heavy op look as "loaded" as one with a real DA dump. Bucket
+/// the count so the operator sees what they actually have.
+#[derive(Default)]
+struct HashBuckets {
+    ntlm_user: usize,
+    machine_account: usize,
+    trust_key: usize,
+    kerberoast_tgs: usize,
+    asrep_tgt: usize,
+    other: usize,
+}
+
+impl HashBuckets {
+    fn total(&self) -> usize {
+        self.ntlm_user
+            + self.machine_account
+            + self.trust_key
+            + self.kerberoast_tgs
+            + self.asrep_tgt
+            + self.other
+    }
+}
+
+fn classify_hashes(hashes: &[Hash]) -> HashBuckets {
+    let mut b = HashBuckets::default();
+    for h in hashes {
+        let hash_type = h.hash_type.trim().to_ascii_lowercase();
+        let value = h.hash_value.as_str();
+
+        let is_asrep = matches!(
+            hash_type.as_str(),
+            "asrep" | "as-rep" | "krb5asrep" | "asreproast"
+        ) || value.starts_with("$krb5asrep$");
+        if is_asrep {
+            b.asrep_tgt += 1;
+            continue;
+        }
+
+        let is_kerberoast = matches!(
+            hash_type.as_str(),
+            "kerberoast" | "krb5tgs" | "tgs-rep" | "tgs"
+        ) || value.starts_with("$krb5tgs$");
+        if is_kerberoast {
+            b.kerberoast_tgs += 1;
+            continue;
+        }
+
+        // Trust keys are `$`-suffixed too — check before machine_account so
+        // a trust hash isn't miscounted as a plain machine account.
+        if h.is_trust_key {
+            b.trust_key += 1;
+            continue;
+        }
+
+        if h.username.trim_end().ends_with('$') {
+            b.machine_account += 1;
+            continue;
+        }
+
+        // Everything left is directly auth-usable NTLM (or AES, treated the
+        // same here — the resolver picks AES over RC4 when injecting).
+        // Empty hash_type defaults to NTLM at ingest time, so untyped rows
+        // land here too.
+        if hash_type.is_empty()
+            || matches!(
+                hash_type.as_str(),
+                "ntlm" | "nt" | "lm" | "aes" | "aes128" | "aes256"
+            )
+        {
+            b.ntlm_user += 1;
+        } else {
+            b.other += 1;
+        }
+    }
+    b
+}
 
 pub(crate) async fn ops_runtime(
     redis_url: Option<String>,
@@ -47,11 +131,31 @@ pub(crate) async fn ops_runtime(
     println!();
 
     let creds = state.all_credentials.len();
-    let hashes = state.all_hashes.len();
+    let buckets = classify_hashes(&state.all_hashes);
+    let hashes_total = buckets.total();
     let vulns = state.discovered_vulnerabilities.len();
     let exploited = state.exploited_vulnerabilities.len();
 
-    println!("Credentials: {creds}  Hashes: {hashes}");
+    println!("Credentials: {creds}");
+    println!("Hashes:      {hashes_total} total");
+    if hashes_total > 0 {
+        // Only show non-zero buckets — empty rows are visual noise and the
+        // common case (e.g. no kerberoast pass yet) shouldn't push real
+        // counts down the screen.
+        let rows: &[(&str, usize)] = &[
+            ("NTLM (auth-usable)", buckets.ntlm_user),
+            ("Machine accounts", buckets.machine_account),
+            ("Trust keys", buckets.trust_key),
+            ("Kerberoast TGS", buckets.kerberoast_tgs),
+            ("AS-REP TGT", buckets.asrep_tgt),
+            ("Other", buckets.other),
+        ];
+        for (label, count) in rows {
+            if *count > 0 {
+                println!("  {label:<19} {count}");
+            }
+        }
+    }
     println!("Vulns: {vulns} discovered, {exploited} exploited");
     println!();
 
@@ -121,4 +225,94 @@ pub(crate) async fn ops_runtime(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash_row(user: &str, hash_type: &str, value: &str) -> Hash {
+        Hash {
+            id: format!("h-{user}-{hash_type}"),
+            username: user.to_string(),
+            hash_value: value.to_string(),
+            hash_type: hash_type.to_string(),
+            domain: "contoso.local".to_string(),
+            cracked_password: None,
+            source: "test".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        }
+    }
+
+    #[test]
+    fn classify_buckets_real_inflation_repro() {
+        // The pathological op that lit this up: a handful of human creds
+        // alongside a forest-wide DCSync (every user + every machine
+        // account) plus a kerberoast pass. The raw count overstates auth
+        // material by ~95%; the bucket breakdown shows where it went.
+        let mut hashes = Vec::new();
+        for i in 0..400 {
+            hashes.push(hash_row(&format!("user{i}"), "NTLM", "deadbeef"));
+        }
+        for i in 0..500 {
+            hashes.push(hash_row(&format!("host{i}$"), "NTLM", "cafef00d"));
+        }
+        for i in 0..1800 {
+            hashes.push(hash_row(
+                &format!("svc{i}"),
+                "kerberoast",
+                "$krb5tgs$23$*svc$REALM$cifs/host.realm*$abc",
+            ));
+        }
+        for i in 0..20 {
+            hashes.push(hash_row(
+                &format!("asrep{i}"),
+                "asrep",
+                "$krb5asrep$23$user@REALM:abc$def",
+            ));
+        }
+
+        let b = classify_hashes(&hashes);
+        assert_eq!(b.ntlm_user, 400);
+        assert_eq!(b.machine_account, 500);
+        assert_eq!(b.kerberoast_tgs, 1800);
+        assert_eq!(b.asrep_tgt, 20);
+        assert_eq!(b.total(), 2720);
+    }
+
+    #[test]
+    fn classify_kerberoast_detected_by_value_prefix_when_type_missing() {
+        // Some ingestion paths leave hash_type empty / "unknown". The
+        // value prefix is the load-bearing signal — don't let an untyped
+        // TGS slip into the NTLM auth-usable bucket.
+        let hashes = vec![hash_row("svc", "", "$krb5tgs$23$*svc$REALM$cifs/x*$abc")];
+        let b = classify_hashes(&hashes);
+        assert_eq!(b.kerberoast_tgs, 1);
+        assert_eq!(b.ntlm_user, 0);
+    }
+
+    #[test]
+    fn classify_trust_key_not_counted_as_machine_account() {
+        // Trust accounts are `$`-suffixed but operationally distinct —
+        // they're forging material, not random machine creds. Order in
+        // classify_hashes matters; this pins it.
+        let mut h = hash_row("FABRIKAM$", "NTLM", "deadbeef");
+        h.is_trust_key = true;
+        let b = classify_hashes(&[h]);
+        assert_eq!(b.trust_key, 1);
+        assert_eq!(b.machine_account, 0);
+    }
+
+    #[test]
+    fn classify_empty_returns_all_zeros() {
+        let b = classify_hashes(&[]);
+        assert_eq!(b.total(), 0);
+    }
 }

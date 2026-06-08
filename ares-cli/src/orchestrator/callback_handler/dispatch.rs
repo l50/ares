@@ -197,9 +197,13 @@ impl OrchestratorCallbackHandler {
             .as_array()
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_else(|| vec!["petitpotam", "printerbug"]);
+        let target_domain = call.arguments["target_domain"]
+            .as_str()
+            .or_else(|| call.arguments["domain"].as_str())
+            .unwrap_or("");
 
         let task_id = dispatcher
-            .request_coercion(target_ip, listener_ip, &techniques)
+            .request_coercion(target_ip, listener_ip, &techniques, target_domain)
             .await?;
 
         info!(target_ip = target_ip, "Dispatched coercion task");

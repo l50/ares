@@ -194,10 +194,35 @@ impl LlmTaskRunner {
             ),
         };
 
+        // Per-role model override (cost lever for low-value roles).
+        //
+        // Each role can be routed to a cheaper model via
+        // `ARES_MODEL_FOR_<ROLE>` (e.g. `ARES_MODEL_FOR_RECON=gpt-5-mini`).
+        // The provider is unchanged — `LlmRequest.model` is sent on every
+        // call, so any model the existing provider can serve works without
+        // wiring a second provider. If the override and the configured
+        // provider don't share an API (e.g. routing recon to claude while
+        // the runner holds an OpenAI provider), the call will fail at
+        // request time with the provider's normal error path.
+        let config_for_role = match resolve_role_model_override(role_str) {
+            Some(model) if model != self.config.model => {
+                let mut cfg = self.config.clone();
+                debug!(
+                    role = role_str,
+                    base_model = %cfg.model,
+                    override_model = %model,
+                    "Routing role to per-role model override"
+                );
+                cfg.model = model;
+                cfg
+            }
+            _ => self.config.clone(),
+        };
+
         let outcome = run_agent_loop(RunAgentLoopParams {
             provider: self.provider.as_ref(),
             dispatcher,
-            config: &self.config,
+            config: &config_for_role,
             system_prompt: &system_prompt,
             task_prompt: &task_prompt,
             role: role_str,
@@ -280,6 +305,38 @@ impl ToolDispatcher for TaskActivityToolDispatcher {
         self.tracker.touch(&self.task_id).await;
         result
     }
+}
+
+/// Resolve a per-role model override from environment variables.
+///
+/// Lookup order (first match wins):
+///   1. `ARES_MODEL_FOR_<ROLE>` — exact role override (e.g.
+///      `ARES_MODEL_FOR_RECON=openai/gpt-5-mini`)
+///   2. `ARES_MODEL_FOR_DEFAULT` — applies to roles not individually overridden
+///
+/// Returns `None` when neither env var is set (caller uses the configured
+/// default). This is opt-in: with no env vars set, behavior is identical to
+/// the pre-routing version.
+///
+/// Use case: route low-value enumeration roles (recon, cracker) to cheaper
+/// models (gpt-5-mini at $0.25/M input) while reserving expensive models
+/// (gpt-5.2 at $1.75/M) for high-leverage roles (privesc, lateral, exploit).
+/// On a typical run, recon emits 60–70% of total input tokens; switching it
+/// alone to gpt-5-mini drops the bill ~50%.
+fn resolve_role_model_override(role: &str) -> Option<String> {
+    let role_upper = role.to_uppercase();
+    let role_key = format!("ARES_MODEL_FOR_{role_upper}");
+    if let Ok(model) = std::env::var(&role_key) {
+        if !model.is_empty() {
+            return Some(model);
+        }
+    }
+    if let Ok(model) = std::env::var("ARES_MODEL_FOR_DEFAULT") {
+        if !model.is_empty() {
+            return Some(model);
+        }
+    }
+    None
 }
 
 /// Build the system prompt for a given agent role.
@@ -439,6 +496,52 @@ fn log_outcome(task_id: &str, outcome: &AgentLoopOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_role_model_override_default_priority() {
+        // Single test combines all branches to avoid env-var races between
+        // parallel tests in the same process.
+        std::env::remove_var("ARES_MODEL_FOR_RECON");
+        std::env::remove_var("ARES_MODEL_FOR_DEFAULT");
+
+        // Neither set → None (caller uses the configured default).
+        assert_eq!(resolve_role_model_override("recon"), None);
+
+        // Only DEFAULT set → applies to every role.
+        std::env::set_var("ARES_MODEL_FOR_DEFAULT", "openai/gpt-5-mini");
+        assert_eq!(
+            resolve_role_model_override("recon"),
+            Some("openai/gpt-5-mini".into())
+        );
+        assert_eq!(
+            resolve_role_model_override("privesc"),
+            Some("openai/gpt-5-mini".into())
+        );
+
+        // Per-role override beats DEFAULT for that role only.
+        std::env::set_var("ARES_MODEL_FOR_RECON", "openai/gpt-5-mini");
+        std::env::set_var("ARES_MODEL_FOR_DEFAULT", "openai/gpt-5.2");
+        assert_eq!(
+            resolve_role_model_override("recon"),
+            Some("openai/gpt-5-mini".into())
+        );
+        assert_eq!(
+            resolve_role_model_override("privesc"),
+            Some("openai/gpt-5.2".into())
+        );
+
+        // Empty string is treated as unset (avoids "= " in env files
+        // accidentally overriding to the empty model).
+        std::env::set_var("ARES_MODEL_FOR_RECON", "");
+        // Falls through to DEFAULT.
+        assert_eq!(
+            resolve_role_model_override("recon"),
+            Some("openai/gpt-5.2".into())
+        );
+
+        std::env::remove_var("ARES_MODEL_FOR_RECON");
+        std::env::remove_var("ARES_MODEL_FOR_DEFAULT");
+    }
 
     #[test]
     fn role_for_task_type_recon_variants() {

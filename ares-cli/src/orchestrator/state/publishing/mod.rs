@@ -36,6 +36,47 @@ pub(super) async fn emit_op_state(
 pub(super) static PASSWORD_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^password\s*:\s*").unwrap());
 
+/// Whether the realm string on a captured credential / hash / user came from
+/// an authoritative AD source — i.e. a successful authenticated round-trip,
+/// a host-pinned NTDS/LSA dump, or an LDAP/Kerberos enumeration result.
+///
+/// Used to gate auto-promotion of the realm into `state.domains`. Realms
+/// from these sources cannot have been an LLM typo: a wrong realm would
+/// have rejected the auth, been absent from NTDS, or never come back from
+/// the DC's LDAP response in the first place. Lower-trust sources (text
+/// scrapes of tool prose, registry autologon, SYSVOL scripts, description
+/// fields) are explicitly excluded — those can carry typos that would
+/// otherwise pollute the canonical domain registry.
+pub(super) fn realm_source_is_authoritative(source: &str) -> bool {
+    matches!(
+        source,
+        // Host-pinned dumps — realm pinned by NTDS / LSA storage.
+        "secretsdump"
+            | "lsassy"
+            | "lsa_secrets"
+            | "dpapi"
+            | "kerberos_extracted"
+            | "initial"
+            // Realm validated by an actual auth round-trip, or extracted
+            // from a Kerberos response that carried the crealm.
+            | "netexec_auth"
+            | "password_spray"
+            | "kerberoast"
+            | "asrep_roast"
+            // Cracked from a hash whose realm was already pinned.
+            | "cracked:hashcat"
+            | "cracked:john"
+            | "cracked"
+            // Authoritative user-enumeration sources (LDAP / Kerberos).
+            | "ldap_extraction"
+            | "kerberos_enum"
+            | "netexec_user_enum"
+            | "secretsdump_implicit"
+            // Cert-based credential extraction (host-pinned chain).
+            | "certipy_esc1_full_chain"
+    )
+}
+
 /// Trust ranking for a credential source.
 ///
 /// Used by `publish_credential` to decide whether a new (user, password)
@@ -497,6 +538,97 @@ mod tests {
         let known = vec!["contoso.local".to_string()];
         let result = sanitize_credential(cred, &HashMap::new(), &known).unwrap();
         assert_eq!(result.domain, "contoso.local");
+    }
+
+    // --- realm_source_is_authoritative ---
+    //
+    // These two tests are paired KEYSTONES. The dreadgoad incident where
+    // `north.sevenkingdoms.local` never reached state.domains — despite 8
+    // NetExec User Enum users, 2 Kerberos enum users, and a `netexec_auth`
+    // credential all referencing it — happened because the publishers
+    // never promoted realms. We now promote on authoritative sources only.
+    //
+    // If you ADD a source string to a parser and forget to update
+    // realm_source_is_authoritative, the source will land in users/creds
+    // but its realm will never reach state.domains — silent data loss.
+    // If you REMOVE an entry from the allowlist, the corresponding
+    // promotion path goes silent.
+    //
+    // Both tests fail loudly on either kind of drift. When you touch
+    // realm_source_is_authoritative, update BOTH lists deliberately.
+
+    #[test]
+    fn realm_source_is_authoritative_allowlists_every_known_strong_source() {
+        // Every source string here corresponds to a real parser/path that
+        // produces a realm pinned by an authoritative AD source (auth
+        // round-trip, NTDS/LSA dump, Kerberos response, LDAP query).
+        let authoritative = [
+            // Host-pinned credential / hash dumps
+            "secretsdump",
+            "lsassy",
+            "lsa_secrets",
+            "dpapi",
+            "kerberos_extracted",
+            "initial",
+            // Validated by an actual auth round-trip
+            "netexec_auth",
+            "password_spray",
+            // Realm extracted from a Kerberos response
+            "kerberoast",
+            "asrep_roast",
+            // Cracked from a hash whose realm was already pinned
+            "cracked:hashcat",
+            "cracked:john",
+            "cracked",
+            // Authoritative user-enumeration sources
+            "ldap_extraction",
+            "kerberos_enum",
+            "netexec_user_enum",
+            "secretsdump_implicit",
+            // Cert-based credential extraction (host-pinned chain)
+            "certipy_esc1_full_chain",
+        ];
+        for src in authoritative {
+            assert!(
+                realm_source_is_authoritative(src),
+                "{src} dropped from authoritative allowlist — realms from this source will silently fail to promote into state.domains"
+            );
+        }
+    }
+
+    #[test]
+    fn realm_source_is_authoritative_rejects_low_trust_and_unknown_sources() {
+        // These sources can carry LLM-typo'd or misattributed realms
+        // (text scrapes of tool prose, descriptions, scripts, registry).
+        // Promoting them would pollute state.domains. Any of these
+        // sneaking onto the allowlist re-introduces the typo-pollution
+        // class of bugs the credential publisher's docstring warns about.
+        let low_trust = [
+            // Text-scrape / prose-parse sources
+            "output_extraction",
+            // User-controllable description / leak sources
+            "description_field",
+            "ldap_description",
+            "user_description_leak",
+            // Script-content sources (anything in SYSVOL is user-writable)
+            "sysvol_script",
+            // Registry-derived sources (user-controllable)
+            "autologon_registry",
+            // NetExec password-from-output (less reliable than netexec_auth)
+            "netexec_password",
+            // DNS dump — record content is not realm-authoritative
+            "adidnsdump",
+            // Catch-alls for unknown / unit-test sources
+            "test",
+            "",
+            "unknown_source",
+        ];
+        for src in low_trust {
+            assert!(
+                !realm_source_is_authoritative(src),
+                "{src:?} on the allowlist re-introduces the LLM-typo pollution class of bugs — review the source before promoting"
+            );
+        }
     }
 
     // --- is_default_os_label ---

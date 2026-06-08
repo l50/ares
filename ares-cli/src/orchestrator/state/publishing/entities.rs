@@ -3,12 +3,12 @@
 use anyhow::Result;
 use redis::AsyncCommands;
 
-use ares_core::models::{OpStateEventPayload, Share, User, VulnerabilityInfo};
+use ares_core::models::{DomainEvidence, OpStateEventPayload, Share, User, VulnerabilityInfo};
 use ares_core::state::{self, RedisStateReader};
 
 use redis::aio::ConnectionLike;
 
-use super::emit_op_state;
+use super::{emit_op_state, realm_source_is_authoritative};
 use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::state::{SharedState, KEY_VULN_QUEUE};
 use crate::orchestrator::task_queue::TaskQueueCore;
@@ -84,9 +84,39 @@ impl SharedState {
             )
             .await;
             let user_domain = user.domain.clone();
+            let user_source = user.source.clone();
             {
                 let mut state = self.inner.write().await;
                 state.users.push(user);
+            }
+            // Promote the realm into state.domains if the user came from an
+            // authoritative AD source (LDAP query, Kerberos enum, NetExec user
+            // enum, secretsdump backfill). NetExec User Enum at the DC is the
+            // signal that recovers child domains the host-FQDN extractor
+            // missed (e.g. only the parent forest root was promoted from a
+            // bare zone-apex hostname).
+            if !user_domain.is_empty()
+                && user_domain.contains('.')
+                && realm_source_is_authoritative(&user_source)
+            {
+                let user_domain_lower = user_domain.to_lowercase();
+                let already_known = {
+                    let state = self.inner.read().await;
+                    state
+                        .domains
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(&user_domain_lower))
+                };
+                if !already_known {
+                    let _ = self
+                        .publish_candidate_domain(
+                            queue,
+                            &user_domain_lower,
+                            DomainEvidence::AuthenticatedAd,
+                            None,
+                        )
+                        .await;
+                }
             }
             // A new user in a domain unblocks AS-REP roasting for that domain:
             // the first auto_credential_access tick may have fired against the
@@ -575,6 +605,96 @@ mod tests {
         assert_eq!(s.users.len(), 1);
         assert_eq!(s.users[0].username, "alice");
         assert_eq!(s.users[0].domain, "contoso.local");
+    }
+
+    #[tokio::test]
+    async fn publish_user_netexec_enum_promotes_unknown_realm() {
+        // Regression: in DreadGOAD, `north.sevenkingdoms.local` (child of
+        // `sevenkingdoms.local`) was never landing in state.domains even
+        // though NetExec User Enum returned 8 users like
+        // `north.sevenkingdoms.local\sansa.stark`. The realm on a NetExec
+        // user-enum response came from the DC's SAMR reply — promotion
+        // closes the gap when the host FQDN extractor missed the child
+        // (e.g. SMB returned `north.sevenkingdoms.local` as the zone-apex
+        // alias hostname).
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut user = make_user("sansa.stark", "north.contoso.local");
+        user.source = "netexec_user_enum".into();
+        state.publish_user(&q, user).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.iter().any(|d| d == "north.contoso.local"),
+            "netexec_user_enum realm should be promoted to state.domains, got {:?}",
+            s.domains
+        );
+    }
+
+    #[tokio::test]
+    async fn dreadgoad_scenario_child_domain_discovered_via_user_enum() {
+        // End-to-end regression for the exact production bug observed on
+        // dreadgoad op-20260607-230002: state.domains held only
+        // {essos.local, sevenkingdoms.local} (both as forest roots) even
+        // though NetExec User Enum returned 8 users in
+        // `north.sevenkingdoms.local`, Kerberos enum found 2 more, and an
+        // authenticated cred `samwell.tarly:Heartsbane` landed in that
+        // realm. None of those paths had been promoting the realm; the
+        // child domain was a ghost.
+        //
+        // After the fix, EACH of the three independent paths
+        // (netexec_user_enum, kerberos_enum, netexec_auth credential) must
+        // be sufficient on its own to put the child realm in
+        // state.domains. We verify each in isolation, then together.
+        let q = mock_queue();
+
+        // Path 1: netexec_user_enum alone is sufficient.
+        {
+            let state = SharedState::new("op-path1".into());
+            let mut user = make_user("sansa.stark", "north.contoso.local");
+            user.source = "netexec_user_enum".into();
+            state.publish_user(&q, user).await.unwrap();
+            let s = state.inner.read().await;
+            assert!(
+                s.domains.iter().any(|d| d == "north.contoso.local"),
+                "netexec_user_enum should be enough to discover child realm, got {:?}",
+                s.domains
+            );
+        }
+
+        // Path 2: kerberos_enum alone is sufficient.
+        {
+            let state = SharedState::new("op-path2".into());
+            let mut user = make_user("sql_svc", "north.contoso.local");
+            user.source = "kerberos_enum".into();
+            state.publish_user(&q, user).await.unwrap();
+            let s = state.inner.read().await;
+            assert!(
+                s.domains.iter().any(|d| d == "north.contoso.local"),
+                "kerberos_enum should be enough to discover child realm, got {:?}",
+                s.domains
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_user_low_trust_source_does_not_promote() {
+        // `output_extraction` users come from parsing arbitrary tool prose —
+        // realm could be misattributed. Don't pollute state.domains.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut user = make_user("alice", "child.contossso.com");
+        user.source = "output_extraction".into();
+        state.publish_user(&q, user).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.is_empty(),
+            "output_extraction must not promote realm, got {:?}",
+            s.domains
+        );
     }
 
     #[tokio::test]

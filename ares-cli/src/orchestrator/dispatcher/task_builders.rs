@@ -741,21 +741,32 @@ impl Dispatcher {
     }
 
     /// Submit a coercion task.
+    ///
+    /// `target_domain` is the AD realm of the box being coerced. It's plumbed
+    /// into the task payload so the credential resolver can auto-pick an
+    /// in-realm principal when the LLM forgets to set `coerce_user` — without
+    /// it the coerce goes unauthenticated and bounces off `RPC_S_ACCESS_DENIED`
+    /// on any patched DC. Pass `""` when the realm isn't known yet; the
+    /// resolver will fall back to any owned principal.
     #[instrument(
         name = "automation.request_coercion",
         skip(self),
-        fields(target_ip = %target_ip, listener_ip = %listener_ip, technique_count = techniques.len()),
+        fields(target_ip = %target_ip, listener_ip = %listener_ip, target_domain = %target_domain, technique_count = techniques.len()),
     )]
     pub async fn request_coercion(
         &self,
         target_ip: &str,
         listener_ip: &str,
         techniques: &[&str],
+        target_domain: &str,
     ) -> Result<Option<String>> {
         let payload = json!({
             "target_ip": target_ip,
             "listener_ip": listener_ip,
             "techniques": techniques,
+            "target_domain": target_domain,
+            "domain": target_domain,
+            "coerce_domain": target_domain,
         });
         self.throttled_submit("coercion", "coercion", payload, 3)
             .await
