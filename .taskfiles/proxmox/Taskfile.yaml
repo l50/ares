@@ -172,13 +172,15 @@ tasks:
   # ============================================================================
 
   submit:
-    desc: "Submit a fresh op against DEFAULT_IPS (override IPS=, DOMAIN=, MODEL=); waits up to 15s to confirm dispatcher claimed it"
+    desc: "Submit a fresh op against DEFAULT_IPS (override IPS=, DOMAIN=, MODEL=); waits up to 15s to confirm dispatcher claimed it, then auto-spawns a detached watcher that drops the report into ./reports/red/ on completion (NO_WATCH=true to disable)."
     silent: true
     vars:
       IPS: '{{.IPS | default .DEFAULT_IPS}}'
       DOMAIN: '{{.DOMAIN | default .DEFAULT_DOMAIN}}'
       TARGET_LABEL: '{{.TARGET_LABEL | default .DEFAULT_TARGET_LABEL}}'
       MODEL: '{{.MODEL | default .DEFAULT_MODEL}}'
+      NO_WATCH: '{{.NO_WATCH | default ""}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
     cmds:
       - |
         IP="{{.ATTACKER_IP}}"
@@ -197,6 +199,26 @@ tasks:
         echo "$SUBMIT_OUT" | tail -3
         OP_ID=$(echo "$SUBMIT_OUT" | grep -oE 'op-[0-9]{8}-[0-9]{6}' | tail -1)
         if [ -z "$OP_ID" ]; then exit 0; fi
+
+        spawn_watcher() {
+          if [ "{{.NO_WATCH}}" = "true" ]; then
+            echo -e "{{.INFO}} NO_WATCH=true — skipping auto-report watcher."
+            echo -e "{{.INFO}}   Manual fetch later: task proxmox:report OP_ID=$OP_ID"
+            return
+          fi
+          mkdir -p "{{.OUTPUT_DIR}}/red"
+          WATCH_LOG="/tmp/ares-proxmox-watch-$OP_ID.log"
+          # nohup + </dev/null detaches from this shell so the watcher
+          # survives terminal close. It polls ssh-side until the op hits a
+          # terminal state, then runs proxmox:report and exits.
+          nohup task proxmox:watch OP_ID="$OP_ID" OUTPUT_DIR="{{.OUTPUT_DIR}}" \
+            </dev/null >"$WATCH_LOG" 2>&1 &
+          WATCH_PID=$!
+          echo -e "{{.SUCCESS}} Auto-report watcher detached (PID $WATCH_PID, log: $WATCH_LOG)"
+          echo -e "{{.INFO}}   Report will appear at {{.OUTPUT_DIR}}/red/$OP_ID.md when op completes."
+          echo -e "{{.INFO}}   To stop early: kill $WATCH_PID  |  Manual fetch: task proxmox:report OP_ID=$OP_ID"
+        }
+
         # Healthcheck: confirm the dispatcher wrapper actually claimed this op
         # (writes "Starting operation: <id>" to dispatch.log). Silent submit +
         # wedged dispatcher has happened in the field — this surfaces it
@@ -206,11 +228,15 @@ tasks:
           if ssh -o ConnectTimeout=8 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
               "sudo grep -qF 'Starting operation: $OP_ID' /var/log/ares/dispatch.log 2>/dev/null"; then
             echo -e "{{.SUCCESS}} Dispatcher claimed $OP_ID (took ~$((i*2))s)"
+            spawn_watcher
             exit 0
           fi
         done
         echo -e "{{.WARN}} Dispatcher did NOT claim $OP_ID within 15s — likely a stale wrapper."
         echo -e "{{.WARN}} Run: task proxmox:deploy:restart  to clear it, then resubmit."
+        # Spawn the watcher anyway — if the user fixes the dispatcher manually,
+        # the op will still complete and the watcher will catch it.
+        spawn_watcher
 
   stop:
     desc: "Stop the latest op and kill the orchestrator (dispatcher stays up)"
@@ -269,6 +295,108 @@ tasks:
         if [ -z "$IP" ]; then echo -e "{{.ERROR}} Could not resolve attacker IP"; exit 1; fi
         ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
           "ARES_REDIS_URL=redis://localhost:6379 ares ops list"
+
+  report:
+    desc: "Generate the markdown report for OP_ID (or LATEST=true) on the attacker and fetch it to OUTPUT_DIR/red/<op>.md (default ./reports). Pass REGENERATE=true to rebuild from state."
+    silent: true
+    vars:
+      OP_ID: '{{.OP_ID | default ""}}'
+      LATEST: '{{.LATEST | default ""}}'
+      REGENERATE: '{{.REGENERATE | default "false"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+    preconditions:
+      - sh: test -n "{{.OP_ID}}" || test "{{.LATEST}}" = "true"
+        msg: "Either OP_ID=op-... or LATEST=true is required"
+    cmds:
+      - |
+        IP="{{.ATTACKER_IP}}"
+        if [ -z "$IP" ]; then echo -e "{{.ERROR}} Could not resolve attacker IP"; exit 1; fi
+        mkdir -p "{{.OUTPUT_DIR}}/red"
+
+        OP_ARG=""
+        LATEST_FLAG=""
+        if [ -n "{{.OP_ID}}" ]; then
+          OP_ARG="{{.OP_ID}}"
+        else
+          LATEST_FLAG="--latest"
+        fi
+        REGEN_FLAG=""
+        [ "{{.REGENERATE}}" = "true" ] && REGEN_FLAG="--regenerate"
+
+        # Generate the report on the attacker. Write to ~/.cache/ares-reports
+        # (user-writable) — /tmp/reports is owned by the root-running dispatcher
+        # and the kali user can't write into it.
+        REMOTE_OUT='$HOME/.cache/ares-reports'
+        ssh -o ConnectTimeout=30 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
+          "mkdir -p $REMOTE_OUT && ARES_REDIS_URL=redis://localhost:6379 ares ops report $OP_ARG $LATEST_FLAG $REGEN_FLAG --output-dir $REMOTE_OUT" \
+          || { echo -e "{{.ERROR}} ares ops report failed on attacker"; exit 1; }
+
+        # Resolve the operation ID locally for the scp filename.
+        if [ -n "{{.OP_ID}}" ]; then
+          RESOLVED_OP="{{.OP_ID}}"
+        else
+          RESOLVED_OP=$(ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
+            "ARES_REDIS_URL=redis://localhost:6379 ares ops list --latest 2>/dev/null" | tr -d '\r\n ')
+        fi
+        if [ -z "$RESOLVED_OP" ]; then echo -e "{{.ERROR}} Could not resolve operation ID"; exit 1; fi
+
+        scp -q -o ConnectTimeout=30 -J {{.PROXMOX_SSH_HOST}} \
+          "{{.ATTACKER_USER}}@$IP:.cache/ares-reports/red/${RESOLVED_OP}.md" \
+          "{{.OUTPUT_DIR}}/red/${RESOLVED_OP}.md" \
+          || { echo -e "{{.ERROR}} scp failed (no ~/.cache/ares-reports/red/${RESOLVED_OP}.md on attacker)"; exit 1; }
+
+        echo -e "{{.SUCCESS}} Report saved to: {{.OUTPUT_DIR}}/red/${RESOLVED_OP}.md"
+
+  watch:
+    desc: "Poll the op status over SSH; when it reaches a terminal state, run proxmox:report and exit. Used by proxmox:submit to auto-fetch reports. Pass OP_ID=op-... (or default LATEST), POLL_INTERVAL=30, MAX_WAIT=7200."
+    silent: true
+    vars:
+      OP_ID: '{{.OP_ID | default ""}}'
+      POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
+      MAX_WAIT: '{{.MAX_WAIT | default "7200"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+    cmds:
+      - |
+        IP="{{.ATTACKER_IP}}"
+        if [ -z "$IP" ]; then echo -e "{{.ERROR}} Could not resolve attacker IP"; exit 1; fi
+        mkdir -p "{{.OUTPUT_DIR}}/red"
+
+        OP_ARG=""
+        LATEST_FLAG="--latest"
+        if [ -n "{{.OP_ID}}" ]; then
+          OP_ARG="{{.OP_ID}}"
+          LATEST_FLAG=""
+        fi
+
+        START=$(date +%s)
+        echo "Watching proxmox op (poll={{.POLL_INTERVAL}}s, max_wait={{.MAX_WAIT}}s, output={{.OUTPUT_DIR}}/red/)"
+        while true; do
+          ELAPSED=$(( $(date +%s) - START ))
+          if [ $ELAPSED -gt {{.MAX_WAIT}} ]; then
+            echo "ERROR: Max wait ({{.MAX_WAIT}}s) exceeded without terminal state"
+            exit 1
+          fi
+          STATUS_OUT=$(ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
+            "ARES_REDIS_URL=redis://localhost:6379 ares ops status $OP_ARG $LATEST_FLAG" 2>&1 || true)
+          STATUS=$(echo "$STATUS_OUT" | grep -E '^Status: ' | head -1 | awk '{print $2}')
+          RESOLVED_OP=$(echo "$STATUS_OUT" | grep -E '^Operation: ' | head -1 | awk '{print $2}')
+          if [ -z "$STATUS" ]; then
+            echo "[${ELAPSED}s] no status yet (waiting for op to register)"
+          else
+            echo "[${ELAPSED}s] op=${RESOLVED_OP:-?} status=$STATUS"
+            case "$STATUS" in
+              completed|stopped|failed|cancelled)
+                if [ -z "$RESOLVED_OP" ]; then
+                  echo "ERROR: Reached terminal state but could not resolve operation ID"
+                  exit 1
+                fi
+                task proxmox:report OP_ID="$RESOLVED_OP" OUTPUT_DIR="{{.OUTPUT_DIR}}"
+                exit 0
+                ;;
+            esac
+          fi
+          sleep {{.POLL_INTERVAL}}
+        done
 
   # ============================================================================
   # Logs / Exec
