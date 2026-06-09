@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 /// 1Password item mappings: (env_var, item_name, field_name)
 const OP_SECRETS: &[(&str, &str, &str)] = &[
-    ("ANTHROPIC_API_KEY", "Dreadnode Claude", "api-key"),
+    ("ANTHROPIC_API_KEY", "Anthropic API", "api-key"),
     ("DREADNODE_API_KEY", "Dreadnode Dev Platform", "api-key"),
     (
         "GRAFANA_SERVICE_ACCOUNT_TOKEN",

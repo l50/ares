@@ -78,8 +78,7 @@ includes:
 vars:
   API_DIR: "."
   # Ares configuration
-  # MODEL: '{{.MODEL | default "claude-sonnet-4-5-20250929"}}'
-  MODEL: '{{.MODEL | default "gpt-5.2"}}'
+  MODEL: '{{.MODEL | default "anthropic/claude-opus-4-8"}}'
   GRAFANA_URL: '{{.GRAFANA_URL}}'
   LOKI_URL: '{{.LOKI_URL}}'
   POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'

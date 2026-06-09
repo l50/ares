@@ -46,7 +46,7 @@ vars:
   DEFAULT_IPS: '{{.DEFAULT_IPS | default "10.1.10.10,10.1.10.11,10.1.10.12,10.1.10.22,10.1.10.23"}}'
   DEFAULT_DOMAIN: '{{.DEFAULT_DOMAIN | default "sevenkingdoms.local"}}'
   DEFAULT_TARGET_LABEL: '{{.DEFAULT_TARGET_LABEL | default "goad-ludus"}}'
-  DEFAULT_MODEL: '{{.DEFAULT_MODEL | default "openai/gpt-5.2"}}'
+  DEFAULT_MODEL: '{{.DEFAULT_MODEL | default "anthropic/claude-opus-4-8"}}'
   # Build target — attacker-1 is x86_64
   RUST_TARGET: '{{.RUST_TARGET | default "x86_64-unknown-linux-gnu"}}'
   # Local binary path produced by `task remote:rust:build`
