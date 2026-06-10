@@ -517,6 +517,147 @@ impl StateInner {
         self.credentials.iter().find(|c| usable(c)).cloned()
     }
 
+    /// Group-aware credential resolver for ACL/RBCD source principals.
+    ///
+    /// When an ACL edge's source is a group name (e.g. BloodHound emits an
+    /// RBCD vuln with `source: "Cross-Forest Admins"` because that Domain
+    /// Local group holds GenericAll on a target computer), `source_user` is
+    /// not a username — it's a group sAMAccountName. The base
+    /// [`find_source_credential`] only matches by username and returns
+    /// `None`, so the vuln gets silently dropped.
+    ///
+    /// This resolver:
+    ///   1. Tries [`find_source_credential`] directly. If `source_user` is a
+    ///      real principal (the common case), this returns immediately.
+    ///   2. On miss, walks `discovered_vulnerabilities` for
+    ///      `foreign_group_membership` entries whose `target` matches
+    ///      `source_user` and whose `domain` matches `target_domain` — the
+    ///      shape emitted by `auto_foreign_group_enum` (see
+    ///      `automation/foreign_group_enum.rs`). For each foreign member
+    ///      `(source, source_domain)` it finds, it recurses into
+    ///      [`find_source_credential`] using `member@source_domain`.
+    ///
+    /// Returns `(credential, via_group)` where `via_group` is `Some(group)`
+    /// when the credential was resolved through group expansion. Callers
+    /// use that to detect cross-realm dispatch and attach the right
+    /// Kerberos ccache.
+    pub fn resolve_principal_to_credential(
+        &self,
+        source_user: &str,
+        target_domain: &str,
+    ) -> Option<(ares_core::models::Credential, Option<String>)> {
+        if let Some(c) = self.find_source_credential(source_user, target_domain) {
+            return Some((c, None));
+        }
+
+        let group_l = source_user.to_lowercase();
+        let target_l = target_domain.to_lowercase();
+        for vuln in self.discovered_vulnerabilities.values() {
+            if !vuln
+                .vuln_type
+                .eq_ignore_ascii_case("foreign_group_membership")
+            {
+                continue;
+            }
+            let vt = vuln
+                .details
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            if vt != group_l {
+                continue;
+            }
+            let vd = vuln
+                .details
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            if vd != target_l {
+                continue;
+            }
+            let Some(member) = vuln.details.get("source").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let member_dom = vuln
+                .details
+                .get("source_domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let principal = if member_dom.is_empty() {
+                member.to_string()
+            } else {
+                format!("{member}@{member_dom}")
+            };
+            if let Some(c) = self.find_source_credential(&principal, target_domain) {
+                return Some((c, Some(source_user.to_string())));
+            }
+        }
+        None
+    }
+
+    /// NTLM-hash variant of [`resolve_principal_to_credential`]: tries the
+    /// direct hash lookup first, then walks `foreign_group_membership`
+    /// entries to resolve a group-typed source to a foreign member's NTLM
+    /// hash. Same `(hash, via_group)` shape so callers can flag
+    /// cross-realm dispatch.
+    pub fn resolve_principal_to_hash(
+        &self,
+        source_user: &str,
+        target_domain: &str,
+    ) -> Option<(ares_core::models::Hash, Option<String>)> {
+        if let Some(h) = self.find_source_hash(source_user, target_domain) {
+            return Some((h, None));
+        }
+
+        let group_l = source_user.to_lowercase();
+        let target_l = target_domain.to_lowercase();
+        for vuln in self.discovered_vulnerabilities.values() {
+            if !vuln
+                .vuln_type
+                .eq_ignore_ascii_case("foreign_group_membership")
+            {
+                continue;
+            }
+            let vt = vuln
+                .details
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            if vt != group_l {
+                continue;
+            }
+            let vd = vuln
+                .details
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            if vd != target_l {
+                continue;
+            }
+            let Some(member) = vuln.details.get("source").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let member_dom = vuln
+                .details
+                .get("source_domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let principal = if member_dom.is_empty() {
+                member.to_string()
+            } else {
+                format!("{member}@{member_dom}")
+            };
+            if let Some(h) = self.find_source_hash(&principal, target_domain) {
+                return Some((h, Some(source_user.to_string())));
+            }
+        }
+        None
+    }
+
     /// NTLM-hash variant of [`find_source_credential`] with the same priority
     /// order. Restricts to NTLM hashes (the only type usable for PTH).
     pub fn find_source_hash(
@@ -1209,5 +1350,180 @@ mod tests {
 
         // Should not be quarantined (expired)
         assert!(!state.is_principal_quarantined("jdoe", "child.contoso.local"));
+    }
+
+    fn fsp_vuln(
+        group: &str,
+        group_domain: &str,
+        member: &str,
+        member_domain: &str,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut details = std::collections::HashMap::new();
+        details.insert("source".into(), serde_json::json!(member));
+        details.insert("source_domain".into(), serde_json::json!(member_domain));
+        details.insert("target".into(), serde_json::json!(group));
+        details.insert("domain".into(), serde_json::json!(group_domain));
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: format!("fsp:{group}:{member}"),
+            vuln_type: "foreign_group_membership".into(),
+            target: group.into(),
+            discovered_by: "test".into(),
+            discovered_at: Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 1,
+        }
+    }
+
+    fn cred(user: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{user}@{domain}"),
+            username: user.into(),
+            password: password.into(),
+            domain: domain.into(),
+            source: String::new(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_principal_direct_match_returns_without_via_group() {
+        let mut state = StateInner::new("op-1".into());
+        state
+            .credentials
+            .push(cred("alice", "Pw!", "contoso.local"));
+        let resolved = state
+            .resolve_principal_to_credential("alice", "contoso.local")
+            .expect("alice should resolve directly");
+        assert_eq!(resolved.0.username, "alice");
+        assert_eq!(resolved.0.domain, "contoso.local");
+        assert!(
+            resolved.1.is_none(),
+            "direct match must not set via_group: {:?}",
+            resolved.1
+        );
+    }
+
+    #[test]
+    fn resolve_principal_expands_group_via_foreign_member() {
+        // `CrossForestAdmins` is a Domain Local group in fabrikam.local
+        // whose only foreign member is `alice@contoso.local`. An RBCD vuln
+        // discovered against a fabrikam computer carries
+        // source="CrossForestAdmins", domain="fabrikam.local" — no matching
+        // credential by username. The resolver must walk the
+        // foreign_group_membership vuln and find alice.
+        let mut state = StateInner::new("op-1".into());
+        let v = fsp_vuln(
+            "CrossForestAdmins",
+            "fabrikam.local",
+            "alice",
+            "contoso.local",
+        );
+        state
+            .discovered_vulnerabilities
+            .insert(v.vuln_id.clone(), v);
+        state
+            .credentials
+            .push(cred("alice", "P@ssw0rd!", "contoso.local"));
+
+        let resolved = state
+            .resolve_principal_to_credential("CrossForestAdmins", "fabrikam.local")
+            .expect("group expansion should resolve to alice");
+        assert_eq!(resolved.0.username, "alice");
+        assert_eq!(resolved.0.domain, "contoso.local");
+        assert_eq!(
+            resolved.1.as_deref(),
+            Some("CrossForestAdmins"),
+            "via_group must surface the indirection"
+        );
+    }
+
+    #[test]
+    fn resolve_principal_group_expansion_returns_none_when_member_uncrackable() {
+        let mut state = StateInner::new("op-1".into());
+        let v = fsp_vuln(
+            "CrossForestAdmins",
+            "fabrikam.local",
+            "alice",
+            "contoso.local",
+        );
+        state
+            .discovered_vulnerabilities
+            .insert(v.vuln_id.clone(), v);
+        // No cred for alice → resolver must report None, not panic and
+        // not return an unrelated credential.
+        state.credentials.push(cred("bob", "Pw!", "contoso.local"));
+
+        assert!(state
+            .resolve_principal_to_credential("CrossForestAdmins", "fabrikam.local")
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_principal_skips_unrelated_fsp_vulns() {
+        // FSP vuln targeting a different group/domain must not contaminate
+        // the lookup. Caller asked about CrossForestAdmins/fabrikam; an
+        // unrelated edge naming a different group must not satisfy it.
+        let mut state = StateInner::new("op-1".into());
+        let v = fsp_vuln(
+            "OtherForeignGroup",
+            "contoso.local",
+            "bob",
+            "fabrikam.local",
+        );
+        state
+            .discovered_vulnerabilities
+            .insert(v.vuln_id.clone(), v);
+        state
+            .credentials
+            .push(cred("bob", "bobpw", "fabrikam.local"));
+
+        assert!(
+            state
+                .resolve_principal_to_credential("CrossForestAdmins", "fabrikam.local")
+                .is_none(),
+            "unrelated FSP edge must not satisfy CrossForestAdmins expansion"
+        );
+    }
+
+    #[test]
+    fn resolve_principal_to_hash_expands_group() {
+        let mut state = StateInner::new("op-1".into());
+        let v = fsp_vuln(
+            "CrossForestAdmins",
+            "fabrikam.local",
+            "alice",
+            "contoso.local",
+        );
+        state
+            .discovered_vulnerabilities
+            .insert(v.vuln_id.clone(), v);
+        state.hashes.push(ares_core::models::Hash {
+            id: "h-alice".into(),
+            username: "alice".into(),
+            hash_value: "deadbeef".into(),
+            hash_type: "NTLM".into(),
+            domain: "contoso.local".into(),
+            cracked_password: None,
+            source: String::new(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        });
+
+        let resolved = state
+            .resolve_principal_to_hash("CrossForestAdmins", "fabrikam.local")
+            .expect("group expansion should resolve to alice's NTLM hash");
+        assert_eq!(resolved.0.username, "alice");
+        assert_eq!(resolved.0.domain, "contoso.local");
+        assert_eq!(resolved.1.as_deref(), Some("CrossForestAdmins"));
     }
 }
