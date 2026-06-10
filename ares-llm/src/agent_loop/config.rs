@@ -28,6 +28,26 @@ pub struct AgentLoopConfig {
     /// Whether to attach Anthropic prompt-cache breakpoints to the stable
     /// prefix (system + tool definitions). No-op for non-Anthropic providers.
     pub enable_prompt_cache: bool,
+    /// No-progress circuit breaker: number of consecutive tool-dispatching
+    /// steps that yield neither a new parser discovery nor a novel tool-call
+    /// signature before the loop exits early (reusing `LoopEndReason::MaxSteps`
+    /// so downstream stall-salvage credits any evidence already gathered).
+    /// This reclaims the wall-clock time and credential inflight-slots that an
+    /// agent would otherwise burn spinning the same handful of calls up to
+    /// `max_steps`. `0` disables the breaker (pure `max_steps` behavior).
+    pub no_progress_limit: u32,
+    /// Discovery-anchored stall breaker: consecutive tool-dispatching steps
+    /// that yield no *new parser discovery* before the loop exits early
+    /// (reusing `LoopEndReason::MaxSteps`). Unlike `no_progress_limit`, this
+    /// counter resets ONLY on a real discovery — never on a merely novel
+    /// tool-call signature. It catches the grind the novelty escape hatch lets
+    /// through: an agent that keeps issuing distinct-but-fruitless calls
+    /// (varying target/user/realm/flags every step) produces a "novel"
+    /// signature each iteration, so `no_progress_limit` never trips and the
+    /// agent runs all the way to `max_steps`. Set higher than
+    /// `no_progress_limit` because legitimate early exploration can take many
+    /// steps before the first discovery lands. `0` disables it.
+    pub no_discovery_limit: u32,
 }
 
 impl Default for AgentLoopConfig {
@@ -43,6 +63,8 @@ impl Default for AgentLoopConfig {
             session_log: SessionLogConfig::default(),
             max_tool_calls_per_name: 10,
             enable_prompt_cache: true,
+            no_progress_limit: 15,
+            no_discovery_limit: 25,
         }
     }
 }
@@ -56,6 +78,8 @@ impl AgentLoopConfig {
     /// - `ARES_AGENT_MAX_TOKENS`
     /// - `ARES_AGENT_MAX_TOOL_CALLS_PER_NAME`
     /// - `ARES_AGENT_ENABLE_PROMPT_CACHE` (`true`/`false`/`1`/`0`)
+    /// - `ARES_AGENT_NO_PROGRESS_LIMIT` (`0` disables the no-progress breaker)
+    /// - `ARES_AGENT_NO_DISCOVERY_LIMIT` (`0` disables the discovery breaker)
     /// - everything from `ContextConfig::from_env`, `BudgetConfig::from_env`,
     ///   `SessionLogConfig::from_env`
     pub fn from_env(model: String, temperature: Option<f32>) -> Self {
@@ -72,6 +96,14 @@ impl AgentLoopConfig {
             enable_prompt_cache: parse_env_bool(
                 "ARES_AGENT_ENABLE_PROMPT_CACHE",
                 defaults.enable_prompt_cache,
+            ),
+            no_progress_limit: parse_env_u32(
+                "ARES_AGENT_NO_PROGRESS_LIMIT",
+                defaults.no_progress_limit,
+            ),
+            no_discovery_limit: parse_env_u32(
+                "ARES_AGENT_NO_DISCOVERY_LIMIT",
+                defaults.no_discovery_limit,
             ),
             retry: defaults.retry,
             context: ContextConfig::from_env(),
@@ -336,6 +368,7 @@ mod tests {
         assert!(cfg.temperature.is_none());
         assert_eq!(cfg.max_tool_calls_per_name, 10);
         assert!(cfg.enable_prompt_cache);
+        assert_eq!(cfg.no_progress_limit, 15);
     }
 
     #[test]
@@ -571,6 +604,7 @@ mod tests {
         std::env::set_var("ARES_AGENT_MAX_TOKENS", "8192");
         std::env::set_var("ARES_AGENT_MAX_TOOL_CALLS_PER_NAME", "3");
         std::env::set_var("ARES_AGENT_ENABLE_PROMPT_CACHE", "false");
+        std::env::set_var("ARES_AGENT_NO_PROGRESS_LIMIT", "9");
         let cfg = AgentLoopConfig::from_env("test-model".into(), Some(0.25));
         assert_eq!(cfg.model, "test-model");
         assert_eq!(cfg.temperature, Some(0.25));
@@ -578,6 +612,8 @@ mod tests {
         assert_eq!(cfg.max_tokens, 8192);
         assert_eq!(cfg.max_tool_calls_per_name, 3);
         assert!(!cfg.enable_prompt_cache);
+        assert_eq!(cfg.no_progress_limit, 9);
+        std::env::remove_var("ARES_AGENT_NO_PROGRESS_LIMIT");
         std::env::remove_var("ARES_AGENT_MAX_STEPS");
         std::env::remove_var("ARES_AGENT_MAX_TOKENS");
         std::env::remove_var("ARES_AGENT_MAX_TOOL_CALLS_PER_NAME");

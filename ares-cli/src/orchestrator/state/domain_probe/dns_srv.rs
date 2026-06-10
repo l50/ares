@@ -17,9 +17,10 @@ use async_trait::async_trait;
 use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
+use hickory_resolver::proto::rr::RData;
 use hickory_resolver::TokioResolver;
 
-use super::{DomainProber, ProbeOutcome};
+use super::{DomainProber, ProbeOutcome, ProbedDc};
 
 /// Real DNS prober. Wraps a hickory `TokioResolver`.
 pub struct DnsSrvProber {
@@ -53,11 +54,41 @@ impl DomainProber for DnsSrvProber {
         let query = format!("_ldap._tcp.dc._msdcs.{}.", fqdn.trim_end_matches('.'));
         match self.resolver.srv_lookup(&query).await {
             Ok(answer) => {
-                if !answer.answers().is_empty() {
-                    ProbeOutcome::Confirmed
-                } else {
-                    ProbeOutcome::Rejected("no SRV records")
+                let answers = answer.answers();
+                if answers.is_empty() {
+                    return ProbeOutcome::Rejected("no SRV records");
                 }
+                // SRV confirms the realm. Best-effort: resolve the SRV target
+                // (the DC's hostname) to an A/AAAA record so the realm gets a
+                // usable DC IP. The `target` field is the DC FQDN. If the A
+                // lookup fails we still confirm — `dc: None` preserves the
+                // prior confirm-only behavior rather than dropping the realm.
+                let target_host: Option<String> = answers.iter().find_map(|rec| match &rec.data {
+                    RData::SRV(srv) => {
+                        let h = srv.target.to_utf8();
+                        let h = h.trim_end_matches('.').to_string();
+                        if h.is_empty() {
+                            None
+                        } else {
+                            Some(h)
+                        }
+                    }
+                    _ => None,
+                });
+                let dc = match target_host {
+                    Some(host) => match self.resolver.lookup_ip(format!("{host}.")).await {
+                        Ok(ips) => ips.iter().next().map(|ip| ProbedDc {
+                            hostname: host,
+                            ip: ip.to_string(),
+                        }),
+                        Err(e) => {
+                            tracing::debug!(target = %host, err = %e, "DNS SRV: target A lookup failed; confirming without DC IP");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                ProbeOutcome::Confirmed { dc }
             }
             Err(e) => match &e {
                 NetError::Dns(DnsError::NoRecordsFound(_)) => {

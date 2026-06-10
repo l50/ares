@@ -121,6 +121,7 @@ pub use s4u::auto_s4u_exploitation;
 pub use searchconnector_coercion::auto_searchconnector_coercion;
 pub use secretsdump::auto_krbtgt_extraction;
 pub use secretsdump::auto_local_admin_secretsdump;
+pub(crate) use secretsdump::{dispatch_krbtgt_extraction_with_ticket, krbtgt_extraction_dedup_key};
 pub use shadow_credentials::auto_shadow_credentials;
 pub use share_coercion::auto_share_coercion;
 pub use share_enum::auto_share_enumeration;

@@ -97,18 +97,29 @@ impl SharedState {
         // Reject cross-realm phantom by user home-realm pinning. The check
         // above only fires when the same (user, password) was previously seen
         // under another realm AND the existing entry's source is strictly more
-        // trusted. That misses the common LLM failure mode: an unrelated
-        // enumeration step (SAMR / LDAP / Kerberos) has already pinned the
-        // user's home realm in state.users, but the LLM later emits a cred for
-        // the same user under a sibling realm — either by hallucinating a
-        // string from in-repo fixtures or by carrying over the realm it was
-        // last reasoning about. A user account lives in exactly one realm
-        // (different SIDs across realms even when the sAMAccountName matches),
-        // so if any authoritative user-enumeration source has pinned this
-        // username to a realm, that set is the only legal home realm for the
-        // cred. Reject anything outside it, independent of arrival order or
-        // source trust.
-        if !cred.domain.is_empty() {
+        // trusted. This guard targets the LLM failure mode where an unrelated
+        // enumeration step has already pinned the user's home realm in
+        // state.users, but the LLM later emits a cred for the same user under a
+        // sibling realm — by hallucinating a string from in-repo fixtures or
+        // carrying over the realm it was last reasoning about.
+        //
+        // CRITICAL SCOPING (regression fix): this rejection only applies to
+        // LOW-TRUST incoming credentials (`credential_source_trust < 2`, i.e.
+        // text scrapes, SYSVOL/registry, description leaks, unknown sources).
+        // High-trust creds — host-pinned dumps (secretsdump/lsa/dpapi=3),
+        // validated auth round-trips (netexec_auth=2), and cracks of
+        // realm-pinned hashes (cracked*=2) — carry their own authoritative
+        // realm and MUST NOT be dropped here. The match is by sAMAccountName
+        // only (no SID, no realm scoping on the lookup), and the pinning set
+        // can be populated by forest-root / GC LDAP enumeration that surfaces
+        // CHILD-domain users under the queried realm. Without the trust gate,
+        // collision-prone accounts (Administrator, krbtgt, svc_*) get a real
+        // child-DC secretsdump credential silently rejected because a
+        // forest-root enum pinned the parent realm first. That silently
+        // destroys valid creds (return Ok(false) looks like success to the
+        // caller), forcing wasteful re-enumeration/re-cracking and starving
+        // cross-forest progress. See #96 regression.
+        if !cred.domain.is_empty() && credential_source_trust(&cred.source) < 2 {
             let state = self.inner.read().await;
             let cred_realm = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
             let mut pinned_realms: Vec<String> = Vec::new();
@@ -129,8 +140,9 @@ impl SharedState {
                     username = %cred.username,
                     rejected_domain = %cred.domain,
                     rejected_source = %cred.source,
+                    cred_trust = credential_source_trust(&cred.source),
                     pinned_realms = ?pinned_realms,
-                    "Rejecting phantom credential — username has authoritative home realm(s) from user enumeration and incoming realm matches none"
+                    "Rejecting phantom credential — low-trust source and username has authoritative home realm(s) that the incoming realm matches none of"
                 );
                 return Ok(false);
             }
@@ -869,11 +881,12 @@ mod tests {
     #[tokio::test]
     async fn publish_credential_rejects_phantom_against_user_home_realm() {
         // Regression: state.users had `alice` pinned to `child.contoso.local`
-        // via netexec_user_enum. The LLM then emitted a cred for the same
-        // username under the sibling realm `contoso.local` — same password
-        // it had seen elsewhere in repo fixtures, wrong realm. The earlier
-        // (user, password)-conflict guard does not fire because no prior
-        // credential for that pair exists; the user-home-realm guard must.
+        // via netexec_user_enum. A LOW-TRUST source (sysvol script scrape)
+        // then emitted a cred for the same username under the sibling realm
+        // `contoso.local` — same password it had seen elsewhere in repo
+        // fixtures, wrong realm. The earlier (user, password)-conflict guard
+        // does not fire because no prior credential for that pair exists; the
+        // user-home-realm guard must — but only for low-trust sources.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
@@ -892,7 +905,8 @@ mod tests {
             username: "alice".into(),
             password: "P@ssw0rd!".into(),
             domain: "contoso.local".into(),
-            source: "netexec_auth".into(),
+            // Low-trust source (trust 1): subject to the home-realm guard.
+            source: "sysvol_script".into(),
             discovered_at: None,
             is_admin: false,
             parent_id: None,
@@ -900,7 +914,7 @@ mod tests {
         };
         assert!(
             !state.publish_credential(&q, phantom).await.unwrap(),
-            "cred for a pinned user under a sibling realm must be rejected"
+            "low-trust cred for a pinned user under a sibling realm must be rejected"
         );
 
         let s = state.inner.read().await;
@@ -956,7 +970,9 @@ mod tests {
         // A user surfaced only by `output_extraction` (text scrape) is not
         // authoritative — its realm could be wrong. The home-realm guard
         // must not fire from it, or else any LLM-typo'd user entry would
-        // start blocking real credentials.
+        // start blocking real credentials. Use a low-trust CRED source so the
+        // guard is actually entered (a high-trust cred would skip it outright)
+        // and the bypass is exercised via the low-trust USER source.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
@@ -974,7 +990,7 @@ mod tests {
             username: "alice".into(),
             password: "P@ssw0rd!".into(),
             domain: "child.contoso.local".into(),
-            source: "netexec_auth".into(),
+            source: "sysvol_script".into(),
             discovered_at: None,
             is_admin: false,
             parent_id: None,
@@ -983,6 +999,91 @@ mod tests {
         assert!(
             state.publish_credential(&q, cred).await.unwrap(),
             "low-trust user-enum source must not pin a home realm"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_credential_high_trust_cred_not_dropped_by_home_realm_pin() {
+        // KEYSTONE regression (#96): forest-root / GC LDAP enumeration pinned
+        // `administrator` to the parent realm `contoso.local` (a real
+        // enumeration source — netexec_user_enum is authoritative). A child-DC
+        // secretsdump then yields a genuine `child.contoso.local\administrator`
+        // credential — a DIFFERENT account (different SID) that collides only
+        // on sAMAccountName. The home-realm guard must NOT drop it: high-trust
+        // sources carry their own authoritative realm. Dropping it silently
+        // (Ok(false)) is exactly what stalled cross-forest progress and forced
+        // wasteful re-enumeration.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let u = User {
+            username: "administrator".into(),
+            domain: "contoso.local".into(),
+            description: String::new(),
+            is_admin: true,
+            source: "netexec_user_enum".into(),
+        };
+        state.publish_user(&q, u).await.unwrap();
+
+        let real = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "administrator".into(),
+            password: "ChildP@ss123".into(),
+            domain: "child.contoso.local".into(),
+            // Host-pinned NTDS dump (trust 3) — authoritative about its realm.
+            source: "secretsdump".into(),
+            discovered_at: None,
+            is_admin: true,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(
+            state.publish_credential(&q, real).await.unwrap(),
+            "high-trust secretsdump cred must NOT be dropped by a sAMAccountName-only home-realm pin from a different realm"
+        );
+
+        let s = state.inner.read().await;
+        assert!(
+            s.credentials
+                .iter()
+                .any(|c| c.domain == "child.contoso.local" && c.source == "secretsdump"),
+            "the real child-realm credential must be stored, got {:?}",
+            s.credentials
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_credential_netexec_auth_cred_not_dropped_by_home_realm_pin() {
+        // Companion to the keystone test: a validated auth round-trip
+        // (netexec_auth, trust 2) proving `administrator` authenticates at
+        // `contoso.local` is real evidence the account exists there, even if
+        // enumeration earlier pinned a child realm. Must be admitted.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let u = User {
+            username: "administrator".into(),
+            domain: "child.contoso.local".into(),
+            description: String::new(),
+            is_admin: true,
+            source: "netexec_user_enum".into(),
+        };
+        state.publish_user(&q, u).await.unwrap();
+
+        let real = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "administrator".into(),
+            password: "P@ssw0rd!".into(),
+            domain: "contoso.local".into(),
+            source: "netexec_auth".into(),
+            discovered_at: None,
+            is_admin: true,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(
+            state.publish_credential(&q, real).await.unwrap(),
+            "validated auth round-trip must not be dropped by a home-realm pin"
         );
     }
 
