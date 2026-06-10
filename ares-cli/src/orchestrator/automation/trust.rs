@@ -1715,7 +1715,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             let mut seen = HashSet::new();
             vuln_items
                 .into_iter()
-                .chain(work.into_iter())
+                .chain(work)
                 .filter(|w| seen.insert(w.dedup_key.clone()))
                 .collect()
         };
