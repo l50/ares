@@ -7,13 +7,20 @@
 {% if domain %}**Domain:** {{ domain }}
 {% endif -%}
 
-Try `crack_with_hashcat` first (it transparently uses remote crackd when
-`HASHCAT_SERVICE_URL` is set, otherwise local hashcat). If the tool returns
-`success=true` with a cracked password in its stdout, **stop immediately and
-call `task_complete`** — do NOT also invoke `crack_with_john` on the same hash.
-Only fall back to `crack_with_john` if `crack_with_hashcat` returned
-`success=false` (e.g. exit_code 127 "hashcat unavailable", 124 timeout, or no
-cracks in the potfile).
+Run `crack_with_hashcat` (it transparently uses remote crackd when
+`HASHCAT_SERVICE_URL` is set, otherwise local hashcat). Read the leading
+`SUCCESS:` or `RESULT:` line in its stdout — `SUCCESS` means a hash was
+cracked, `RESULT ... 0 hashes cracked` means hashcat ran the full wordlist
+(and rules) without finding a match. Either way, **call `task_complete` and
+stop**. Do not invoke `crack_with_john` on the same hash — running the same
+wordlist on a CPU backend after a GPU has already exhausted it is pure waste.
+
+Only fall back to `crack_with_john` when hashcat itself was **unavailable**:
+the tool returned `success=false` with `exit_code=127` and the stderr says
+`hashcat unavailable`. That's the one case john can do something hashcat
+couldn't. Stage-error failures (`success=false`, other exit codes) mean the
+remote crackd service is broken — fix it rather than wasting CPU on a
+duplicate attack.
 
 In the `task_complete` summary, attribute the password to the tool that
 actually produced it — `crack_with_hashcat` (and note "via remote crackd" if

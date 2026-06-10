@@ -228,6 +228,9 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
         last_error = stage1.error.clone();
     }
     if !stage1.cracked.is_empty() || stage1.timed_out {
+        // success=true for both cracked-something and clean-timeout: hashcat
+        // ran. The crack attempt is the success — finding a plaintext is the
+        // outcome. john on CPU has nothing to add either way.
         return Ok(ToolOutput {
             stdout: format_result_stdout(
                 &stage1.cracked,
@@ -236,7 +239,7 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
             ),
             stderr: last_error.unwrap_or_default(),
             exit_code: Some(if !stage1.cracked.is_empty() { 0 } else { 124 }),
-            success: !stage1.cracked.is_empty(),
+            success: true,
         });
     }
     // If stage 1 errored (submission failed or hashcat exited badly), stage 2
@@ -255,11 +258,14 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
     let elapsed = overall_started.elapsed().as_secs();
     let remaining = max_time_secs.saturating_sub(elapsed);
     if remaining < POLL_INTERVAL_SECS {
+        // Stage 1 finished cleanly with no cracks and the time budget is
+        // spent. Report success=true: hashcat ran the bare wordlist; john
+        // re-running the same wordlist on CPU would be pure waste.
         return Ok(ToolOutput {
-            stdout: transcript,
+            stdout: format_result_stdout(&[], &transcript, &format!("wordlist={wordlist}")),
             stderr: last_error.unwrap_or_default(),
-            exit_code: Some(1),
-            success: false,
+            exit_code: Some(124),
+            success: true,
         });
     }
     let stage2 = run_stage(
@@ -286,8 +292,12 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
     }
 
     let cracked = stage2.cracked;
-    let success = !cracked.is_empty();
-    let exit_code = if success {
+    // success=true whenever crackd reached a terminal status (cracked,
+    // exhausted, or timed out). Only stage2.terminal_status == "error"
+    // counts as a hashcat failure that justifies falling back to john on
+    // CPU — and that's handled below.
+    let stage2_errored = stage2.terminal_status == "error";
+    let exit_code = if !cracked.is_empty() {
         0
     } else if stage2.timed_out {
         124
@@ -302,7 +312,7 @@ pub(super) async fn crack(args: &Value, base_url: &str) -> Result<ToolOutput> {
         ),
         stderr: last_error.unwrap_or_default(),
         exit_code: Some(exit_code),
-        success,
+        success: !stage2_errored,
     })
 }
 

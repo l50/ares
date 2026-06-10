@@ -337,14 +337,19 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
     // infer it from interleaved stage output.
     let cracked = extract_cracked_lines(&show_result.stdout);
     let header = result_header("crack_with_hashcat (local hashcat)", &cracked);
+    // success=true whenever hashcat actually ran (the unavailable case
+    // returned earlier with exit_code=127). A finished run with no cracks
+    // is a completed attempt, not a tool failure — surface it as success
+    // so the agent doesn't pointlessly re-run the same wordlist via john
+    // on CPU. exit_code stays informative: 0 if anything cracked, 1 if not.
     Ok(ToolOutput {
         stdout: format!(
             "{header}\n{all_output}\n--- hashcat --show ---\n{}",
             show_result.stdout
         ),
         stderr: show_result.stderr,
-        exit_code: show_result.exit_code,
-        success: !cracked.is_empty(),
+        exit_code: Some(if cracked.is_empty() { 1 } else { 0 }),
+        success: true,
     })
 }
 
