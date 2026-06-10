@@ -272,6 +272,221 @@ async fn max_steps_limit() {
 }
 
 #[tokio::test]
+async fn no_progress_breaker_exits_before_max_steps_on_repeated_calls() {
+    // LLM spins the *identical* tool call forever and the dispatcher returns
+    // output with no discoveries. max_steps is high (50) but the no-progress
+    // breaker (limit 3) must cut the loop far earlier, reusing MaxSteps.
+    let responses: Vec<LlmResponse> = (0..50)
+        .map(|i| {
+            tool_use_response(vec![ToolCall {
+                id: format!("call_{i}"),
+                name: "nmap_scan".into(),
+                arguments: json!({"target": "192.168.58.10"}), // identical every step
+            }])
+        })
+        .collect();
+
+    let provider = MockProvider::new(responses);
+    // Empty results → MockDispatcher default output carries no discoveries.
+    let dispatcher = Arc::new(MockDispatcher::new(vec![]));
+
+    let mut config = default_config(50);
+    config.no_progress_limit = 3;
+
+    let outcome = run_agent_loop(RunAgentLoopParams {
+        provider: &provider,
+        dispatcher,
+        config: &config,
+        system_prompt: "You are a recon agent.",
+        task_prompt: "Keep scanning the same host.",
+        role: "recon",
+        task_id: "task-recon-noprogress",
+        tools: &test_tools(),
+        callback_handler: None,
+        hostname_map: None,
+    })
+    .await;
+
+    match &outcome.reason {
+        LoopEndReason::MaxSteps => {}
+        other => panic!("Expected MaxSteps (no-progress early exit), got: {other:?}"),
+    }
+    // First call is novel (streak 0); streak then climbs 1,2,3 and the
+    // top-of-loop breaker fires once it reaches the limit — long before 50.
+    assert!(
+        outcome.steps < 10,
+        "expected early exit well under max_steps, got {} steps",
+        outcome.steps
+    );
+}
+
+#[tokio::test]
+async fn no_progress_breaker_does_not_fire_while_discoveries_flow() {
+    // Identical tool call every step, but each dispatch yields a fresh
+    // discovery (e.g. a paginating enumeration). The streak must reset every
+    // step, so the loop runs all the way to max_steps rather than tripping the
+    // no-progress breaker early.
+    let responses: Vec<LlmResponse> = (0..6)
+        .map(|i| {
+            tool_use_response(vec![ToolCall {
+                id: format!("call_{i}"),
+                name: "nmap_scan".into(),
+                arguments: json!({"target": "192.168.58.10"}), // identical every step
+            }])
+        })
+        .collect();
+
+    // One discovery per dispatch keeps `made_discovery` true → streak resets.
+    let dispatcher_results: Vec<Result<ToolExecResult>> = (0..6)
+        .map(|i| {
+            Ok(ToolExecResult {
+                output: "scan complete".into(),
+                error: None,
+                discoveries: Some(json!({"hosts": [format!("192.168.58.{}", 20 + i)]})),
+            })
+        })
+        .collect();
+
+    let provider = MockProvider::new(responses);
+    let dispatcher = Arc::new(MockDispatcher::new(dispatcher_results));
+
+    let mut config = default_config(6);
+    config.no_progress_limit = 3;
+
+    let outcome = run_agent_loop(RunAgentLoopParams {
+        provider: &provider,
+        dispatcher,
+        config: &config,
+        system_prompt: "You are a recon agent.",
+        task_prompt: "Enumerate.",
+        role: "recon",
+        task_id: "task-recon-noprogress-disc",
+        tools: &test_tools(),
+        callback_handler: None,
+        hostname_map: None,
+    })
+    .await;
+
+    match &outcome.reason {
+        LoopEndReason::MaxSteps => {}
+        other => panic!("Expected MaxSteps at the real cap, got: {other:?}"),
+    }
+    // Ran the full budget because every step made progress.
+    assert_eq!(outcome.steps, 6);
+    assert_eq!(outcome.tool_calls_dispatched, 6);
+}
+
+#[tokio::test]
+async fn discovery_breaker_fires_through_novelty_escape_hatch() {
+    // Regression: the credential_access grind that ran to max_steps. Every
+    // step issues a DISTINCT tool call (novel target/user each time) that
+    // surfaces NO discovery. The novelty keeps `unproductive_streak` pinned at
+    // 0, so the no-progress breaker never fires — exactly the escape hatch
+    // that let agents burn the full step budget. The discovery-anchored
+    // breaker must catch it instead.
+    let responses: Vec<LlmResponse> = (0..30)
+        .map(|i| {
+            tool_use_response(vec![ToolCall {
+                id: format!("call_{i}"),
+                name: "secretsdump".into(),
+                // Distinct args every step → novel signature every step.
+                arguments: json!({"target": format!("192.168.58.{}", 10 + i), "user": format!("svc_{i}")}),
+            }])
+        })
+        .collect();
+
+    let provider = MockProvider::new(responses);
+    // No discoveries ever → discovery streak climbs monotonically.
+    let dispatcher = Arc::new(MockDispatcher::new(vec![]));
+
+    let mut config = default_config(30);
+    // No-progress breaker effectively OFF so it cannot account for the early
+    // exit — only the discovery breaker can. Proves novelty no longer rescues
+    // a fruitless agent.
+    config.no_progress_limit = 100;
+    config.no_discovery_limit = 5;
+
+    let outcome = run_agent_loop(RunAgentLoopParams {
+        provider: &provider,
+        dispatcher,
+        config: &config,
+        system_prompt: "You are a credential-access agent.",
+        task_prompt: "Dump everything.",
+        role: "credential_access",
+        task_id: "task-cred-novelty-grind",
+        tools: &test_tools(),
+        callback_handler: None,
+        hostname_map: None,
+    })
+    .await;
+
+    match &outcome.reason {
+        LoopEndReason::MaxSteps => {}
+        other => panic!("Expected MaxSteps (discovery-breaker early exit), got: {other:?}"),
+    }
+    // Discovery streak hits 5 around step 5–6; must exit far short of 30.
+    assert!(
+        outcome.steps < 10,
+        "discovery breaker should cut the fruitless grind well under max_steps, got {} steps",
+        outcome.steps
+    );
+}
+
+#[tokio::test]
+async fn discovery_breaker_does_not_fire_while_discoveries_flow() {
+    // Companion guard: novel calls that DO surface discoveries must run the
+    // full budget — the discovery breaker only targets fruitless grinds.
+    let responses: Vec<LlmResponse> = (0..6)
+        .map(|i| {
+            tool_use_response(vec![ToolCall {
+                id: format!("call_{i}"),
+                name: "secretsdump".into(),
+                arguments: json!({"target": format!("192.168.58.{}", 10 + i)}),
+            }])
+        })
+        .collect();
+    let dispatcher_results: Vec<Result<ToolExecResult>> = (0..6)
+        .map(|i| {
+            Ok(ToolExecResult {
+                output: "dumped".into(),
+                error: None,
+                discoveries: Some(json!({"credentials": [format!("svc_{i}")]})),
+            })
+        })
+        .collect();
+
+    let provider = MockProvider::new(responses);
+    let dispatcher = Arc::new(MockDispatcher::new(dispatcher_results));
+
+    let mut config = default_config(6);
+    config.no_progress_limit = 100;
+    config.no_discovery_limit = 3;
+
+    let outcome = run_agent_loop(RunAgentLoopParams {
+        provider: &provider,
+        dispatcher,
+        config: &config,
+        system_prompt: "You are a credential-access agent.",
+        task_prompt: "Dump everything.",
+        role: "credential_access",
+        task_id: "task-cred-disc-flow",
+        tools: &test_tools(),
+        callback_handler: None,
+        hostname_map: None,
+    })
+    .await;
+
+    match &outcome.reason {
+        LoopEndReason::MaxSteps => {}
+        other => panic!("Expected MaxSteps at the real cap, got: {other:?}"),
+    }
+    assert_eq!(
+        outcome.steps, 6,
+        "discoveries every step must reset the breaker"
+    );
+}
+
+#[tokio::test]
 async fn end_turn_no_tool_calls() {
     let response = LlmResponse {
         content: "I have analyzed the network and there is nothing more to do.".into(),

@@ -64,7 +64,7 @@ operation:
 # Agent configurations
 agents:
   orchestrator:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 200
     pod_selector: "app.kubernetes.io/name=ares-orchestrator"
     # Tools: OrchestratorTools, RedTeamReportingTools
@@ -94,7 +94,7 @@ agents:
       - complete_operation
 
   recon:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=recon"
     # Provisioned by: ansible/playbooks/ares/recon.yml → dreadnode.nimbus_range.recon_tools
@@ -122,7 +122,7 @@ agents:
       - impacket-GetUserSPNs
 
   credential_access:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=credential_access"
     # Provisioned by: ansible/playbooks/ares/credential_access.yml → dreadnode.nimbus_range.credential_access_tools
@@ -144,7 +144,7 @@ agents:
       - impacket-secretsdump
 
   cracker:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 150
     pod_selector: "ares.dreadnode.io/role=cracker"
     # Provisioned by: ansible/playbooks/ares/cracker.yml → dreadnode.nimbus_range.cracking_tools
@@ -157,7 +157,7 @@ agents:
       - seclists
 
   acl:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 150  # ACL analysis requires complex path finding
     pod_selector: "ares.dreadnode.io/role=acl"
     # Provisioned by: ansible/playbooks/ares/acl_abuse.yml → dreadnode.nimbus_range.acl_tools
@@ -174,7 +174,7 @@ agents:
       - impacket-dacledit
 
   privesc:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=privesc"
     # Provisioned by: ansible/playbooks/ares/privesc.yml → dreadnode.nimbus_range.privesc_tools
@@ -228,7 +228,7 @@ agents:
       - SCMUACBypass          # UAC bypass (git: /opt/privesc/SCMUACBypass)
 
   lateral:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 300
     pod_selector: "ares.dreadnode.io/role=lateral"
     # Provisioned by: ansible/playbooks/ares/lateral_movement.yml → dreadnode.nimbus_range.lateral_movement_tools
@@ -258,7 +258,7 @@ agents:
       - impacket-secretsdump
 
   coercion:
-    model: "anthropic/claude-opus-4-8"
+    model: "openai/gpt-5"
     max_steps: 30
     pod_selector: "ares.dreadnode.io/role=coercion"
     # Provisioned by: ansible/playbooks/ares/coercion.yml → dreadnode.nimbus_range.coercion_tools

@@ -78,7 +78,7 @@ includes:
 vars:
   API_DIR: "."
   # Ares configuration
-  MODEL: '{{.MODEL | default "anthropic/claude-opus-4-8"}}'
+  MODEL: '{{.MODEL | default "openai/gpt-5"}}'
   GRAFANA_URL: '{{.GRAFANA_URL}}'
   LOKI_URL: '{{.LOKI_URL}}'
   POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'

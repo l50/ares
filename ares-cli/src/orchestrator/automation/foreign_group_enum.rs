@@ -24,14 +24,60 @@ use crate::orchestrator::state::*;
 /// Pure logic extracted from `auto_foreign_group_enum` so it can be unit-tested
 /// without needing a `Dispatcher` or async runtime.
 fn collect_foreign_group_work(state: &StateInner) -> Vec<ForeignGroupWork> {
-    if state.credentials.is_empty() || state.domains.len() < 2 {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    // Candidate realms to enumerate. Previously this was just `state.domains`,
+    // the canonical PROMOTED set — which gated the whole enumeration behind
+    // `state.domains.len() >= 2`. In a cross-forest start that's a deadlock: we
+    // hold a credential in a second realm (e.g. a forest we cracked into) but
+    // that realm only ever enters `state.domains` via the authoritative-source
+    // promotion path, so if it arrived low-trust it never lands and the
+    // foreign-group enum that would surface the bridge never runs.
+    //
+    // Derive candidates from the union of every realm we have evidence for:
+    // promoted domains, known DCs, known trusts, PLUS the realm of any held
+    // credential. A realm we can authenticate into is reason enough to
+    // enumerate its foreign security principals, promoted or not. We do NOT
+    // pre-filter by DC reachability here — the per-realm loop below still skips
+    // realms with no resolvable DC, but they must still COUNT toward the
+    // two-realm gate (mirroring the old `state.domains.len()` check, which
+    // counted DC-less realms too). Dedup by lowercase name.
+    let mut candidate_domains: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_candidate = |raw: &str, candidates: &mut Vec<String>| {
+        if raw.is_empty() {
+            return;
+        }
+        if seen.insert(raw.to_lowercase()) {
+            candidates.push(raw.to_string());
+        }
+    };
+    for d in &state.domains {
+        push_candidate(d, &mut candidate_domains);
+    }
+    for d in state.domain_controllers.keys() {
+        push_candidate(d, &mut candidate_domains);
+    }
+    for d in state.trusted_domains.keys() {
+        push_candidate(d, &mut candidate_domains);
+    }
+    for c in &state.credentials {
+        push_candidate(&c.domain, &mut candidate_domains);
+    }
+
+    // Foreign-principal enumeration only makes sense with at least two realms in
+    // play — one local, one foreign. With a single known realm there is nothing
+    // "foreign" to find yet.
+    if candidate_domains.len() < 2 {
         return Vec::new();
     }
 
     let mut items = Vec::new();
 
-    // For each domain, enumerate foreign security principals
-    for domain in &state.domains {
+    // For each candidate realm, enumerate foreign security principals
+    for domain in &candidate_domains {
         let dedup_key = format!("foreign_group:{domain}");
         if state.is_processed(DEDUP_FOREIGN_GROUP_ENUM, &dedup_key) {
             continue;
