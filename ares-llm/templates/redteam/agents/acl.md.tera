@@ -69,6 +69,14 @@ bloodyad_set_password(target="user", new_password="NewPass123!")
 → Use new password immediately
 ```
 
+If `bloodyad_set_password` fails with `unicodePwd modify rejected`, `LDAP
+server is unwilling to perform`, `confidentiality required`, or any LDAP
+signing / channel-binding / LDAPS-required error, retry over SAMR/RPC:
+```
+samr_change_password(target_user="user", new_password="NewPass123!")
+→ Same ForceChangePassword primitive, different wire protocol
+```
+
 ### AddMember (on groups)
 ```
 bloodyad_add_group_member(group="Domain Admins", member="youruser")
@@ -146,7 +154,8 @@ Report to orchestrator via request_assistance:
 |------|----------|
 | pywhisker | Shadow credentials attack |
 | targeted_kerberoast | Set SPN and kerberoast |
-| bloodyad_set_password | Reset user password (ForceChangePassword ACL) |
+| bloodyad_set_password | Reset user password via LDAP (ForceChangePassword ACL) |
+| samr_change_password | Reset user password via SAMR/RPC — fallback when LDAP `unicodePwd` modify is rejected |
 | dacl_edit | Modify DACL permissions |
 | bloodyad_add_genericall | Grant GenericAll permission |
 | bloodyad_add_group_member | Add to groups |

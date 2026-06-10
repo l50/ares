@@ -1031,6 +1031,7 @@ pub(crate) fn requires_exact_realm(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "bloodyad_set_password"
+            | "samr_change_password"
             | "bloodyad_add_group_member"
             | "bloodyad_add_genericall"
             | "dacl_edit"
@@ -2028,6 +2029,7 @@ mod tests {
     fn requires_exact_realm_covers_ldap_bind_tools() {
         for tool in [
             "bloodyad_set_password",
+            "samr_change_password",
             "bloodyad_add_group_member",
             "bloodyad_add_genericall",
             "dacl_edit",

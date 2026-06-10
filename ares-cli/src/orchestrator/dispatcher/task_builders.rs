@@ -636,7 +636,8 @@ impl Dispatcher {
         // the right tools: ACL primitives (genericall/writedacl/writeproperty/
         // allextendedrights/etc.) route to the `acl` worker which exposes
         // `bloodyad_add_group_member`, `bloodyad_set_password`,
-        // `bloodyad_add_genericall`, `pywhisker`, and `dacl_edit`. The
+        // `samr_change_password`, `bloodyad_add_genericall`, `pywhisker`,
+        // and `dacl_edit`. The
         // legacy default of `privesc` left the agent with certipy/mssql/
         // delegation tools only, so AllExtendedRights-on-group primitives
         // dispatched as `exploit_*` would bail with "missing bloodyAD".

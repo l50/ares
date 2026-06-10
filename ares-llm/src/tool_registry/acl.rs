@@ -75,6 +75,46 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "samr_change_password".into(),
+            description: "Force-set a user's password via impacket changepasswd.py over SAMR/RPC (the `User-Force-Change-Password` extended right delivered through `SamrSetInformationUser2` instead of an LDAP `unicodePwd` modify). USE THIS AS A FALLBACK when `bloodyad_set_password` fails with errors like `unicodePwd modify rejected`, `LDAP server is unwilling to perform`, `confidentiality required`, or any LDAP signing / channel-binding / LDAPS-required complaint — those policies block bloodyAD's LDAP write path but do not block SAMR over RPC. Exploits the same ForceChangePassword, GenericAll, or AllExtendedRights ACE; only the wire protocol changes.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_user": {
+                        "type": "string",
+                        "description": "SAMAccountName of the user whose password will be reset"
+                    },
+                    "new_password": {
+                        "type": "string",
+                        "description": "New password to set on the target account"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain FQDN"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username for authentication (principal with password reset rights — passed to changepasswd.py as `-altuser`)"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for authentication (passed as `-altpass`)"
+                    },
+                    "dc_ip": {
+                        "type": "string",
+                        "description": "Domain controller IP address"
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["rpc-samr", "smb", "kpasswd"],
+                        "description": "Wire protocol for the password change (default: rpc-samr). Use `kpasswd` only when targeting the Kerberos password-change service directly.",
+                        "default": "rpc-samr"
+                    }
+                },
+                "required": ["target_user", "new_password", "domain", "username", "password", "dc_ip"]
+            }),
+        },
+        ToolDefinition {
             name: "bloodyad_add_genericall".into(),
             description: "Add a GenericAll ACE to a target object via BloodyAD. Grants full control over the target by writing a new ACE into its DACL. Requires WriteDacl permission on the target.".into(),
             input_schema: json!({
