@@ -235,9 +235,11 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             }
 
             // ForceChangePassword / GenericAll overwrite the target's
-            // plaintext via `bloodyad_set_password`. Skip when we already
-            // have material so the scoreboard's back-verification against
-            // the original lab-provisioned password still holds.
+            // plaintext via `bloodyad_set_password` (or `samr_change_password`
+            // as the SAMR/RPC fallback when LDAP unicodePwd writes are
+            // rejected by the DC). Skip when we already have material so the
+            // scoreboard's back-verification against the original
+            // lab-provisioned password still holds.
             let is_destructive_acl =
                 vtype.contains("forcechangepassword") || vtype.contains("genericall");
             if is_destructive_acl && !target_user.is_empty() {

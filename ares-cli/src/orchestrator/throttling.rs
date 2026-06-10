@@ -340,6 +340,27 @@ impl Throttler {
             }
         }
 
+        // Secretsdump is the canonical DA route once a local-admin credential
+        // is in hand. auto_local_admin_secretsdump (and the PTH child-to-parent
+        // path) submit as task_type=credential_access, which shares a per-role
+        // cap with kerberoast/AS-REP roast/password-spray automations. When
+        // those long-running enumeration tasks saturate the role, every fresh
+        // secretsdump request gets deferred and then stale-evicted from the
+        // deferred queue before it can run — the op stalls with 0 DCs
+        // compromised despite having valid credentials. Whitelist the
+        // `secretsdump` technique only (not the whole role) so it rides the
+        // bypass channel without giving roast/spray automations a free pass.
+        if task_type == "credential_access" {
+            if let Some(technique) = payload
+                .and_then(|p| p.get("technique"))
+                .and_then(|v| v.as_str())
+            {
+                if technique.eq_ignore_ascii_case("secretsdump") {
+                    return true;
+                }
+            }
+        }
+
         false
     }
 }
@@ -510,6 +531,46 @@ mod tests {
                 t.check("exploit", "privesc", Some(&payload)).await,
                 ThrottleDecision::Allow,
                 "{vt} should bypass hard cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_path_secretsdump_bypasses_role_cap() {
+        // Saturate the credential_access role with kerberoast-style work
+        // (no payload), then verify a secretsdump submission rides the bypass
+        // while sibling techniques (kerberoast, asreproast, password_spray)
+        // still defer. Per-role fairness for high-volume enumeration is
+        // preserved; only the DA-route technique punches through.
+        let (t, tracker) = make_throttler(8);
+        for i in 0..3 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("kr{i}"),
+                    task_type: "credential_access".into(),
+                    role: "credential_access".into(),
+                    submitted_at: Instant::now(),
+                    last_activity: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+
+        let secretsdump = json!({"technique": "secretsdump", "target_ip": "10.1.10.10"});
+        assert_eq!(
+            t.check("credential_access", "credential_access", Some(&secretsdump))
+                .await,
+            ThrottleDecision::Allow,
+            "secretsdump must bypass per-role cap"
+        );
+
+        for technique in ["kerberoast", "asreproast", "password_spray"] {
+            let payload = json!({"technique": technique});
+            assert_eq!(
+                t.check("credential_access", "credential_access", Some(&payload))
+                    .await,
+                ThrottleDecision::Defer,
+                "{technique} must still be capped"
             );
         }
     }
