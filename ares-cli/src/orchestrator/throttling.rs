@@ -556,7 +556,7 @@ mod tests {
                 .await;
         }
 
-        let secretsdump = json!({"technique": "secretsdump", "target_ip": "10.1.10.10"});
+        let secretsdump = json!({"technique": "secretsdump", "target_ip": "192.168.58.10"});
         assert_eq!(
             t.check("credential_access", "credential_access", Some(&secretsdump))
                 .await,

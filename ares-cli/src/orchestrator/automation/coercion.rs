@@ -36,8 +36,8 @@ pub(crate) fn select_coercion_work(state: &StateInner, listener_ip: &str) -> Vec
     // LLM here. A more granular "skip only DCs owned by the chain" filter
     // turned out to misfire on cross-realm topologies: the ESC8 vuln records
     // the CA's enrollment realm in `details["domain"]` (e.g.
-    // north.sevenkingdoms.local) while the coerce-target DC's home in
-    // `domain_controllers` is the parent realm (sevenkingdoms.local), so a
+    // child.contoso.local) while the coerce-target DC's home in
+    // `domain_controllers` is the parent realm (contoso.local), so a
     // domain-equality test missed the overlap and the LLM coerce raced the
     // chain anyway. Coarse-skip is the safer wire.
     let has_adcs_vuln = state.discovered_vulnerabilities.values().any(|v| {
@@ -230,17 +230,15 @@ mod tests {
     fn select_coercion_skip_holds_even_when_vuln_realm_mismatches_dc_realm() {
         // ESC8 vuln carries the CA's enrollment realm in
         // `details["domain"]` — often the CHILD realm
-        // (north.sevenkingdoms.local) while the coerce-target DC's home in
-        // `domain_controllers` is the PARENT (sevenkingdoms.local). An
+        // (child.contoso.local) while the coerce-target DC's home in
+        // `domain_controllers` is the PARENT (contoso.local). An
         // earlier domain-equality skip missed this case and the standalone
         // coerce raced the ADCS chain. The coarse skip catches it.
         let mut s = StateInner::new("op".into());
         s.domain_controllers
-            .insert("sevenkingdoms.local".into(), "10.1.10.10".into());
-        s.discovered_vulnerabilities.insert(
-            "v1".into(),
-            make_esc8_vuln("v1", "north.sevenkingdoms.local"),
-        );
-        assert!(select_coercion_work(&s, "10.1.10.167").is_empty());
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        s.discovered_vulnerabilities
+            .insert("v1".into(), make_esc8_vuln("v1", "child.contoso.local"));
+        assert!(select_coercion_work(&s, "192.168.58.167").is_empty());
     }
 }

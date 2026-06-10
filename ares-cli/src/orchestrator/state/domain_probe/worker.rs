@@ -234,12 +234,12 @@ mod tests {
 
     #[tokio::test]
     async fn dc_zone_apex_hostname_promotes_child_after_probe_confirms() {
-        // End-to-end regression for the dreadgoad bug: a child-domain DC's
-        // SMB hostname query returns the bare domain (`north.contoso.local`)
-        // instead of the proper FQDN (`winterfell.north.contoso.local`).
-        // The hosts.rs publisher's parts[1..] extractor only sees the
-        // parent suffix; the child must reach state.domains via the
-        // whole-hostname candidate + DNS SRV probe path.
+        // End-to-end regression for the child-domain alias bug: a
+        // child-domain DC's SMB hostname query returns the bare domain
+        // (`child.contoso.local`) instead of the proper FQDN
+        // (`dc02.child.contoso.local`). The hosts.rs publisher's parts[1..]
+        // extractor only sees the parent suffix; the child must reach
+        // state.domains via the whole-hostname candidate + DNS SRV probe.
         use ares_core::models::Host;
 
         let state = SharedState::new("op-1".into());
@@ -247,7 +247,7 @@ mod tests {
 
         let host = Host {
             ip: "192.168.58.11".into(),
-            hostname: "north.contoso.local".into(),
+            hostname: "child.contoso.local".into(),
             os: String::new(),
             roles: vec![],
             services: vec![],
@@ -266,19 +266,19 @@ mod tests {
                 s.domains
             );
             assert!(
-                s.candidate_domains.contains_key("north.contoso.local"),
+                s.candidate_domains.contains_key("child.contoso.local"),
                 "child must be queued for probe, got candidates {:?}",
                 s.candidate_domains.keys().collect::<Vec<_>>()
             );
         }
 
         // Simulate DNS SRV probe confirming the child is a real domain.
-        let prober = StubProber::new(vec![("north.contoso.local", ProbeOutcome::Confirmed)]);
+        let prober = StubProber::new(vec![("child.contoso.local", ProbeOutcome::Confirmed)]);
         drain_with_mock(&state, &q, &prober).await;
 
         let s = state.inner.read().await;
         assert!(
-            s.domains.iter().any(|d| d == "north.contoso.local"),
+            s.domains.iter().any(|d| d == "child.contoso.local"),
             "child should be promoted after probe confirms, got {:?}",
             s.domains
         );

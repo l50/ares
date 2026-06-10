@@ -94,6 +94,48 @@ impl SharedState {
             }
         }
 
+        // Reject cross-realm phantom by user home-realm pinning. The check
+        // above only fires when the same (user, password) was previously seen
+        // under another realm AND the existing entry's source is strictly more
+        // trusted. That misses the common LLM failure mode: an unrelated
+        // enumeration step (SAMR / LDAP / Kerberos) has already pinned the
+        // user's home realm in state.users, but the LLM later emits a cred for
+        // the same user under a sibling realm — either by hallucinating a
+        // string from in-repo fixtures or by carrying over the realm it was
+        // last reasoning about. A user account lives in exactly one realm
+        // (different SIDs across realms even when the sAMAccountName matches),
+        // so if any authoritative user-enumeration source has pinned this
+        // username to a realm, that set is the only legal home realm for the
+        // cred. Reject anything outside it, independent of arrival order or
+        // source trust.
+        if !cred.domain.is_empty() {
+            let state = self.inner.read().await;
+            let cred_realm = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
+            let mut pinned_realms: Vec<String> = Vec::new();
+            for u in state.users.iter() {
+                if !u.username.eq_ignore_ascii_case(&cred.username) {
+                    continue;
+                }
+                if u.domain.is_empty() || !realm_source_is_authoritative(&u.source) {
+                    continue;
+                }
+                let realm = strip_netexec_artifact(&u.domain.to_lowercase()).to_string();
+                if !pinned_realms.iter().any(|r| r == &realm) {
+                    pinned_realms.push(realm);
+                }
+            }
+            if !pinned_realms.is_empty() && !pinned_realms.iter().any(|r| r == &cred_realm) {
+                tracing::warn!(
+                    username = %cred.username,
+                    rejected_domain = %cred.domain,
+                    rejected_source = %cred.source,
+                    pinned_realms = ?pinned_realms,
+                    "Rejecting phantom credential — username has authoritative home realm(s) from user enumeration and incoming realm matches none"
+                );
+                return Ok(false);
+            }
+        }
+
         let operation_id = {
             let state = self.inner.read().await;
             state.operation_id.clone()
@@ -536,6 +578,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::state::SharedState;
     use crate::orchestrator::task_queue::TaskQueueCore;
+    use ares_core::models::User;
     use ares_core::op_state_log::OpStateRecorder;
     use ares_core::state::mock_redis::MockRedisConnection;
     use std::sync::Arc;
@@ -644,34 +687,34 @@ mod tests {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let mut cred = make_cred("samwell.tarly", "Heartsbane", "north.contoso.local");
+        let mut cred = make_cred("alice", "P@ssw0rd!", "child.contoso.local");
         cred.source = "netexec_auth".into();
         state.publish_credential(&q, cred).await.unwrap();
 
         let s = state.inner.read().await;
         assert!(
-            s.domains.iter().any(|d| d == "north.contoso.local"),
+            s.domains.iter().any(|d| d == "child.contoso.local"),
             "authoritative-source realm should be promoted, got {:?}",
             s.domains
         );
     }
 
     #[tokio::test]
-    async fn dreadgoad_scenario_authenticated_credential_discovers_child_realm() {
-        // Third leg of the dreadgoad regression: even when host enum and
+    async fn child_realm_discovered_via_authenticated_credential() {
+        // Third leg of the child-domain regression: even when host enum and
         // user enum somehow miss a child domain, a single authenticated
         // credential against the DC (`netexec_auth` round-trip) proves
         // the realm exists. That cred alone must be enough.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let mut cred = make_cred("samwell.tarly", "Heartsbane", "north.contoso.local");
+        let mut cred = make_cred("alice", "P@ssw0rd!", "child.contoso.local");
         cred.source = "netexec_auth".into();
         state.publish_credential(&q, cred).await.unwrap();
 
         let s = state.inner.read().await;
         assert!(
-            s.domains.iter().any(|d| d == "north.contoso.local"),
+            s.domains.iter().any(|d| d == "child.contoso.local"),
             "single authenticated credential should discover child realm, got {:?}",
             s.domains
         );
@@ -709,7 +752,7 @@ mod tests {
         let real = Credential {
             id: uuid::Uuid::new_v4().to_string(),
             username: "alice".to_string(),
-            password: "Heartsbane".to_string(),
+            password: "P@ssw0rd!".to_string(),
             domain: "child.contoso.local".to_string(),
             source: "initial".to_string(),
             discovered_at: None,
@@ -722,7 +765,7 @@ mod tests {
         let phantom = Credential {
             id: uuid::Uuid::new_v4().to_string(),
             username: "alice".to_string(),
-            password: "Heartsbane".to_string(),
+            password: "P@ssw0rd!".to_string(),
             domain: "contoso.local".to_string(),
             source: "description_field".to_string(),
             discovered_at: None,
@@ -824,6 +867,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_credential_rejects_phantom_against_user_home_realm() {
+        // Regression: state.users had `alice` pinned to `child.contoso.local`
+        // via netexec_user_enum. The LLM then emitted a cred for the same
+        // username under the sibling realm `contoso.local` — same password
+        // it had seen elsewhere in repo fixtures, wrong realm. The earlier
+        // (user, password)-conflict guard does not fire because no prior
+        // credential for that pair exists; the user-home-realm guard must.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let u = User {
+            username: "alice".into(),
+            domain: "child.contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: "netexec_user_enum".into(),
+        };
+        // Use publish_user so the user lands the same way enumeration would.
+        state.publish_user(&q, u).await.unwrap();
+
+        let phantom = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "alice".into(),
+            password: "P@ssw0rd!".into(),
+            domain: "contoso.local".into(),
+            source: "netexec_auth".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(
+            !state.publish_credential(&q, phantom).await.unwrap(),
+            "cred for a pinned user under a sibling realm must be rejected"
+        );
+
+        let s = state.inner.read().await;
+        assert!(
+            s.credentials.is_empty(),
+            "phantom must not enter state.credentials, got {:?}",
+            s.credentials
+        );
+        assert!(
+            !s.domains.iter().any(|d| d == "contoso.local"),
+            "rejected phantom must not promote its realm into state.domains, got {:?}",
+            s.domains
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_credential_accepts_real_realm_when_user_pinned() {
+        // Sanity check the home-realm guard is realm-scoped, not blanket:
+        // when state.users pins `alice` to `child.contoso.local`, a cred for
+        // alice under that same realm must still be admitted.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let u = User {
+            username: "alice".into(),
+            domain: "child.contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: "netexec_user_enum".into(),
+        };
+        state.publish_user(&q, u).await.unwrap();
+
+        let cred = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "alice".into(),
+            password: "P@ssw0rd!".into(),
+            domain: "child.contoso.local".into(),
+            source: "netexec_auth".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(state.publish_credential(&q, cred).await.unwrap());
+
+        let s = state.inner.read().await;
+        assert_eq!(s.credentials.len(), 1);
+        assert_eq!(s.credentials[0].domain, "child.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn publish_credential_home_realm_guard_ignores_low_trust_user_source() {
+        // A user surfaced only by `output_extraction` (text scrape) is not
+        // authoritative — its realm could be wrong. The home-realm guard
+        // must not fire from it, or else any LLM-typo'd user entry would
+        // start blocking real credentials.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let u = User {
+            username: "alice".into(),
+            domain: "contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: "output_extraction".into(),
+        };
+        state.publish_user(&q, u).await.unwrap();
+
+        let cred = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "alice".into(),
+            password: "P@ssw0rd!".into(),
+            domain: "child.contoso.local".into(),
+            source: "netexec_auth".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(
+            state.publish_credential(&q, cred).await.unwrap(),
+            "low-trust user-enum source must not pin a home realm"
+        );
+    }
+
+    #[tokio::test]
     async fn publish_credential_equal_trust_both_stored() {
         // Two same-source records for the same (user, password) with
         // different realms: trust ranking can't disambiguate, so we keep
@@ -909,13 +1072,13 @@ mod tests {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let mut hash = make_hash("krbtgt", "north.contoso.local", "NTLM", NTLM_HASH_A);
+        let mut hash = make_hash("krbtgt", "child.contoso.local", "NTLM", NTLM_HASH_A);
         hash.source = "secretsdump".into();
         state.publish_hash(&q, hash).await.unwrap();
 
         let s = state.inner.read().await;
         assert!(
-            s.domains.iter().any(|d| d == "north.contoso.local"),
+            s.domains.iter().any(|d| d == "child.contoso.local"),
             "secretsdump realm should be promoted, got {:?}",
             s.domains
         );

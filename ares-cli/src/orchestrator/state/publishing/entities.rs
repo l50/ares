@@ -609,39 +609,35 @@ mod tests {
 
     #[tokio::test]
     async fn publish_user_netexec_enum_promotes_unknown_realm() {
-        // Regression: in DreadGOAD, `north.sevenkingdoms.local` (child of
-        // `sevenkingdoms.local`) was never landing in state.domains even
-        // though NetExec User Enum returned 8 users like
-        // `north.sevenkingdoms.local\sansa.stark`. The realm on a NetExec
-        // user-enum response came from the DC's SAMR reply — promotion
-        // closes the gap when the host FQDN extractor missed the child
-        // (e.g. SMB returned `north.sevenkingdoms.local` as the zone-apex
-        // alias hostname).
+        // Regression: a child realm (e.g. `child.contoso.local`) was never
+        // landing in state.domains even when NetExec User Enum returned a
+        // batch of users like `child.contoso.local\alice`. The realm on a
+        // NetExec user-enum response came from the DC's SAMR reply —
+        // promotion closes the gap when the host FQDN extractor missed the
+        // child (e.g. SMB returned the child realm as a zone-apex alias
+        // hostname rather than as a proper child FQDN).
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let mut user = make_user("sansa.stark", "north.contoso.local");
+        let mut user = make_user("alice", "child.contoso.local");
         user.source = "netexec_user_enum".into();
         state.publish_user(&q, user).await.unwrap();
 
         let s = state.inner.read().await;
         assert!(
-            s.domains.iter().any(|d| d == "north.contoso.local"),
+            s.domains.iter().any(|d| d == "child.contoso.local"),
             "netexec_user_enum realm should be promoted to state.domains, got {:?}",
             s.domains
         );
     }
 
     #[tokio::test]
-    async fn dreadgoad_scenario_child_domain_discovered_via_user_enum() {
-        // End-to-end regression for the exact production bug observed on
-        // dreadgoad op-20260607-230002: state.domains held only
-        // {essos.local, sevenkingdoms.local} (both as forest roots) even
-        // though NetExec User Enum returned 8 users in
-        // `north.sevenkingdoms.local`, Kerberos enum found 2 more, and an
-        // authenticated cred `samwell.tarly:Heartsbane` landed in that
-        // realm. None of those paths had been promoting the realm; the
-        // child domain was a ghost.
+    async fn child_domain_discovered_via_user_enum() {
+        // End-to-end regression for a production bug: state.domains held
+        // only the two forest roots even though NetExec User Enum returned
+        // users in a child realm, Kerberos enum found more, and an
+        // authenticated cred landed in that realm. None of those paths had
+        // been promoting the realm; the child domain was a ghost.
         //
         // After the fix, EACH of the three independent paths
         // (netexec_user_enum, kerberos_enum, netexec_auth credential) must
@@ -652,12 +648,12 @@ mod tests {
         // Path 1: netexec_user_enum alone is sufficient.
         {
             let state = SharedState::new("op-path1".into());
-            let mut user = make_user("sansa.stark", "north.contoso.local");
+            let mut user = make_user("alice", "child.contoso.local");
             user.source = "netexec_user_enum".into();
             state.publish_user(&q, user).await.unwrap();
             let s = state.inner.read().await;
             assert!(
-                s.domains.iter().any(|d| d == "north.contoso.local"),
+                s.domains.iter().any(|d| d == "child.contoso.local"),
                 "netexec_user_enum should be enough to discover child realm, got {:?}",
                 s.domains
             );
@@ -666,12 +662,12 @@ mod tests {
         // Path 2: kerberos_enum alone is sufficient.
         {
             let state = SharedState::new("op-path2".into());
-            let mut user = make_user("sql_svc", "north.contoso.local");
+            let mut user = make_user("sql_svc", "child.contoso.local");
             user.source = "kerberos_enum".into();
             state.publish_user(&q, user).await.unwrap();
             let s = state.inner.read().await;
             assert!(
-                s.domains.iter().any(|d| d == "north.contoso.local"),
+                s.domains.iter().any(|d| d == "child.contoso.local"),
                 "kerberos_enum should be enough to discover child realm, got {:?}",
                 s.domains
             );
