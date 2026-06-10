@@ -447,6 +447,27 @@ impl SharedState {
                 // in-memory set is the source of truth — this is purely a
                 // visibility mirror.
                 if let Some(domain) = newly_dominated {
+                    // Register the dominated domain in authoritative state if it
+                    // isn't there yet. A domain can be dominated via a krbtgt hash
+                    // while only ever appearing in `domain_controllers` (its DC was
+                    // discovered) and never in `domains` — e.g. a child domain
+                    // reached through cross-domain credential reuse. Left
+                    // unregistered, the domain is owned but missing from
+                    // `all_domains`, so the loot/runtime denominator undercounts
+                    // (`1/2` instead of `1/3`) and `count_compromised_forests`
+                    // can't credit the forest. The domination gate above already
+                    // proved the domain is real (it has a confirmed DC or was
+                    // already known) — exactly the corroboration `promote_domain`
+                    // requires — and `promote_domain` is idempotent, so this is a
+                    // no-op when the domain is already present.
+                    if let Err(e) = self.promote_domain(queue, &domain).await {
+                        tracing::warn!(
+                            domain = %domain,
+                            err = %e,
+                            "Failed to register dominated domain in authoritative state"
+                        );
+                    }
+
                     use redis::AsyncCommands;
                     let key = format!(
                         "{}:{}:{}",
@@ -1245,6 +1266,52 @@ mod tests {
         let s = state.inner.read().await;
         assert!(s.has_domain_admin);
         assert!(s.dominated_domains.contains("contoso.local"));
+    }
+
+    #[tokio::test]
+    async fn publish_krbtgt_hash_promotes_dc_only_child_domain_to_state() {
+        // Regression: a child domain reached via cross-domain credential reuse
+        // can have a discovered DC (present in `domain_controllers`) without ever
+        // being registered in `state.domains`. A krbtgt hash for that domain
+        // dominates it — the domination gate accepts a domain known only through
+        // `domain_controllers` — but historically the domain was never added to
+        // `state.domains`. Since the loot/runtime denominator (`all_domains`) is
+        // built from `state.domains`, the owned child was missing from the count
+        // (e.g. `1/2 domains` while three were listed) and could not credit its
+        // forest in `count_compromised_forests`. Domination must now also register
+        // the domain in authoritative state. A non-authoritative hash source
+        // ("test", not "secretsdump") is used so promotion can only come from the
+        // domination path under test, not the authoritative-source shortcut.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        // Child domain known ONLY via its discovered DC, not via `domains`.
+        {
+            let mut s = state.inner.write().await;
+            s.domain_controllers.insert(
+                "child.contoso.local".to_string(),
+                "192.168.58.241".to_string(),
+            );
+            assert!(
+                !s.domains.iter().any(|d| d == "child.contoso.local"),
+                "precondition: child domain must not be registered yet"
+            );
+        }
+
+        let hash = make_hash("krbtgt", "child.contoso.local", "NTLM", NTLM_HASH_A);
+        state.publish_hash(&q, hash).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.dominated_domains.contains("child.contoso.local"),
+            "child domain should be dominated via its known DC"
+        );
+        assert!(
+            s.domains.iter().any(|d| d == "child.contoso.local"),
+            "dominated child domain must be registered in state.domains so \
+             all_domains counts it, got {:?}",
+            s.domains
+        );
     }
 
     #[tokio::test]
