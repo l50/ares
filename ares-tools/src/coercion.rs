@@ -826,7 +826,7 @@ fn parse_relay_coerce_args(args: &Value) -> Result<RelayCoerceConfig> {
     // SMB→HTTP (web enrollment) and the equivalent SMB→RPC (ICPR), and IIS
     // does not refuse a relayed NTLM auth that comes back to itself from a
     // different protocol. Empirically the same-host chain captures a valid
-    // PFX in production lab runs against winterfell/contoso. Keeping the
+    // PFX in production lab runs against single-DC contoso forests. Keeping the
     // self-coerce as a last-tier candidate gives the orchestrator a fallback
     // when no foreign DC is reachable for cross-host coercion — without it,
     // a single-DC forest with ESC8 was unreachable through the auto chain.
@@ -1765,8 +1765,8 @@ struct PfxCapture {
 /// The earlier "last_user × last_pfx" form (most-recent-of-each) misfires
 /// when the relay catches incidental auth from a different machine *after*
 /// the PFX has already been written — e.g. an ntlmrelayx with
-/// `--keep-relaying` accepts a stray MEEREEN$ probe *after* writing
-/// WINTERFELL.pfx, and the final `(MEEREEN$, ./WINTERFELL.pfx)` pair fed to
+/// `--keep-relaying` accepts a stray DC02$ probe *after* writing
+/// DC01.pfx, and the final `(DC02$, ./DC01.pfx)` pair fed to
 /// `certipy_auth` PKINIT-fails with KDC_ERR_C_PRINCIPAL_UNKNOWN. Pairing
 /// by line proximity (last user *before* the PKCS#12 write) keeps the
 /// principal aligned with the cert subject.
@@ -2807,21 +2807,21 @@ MIIBlahSecondCert==\n\
     fn extract_pfx_capture_pairs_user_with_pfx_by_proximity() {
         // Regression: when `--keep-relaying` catches a stray auth AFTER the
         // PFX has been written, the old `last_user × last_pfx` form mispaired
-        // the cert with the late auth (e.g. WINTERFELL.pfx paired with
-        // MEEREEN$) and certipy_auth bailed with KDC_ERR_C_PRINCIPAL_UNKNOWN.
+        // the cert with the late auth (e.g. DC01.pfx paired with
+        // DC02$) and certipy_auth bailed with KDC_ERR_C_PRINCIPAL_UNKNOWN.
         let log = "\
 [*] Servers started, waiting for connections\n\
-[*] (SMB): Authenticating CONTOSO/WINTERFELL$@192.168.58.11 SUCCEED\n\
+[*] (SMB): Authenticating CONTOSO/DC01$@192.168.58.11 SUCCEED\n\
 [*] GOT CERTIFICATE! ID 6\n\
-[*] Writing PKCS#12 certificate to ./WINTERFELL.pfx\n\
-[*] (SMB): Authenticating CONTOSO/MEEREEN$@192.168.58.12 SUCCEED\n\
+[*] Writing PKCS#12 certificate to ./DC01.pfx\n\
+[*] (SMB): Authenticating CONTOSO/DC02$@192.168.58.12 SUCCEED\n\
 [*] done\n";
         let cap = super::extract_pfx_capture_from_log(log).expect("should extract");
         assert_eq!(
-            cap.user, "WINTERFELL$",
+            cap.user, "DC01$",
             "user must be paired with the cert that was actually written, not a later stray auth"
         );
-        assert_eq!(cap.pfx_basename, "./WINTERFELL.pfx");
+        assert_eq!(cap.pfx_basename, "./DC01.pfx");
     }
 
     #[test]

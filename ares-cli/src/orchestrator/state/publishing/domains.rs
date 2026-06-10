@@ -122,8 +122,8 @@ impl SharedState {
     /// (`dc01.contoso.local`) won't get falsely promoted just because its
     /// parent domain is in `state.domains`. Used by [`publish_host`] when a
     /// DC's reported hostname might *itself* be the domain (zone-apex
-    /// alias) — e.g. SMB hostname query returns `north.sevenkingdoms.local`
-    /// for the IP of the `winterfell` DC. The DNS SRV probe is the only
+    /// alias) — e.g. SMB hostname query returns `child.contoso.local`
+    /// for the IP of the `dc02` child DC. The DNS SRV probe is the only
     /// path to promotion: real child domains pass, host FQDNs get rejected.
     pub async fn record_hostname_candidate(
         &self,

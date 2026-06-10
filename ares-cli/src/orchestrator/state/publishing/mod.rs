@@ -542,11 +542,11 @@ mod tests {
 
     // --- realm_source_is_authoritative ---
     //
-    // These two tests are paired KEYSTONES. The dreadgoad incident where
-    // `north.sevenkingdoms.local` never reached state.domains — despite 8
-    // NetExec User Enum users, 2 Kerberos enum users, and a `netexec_auth`
-    // credential all referencing it — happened because the publishers
-    // never promoted realms. We now promote on authoritative sources only.
+    // These two tests are paired KEYSTONES. A prior incident where a child
+    // realm never reached state.domains — despite a batch of NetExec User
+    // Enum users, Kerberos enum users, and a `netexec_auth` credential all
+    // referencing it — happened because the publishers never promoted
+    // realms. We now promote on authoritative sources only.
     //
     // If you ADD a source string to a parser and forget to update
     // realm_source_is_authoritative, the source will land in users/creds
