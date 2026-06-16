@@ -129,12 +129,21 @@ tasks:
             exit 1
           fi
 
-          # Create source tarball (exclude build artifacts and git metadata)
+          # Create source tarball (exclude build artifacts and git metadata).
+          # .cargo/ holds an OPTIONAL gitignored per-dev config.toml; include
+          # only if present so fresh clones (without one) don't fail the tar.
+          # Always include the tracked Cross.toml + ares-core migrations/.
+          # COPYFILE_DISABLE prevents BSD tar from emitting macOS AppleDouble
+          # `._*` metadata files; the matching --exclude is belt+suspenders for
+          # any `._*` already on disk from prior Finder access — sqlx::migrate!
+          # rejects them as malformed migration names.
           SRC_TAR=$(mktemp /tmp/ares-src-XXXXXX.tar.gz)
           trap "rm -f $SRC_TAR" EXIT
-          tar -czf "$SRC_TAR" \
-            --exclude='target' --exclude='.git' --exclude='*.o' --exclude='*.d' \
-            -C "$(pwd)" Cargo.toml Cargo.lock Cross.toml tools.yaml .cargo/ ares-core/ ares-cli/ ares-llm/ ares-tools/
+          SRC_PATHS="Cargo.toml Cargo.lock Cross.toml tools.yaml ares-core/ ares-cli/ ares-llm/ ares-tools/"
+          [ -d .cargo ] && SRC_PATHS="$SRC_PATHS .cargo/"
+          COPYFILE_DISABLE=1 tar -czf "$SRC_TAR" \
+            --exclude='target' --exclude='.git' --exclude='*.o' --exclude='*.d' --exclude='._*' \
+            -C "$(pwd)" $SRC_PATHS
 
           # Upload source to S3
           echo -e "{{.INFO}} Uploading source to S3..."
@@ -154,6 +163,7 @@ tasks:
               "mkdir -p " + $build_dir,
               "aws s3 cp s3://" + $bucket + "/" + $prefix + "/ares-src.tar.gz /tmp/ares-src.tar.gz",
               "tar -xzf /tmp/ares-src.tar.gz -C " + $build_dir,
+              "find " + $build_dir + " -name \"._*\" -delete 2>/dev/null || true",
               "cd " + $build_dir + " && cargo build --profile dev-deploy -p ares-cli 2>&1",
               "SRC=" + $build_dir + "/target/dev-deploy/ares",
               "if [ ! -f \"$SRC\" ]; then echo ERROR: build artifact missing at $SRC; exit 1; fi",
@@ -1280,6 +1290,10 @@ tasks:
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_TRACES_ENDPOINT}' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_RESOURCE_ATTRIBUTES=deployment.environment=staging,attack.team=red' >> /etc/ares/env"
+        # JSONL session log capture (ingested into Postgres llm_messages / tool_calls).
+        # Env var name per ares-llm/src/agent_loop/config.rs.
+        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_SESSION_LOG_DIR=/var/log/ares/session' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; mkdir -p /var/log/ares/session && chmod 0755 /var/log/ares/session"
         ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 /etc/ares/env; echo Wrote /etc/ares/env"
         # Restart workers so they pick up the new env file
         ENV_FILE_CMD="$ENV_FILE_CMD; for role in recon credential_access cracker acl privesc lateral coercion; do systemctl restart ares@\${role} 2>/dev/null || true; done; echo Workers restarted"

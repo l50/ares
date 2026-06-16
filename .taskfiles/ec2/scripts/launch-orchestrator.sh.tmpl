@@ -6,6 +6,12 @@
 # resulting in CONSTRAINT_MEMCG OOM-kills regardless of OOMScoreAdjust.
 set -euo pipefail
 
+# Pick up static box config (SESSION_LOG_DIR, OTEL endpoints, etc.) and
+# runtime-resolved secrets (ARES_DATABASE_URL from Secrets Manager) before
+# any per-op overrides below.
+if [ -f /etc/ares/env ]; then set -a; . /etc/ares/env; set +a; fi
+if [ -f /run/ares/env ]; then set -a; . /run/ares/env; set +a; fi
+
 export ARES_REDIS_URL=redis://127.0.0.1:6379
 export NATS_URL=nats://127.0.0.1:4222
 export RUST_LOG=info
@@ -79,6 +85,8 @@ exec systemd-run \
   --setenv=OTEL_EXPORTER_OTLP_TRACES_ENDPOINT \
   --setenv=OTEL_EXPORTER_OTLP_PROTOCOL \
   --setenv=OTEL_RESOURCE_ATTRIBUTES \
+  --setenv=ARES_DATABASE_URL \
+  --setenv=ARES_SESSION_LOG_DIR \
   --property=StandardOutput=append:/var/log/ares/orchestrator.log \
   --property=StandardError=append:/var/log/ares/orchestrator.log \
   --property=OOMScoreAdjust=-500 \
