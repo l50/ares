@@ -232,6 +232,81 @@ impl StateInner {
         }
     }
 
+    // ----- Typed write surface --------------------------------------------
+    //
+    // The publishing layer (orchestrator/state/publishing/) writes to
+    // StateInner through the methods below instead of poking fields
+    // directly. Keeps the in-memory mutation surface visible and gives
+    // future invariants (e.g. realm canonicalization, dedup) one place to
+    // land. Redis remains the dedup oracle for credentials and hashes —
+    // these methods mirror successful redis inserts into the in-memory view.
+
+    /// Append a credential to in-memory state. Callers must run
+    /// `RedisStateReader::add_credential` first; this mirrors the redis
+    /// insert.
+    pub fn add_credential(&mut self, cred: ares_core::models::Credential) {
+        self.credentials.push(cred);
+    }
+
+    /// Append a hash to in-memory state. Same redis-oracle contract as
+    /// [`add_credential`].
+    pub fn add_hash(&mut self, hash: ares_core::models::Hash) {
+        self.hashes.push(hash);
+    }
+
+    /// Upsert an AES256 key onto an existing in-memory hash matching by
+    /// `(username, domain, hash_type, hash_value)`. Returns true when the
+    /// existing entry was found and its `aes_key` was filled in (i.e. it had
+    /// no key before). Used when redis dedup rejected a hash insert but the
+    /// incoming entry carries an AES key the in-memory entry lacks —
+    /// Win2016+ rejects RC4-only inter-realm tickets, so losing AES to
+    /// dedup blocks cross-forest forge.
+    pub fn upsert_hash_aes_key(&mut self, hash: &ares_core::models::Hash) -> bool {
+        if hash.aes_key.is_none() {
+            return false;
+        }
+        match self.hashes.iter_mut().find(|h| {
+            h.username.eq_ignore_ascii_case(&hash.username)
+                && h.domain.eq_ignore_ascii_case(&hash.domain)
+                && h.hash_type.eq_ignore_ascii_case(&hash.hash_type)
+                && h.hash_value == hash.hash_value
+        }) {
+            Some(existing) if existing.aes_key.is_none() => {
+                existing.aes_key = hash.aes_key.clone();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mark `domain` as dominated. Returns true when newly inserted.
+    pub fn mark_dominated(&mut self, domain: String) -> bool {
+        self.dominated_domains.insert(domain)
+    }
+
+    /// Set the cracked password on the first matching hash (by username and
+    /// domain, case-insensitive) that has no cracked password yet. Returns
+    /// `(operation_id, hash_type)` on success so the caller can persist the
+    /// change to Redis under the right key; returns `None` when no matching
+    /// uncracked hash exists.
+    pub fn set_first_uncracked_password(
+        &mut self,
+        username: &str,
+        domain: &str,
+        password: &str,
+    ) -> Option<(String, String)> {
+        let idx = self.hashes.iter().position(|h| {
+            h.username.eq_ignore_ascii_case(username)
+                && h.domain.eq_ignore_ascii_case(domain)
+                && h.cracked_password.is_none()
+        })?;
+        self.hashes[idx].cracked_password = Some(password.to_string());
+        let ht = self.hashes[idx].hash_type.clone();
+        Some((self.operation_id.clone(), ht))
+    }
+
+    // ----- /Typed write surface -------------------------------------------
+
     /// Check if a username is the delegating account for a constrained
     /// delegation or RBCD vulnerability.  These accounts must be reserved
     /// for S4U exploitation — spraying or secretsdump with their creds
@@ -549,47 +624,7 @@ impl StateInner {
         if let Some(c) = self.find_source_credential(source_user, target_domain) {
             return Some((c, None));
         }
-
-        let group_l = source_user.to_lowercase();
-        let target_l = target_domain.to_lowercase();
-        for vuln in self.discovered_vulnerabilities.values() {
-            if !vuln
-                .vuln_type
-                .eq_ignore_ascii_case("foreign_group_membership")
-            {
-                continue;
-            }
-            let vt = vuln
-                .details
-                .get("target")
-                .and_then(|v| v.as_str())
-                .map(str::to_lowercase)
-                .unwrap_or_default();
-            if vt != group_l {
-                continue;
-            }
-            let vd = vuln
-                .details
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .map(str::to_lowercase)
-                .unwrap_or_default();
-            if vd != target_l {
-                continue;
-            }
-            let Some(member) = vuln.details.get("source").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let member_dom = vuln
-                .details
-                .get("source_domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let principal = if member_dom.is_empty() {
-                member.to_string()
-            } else {
-                format!("{member}@{member_dom}")
-            };
+        for principal in self.foreign_group_members(source_user, target_domain) {
             if let Some(c) = self.find_source_credential(&principal, target_domain) {
                 return Some((c, Some(source_user.to_string())));
             }
@@ -610,52 +645,69 @@ impl StateInner {
         if let Some(h) = self.find_source_hash(source_user, target_domain) {
             return Some((h, None));
         }
-
-        let group_l = source_user.to_lowercase();
-        let target_l = target_domain.to_lowercase();
-        for vuln in self.discovered_vulnerabilities.values() {
-            if !vuln
-                .vuln_type
-                .eq_ignore_ascii_case("foreign_group_membership")
-            {
-                continue;
-            }
-            let vt = vuln
-                .details
-                .get("target")
-                .and_then(|v| v.as_str())
-                .map(str::to_lowercase)
-                .unwrap_or_default();
-            if vt != group_l {
-                continue;
-            }
-            let vd = vuln
-                .details
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .map(str::to_lowercase)
-                .unwrap_or_default();
-            if vd != target_l {
-                continue;
-            }
-            let Some(member) = vuln.details.get("source").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let member_dom = vuln
-                .details
-                .get("source_domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let principal = if member_dom.is_empty() {
-                member.to_string()
-            } else {
-                format!("{member}@{member_dom}")
-            };
+        for principal in self.foreign_group_members(source_user, target_domain) {
             if let Some(h) = self.find_source_hash(&principal, target_domain) {
                 return Some((h, Some(source_user.to_string())));
             }
         }
         None
+    }
+
+    /// Walk `discovered_vulnerabilities` for `foreign_group_membership`
+    /// entries whose `target` is `group` and whose `domain` is
+    /// `target_domain`, yielding each foreign member as a principal string
+    /// (`member@source_domain`, or just `member` if no domain is recorded).
+    ///
+    /// Shared by [`resolve_principal_to_credential`] /
+    /// [`resolve_principal_to_hash`] — both need the same expansion to
+    /// translate a group-typed ACL/RBCD source into the concrete principals
+    /// whose creds or hashes can sign the action.
+    fn foreign_group_members<'a>(
+        &'a self,
+        group: &'a str,
+        target_domain: &'a str,
+    ) -> impl Iterator<Item = String> + 'a {
+        let group_l = group.to_lowercase();
+        let target_l = target_domain.to_lowercase();
+        self.discovered_vulnerabilities
+            .values()
+            .filter_map(move |vuln| {
+                if !vuln
+                    .vuln_type
+                    .eq_ignore_ascii_case("foreign_group_membership")
+                {
+                    return None;
+                }
+                let vt = vuln
+                    .details
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_lowercase)
+                    .unwrap_or_default();
+                if vt != group_l {
+                    return None;
+                }
+                let vd = vuln
+                    .details
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_lowercase)
+                    .unwrap_or_default();
+                if vd != target_l {
+                    return None;
+                }
+                let member = vuln.details.get("source").and_then(|v| v.as_str())?;
+                let member_dom = vuln
+                    .details
+                    .get("source_domain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Some(if member_dom.is_empty() {
+                    member.to_string()
+                } else {
+                    format!("{member}@{member_dom}")
+                })
+            })
     }
 
     /// NTLM-hash variant of [`find_source_credential`] with the same priority
