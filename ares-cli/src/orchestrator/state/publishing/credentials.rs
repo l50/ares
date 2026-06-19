@@ -1281,11 +1281,11 @@ mod tests {
 
     #[tokio::test]
     async fn publish_hash_netntlmv2_per_session_captures_land_as_distinct_rows() {
-        // The ESC8 chain depends on each fresh NetNTLMv2 capture landing as a
-        // new row: each carries a per-session server challenge that's a
-        // one-shot replay opportunity, and the downstream relay auto-pipeline
-        // signals off `publish_hash` returning true. Identity-only dedup
-        // here silently broke the chain — proven empirically against the
+        // The ESC8 chain depends on each distinct NetNTLMv2 capture landing as
+        // a new row: each binds a fresh per-session server challenge so the
+        // bytes legitimately differ, and the downstream relay auto-pipeline
+        // re-fires on every `publish_hash` that returns true. Identity-only
+        // dedup here silently broke the chain — proven empirically against the
         // GOAD lab where 18+ successful coerce calls produced 0 cert
         // dispatches because every capture after the first returned false
         // and no auto-pipeline ever re-fired.
@@ -1316,10 +1316,10 @@ mod tests {
 
     #[tokio::test]
     async fn publish_hash_netntlmv2_identical_replays_still_dedup() {
-        // The relay chain needs fresh nonces to land, but a literally
-        // identical capture (same challenge bytes — only possible if Responder
-        // re-emits the same line) should still collapse to one row, so the
-        // bytewise NTLM-path dedup correctly handles the replay case.
+        // The auto-pipeline re-fires on each new publish_hash→true, but a
+        // literally identical capture (same challenge bytes — only possible if
+        // Responder re-emits the same line) should still collapse to one row,
+        // so the bytewise NTLM-path dedup correctly handles the duplicate case.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
