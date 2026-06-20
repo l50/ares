@@ -20,6 +20,17 @@ redundant_clone = "deny"
 # `#[expect(clippy::derive_partial_eq_without_eq, reason = "...")]` on the type
 # explaining which field blocks it.
 derive_partial_eq_without_eq = "deny"
+# `format!("{}", x)` / `format!("{}", x.field)` — inline the binding into the
+# format string (`format!("{x}")`) when it's a plain identifier or field access.
+uninlined_format_args = "deny"
+# `"".to_string()` / `String::from("")` allocate an empty string the long way —
+# `String::new()` is clearer and const.
+manual_string_new = "deny"
+# `for x in v.iter()` / `.iter_mut()` / `.into_iter()` on an owned value — loop
+# over `&v` / `&mut v` / `v` directly instead of the explicit method call.
+explicit_iter_loop = "deny"
+# `if cond { 1 } else { 0 }` — use `usize::from(cond)` (or the matching int type).
+bool_to_int_with_if = "deny"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
