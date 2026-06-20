@@ -96,7 +96,7 @@ pub fn credential_key_from_payload(payload: &serde_json::Value) -> Option<String
     let cred = payload.get("credential")?;
     let username = cred.get("username").and_then(|v| v.as_str())?;
     let domain = cred.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-    Some(format!("{}@{}", username, domain))
+    Some(format!("{username}@{domain}"))
 }
 
 /// Central dispatcher for submitting tasks with throttling and routing.
@@ -355,12 +355,12 @@ mod tests {
     async fn inflight_many_independent_keys() {
         let ci = CredentialInflight::new(1);
         for i in 0..100 {
-            let key = format!("user{}@domain", i);
+            let key = format!("user{i}@domain");
             assert!(ci.try_acquire(&key).await);
         }
         // All at limit
         for i in 0..100 {
-            let key = format!("user{}@domain", i);
+            let key = format!("user{i}@domain");
             assert!(!ci.try_acquire(&key).await);
         }
     }

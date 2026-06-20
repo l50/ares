@@ -791,8 +791,7 @@ mod tests {
             for tech in &new_techniques {
                 assert!(
                     s.weights.contains_key(*tech),
-                    "Preset {:?} missing weight for {tech}",
-                    preset
+                    "Preset {preset:?} missing weight for {tech}"
                 );
             }
         }

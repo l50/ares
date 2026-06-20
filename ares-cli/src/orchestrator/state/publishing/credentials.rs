@@ -233,7 +233,7 @@ impl SharedState {
         if !cred.domain.is_empty() && credential_source_trust(&cred.source) < 2 {
             let cred_realm = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
             let mut pinned_realms: Vec<String> = Vec::new();
-            for u in state.users.iter() {
+            for u in &state.users {
                 if !u.username.eq_ignore_ascii_case(&cred.username) {
                     continue;
                 }
@@ -565,7 +565,7 @@ impl SharedState {
         // when the krbtgt domain resolved to a known DC — otherwise we'd emit
         // a `dc_secretsdump on ` finding with empty target/domain.
         if let Some(dc_target) = dc_target {
-            let vuln_id = format!("dc_secretsdump_{}", krbtgt_domain);
+            let vuln_id = format!("dc_secretsdump_{krbtgt_domain}");
             let mut details = HashMap::new();
             details.insert(
                 "domain".into(),

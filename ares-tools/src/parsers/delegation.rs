@@ -52,7 +52,7 @@ pub fn parse_delegation(output: &str, params: &Value) -> Vec<Value> {
         // "Constrained w/ Protocol Transition" that break simple column indexing.
         let delegation_target = extract_spn_from_parts(&parts);
 
-        let vuln_type = format!("{}_delegation", delegation_type);
+        let vuln_type = format!("{delegation_type}_delegation");
         let dedup_key = format!("{}:{}", account.to_lowercase(), vuln_type);
         if !seen.insert(dedup_key) {
             continue; // skip duplicate account+type
@@ -221,7 +221,7 @@ DC02$   Computer     Unconstrained                        N/A                   
 
         // Dedup: sarah.connor unconstrained, john.smith constrained,
         // SRV01$ constrained, DC02$ unconstrained = 4
-        assert_eq!(vulns.len(), 4, "Expected 4 deduped vulns, got {:?}", vulns);
+        assert_eq!(vulns.len(), 4, "Expected 4 deduped vulns, got {vulns:?}");
 
         // sarah.connor → unconstrained
         assert_eq!(vulns[0]["vuln_type"], "unconstrained_delegation");
@@ -233,8 +233,7 @@ DC02$   Computer     Unconstrained                        N/A                   
         let spn = vulns[1]["details"]["delegation_target"].as_str().unwrap();
         assert!(
             spn.starts_with("CIFS/dc02"),
-            "Expected CIFS/dc02 SPN, got {}",
-            spn
+            "Expected CIFS/dc02 SPN, got {spn}"
         );
 
         // SRV01$ → constrained with HTTP SPN
@@ -243,8 +242,7 @@ DC02$   Computer     Unconstrained                        N/A                   
         let spn = vulns[2]["details"]["delegation_target"].as_str().unwrap();
         assert!(
             spn.starts_with("HTTP/dc02"),
-            "Expected HTTP/dc02 SPN, got {}",
-            spn
+            "Expected HTTP/dc02 SPN, got {spn}"
         );
 
         // DC02$ → unconstrained

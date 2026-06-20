@@ -639,7 +639,7 @@ mod tests {
                 pyramid_level: crate::models::PyramidLevel::DomainNames,
                 mitre_techniques: vec![],
                 required: true,
-                source: "".to_string(),
+                source: String::new(),
             }],
             found_techniques: vec![ExpectedTechnique {
                 technique_id: "T1558.003".to_string(),
@@ -888,7 +888,7 @@ mod tests {
                     pyramid_level: crate::models::PyramidLevel::IpAddresses,
                     mitre_techniques: vec![],
                     required: true,
-                    source: "".to_string(),
+                    source: String::new(),
                 },
                 ExpectedIOC {
                     ioc_type: "ip".to_string(),
@@ -896,7 +896,7 @@ mod tests {
                     pyramid_level: crate::models::PyramidLevel::IpAddresses,
                     mitre_techniques: vec![],
                     required: true,
-                    source: "".to_string(),
+                    source: String::new(),
                 },
             ],
             missed_iocs: vec![ExpectedIOC {
@@ -905,7 +905,7 @@ mod tests {
                 pyramid_level: crate::models::PyramidLevel::DomainNames,
                 mitre_techniques: vec![],
                 required: true,
-                source: "".to_string(),
+                source: String::new(),
             }],
             ..Default::default()
         };

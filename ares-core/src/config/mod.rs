@@ -396,10 +396,8 @@ security: {}
         let cfg = AresConfig::load(f.path()).unwrap();
         assert!(cfg.grafana.is_none());
 
-        let with_grafana = format!(
-            "{}\ngrafana:\n  enabled: true\n  base_url: http://grafana\n",
-            MINIMAL_YAML
-        );
+        let with_grafana =
+            format!("{MINIMAL_YAML}\ngrafana:\n  enabled: true\n  base_url: http://grafana\n");
         let f2 = write_temp_yaml(&with_grafana);
         let cfg2 = AresConfig::load(f2.path()).unwrap();
         assert!(cfg2.grafana.is_some());

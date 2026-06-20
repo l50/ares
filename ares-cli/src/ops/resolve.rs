@@ -29,8 +29,7 @@ pub(crate) fn resolve_ec2_targets(
             "Name=instance-state-name,Values=running",
             "--query",
             &format!(
-                "Reservations[*].Instances[?contains(Tags[?Key==`Name`].Value|[0], `{}`)].PrivateIpAddress",
-                name_pattern
+                "Reservations[*].Instances[?contains(Tags[?Key==`Name`].Value|[0], `{name_pattern}`)].PrivateIpAddress"
             ),
             "--output",
             "text",

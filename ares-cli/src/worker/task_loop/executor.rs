@@ -53,12 +53,12 @@ pub async fn run_agent_task(
                 let combined = output.combined();
                 let disc = ares_tools::parsers::parse_tool_output(tool_name, &raw, tool_params);
                 all_discoveries.push(disc);
-                outputs.push(format!("=== {} ===\n{}", tool_name, combined));
+                outputs.push(format!("=== {tool_name} ===\n{combined}"));
             }
             Err(e) => {
                 warn!(tool = %tool_name, err = %e, "Expanded tool failed");
                 any_error = true;
-                outputs.push(format!("=== {} ===\nERROR: {}", tool_name, e));
+                outputs.push(format!("=== {tool_name} ===\nERROR: {e}"));
             }
         }
     }

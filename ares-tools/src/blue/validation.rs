@@ -83,8 +83,7 @@ pub fn validate_evidence(evidence_type: &str, value: &str, source: &str) -> Vali
         && value.parse::<IpAddr>().is_err()
     {
         warnings.push(format!(
-            "Evidence type is 'suspicious_ip' but value '{}' is not a valid IP address",
-            value,
+            "Evidence type is 'suspicious_ip' but value '{value}' is not a valid IP address",
         ));
         // This is a warning, not a hard failure -- the agent might be
         // storing a hostname or CIDR that we still want to record.

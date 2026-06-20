@@ -241,7 +241,7 @@ async fn wake_cross_forest_fallbacks(dispatcher: &Dispatcher, target_domain: &st
     {
         let s = dispatcher.state.read().await;
         let suffix = format!(".{target_l}");
-        for h in s.hosts.iter() {
+        for h in &s.hosts {
             let hostname = h.hostname.to_lowercase();
             let belongs =
                 !hostname.is_empty() && (hostname == target_l || hostname.ends_with(&suffix));
@@ -393,7 +393,7 @@ pub(crate) fn collect_candidate_children(state: &StateInner) -> HashSet<String> 
         .iter()
         .map(|d| d.to_lowercase())
         .collect();
-    for h in state.hashes.iter() {
+    for h in &state.hashes {
         if h.username.eq_ignore_ascii_case("administrator")
             && h.hash_type.eq_ignore_ascii_case("NTLM")
             && !h.hash_value.is_empty()
@@ -417,7 +417,7 @@ pub(crate) fn build_child_to_parent_work_path_a(
     candidates: &HashSet<String>,
 ) -> Vec<ChildToParentWorkItem> {
     let mut out = Vec::new();
-    for child_domain in candidates.iter() {
+    for child_domain in candidates {
         let cd_lower = child_domain.to_lowercase();
         let labels: Vec<&str> = cd_lower.split('.').collect();
         if labels.len() < 3 {
@@ -689,7 +689,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     .keys()
                     .map(|d| d.to_lowercase())
                     .collect();
-                for d in state.dominated_domains.iter() {
+                for d in &state.dominated_domains {
                     candidate_domains.insert(d.to_lowercase());
                 }
                 let enum_work: Vec<(String, String, String)> = candidate_domains
@@ -978,8 +978,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         details.insert(
                             "note".into(),
                             serde_json::Value::String(format!(
-                                "Child-to-parent escalation via ExtraSid — {} → {}",
-                                child_domain, parent_domain
+                                "Child-to-parent escalation via ExtraSid — {child_domain} → {parent_domain}"
                             )),
                         );
                         let vuln = ares_core::models::VulnerabilityInfo {

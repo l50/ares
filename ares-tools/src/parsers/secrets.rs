@@ -140,7 +140,7 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                 if nt_hash.len() == 32 && nt_hash != "31d6cfe0d16ae931b73c59d7e0c089c0" {
                     // Skip empty/disabled hashes
                     let lm_hash = parts[2];
-                    let hash_value = format!("{}:{}", lm_hash, nt_hash);
+                    let hash_value = format!("{lm_hash}:{nt_hash}");
 
                     // NTDS exposes rotated-out credentials as
                     // `<name>_history0`, `<name>_history1`, ... and some

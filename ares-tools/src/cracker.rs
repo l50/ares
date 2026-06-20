@@ -235,7 +235,7 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
     };
     let rules_budget = max_time_secs - wordlist_budget;
 
-    let total_lists = wordlists.len() + if dynamic_file.is_some() { 1 } else { 0 };
+    let total_lists = wordlists.len() + usize::from(dynamic_file.is_some());
     let per_list_secs = if total_lists > 0 {
         wordlist_budget / total_lists as i64
     } else {
@@ -348,7 +348,7 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
             show_result.stdout
         ),
         stderr: show_result.stderr,
-        exit_code: Some(if cracked.is_empty() { 1 } else { 0 }),
+        exit_code: Some(i32::from(cracked.is_empty())),
         success: true,
     })
 }
@@ -435,7 +435,7 @@ pub async fn crack_with_john(args: &Value) -> Result<ToolOutput> {
         None
     };
 
-    let total_lists = wordlists.len() + if dynamic_file.is_some() { 1 } else { 0 };
+    let total_lists = wordlists.len() + usize::from(dynamic_file.is_some());
     let per_list_secs = if total_lists > 0 {
         max_time_secs / total_lists as i64
     } else {

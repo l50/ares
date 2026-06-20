@@ -393,7 +393,7 @@ pub(crate) fn common_spray_prereqs_met(state: &StateInner, domain: &str) -> bool
     if !asrep_done {
         return false;
     }
-    let delegation_prefix = format!("{}:", d);
+    let delegation_prefix = format!("{d}:");
     if !state.has_processed_prefix(DEDUP_DELEGATION_CREDS, &delegation_prefix) {
         return false;
     }

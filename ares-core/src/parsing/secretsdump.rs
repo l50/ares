@@ -44,7 +44,7 @@ pub fn parse_secretsdump(output: &str) -> Vec<ParsedHash> {
                 continue;
             }
 
-            let hash_value = format!("{}:{}", lm_hash, nt_hash);
+            let hash_value = format!("{lm_hash}:{nt_hash}");
             let username_lower = username.to_lowercase();
 
             results.push(ParsedHash {

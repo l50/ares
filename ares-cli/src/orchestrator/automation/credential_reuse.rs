@@ -258,7 +258,7 @@ pub async fn auto_credential_reuse(
             );
 
             let probe_cred = ares_core::models::Credential {
-                id: format!("reuse-probe-{}@{}", username, target_domain),
+                id: format!("reuse-probe-{username}@{target_domain}"),
                 username: username.clone(),
                 password: password.clone(),
                 domain: target_domain.clone(),

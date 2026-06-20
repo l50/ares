@@ -1131,7 +1131,7 @@ mod tests {
         ] {
             let host = make_host(malformed, "", false);
             let added = state.publish_host(&q, host).await.unwrap();
-            assert!(!added, "must drop malformed host.ip {:?}", malformed);
+            assert!(!added, "must drop malformed host.ip {malformed:?}");
         }
         let s = state.inner.read().await;
         assert!(

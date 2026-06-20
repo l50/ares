@@ -560,7 +560,7 @@ mod tests {
         let outcome = AgentLoopOutcome {
             reason: LoopEndReason::RequestAssistance {
                 issue: "Critical: active data exfiltration".into(),
-                context: "".into(),
+                context: String::new(),
             },
             total_usage: Default::default(),
             steps: 3,
@@ -594,7 +594,7 @@ mod tests {
         let outcome = outcome_with(
             LoopEndReason::RequestAssistance {
                 issue: "Suspicious 4625 cluster, need access to host logs".into(),
-                context: "".into(),
+                context: String::new(),
             },
             4,
         );

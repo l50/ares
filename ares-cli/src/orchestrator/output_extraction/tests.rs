@@ -278,8 +278,7 @@ userPrincipalName: sam.wilson@child.contoso.local";
     // john.smith:Summer2025 must NEVER be produced.
     assert!(
         creds.is_empty(),
-        "LDIF description without same-line username must not produce credentials, got: {:?}",
-        creds
+        "LDIF description without same-line username must not produce credentials, got: {creds:?}"
     );
 }
 

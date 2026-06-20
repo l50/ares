@@ -616,9 +616,9 @@ mod tests {
             AgentRole::Orchestrator,
         ] {
             let result = build_system_prompt(*role, &snapshot, &[], "192.168.58.50");
-            assert!(result.is_ok(), "Failed for role: {:?}", role);
+            assert!(result.is_ok(), "Failed for role: {role:?}");
             let prompt = result.unwrap();
-            assert!(!prompt.is_empty(), "Empty prompt for role: {:?}", role);
+            assert!(!prompt.is_empty(), "Empty prompt for role: {role:?}");
         }
     }
 

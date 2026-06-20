@@ -152,7 +152,7 @@ pub async fn enumerate_users(args: &Value) -> Result<ToolOutput> {
 
     let build_creds = || -> Vec<String> {
         if null_session {
-            vec!["-u".into(), "".into(), "-p".into(), "".into()]
+            vec!["-u".into(), String::new(), "-p".into(), String::new()]
         } else {
             credentials::netexec_creds(
                 optional_str(args, "username"),
@@ -447,7 +447,7 @@ pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
             r#"python3 -c "
 from impacket.ldap import ldap as ldap_mod
 from impacket.ldap.ldaptypes import LDAP_SID
-conn = ldap_mod.LDAPConnection('ldap://{target}', '{base_dn}', '{target}')
+conn = ldap_mod.LDAPConnection('ldap://{target}', '{computed_base_dn}', '{target}')
 conn.login('{u}', '', '{bind_domain}', lmhash='', nthash='{nt_hash}')
 sc = ldap_mod.SimplePagedResultsControl(size=1000)
 resp = conn.search(searchFilter='(objectClass=trustedDomain)', attributes=['cn','trustDirection','trustType','trustAttributes','flatName','securityIdentifier'], searchControls=[sc])
@@ -473,11 +473,6 @@ for item in resp:
         pass
 "
 "#,
-            target = target,
-            bind_domain = bind_domain,
-            u = u,
-            nt_hash = nt_hash,
-            base_dn = computed_base_dn,
         );
         return CommandBuilder::new("bash")
             .args(["-c", &ldap_query])
@@ -724,11 +719,6 @@ for item in resp:
         pass
 "
 "#,
-            target = target,
-            domain = domain,
-            u = u,
-            nt_hash = nt_hash,
-            base_dn = base_dn,
         );
         return CommandBuilder::new("bash")
             .args(["-c", &ldap_query])

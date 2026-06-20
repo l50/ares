@@ -577,24 +577,20 @@ mod tests {
             // record_compromised_host is the remaining reporting tool (log-only, no state write)
             assert!(
                 names.contains(&"record_compromised_host"),
-                "Role {:?} missing record_compromised_host",
-                role
+                "Role {role:?} missing record_compromised_host"
             );
             // Removed reporting tools must NOT be present
             assert!(
                 !names.contains(&"record_weakness"),
-                "Role {:?} has removed tool record_weakness",
-                role
+                "Role {role:?} has removed tool record_weakness"
             );
             assert!(
                 !names.contains(&"list_weaknesses"),
-                "Role {:?} has removed tool list_weaknesses",
-                role
+                "Role {role:?} has removed tool list_weaknesses"
             );
             assert!(
                 !names.contains(&"record_timeline_event"),
-                "Role {:?} has removed tool record_timeline_event",
-                role
+                "Role {role:?} has removed tool record_timeline_event"
             );
         }
     }
@@ -750,8 +746,7 @@ mod tests {
             assert_eq!(
                 AgentRole::parse(role.as_str()),
                 Some(role),
-                "Roundtrip failed for {:?}",
-                role
+                "Roundtrip failed for {role:?}"
             );
         }
     }
@@ -950,8 +945,7 @@ mod tests {
                 let tools = blue_tools_for_role(role);
                 assert!(
                     !tools.iter().any(|t| t.name == "add_lateral_connection"),
-                    "{:?} should NOT have add_lateral_connection",
-                    role
+                    "{role:?} should NOT have add_lateral_connection"
                 );
             }
         }
@@ -1026,18 +1020,15 @@ mod tests {
                 let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
                 assert!(
                     names.contains(&"add_evidence"),
-                    "{:?} missing add_evidence",
-                    role
+                    "{role:?} missing add_evidence"
                 );
                 assert!(
                     names.contains(&"get_investigation_summary"),
-                    "{:?} missing get_investigation_summary",
-                    role
+                    "{role:?} missing get_investigation_summary"
                 );
                 assert!(
                     names.contains(&"add_technique"),
-                    "{:?} missing add_technique",
-                    role
+                    "{role:?} missing add_technique"
                 );
             }
         }

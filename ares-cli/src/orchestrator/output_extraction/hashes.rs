@@ -105,7 +105,7 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
         if RE_NTLM_PARTIAL.is_match(line) && i + 1 < lines.len() {
             let next = lines[i + 1].trim();
             if RE_NTLM_CONTINUATION.is_match(next) {
-                unwrapped.push(format!("{}{}", line, next));
+                unwrapped.push(format!("{line}{next}"));
                 i += 2;
                 continue;
             }

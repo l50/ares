@@ -1095,7 +1095,7 @@ mod tests {
         let mut dominated = HashSet::new();
         dominated.insert("contoso.local".to_string());
         let mut dcs = std::collections::HashMap::new();
-        dcs.insert("".to_string(), "192.168.58.1".to_string());
+        dcs.insert(String::new(), "192.168.58.1".to_string());
         let result = compute_undominated_forests(
             Some("contoso.local"),
             Some("contoso.local"),

@@ -349,7 +349,7 @@ pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher:
         let upgraded = {
             let mut state = dispatcher.state.write().await;
             let mut found = false;
-            for cred in state.credentials.iter_mut() {
+            for cred in &mut state.credentials {
                 if cred.username.to_lowercase() == username.to_lowercase()
                     && cred.domain.to_lowercase() == domain
                     && !cred.is_admin

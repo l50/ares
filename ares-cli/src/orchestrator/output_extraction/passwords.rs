@@ -75,7 +75,7 @@ fn extract_rpcclient_description_passwords(
                         .trim_matches('"')
                         .to_string();
                     if is_valid_credential(username, &password) {
-                        let key = format!("{}\\{}:{}", default_domain, username, password);
+                        let key = format!("{default_domain}\\{username}:{password}");
                         if seen.insert(key) {
                             credentials.push(make_credential(
                                 username,
@@ -154,7 +154,7 @@ pub fn extract_plaintext_passwords(
                     .trim()
                     .to_string();
                 if is_valid_credential(&user, &pass) {
-                    let key = format!("{}\\{}:{}", domain, user, pass);
+                    let key = format!("{domain}\\{user}:{pass}");
                     if seen.insert(key) {
                         credentials.push(make_credential(&user, &pass, &domain, "netexec_auth"));
                     }
@@ -182,7 +182,7 @@ pub fn extract_plaintext_passwords(
                 let user = caps.get(2).unwrap().as_str().to_string();
                 let pass = caps.get(3).unwrap().as_str().to_string();
                 if is_valid_credential(&user, &pass) {
-                    let key = format!("{}\\{}:{}", domain, user, pass);
+                    let key = format!("{domain}\\{user}:{pass}");
                     if seen.insert(key) {
                         credentials.push(make_credential(
                             &user,
@@ -250,7 +250,7 @@ pub fn extract_plaintext_passwords(
             };
 
             if !username.is_empty() && is_valid_credential(&username, &password) {
-                let key = format!("{}\\{}:{}", current_domain, username, password);
+                let key = format!("{current_domain}\\{username}:{password}");
                 if seen.insert(key) {
                     credentials.push(make_credential(
                         &username,

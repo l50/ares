@@ -244,9 +244,7 @@ impl CommandBuilder {
                 }
                 abort.abort();
                 Err(anyhow::anyhow!(
-                    "command timed out after {:?}: {}",
-                    timeout,
-                    display_cmd
+                    "command timed out after {timeout:?}: {display_cmd}"
                 ))
             }
         }

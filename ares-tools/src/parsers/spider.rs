@@ -482,8 +482,7 @@ $pass = New-Object Security.PSCredential
         let creds = parse_spider_credentials(output, &json!({"domain": "contoso.local"}));
         assert!(
             creds.is_empty(),
-            "should reject variable-ref usernames and cmdlet passwords, got: {:?}",
-            creds
+            "should reject variable-ref usernames and cmdlet passwords, got: {creds:?}"
         );
     }
 
@@ -504,8 +503,7 @@ $password = "P@ssw0rd!"
         let creds = parse_spider_credentials(output, &json!({"domain": "fabrikam.local"}));
         assert!(
             creds.is_empty(),
-            "should reject `$User.UserName` username after stripping `FABRIKAM\\` prefix, got: {:?}",
-            creds
+            "should reject `$User.UserName` username after stripping `FABRIKAM\\` prefix, got: {creds:?}"
         );
     }
 
@@ -520,8 +518,7 @@ net use \\dc01\share /user:CONTOSO\Get-Credential P@ssw0rd!
         let creds = parse_spider_credentials(output, &json!({"domain": "contoso.local"}));
         assert!(
             creds.is_empty(),
-            "should reject cmdlet-shaped username in net use, got: {:?}",
-            creds
+            "should reject cmdlet-shaped username in net use, got: {creds:?}"
         );
     }
 

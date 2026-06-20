@@ -39,7 +39,7 @@ fn extract_source_domain(step: &serde_json::Value) -> &str {
 
 /// Build ACL chain step dedup key.
 fn acl_step_dedup_key(chain_idx: usize, step_idx: usize) -> String {
-    format!("chain:{}:step:{}", chain_idx, step_idx)
+    format!("chain:{chain_idx}:step:{step_idx}")
 }
 
 /// Follows ACL chains from BloodHound results, dispatching each step when
