@@ -28,7 +28,9 @@ pub use delegation::{extract_delegation_account, parse_delegation};
 pub use mssql::{parse_mssql_impersonation, parse_mssql_linked_servers};
 pub use nmap::{flush_nmap_host, parse_nmap_output};
 pub use ntsd::parse_acl_enumeration;
-pub use secrets::{parse_asrep_roast, parse_kerberoast, parse_secretsdump};
+pub use secrets::{
+    extract_mssql_hosts_from_kerberoast, parse_asrep_roast, parse_kerberoast, parse_secretsdump,
+};
 pub use smb::{parse_netexec_smb, parse_smb_signing};
 pub use spider::parse_spider_credentials;
 pub use trust::parse_domain_trusts;
@@ -132,6 +134,14 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
             let hashes = parse_kerberoast(output, params);
             if !hashes.is_empty() {
                 discoveries["hashes"] = Value::Array(hashes);
+            }
+            // An `MSSQLSvc/<fqdn>` SPN in the roast output proves the host runs
+            // SQL Server on 1433 even when no port scan ever reached it —
+            // enrich `host.services` so `auto_mssql_detection` can arm the
+            // MSSQL automation tree off the kerberoast alone.
+            let mssql_hosts = extract_mssql_hosts_from_kerberoast(output);
+            if !mssql_hosts.is_empty() {
+                discoveries["hosts"] = Value::Array(mssql_hosts);
             }
         }
         "asrep_roast" | "kerberos_user_enum_noauth" => {
@@ -918,6 +928,27 @@ contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:222222222222222
         let params = json!({"domain": "contoso.local"});
         let disc = parse_tool_output("kerberoast", output, &params);
         assert_eq!(disc["hashes"].as_array().unwrap().len(), 1);
+        // No MSSQLSvc SPN in this roast → no host enrichment.
+        assert!(disc.get("hosts").is_none());
+    }
+
+    #[test]
+    fn parse_tool_output_kerberoast_enriches_mssql_host() {
+        // A roast that captured an MSSQLSvc ticket must surface BOTH the hash
+        // and a host carrying 1433 so auto_mssql_detection can arm the tree.
+        let output =
+            "$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$MSSQLSvc/sql01.contoso.local~1433*$aabb$ccdd";
+        let params = json!({"domain": "contoso.local"});
+        let disc = parse_tool_output("kerberoast", output, &params);
+        assert_eq!(disc["hashes"].as_array().unwrap().len(), 1);
+        let hosts = disc["hosts"].as_array().expect("hosts array");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0]["hostname"], "sql01.contoso.local");
+        assert!(hosts[0]["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("1433")));
     }
 
     #[test]

@@ -288,6 +288,19 @@ pub async fn process_completed_task(
             // primitive on getST exit-0.
             let has_ticket_evidence =
                 is_ticket_grant_vuln(&vuln_id) && result_has_ccache_evidence(&result.result);
+            // MSSQL primitives (mssql_access / mssql_impersonation /
+            // mssql_linked_server) connect and run SELECTs but extract no
+            // credential/hash/host the regex parsers attach to `discoveries`
+            // and write no `.ccache` — so the default evidence gate rejects
+            // every confirmed MSSQL win and `mark_exploited` is never called.
+            // That deadlocks the entire deterministic MSSQL automation tree:
+            // `auto_mssql_exploitation::select_mssql_deep_work` and
+            // `auto_mssql_impersonation::collect_impersonation_work` both gate
+            // on `exploited_vulnerabilities`, which nothing else ever sets.
+            // Credit the primitive when the raw tool output proves a real
+            // impacket-mssqlclient session landed (post-auth banner / prompt).
+            let has_mssql_evidence =
+                vuln_id.starts_with("mssql") && result_has_mssql_session(&result.result);
             // Stall-tolerance: when the LLM ends its turn without calling
             // task_complete (LoopEndReason::MaxSteps or budget exhaustion),
             // submission.rs stamps `success=false` with an error string
@@ -302,10 +315,14 @@ pub async fn process_completed_task(
             let stalled_with_evidence = !result.success
                 && error_indicates_stall(result.error.as_deref())
                 && !result_text_indicates_failure(&result.result)
-                && (result_has_parser_evidence(&result.result) || has_ticket_evidence);
+                && (result_has_parser_evidence(&result.result)
+                    || has_ticket_evidence
+                    || has_mssql_evidence);
             let actually_succeeded = (result.success
                 && !result_text_indicates_failure(&result.result)
-                && (result_has_parser_evidence(&result.result) || has_ticket_evidence))
+                && (result_has_parser_evidence(&result.result)
+                    || has_ticket_evidence
+                    || has_mssql_evidence))
                 || stalled_with_evidence;
 
             if actually_succeeded {
@@ -912,6 +929,34 @@ fn error_indicates_stall(err: Option<&str>) -> bool {
         || lower.contains("max steps")
         || lower.contains("agent hit max tokens")
         || lower.contains("budget exceeded")
+}
+
+/// True when an exploit task's raw tool output proves a real
+/// impacket-mssqlclient session reached the server. Recognises the post-auth
+/// connection banner (`ENVCHANGE(...)`, `ACK: Result`) and the interactive
+/// `SQL>` / `SQL (...)>` prompt impacket only prints after a successful login.
+///
+/// MSSQL access / impersonation / linked-server primitives produce no
+/// credential/hash/host/ccache the regex parsers can attach to `discoveries`,
+/// so this is the grounding signal that lets `mark_exploited` fire and unblocks
+/// the deterministic MSSQL automation tree. Narrow on purpose — a bare LLM
+/// claim of "connected" with no tool banner won't match, and login failures
+/// (`[-] ERROR(...): Login failed`) emit none of these tokens.
+fn result_has_mssql_session(result: &Option<Value>) -> bool {
+    let Some(payload) = result.as_ref() else {
+        return false;
+    };
+    for text in collect_result_text_parts(payload) {
+        let lower = text.to_lowercase();
+        if lower.contains("envchange(")
+            || lower.contains("ack: result")
+            || lower.contains("sql>")
+            || (lower.contains("sql (") && lower.contains(")>"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn result_has_parser_evidence(result: &Option<Value>) -> bool {
