@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn shell_join_empty_string_arg() {
-        let args = vec!["".to_string()];
+        let args = vec![String::new()];
         assert_eq!(shell_join(&args), "''");
     }
 

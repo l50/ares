@@ -432,7 +432,7 @@ fn print_vulnerabilities(
 
     let mut exploitable: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
     let mut findings: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
-    for (id, vuln) in discovered.iter() {
+    for (id, vuln) in discovered {
         if vuln.priority <= EXPLOITABLE_PRIORITY_MAX {
             exploitable.push((id, vuln));
         } else {
@@ -892,7 +892,7 @@ fn print_attack_path(timeline_events: &[serde_json::Value]) {
             format!("{prefix}{description}")
         };
 
-        println!("  {:<23} {:<70} {}", ts_display, desc_display, mitre);
+        println!("  {ts_display:<23} {desc_display:<70} {mitre}");
     }
     println!();
 }
@@ -1719,11 +1719,7 @@ mod tests {
 
     #[test]
     fn forest_structure_empty_strings_filtered() {
-        let input = vec![
-            "".to_string(),
-            "  ".to_string(),
-            "contoso.local".to_string(),
-        ];
+        let input = vec![String::new(), "  ".to_string(), "contoso.local".to_string()];
         let (domains, roots, _children) = compute_forest_structure(&input);
         assert_eq!(domains, vec!["contoso.local"]);
         assert_eq!(roots, vec!["contoso.local"]);
@@ -1888,7 +1884,7 @@ mod tests {
             "Contoso.Local".into(),
             "  contoso.local  ".into(),
             "contoso.local.".into(),
-            "".into(),
+            String::new(),
         ];
         let t = super::compute_forest_topology(&input);
         assert_eq!(t.forest_roots, vec!["contoso.local"]);
@@ -2025,7 +2021,7 @@ mod tests {
             ares_core::models::VulnerabilityInfo {
                 vuln_id: vuln_id.into(),
                 vuln_type: "test".into(),
-                target: "".into(),
+                target: String::new(),
                 discovered_by: "test".into(),
                 discovered_at: chrono::Utc::now(),
                 details: HashMap::new(),

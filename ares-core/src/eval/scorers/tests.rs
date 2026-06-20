@@ -24,7 +24,7 @@ fn make_gt() -> EvaluationGroundTruth {
                 pyramid_level: PyramidLevel::IpAddresses,
                 mitre_techniques: vec!["T1046".to_string()],
                 required: true,
-                source: "".to_string(),
+                source: String::new(),
             },
             ExpectedIOC {
                 ioc_type: "user".to_string(),
@@ -32,7 +32,7 @@ fn make_gt() -> EvaluationGroundTruth {
                 pyramid_level: PyramidLevel::NetworkHostArtifacts,
                 mitre_techniques: vec![],
                 required: true,
-                source: "".to_string(),
+                source: String::new(),
             },
             ExpectedIOC {
                 ioc_type: "hash".to_string(),
@@ -40,7 +40,7 @@ fn make_gt() -> EvaluationGroundTruth {
                 pyramid_level: PyramidLevel::HashValues,
                 mitre_techniques: vec![],
                 required: false,
-                source: "".to_string(),
+                source: String::new(),
             },
         ],
         expected_techniques: vec![
@@ -154,7 +154,7 @@ fn ioc_user_domain_prefix() {
         pyramid_level: PyramidLevel::NetworkHostArtifacts,
         mitre_techniques: vec![],
         required: true,
-        source: "".to_string(),
+        source: String::new(),
     };
 
     let found = build_found_values(&snap);

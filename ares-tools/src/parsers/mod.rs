@@ -949,7 +949,7 @@ contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:222222222222222
         let params = json!({"domain": "contoso.local", "dc_ip": "192.168.58.10"});
         let disc = parse_tool_output("kerberos_user_enum_noauth", output, &params);
         let users = disc["discovered_users"].as_array().unwrap();
-        assert_eq!(users.len(), 3, "Should find 3 valid users, got {:?}", users);
+        assert_eq!(users.len(), 3, "Should find 3 valid users, got {users:?}");
 
         let names: Vec<&str> = users
             .iter()

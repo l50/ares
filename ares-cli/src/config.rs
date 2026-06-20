@@ -85,7 +85,7 @@ fn config_show(config_path: Option<String>, models_only: bool) -> Result<()> {
     let mut roles: Vec<_> = cfg.agents.iter().collect();
     roles.sort_by_key(|(k, _)| (*k).clone());
     for (role, agent) in &roles {
-        println!("  {}:", role);
+        println!("  {role}:");
         println!("    model: {}", agent.model);
         println!("    max_steps: {}", agent.max_steps);
         if !agent.pod_selector.is_empty() {
@@ -123,7 +123,7 @@ fn config_show(config_path: Option<String>, models_only: bool) -> Result<()> {
     let mut vulns: Vec<_> = cfg.vulnerability_priorities.iter().collect();
     vulns.sort_by_key(|(_, v)| **v);
     for (vuln, priority) in &vulns {
-        println!("  {}: {}", vuln, priority);
+        println!("  {vuln}: {priority}");
     }
 
     // Context management
@@ -160,7 +160,7 @@ fn config_validate(config_path: Option<String>) -> Result<()> {
     // Check all agents have models
     for (role, agent) in &cfg.agents {
         if agent.model.is_empty() {
-            warnings.push(format!("Agent '{}' has no model set", role));
+            warnings.push(format!("Agent '{role}' has no model set"));
         }
     }
 
@@ -177,7 +177,7 @@ fn config_validate(config_path: Option<String>) -> Result<()> {
     ];
     for role in &expected_roles {
         if !cfg.agents.contains_key(*role) {
-            warnings.push(format!("Expected agent role '{}' not found", role));
+            warnings.push(format!("Expected agent role '{role}' not found"));
         }
     }
 
@@ -195,7 +195,7 @@ fn config_validate(config_path: Option<String>) -> Result<()> {
     } else {
         println!("Config: {} ({} warnings)\n", path.display(), warnings.len());
         for w in &warnings {
-            println!("  WARNING: {}", w);
+            println!("  WARNING: {w}");
         }
     }
 
@@ -246,7 +246,7 @@ fn config_set_model(
     std::fs::write(&path, &new_contents)
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
-    println!("{}: {} -> {}", role, old_model, model);
+    println!("{role}: {old_model} -> {model}");
     Ok(())
 }
 
@@ -256,7 +256,7 @@ fn config_set_model(
 /// It finds the role's section under `agents:` and replaces its `model:` line.
 fn replace_model_in_yaml(yaml: &str, role: &str, _old_model: &str, new_model: &str) -> String {
     // Strategy: find `  {role}:\n` then the next `    model: "{old}"` line
-    let role_header = format!("  {}:", role);
+    let role_header = format!("  {role}:");
     let mut result = String::with_capacity(yaml.len());
     let lines = yaml.lines().peekable();
     let mut in_target_role = false;
@@ -279,7 +279,7 @@ fn replace_model_in_yaml(yaml: &str, role: &str, _old_model: &str, new_model: &s
             if trimmed.starts_with("model:") {
                 // Replace the model value, preserving indentation
                 let indent = &line[..line.len() - line.trim_start().len()];
-                let new_line = format!("{}model: \"{}\"", indent, new_model);
+                let new_line = format!("{indent}model: \"{new_model}\"");
                 result.push_str(&new_line);
                 result.push('\n');
                 replaced = true;

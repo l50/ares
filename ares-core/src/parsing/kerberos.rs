@@ -112,7 +112,7 @@ mod tests {
     fn extract_tgs_hash_value_preserved() {
         let line =
             "$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$cifs/dc01.contoso.local@CONTOSO.LOCAL$abc123def456";
-        let output = format!("{}\n", line);
+        let output = format!("{line}\n");
         let results = extract_kerberos_hashes(&output);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hash_value, line);

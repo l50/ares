@@ -81,7 +81,7 @@ pub(super) fn build_pattern_filter(patterns: &[&str]) -> String {
     if patterns.len() <= 3 && patterns.iter().all(|p| !is_regex_pattern(p)) {
         return patterns
             .iter()
-            .map(|p| format!(r#" |= "{}""#, p))
+            .map(|p| format!(r#" |= "{p}""#))
             .collect::<String>();
     }
     // Multiple or regex patterns: use case-insensitive regex alternation

@@ -62,7 +62,7 @@ pub fn extract_shares(output: &str) -> Vec<Share> {
                     } else {
                         String::new()
                     };
-                    let key = format!("{}:{}", current_ip, share_name);
+                    let key = format!("{current_ip}:{share_name}");
                     if seen.insert(key) {
                         shares.push(Share {
                             host: current_ip.clone(),

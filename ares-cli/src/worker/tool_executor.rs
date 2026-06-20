@@ -657,9 +657,8 @@ mod tests {
         // Verify the format used in execute_and_respond for unavailable tools
         let tool_name = "nonexistent_tool";
         let error_msg = format!(
-            "Tool '{}' is not installed on this worker. \
-             Do not call this tool again — it failed to spawn previously.",
-            tool_name
+            "Tool '{tool_name}' is not installed on this worker. \
+             Do not call this tool again — it failed to spawn previously."
         );
         assert!(error_msg.contains("nonexistent_tool"));
         assert!(error_msg.contains("not installed"));

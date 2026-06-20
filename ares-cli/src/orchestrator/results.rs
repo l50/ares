@@ -189,7 +189,7 @@ mod tests {
     use super::*;
 
     fn conn_err(msg: &str) -> anyhow::Error {
-        anyhow::anyhow!("{}", msg)
+        anyhow::anyhow!("{msg}")
     }
 
     #[test]

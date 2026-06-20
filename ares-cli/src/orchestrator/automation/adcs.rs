@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn extract_domain_from_fqdn_trailing_dot() {
         // "host." splits into ("host", "") -> Some("")
-        assert_eq!(extract_domain_from_fqdn("host."), Some("".to_string()));
+        assert_eq!(extract_domain_from_fqdn("host."), Some(String::new()));
     }
 
     #[test]

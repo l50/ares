@@ -252,8 +252,8 @@ impl InvestigationStore {
             data.query_effectiveness.push(QueryEffectiveness {
                 query_pattern: query_pattern.to_string(),
                 total_executions: 1,
-                successful_executions: if successful { 1 } else { 0 },
-                evidence_producing: if produced_evidence { 1 } else { 0 },
+                successful_executions: usize::from(successful),
+                evidence_producing: usize::from(produced_evidence),
                 alert_types: alert_type
                     .map(|at| vec![at.to_string()])
                     .unwrap_or_default(),

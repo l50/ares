@@ -207,7 +207,7 @@ async fn multi_turn_tool_use_then_task_complete() {
             assert_eq!(task_id, "task-recon-001");
             assert!(result.contains("Found 5 hosts"));
         }
-        other => panic!("Expected TaskComplete, got: {:?}", other),
+        other => panic!("Expected TaskComplete, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 2);
@@ -226,7 +226,7 @@ async fn max_steps_limit() {
     let responses: Vec<LlmResponse> = (0..5)
         .map(|i| {
             tool_use_response(vec![ToolCall {
-                id: format!("call_{}", i),
+                id: format!("call_{i}"),
                 name: "nmap_scan".into(),
                 arguments: json!({"target": format!("192.168.58.{}", i)}),
             }])
@@ -263,7 +263,7 @@ async fn max_steps_limit() {
 
     match &outcome.reason {
         LoopEndReason::MaxSteps => {}
-        other => panic!("Expected MaxSteps, got: {:?}", other),
+        other => panic!("Expected MaxSteps, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 3);
@@ -517,7 +517,7 @@ async fn end_turn_no_tool_calls() {
         LoopEndReason::EndTurn { content } => {
             assert!(content.contains("nothing more to do"));
         }
-        other => panic!("Expected EndTurn, got: {:?}", other),
+        other => panic!("Expected EndTurn, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 1);
@@ -575,7 +575,7 @@ async fn tool_dispatch_error_fed_back() {
             assert_eq!(task_id, "task-recon-004");
             assert!(result.contains("failed"));
         }
-        other => panic!("Expected TaskComplete, got: {:?}", other),
+        other => panic!("Expected TaskComplete, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 2);
@@ -628,7 +628,7 @@ async fn tool_dispatch_hard_error_fed_back() {
         LoopEndReason::TaskComplete { task_id, .. } => {
             assert_eq!(task_id, "task-recon-004b");
         }
-        other => panic!("Expected TaskComplete, got: {:?}", other),
+        other => panic!("Expected TaskComplete, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 2);
@@ -669,7 +669,7 @@ async fn request_assistance_callback() {
             assert_eq!(issue, "Cannot reach target host");
             assert!(context.contains("ARP scan"));
         }
-        other => panic!("Expected RequestAssistance, got: {:?}", other),
+        other => panic!("Expected RequestAssistance, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 1);
@@ -770,7 +770,7 @@ async fn llm_error_returns_error_outcome() {
         LoopEndReason::Error(msg) => {
             assert!(msg.contains("no more queued responses"));
         }
-        other => panic!("Expected Error, got: {:?}", other),
+        other => panic!("Expected Error, got: {other:?}"),
     }
 
     assert_eq!(outcome.steps, 1);
@@ -853,7 +853,7 @@ async fn rate_limit_retry_succeeds() {
         LoopEndReason::EndTurn { content } => {
             assert!(content.contains("Recovered"));
         }
-        other => panic!("Expected EndTurn after retry, got: {:?}", other),
+        other => panic!("Expected EndTurn after retry, got: {other:?}"),
     }
 
     // Should have taken 1 step (the retry is transparent to the loop)
@@ -904,7 +904,7 @@ async fn auth_error_fails_immediately() {
         LoopEndReason::Error(msg) => {
             assert!(msg.contains("authentication failed"));
         }
-        other => panic!("Expected Error with auth message, got: {:?}", other),
+        other => panic!("Expected Error with auth message, got: {other:?}"),
     }
 
     // Should have taken exactly 1 step (no retries for auth errors)

@@ -415,7 +415,7 @@ pub async fn process_completed_task(
     if result_has_seimpersonate_signal(&result.result) {
         let host_label =
             derive_seimpersonate_host_label(dispatcher, task_target_ip.as_deref()).await;
-        let vuln_id = format!("seimpersonate_{}", host_label);
+        let vuln_id = format!("seimpersonate_{host_label}");
         let mut details = std::collections::HashMap::new();
         details.insert("host".into(), Value::String(host_label.clone()));
         if let Some(ref ip) = task_target_ip {

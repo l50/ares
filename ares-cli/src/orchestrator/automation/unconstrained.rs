@@ -1203,7 +1203,7 @@ mod tests {
         ares_core::models::VulnerabilityInfo {
             vuln_id: vuln_id.to_string(),
             vuln_type: "unconstrained_delegation".into(),
-            target: "".into(),
+            target: String::new(),
             discovered_by: "test".into(),
             discovered_at: chrono::Utc::now(),
             details,

@@ -331,7 +331,7 @@ mod tests {
         let cred = ares_core::models::Credential {
             id: "c1".into(),
             username: "admin".into(),
-            password: "".into(),
+            password: String::new(),
             domain: "contoso.local".into(),
             source: "test".into(),
             is_admin: false,

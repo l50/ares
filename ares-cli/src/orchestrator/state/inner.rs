@@ -772,7 +772,7 @@ impl StateInner {
     pub fn forest_root_of(&self, domain: &str) -> String {
         let d = domain.to_lowercase();
         // Check if this domain is a child of any known domain
-        for known in self.domains.iter() {
+        for known in &self.domains {
             let k = known.to_lowercase();
             if d != k && d.ends_with(&format!(".{k}")) {
                 return k;
@@ -1251,11 +1251,11 @@ mod tests {
             ares_core::models::VulnerabilityInfo {
                 vuln_id: "constrained_delegation_john.smith".into(),
                 vuln_type: "constrained_delegation".into(),
-                target: "".into(),
-                discovered_by: "".into(),
+                target: String::new(),
+                discovered_by: String::new(),
                 discovered_at: chrono::Utc::now(),
                 details,
-                recommended_agent: "".into(),
+                recommended_agent: String::new(),
                 priority: 8,
             },
         );

@@ -84,7 +84,7 @@ pub fn parse_nmap_output(output: &str, params: &Value) -> Vec<Value> {
                                            // nmap -sV output: "389/tcp open ldap Microsoft Windows Active Directory LDAP ..."
                                            // We want just "ldap", not the full version string.
                 let service = parts[2];
-                services.push(format!("{} ({})", port_proto, service));
+                services.push(format!("{port_proto} ({service})"));
             }
         }
 

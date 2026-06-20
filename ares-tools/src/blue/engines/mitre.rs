@@ -95,8 +95,7 @@ pub fn generate_mitre_questions(
                             questions.push(InvestigativeQuestion {
                                 id: make_question_id("recipe"),
                                 question: format!(
-                                    "Check for: {} (detection recipe: {})",
-                                    text, recipe_name
+                                    "Check for: {text} (detection recipe: {recipe_name})"
                                 ),
                                 source: "mitre",
                                 rationale: format!("Detection indicator from {recipe_name} recipe"),

@@ -95,17 +95,14 @@ impl OperationRecoveryManager {
             .await
             .context("Failed to check operation existence")?;
         if !exists {
-            anyhow::bail!(
-                "Operation {} not found in Redis -- cannot recover",
-                operation_id
-            );
+            anyhow::bail!("Operation {operation_id} not found in Redis -- cannot recover");
         }
 
         let mut loaded_state = reader
             .load_state(&mut conn)
             .await
             .context("Failed to load state from Redis")?
-            .ok_or_else(|| anyhow::anyhow!("Operation {} has no state data", operation_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Operation {operation_id} has no state data"))?;
 
         info!(
             operation_id = operation_id,
@@ -226,8 +223,7 @@ impl OperationRecoveryManager {
                 // Exceeded max retries
                 task.status = TaskStatus::Failed;
                 task.error = Some(format!(
-                    "Pod restart during execution (max retries {} exceeded)",
-                    max_retries
+                    "Pod restart during execution (max retries {max_retries} exceeded)"
                 ));
                 task.completed_at = Some(chrono::Utc::now());
                 failed_task_ids.push(task_id.clone());

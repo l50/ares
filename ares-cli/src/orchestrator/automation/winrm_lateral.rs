@@ -339,8 +339,7 @@ mod tests {
             });
             assert_eq!(
                 has_winrm, expected,
-                "Services {:?} should have winrm={expected}",
-                services
+                "Services {services:?} should have winrm={expected}"
             );
         }
     }

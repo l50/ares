@@ -7,7 +7,7 @@ use crate::models::PyramidLevel;
 fn expected_technique_exact_match() {
     let tech = ExpectedTechnique {
         technique_id: "T1003".to_string(),
-        technique_name: "".to_string(),
+        technique_name: String::new(),
         required: true,
         parent_id: None,
     };
@@ -19,7 +19,7 @@ fn expected_technique_exact_match() {
 fn expected_technique_parent_child_match() {
     let parent = ExpectedTechnique {
         technique_id: "T1003".to_string(),
-        technique_name: "".to_string(),
+        technique_name: String::new(),
         required: true,
         parent_id: None,
     };
@@ -28,7 +28,7 @@ fn expected_technique_parent_child_match() {
 
     let child = ExpectedTechnique {
         technique_id: "T1003.006".to_string(),
-        technique_name: "".to_string(),
+        technique_name: String::new(),
         required: true,
         parent_id: Some("T1003".to_string()),
     };
@@ -67,7 +67,7 @@ fn ground_truth_filters() {
                 pyramid_level: PyramidLevel::IpAddresses,
                 mitre_techniques: vec![],
                 required: true,
-                source: "".to_string(),
+                source: String::new(),
             },
             ExpectedIOC {
                 ioc_type: "hash".to_string(),
@@ -75,19 +75,19 @@ fn ground_truth_filters() {
                 pyramid_level: PyramidLevel::HashValues,
                 mitre_techniques: vec![],
                 required: false,
-                source: "".to_string(),
+                source: String::new(),
             },
         ],
         expected_techniques: vec![
             ExpectedTechnique {
                 technique_id: "T1003".to_string(),
-                technique_name: "".to_string(),
+                technique_name: String::new(),
                 required: true,
                 parent_id: None,
             },
             ExpectedTechnique {
                 technique_id: "T1046".to_string(),
-                technique_name: "".to_string(),
+                technique_name: String::new(),
                 required: false,
                 parent_id: None,
             },
@@ -313,7 +313,7 @@ fn writable_share_is_marked_required() {
         gt.expected_shares
             .iter()
             .find(|s| s.name == name)
-            .unwrap_or_else(|| panic!("share '{}' missing", name))
+            .unwrap_or_else(|| panic!("share '{name}' missing"))
     };
 
     // READ alone is not writable in the codebase logic — only WRITE or READ/WRITE
@@ -376,7 +376,6 @@ fn technique_deduplication_across_vulns() {
         .count();
     assert_eq!(
         t1558_count, 1,
-        "T1558.003 must be deduplicated across vulns: found {} copies",
-        t1558_count
+        "T1558.003 must be deduplicated across vulns: found {t1558_count} copies"
     );
 }

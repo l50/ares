@@ -38,7 +38,7 @@ fn secretsdump_dedup_key(ip: &str, domain: &str, username: &str) -> String {
 
 /// Build PTH secretsdump dedup key.
 fn pth_secretsdump_dedup_key(dc_ip: &str, parent_domain: &str) -> String {
-    format!("{}:{}:pth_admin", dc_ip, parent_domain)
+    format!("{dc_ip}:{parent_domain}:pth_admin")
 }
 
 /// Build parent-to-child PTH dedup key. Distinct from `pth_secretsdump_dedup_key`
@@ -101,7 +101,7 @@ pub(crate) fn select_local_admin_secretsdump_work(state: &StateInner) -> Vec<Sec
         .filter(|c| c.is_admin || !state.is_delegation_account(&c.username))
         .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
     {
-        for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
+        for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
             if !is_valid_secretsdump_target(dc_domain, &cred.domain) {
                 continue;
             }
@@ -125,7 +125,7 @@ pub(crate) fn select_pth_secretsdump_work(state: &StateInner) -> Vec<PthSecretsd
     let mut items = Vec::new();
     for dominated in &state.dominated_domains {
         let dom = dominated.to_lowercase();
-        for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
+        for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
             if !is_child_of(&dom, dc_domain) {
                 continue;
             }
@@ -178,7 +178,7 @@ pub(crate) fn select_parent_to_child_secretsdump_work(
         }) else {
             continue;
         };
-        for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
+        for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
             let dc_dom_lc = dc_domain.to_lowercase();
             if !is_child_of(&dc_dom_lc, &parent_dom) {
                 continue;
@@ -277,7 +277,7 @@ async fn dispatch_krbtgt_extraction_direct(
 ) -> bool {
     let task_id = format!("krbtgt_extract_{}", uuid::Uuid::new_v4().simple());
     let call = ToolCall {
-        id: format!("{}_call", task_id),
+        id: format!("{task_id}_call"),
         name: "secretsdump".to_string(),
         arguments: build_krbtgt_extraction_args(dc_ip, domain, hash_value),
     };
@@ -346,7 +346,7 @@ pub(crate) async fn dispatch_krbtgt_extraction_with_ticket(
 ) -> bool {
     let task_id = format!("krbtgt_extract_s4u_{}", uuid::Uuid::new_v4().simple());
     let call = ToolCall {
-        id: format!("{}_call", task_id),
+        id: format!("{task_id}_call"),
         name: "secretsdump".to_string(),
         arguments: build_krbtgt_extraction_ticket_args(dc_ip, domain, username, ticket_path),
     };
@@ -583,7 +583,7 @@ pub async fn auto_krbtgt_extraction(
         let work: Vec<(String, String, String, String)> = {
             let state = dispatcher.state.read().await;
             let mut items = Vec::new();
-            for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
+            for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
                 let dom = dc_domain.to_lowercase();
                 if has_krbtgt_hash(&state, &dom) {
                     continue;

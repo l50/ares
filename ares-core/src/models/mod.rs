@@ -145,7 +145,7 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("target_domain".to_string(), "null".to_string());
         data.insert("target_ip".to_string(), "\"\"".to_string());
-        data.insert("domain_admin_path".to_string(), "".to_string());
+        data.insert("domain_admin_path".to_string(), String::new());
 
         let meta = OperationMeta::from_redis_hash(&data);
         assert!(meta.target_domain.is_none());

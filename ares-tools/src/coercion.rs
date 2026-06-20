@@ -332,9 +332,8 @@ async fn spawn_responder(
         if Instant::now() >= deadline {
             let stderr = stderr_buf.lock().await.clone();
             return Err(format!(
-                "responder didn't bind {listener_ip}:445 within {:?} \
-                 (stderr={stderr})",
-                bind_timeout
+                "responder didn't bind {listener_ip}:445 within {bind_timeout:?} \
+                 (stderr={stderr})"
             ));
         }
         sleep(Duration::from_millis(250)).await;
@@ -1680,7 +1679,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     Ok(ToolOutput {
         stdout,
         stderr: String::new(),
-        exit_code: Some(if success { 0 } else { 1 }),
+        exit_code: Some(i32::from(!success)),
         success,
     })
 }

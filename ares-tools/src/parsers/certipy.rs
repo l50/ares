@@ -99,7 +99,7 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
                 Some(tmpl) => {
                     format!("adcs_{}_{}_{}", esc_type, target_ip, slugify_template(tmpl),)
                 }
-                None => format!("adcs_{}_{}", esc_type, target_ip),
+                None => format!("adcs_{esc_type}_{target_ip}"),
             };
 
             vulns.push(json!({

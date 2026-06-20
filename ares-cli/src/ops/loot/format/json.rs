@@ -123,7 +123,7 @@ pub(super) fn print_loot_json(
                 "compromised": root_compromised || !compromised_children.is_empty(),
                 "root_compromised": root_compromised,
                 "total_domains": 1 + children.len(),
-                "compromised_domains": (if root_compromised { 1 } else { 0 }) + compromised_children.len(),
+                "compromised_domains": usize::from(root_compromised) + compromised_children.len(),
             })
         })
         .collect();

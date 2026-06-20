@@ -71,7 +71,7 @@ async fn credential_summary_empty() {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
             assert_eq!(parsed["total_credentials"], 0);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -97,7 +97,7 @@ async fn credential_summary_with_data() {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
             assert_eq!(parsed["total_credentials"], 2);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -115,7 +115,7 @@ async fn hash_summary_empty() {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
             assert_eq!(parsed["total_hashes"], 0);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -144,7 +144,7 @@ async fn hash_value_lookup() {
             assert!(msg.contains("313b6f423a71d74c"));
             assert!(msg.contains("f8b6c5e4d3a2b109"));
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -159,7 +159,7 @@ async fn hash_value_not_found() {
     let result = handler.handle_callback(&call).await.unwrap().unwrap();
     match result {
         CallbackResult::Continue(msg) => assert!(msg.contains("No hashes found")),
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -177,7 +177,7 @@ async fn pending_tasks_empty() {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
             assert_eq!(parsed["total"], 0);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -235,7 +235,7 @@ async fn operation_summary() {
             assert_eq!(parsed["hashes"]["total"], 1);
             assert_eq!(parsed["has_domain_admin"], true);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -279,7 +279,7 @@ async fn all_credentials_pagination() {
             assert_eq!(parsed["credentials"].as_array().unwrap().len(), 3);
             assert_eq!(parsed["offset"], 2);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -341,7 +341,7 @@ async fn full_summary_with_populated_state() {
             assert_eq!(p["has_domain_admin"], true);
             assert_eq!(p["discovered_vulnerabilities"], 1);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -371,7 +371,7 @@ async fn credential_summary_multi_domain() {
             let domains = p["by_domain"].as_array().unwrap();
             assert_eq!(domains.len(), 2);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -397,7 +397,7 @@ async fn hash_value_case_insensitive_lookup() {
     let result = handler.handle_callback(&call).await.unwrap().unwrap();
     match result {
         CallbackResult::Continue(msg) => assert!(msg.contains("beef:dead")),
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -433,7 +433,7 @@ async fn hash_value_filter_by_type() {
             assert!(msg.contains("aes_hash"));
             assert!(!msg.contains("ntlm_hash"));
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -546,7 +546,7 @@ async fn all_hashes_pagination_large() {
             assert_eq!(p["total"], 50);
             assert_eq!(p["hashes"].as_array().unwrap().len(), 10);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -564,7 +564,7 @@ async fn record_credential_disabled() {
             assert!(msg.contains("disabled"));
             assert!(msg.contains("automatically extracted"));
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -582,7 +582,7 @@ async fn record_timeline_event_disabled() {
             assert!(msg.contains("disabled"));
             assert!(msg.contains("automatically generated"));
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -624,7 +624,7 @@ async fn list_credentials_delegates_to_get_all() {
             assert_eq!(parsed["total"], 2);
             assert!(parsed["credentials"].as_array().is_some());
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -702,7 +702,7 @@ async fn hash_summary_with_mixed_types() {
             let by_type = parsed["by_type"].as_array().unwrap();
             assert_eq!(by_type.len(), 2); // NTLM and aes256
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -736,7 +736,7 @@ async fn all_credentials_zero_offset_default_limit() {
             assert_eq!(parsed["limit"], 30);
             assert_eq!(parsed["credentials"].as_array().unwrap().len(), 5);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -768,7 +768,7 @@ async fn all_hashes_default_params() {
             assert_eq!(h["username"], "admin");
             assert_eq!(h["has_aes_key"], true);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -790,7 +790,7 @@ async fn operation_summary_empty_state() {
             assert_eq!(parsed["hosts"], 0);
             assert_eq!(parsed["discovered_vulnerabilities"], 0);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
 
@@ -818,6 +818,6 @@ async fn hash_value_empty_domain_filter() {
             let arr = parsed.as_array().unwrap();
             assert_eq!(arr.len(), 2);
         }
-        other => panic!("Expected Continue, got: {:?}", other),
+        other => panic!("Expected Continue, got: {other:?}"),
     }
 }
