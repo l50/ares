@@ -107,6 +107,14 @@ pub struct StateInner {
     // ACL step dedup (tracks which chain steps have been dispatched)
     pub dispatched_acl_steps: HashSet<String>,
 
+    // Machine accounts ares created during the op (via impacket-addcomputer in
+    // the RBCD / shadow-cred / KrbRelayUp chains). Stored normalized: lowercase,
+    // trailing `$` stripped. ACL/RBCD chain-followers exclude these as targets so
+    // ares never burns cycles attacking (or `bloodyad_set_password`-ing) the
+    // decoy/helper accounts it planted itself. In-memory only — on restart the
+    // worst case is re-observing the addcomputer success line.
+    pub created_machine_accounts: HashSet<String>,
+
     // Pending/completed tasks (in-memory only)
     pub pending_tasks: HashMap<String, TaskInfo>,
     pub completed_tasks: HashMap<String, ares_core::models::TaskResult>,
@@ -218,6 +226,7 @@ impl StateInner {
             mssql_enum_dispatched: HashSet::new(),
             acl_chains: Vec::new(),
             dispatched_acl_steps: HashSet::new(),
+            created_machine_accounts: HashSet::new(),
             pending_tasks: HashMap::new(),
             completed_tasks: HashMap::new(),
             quarantined_principals: HashMap::new(),
@@ -282,6 +291,31 @@ impl StateInner {
     /// Mark `domain` as dominated. Returns true when newly inserted.
     pub fn mark_dominated(&mut self, domain: String) -> bool {
         self.dominated_domains.insert(domain)
+    }
+
+    /// Normalize a machine-account name for self-created tracking: lowercase
+    /// and strip the trailing `$` so `ARESATK01$`, `aresatk01$`, and
+    /// `aresatk01` all collapse to the same key.
+    fn normalize_machine_account(name: &str) -> String {
+        name.trim().trim_end_matches('$').to_lowercase()
+    }
+
+    /// Record a machine account ares created (e.g. via impacket-addcomputer).
+    /// Returns true when newly inserted.
+    pub fn record_created_machine_account(&mut self, name: &str) -> bool {
+        let key = Self::normalize_machine_account(name);
+        if key.is_empty() {
+            return false;
+        }
+        self.created_machine_accounts.insert(key)
+    }
+
+    /// True when `name` is a machine account ares created itself during this op.
+    /// Chain-followers consult this to avoid attacking their own planted
+    /// helper/decoy accounts.
+    pub fn is_self_created_machine_account(&self, name: &str) -> bool {
+        let key = Self::normalize_machine_account(name);
+        !key.is_empty() && self.created_machine_accounts.contains(&key)
     }
 
     /// Set the cracked password on the first matching hash (by username and
@@ -1137,6 +1171,31 @@ mod tests {
             .mssql_enum_dispatched
             .insert("192.168.58.20".to_string());
         assert!(state.mssql_enum_dispatched.contains("192.168.58.20"));
+    }
+
+    #[test]
+    fn created_machine_account_tracking_normalizes() {
+        let mut state = StateInner::new("op-1".into());
+        assert!(!state.is_self_created_machine_account("ARESATK01$"));
+
+        // Record with trailing `$` and uppercase; lookups in any case/with or
+        // without `$` must all hit.
+        assert!(state.record_created_machine_account("ARESATK01$"));
+        assert!(state.is_self_created_machine_account("ARESATK01$"));
+        assert!(state.is_self_created_machine_account("aresatk01"));
+        assert!(state.is_self_created_machine_account("  ARESATK01$  "));
+        // A different account is not matched.
+        assert!(!state.is_self_created_machine_account("SQL01$"));
+        // Re-recording the same (normalized) name is idempotent.
+        assert!(!state.record_created_machine_account("aresatk01"));
+    }
+
+    #[test]
+    fn created_machine_account_ignores_empty() {
+        let mut state = StateInner::new("op-1".into());
+        assert!(!state.record_created_machine_account("$"));
+        assert!(!state.record_created_machine_account("   "));
+        assert!(!state.is_self_created_machine_account(""));
     }
 
     #[test]
