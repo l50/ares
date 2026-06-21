@@ -265,9 +265,7 @@ mod tests {
     fn primed_state() -> StateInner {
         let mut state = StateInner::new("test".into());
         let vuln = seimpersonate_vuln("192.168.58.20", "sql01");
-        state
-            .exploited_vulnerabilities
-            .insert(vuln.vuln_id.clone());
+        state.exploited_vulnerabilities.insert(vuln.vuln_id.clone());
         state
             .discovered_vulnerabilities
             .insert(vuln.vuln_id.clone(), vuln);
@@ -365,9 +363,7 @@ mod tests {
         let mut state = StateInner::new("test".into());
         let mut vuln = seimpersonate_vuln("192.168.58.21", "sql02");
         vuln.details.remove("target_ip");
-        state
-            .exploited_vulnerabilities
-            .insert(vuln.vuln_id.clone());
+        state.exploited_vulnerabilities.insert(vuln.vuln_id.clone());
         state
             .discovered_vulnerabilities
             .insert(vuln.vuln_id.clone(), vuln);
