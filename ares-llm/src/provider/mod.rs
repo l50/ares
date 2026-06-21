@@ -260,7 +260,8 @@ pub trait LlmProvider: Send + Sync {
 ///
 /// Supported prefixes:
 /// - `anthropic/` → AnthropicProvider (reads `ANTHROPIC_API_KEY`)
-/// - `openai/` → OpenAiProvider (reads `OPENAI_API_KEY`)
+/// - `openai/` → OpenAiProvider (reads `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`
+///   to target any OpenAI-compatible endpoint, e.g. Gemini's `/v1beta/openai` API)
 /// - `ollama/` → OllamaProvider (reads `OLLAMA_BASE_URL`, default `http://localhost:11434`)
 ///
 /// If no prefix, defaults to Anthropic.
@@ -273,7 +274,10 @@ pub fn create_provider(model: &str) -> anyhow::Result<(Box<dyn LlmProvider>, Str
     } else if let Some(model_name) = model.strip_prefix("openai/") {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))?;
-        let provider = openai::OpenAiProvider::new(api_key, None);
+        // Optional override so `openai/<model>` can target any OpenAI-compatible
+        // endpoint (e.g. Gemini's `/v1beta/openai/chat/completions`).
+        let base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let provider = openai::OpenAiProvider::new(api_key, base_url);
         Ok((Box::new(provider), model_name.to_string()))
     } else if let Some(model_name) = model.strip_prefix("ollama/") {
         let base_url = std::env::var("OLLAMA_BASE_URL")
