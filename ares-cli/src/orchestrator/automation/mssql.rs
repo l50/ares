@@ -37,8 +37,19 @@ pub async fn auto_mssql_detection(
                         .iter()
                         .any(|s| s.contains("1433") || s.to_lowercase().contains("mssql"))
                 })
-                .filter(|h| !state.mssql_enum_dispatched.contains(&h.ip))
-                .map(|h| (h.ip.clone(), h.hostname.clone()))
+                .filter_map(|h| {
+                    // A host discovered only via a kerberoast MSSQLSvc SPN
+                    // carries an empty ip — recover it from a sibling scan
+                    // record by hostname before targeting, otherwise the vuln
+                    // is published with an empty `target` and goes nowhere.
+                    let ip = if h.ip.is_empty() {
+                        state.resolve_host_ip_by_hostname(&h.hostname)?
+                    } else {
+                        h.ip.clone()
+                    };
+                    Some((ip, h.hostname.clone()))
+                })
+                .filter(|(ip, _)| !state.mssql_enum_dispatched.contains(ip))
                 .collect()
         };
 

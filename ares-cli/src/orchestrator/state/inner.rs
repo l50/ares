@@ -459,6 +459,45 @@ impl StateInner {
         None
     }
 
+    /// Resolve a host's IP from its hostname by scanning other host records.
+    ///
+    /// A host discovered only via a kerberoast `MSSQLSvc/<fqdn>` SPN carries an
+    /// empty `ip` (see `extract_mssql_hosts_from_kerberoast`); `publish_host`
+    /// merges it by hostname into an IP-bearing scan record. That merge misses
+    /// when the scan record knows the machine by its bare NetBIOS short name
+    /// (`sql01`) while the SPN carries the FQDN (`sql01.contoso.local`),
+    /// leaving two split records. This recovers the IP so `auto_mssql_detection`
+    /// can still target the host instead of emitting an empty `target`.
+    pub fn resolve_host_ip_by_hostname(&self, hostname: &str) -> Option<String> {
+        if hostname.is_empty() {
+            return None;
+        }
+        let hostname_lower = hostname.to_lowercase();
+        // Pass 1: exact FQDN match (case-insensitive).
+        for host in &self.hosts {
+            if host.ip.is_empty() || host.hostname.is_empty() {
+                continue;
+            }
+            if host.hostname.eq_ignore_ascii_case(&hostname_lower) {
+                return Some(host.ip.clone());
+            }
+        }
+        // Pass 2: a bare short-name record matching this FQDN's first label.
+        // Restricted to dotless hostnames so we never cross-match
+        // `sql01.contoso.local` to `sql01.fabrikam.local`.
+        let short = hostname_lower.split('.').next().unwrap_or(&hostname_lower);
+        for host in &self.hosts {
+            if host.ip.is_empty() || host.hostname.is_empty() {
+                continue;
+            }
+            let other = host.hostname.to_lowercase();
+            if !other.contains('.') && other == short {
+                return Some(host.ip.clone());
+            }
+        }
+        None
+    }
+
     /// Return all unique domains that have a resolvable DC.
     ///
     /// Merges domains from `domain_controllers`, `domains`, and `trusted_domains`
@@ -1636,5 +1675,70 @@ mod tests {
         assert_eq!(resolved.0.username, "alice");
         assert_eq!(resolved.0.domain, "contoso.local");
         assert_eq!(resolved.1.as_deref(), Some("CrossForestAdmins"));
+    }
+
+    // --- resolve_host_ip_by_hostname (kerberoast MSSQLSvc IP recovery) -----
+
+    fn host_with(ip: &str, hostname: &str) -> Host {
+        Host {
+            ip: ip.to_string(),
+            hostname: hostname.to_string(),
+            os: String::new(),
+            roles: vec![],
+            services: vec![],
+            is_dc: false,
+            owned: false,
+        }
+    }
+
+    #[test]
+    fn resolve_host_ip_by_hostname_matches_exact_fqdn() {
+        let mut state = StateInner::new("op-1".into());
+        state
+            .hosts
+            .push(host_with("192.168.58.30", "sql01.contoso.local"));
+        assert_eq!(
+            state.resolve_host_ip_by_hostname("SQL01.contoso.local"),
+            Some("192.168.58.30".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_host_ip_by_hostname_matches_bare_short_name() {
+        // The split-record case: the scan record knows the host only by its
+        // short NetBIOS name while the kerberoast SPN carries the FQDN.
+        let mut state = StateInner::new("op-1".into());
+        state.hosts.push(host_with("192.168.58.30", "sql01"));
+        assert_eq!(
+            state.resolve_host_ip_by_hostname("sql01.contoso.local"),
+            Some("192.168.58.30".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_host_ip_by_hostname_no_cross_domain_fqdn_match() {
+        // A short-label collision across domains must NOT resolve: the only
+        // IP-bearing record is sql01.fabrikam.local, but we asked about
+        // sql01.contoso.local.
+        let mut state = StateInner::new("op-1".into());
+        state
+            .hosts
+            .push(host_with("192.168.58.40", "sql01.fabrikam.local"));
+        assert_eq!(
+            state.resolve_host_ip_by_hostname("sql01.contoso.local"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_host_ip_by_hostname_ignores_empty_ip_and_empty_arg() {
+        let mut state = StateInner::new("op-1".into());
+        // Only an empty-IP record exists — nothing to recover from.
+        state.hosts.push(host_with("", "sql01.contoso.local"));
+        assert_eq!(
+            state.resolve_host_ip_by_hostname("sql01.contoso.local"),
+            None
+        );
+        assert_eq!(state.resolve_host_ip_by_hostname(""), None);
     }
 }
