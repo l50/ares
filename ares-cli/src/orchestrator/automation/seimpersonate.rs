@@ -85,7 +85,10 @@ fn collect_seimpersonate_work(state: &StateInner) -> Vec<SeImpersonateWork> {
                 })?;
 
             // Already own this host via admin/secretsdump -> SYSTEM is redundant.
-            if state.is_processed(DEDUP_SECRETSDUMP, &target_ip) {
+            // Every DEDUP_SECRETSDUMP key is composite (`{ip}:{domain}:{user}`,
+            // `{ip}:{domain}:pth_admin`, `{ip}:{domain}:krbtgt_extraction_*`), so
+            // a bare-IP exact match never fires — probe by the `{ip}:` prefix.
+            if state.has_processed_prefix(DEDUP_SECRETSDUMP, &format!("{target_ip}:")) {
                 return None;
             }
 
@@ -318,10 +321,26 @@ mod tests {
 
     #[test]
     fn collect_skips_host_we_already_own() {
-        // Existing secretsdump on the host means SYSTEM is redundant.
+        // Existing secretsdump on the host means SYSTEM is redundant. Production
+        // writers use composite `{ip}:{domain}:{user}` keys (never a bare IP),
+        // so the guard must match on the `{ip}:` prefix.
         let mut state = primed_state();
-        state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.20".into());
+        state.mark_processed(
+            DEDUP_SECRETSDUMP,
+            "192.168.58.20:contoso.local:administrator".into(),
+        );
         assert!(collect_seimpersonate_work(&state).is_empty());
+    }
+
+    #[test]
+    fn collect_not_suppressed_by_other_host_secretsdump() {
+        // A secretsdump on a *different* host must not suppress this one.
+        let mut state = primed_state();
+        state.mark_processed(
+            DEDUP_SECRETSDUMP,
+            "192.168.58.99:contoso.local:administrator".into(),
+        );
+        assert_eq!(collect_seimpersonate_work(&state).len(), 1);
     }
 
     #[test]
