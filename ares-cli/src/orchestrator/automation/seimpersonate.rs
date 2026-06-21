@@ -435,7 +435,10 @@ mod tests {
         let mut tracker = HashMap::new();
         tracker.insert(
             "seimpersonate_sql01".to_string(),
-            (now - (SEIMPERSONATE_FAILURE_COOLDOWN + Duration::from_secs(1)), 1),
+            (
+                now - (SEIMPERSONATE_FAILURE_COOLDOWN + Duration::from_secs(1)),
+                1,
+            ),
         );
         assert_eq!(collect_seimpersonate_work(&state, &tracker, now).len(), 1);
     }
