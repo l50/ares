@@ -3,9 +3,51 @@ use super::admin_checks::{
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
 use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
-use super::{result_has_credential_evidence, result_has_parser_evidence};
+use super::{result_has_credential_evidence, result_has_mssql_session, result_has_parser_evidence};
 use ares_core::models::{Credential, Hash};
 use serde_json::json;
+
+#[test]
+fn mssql_session_recognised_from_envchange_banner() {
+    // impacket-mssqlclient emits ENVCHANGE only after a successful login.
+    let result = Some(json!({
+        "tool_outputs": [
+            "[*] Encryption required, switching to TLS\n\
+             [*] ENVCHANGE(DATABASE): Old Value: master, New Value: master\n\
+             SQL> SELECT @@version"
+        ]
+    }));
+    assert!(result_has_mssql_session(&result));
+}
+
+#[test]
+fn mssql_session_recognised_from_sql_prompt_object_output() {
+    // tool_outputs entries can be objects carrying an `output` field.
+    let result = Some(json!({
+        "tool_outputs": [
+            {"output": "SQL (SQL01\\svc_sql  dbo@master)> SELECT SYSTEM_USER"}
+        ]
+    }));
+    assert!(result_has_mssql_session(&result));
+}
+
+#[test]
+fn mssql_session_rejects_login_failure() {
+    // A login failure carries none of the post-auth banner tokens.
+    let result = Some(json!({
+        "tool_outputs": ["[-] ERROR(SQL01): Login failed for user 'svc_sql'"]
+    }));
+    assert!(!result_has_mssql_session(&result));
+}
+
+#[test]
+fn mssql_session_rejects_bare_llm_claim() {
+    // A summary-only "I connected" with no tool banner must not count —
+    // collect_result_text_parts only reads tool_outputs.
+    let result = Some(json!({"summary": "Connected to MSSQL and confirmed access"}));
+    assert!(!result_has_mssql_session(&result));
+    assert!(!result_has_mssql_session(&None));
+}
 
 #[test]
 fn parser_evidence_requires_discoveries_key() {

@@ -40,6 +40,23 @@ impl ExploitAuth {
             .unwrap_or(false);
         cred_match || hash_match
     }
+
+    /// True when the selected auth clears the dispatch credential gate.
+    ///
+    /// Non-MSSQL exploits require a domain-matched credential
+    /// ([`Self::matches_domain`]) — firing with a wrong-realm cred just
+    /// produces KRB failures. MSSQL exploits relax to "any usable credential
+    /// or hash": a SQL Server login is decoupled from the AD realm (SQL
+    /// logins, `sa`, Windows-auth across trusts), so an exact domain-string
+    /// match is the wrong gate and would defer dispatch forever when the only
+    /// creds we hold carry a NetBIOS/short or trusted-realm domain form.
+    fn satisfies_dispatch_gate(&self, target_domain: &str, is_mssql: bool) -> bool {
+        if is_mssql {
+            self.credential.is_some() || self.hash.is_some()
+        } else {
+            self.matches_domain(target_domain)
+        }
+    }
 }
 
 /// Select a credential + hash for an exploit task.
@@ -568,10 +585,20 @@ impl Dispatcher {
             //
             // Pre-auth attacks (zerologon and friends) bypass the gate
             // because they don't need authentication to fire.
-            if !domain.is_empty()
-                && !vuln_type_is_preauth(&vuln.vuln_type)
-                && !auth.matches_domain(domain)
-            {
+            //
+            // MSSQL primitives use a relaxed gate: a SQL Server login is
+            // decoupled from the AD realm (SQL logins, `sa`, and Windows-auth
+            // across trusts all authenticate fine), so requiring an exact
+            // `c.domain == details["domain"]` string match defers dispatch
+            // forever when the only creds we hold carry a NetBIOS/short or
+            // trusted-realm domain form — even though they are exactly the
+            // sysadmin/impersonator accounts on the box. Gate MSSQL on
+            // "we hold *some* usable credential or hash" instead; the worker
+            // is handed every domain credential via `all_credentials` below
+            // and tries each. Non-MSSQL exploits keep the strict domain gate.
+            let is_mssql_exploit = vuln.vuln_type.to_lowercase().starts_with("mssql");
+            let auth_satisfied = auth.satisfies_dispatch_gate(domain, is_mssql_exploit);
+            if !domain.is_empty() && !vuln_type_is_preauth(&vuln.vuln_type) && !auth_satisfied {
                 debug!(
                     vuln_id = %vuln.vuln_id,
                     vuln_type = %vuln.vuln_type,
@@ -937,6 +964,40 @@ mod tests {
     fn matches_domain_empty_target_rejects_no_auth() {
         let auth = ExploitAuth::default();
         assert!(!auth.matches_domain(""));
+    }
+
+    #[test]
+    fn dispatch_gate_non_mssql_requires_domain_match() {
+        // Non-MSSQL: a wrong-realm cred must NOT satisfy the gate.
+        let auth = ExploitAuth {
+            credential: Some(make_cred("alice", "contoso.local")),
+            hash: None,
+        };
+        assert!(!auth.satisfies_dispatch_gate("fabrikam.local", false));
+        assert!(auth.satisfies_dispatch_gate("contoso.local", false));
+    }
+
+    #[test]
+    fn dispatch_gate_mssql_accepts_cross_realm_cred() {
+        // MSSQL: a cred whose domain string does not match the vuln's domain
+        // (NetBIOS/short/trusted-realm form) still clears the gate — SQL login
+        // is decoupled from the AD realm. This is the symptom-2 fix: holding
+        // the sysadmin/impersonator account must let the exploit dispatch.
+        let auth = ExploitAuth {
+            credential: Some(make_cred("svc_sql", "contoso.local")),
+            hash: None,
+        };
+        assert!(auth.satisfies_dispatch_gate("CONTOSO", true));
+        assert!(auth.satisfies_dispatch_gate("child.contoso.local", true));
+    }
+
+    #[test]
+    fn dispatch_gate_mssql_still_requires_some_auth() {
+        // MSSQL relaxation is "any usable auth", not "no auth" — with nothing
+        // in state the gate must still defer so we don't loop a credless
+        // exploit until abandonment.
+        let auth = ExploitAuth::default();
+        assert!(!auth.satisfies_dispatch_gate("contoso.local", true));
     }
 
     #[test]
