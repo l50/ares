@@ -22,6 +22,15 @@ static RE_CRACKED_ASREP: LazyLock<Regex> = LazyLock::new(|| {
 static RE_CRACKED_NTLM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-fA-F0-9]{32}:(.+)$").unwrap());
 
+/// Hashcat cracked NetNTLMv2 (mode 5600), as captured by Responder/relay:
+/// `USER::DOMAIN:serverchallenge:ntproofstr:blob:plaintext`. The username and
+/// (NetBIOS) domain are embedded in the hash itself; the three hex fields are
+/// the challenge, the NT proof string, and the blob. Without this, a cracked
+/// Responder hash produced zero credentials and never reached state.
+static RE_CRACKED_NETNTLMV2: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([^:\s]+)::([^:]+):[a-fA-F0-9]+:[a-fA-F0-9]+:[a-fA-F0-9]+:(.+)$").unwrap()
+});
+
 /// John --show output: user:plaintext:RID:LM:NT:...
 static RE_JOHN_SHOW: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([^:\s$][^:]*):([^:]+):\d*:(?:[a-fA-F0-9]*:){0,3}:*\s*$").unwrap()
@@ -118,6 +127,31 @@ pub fn parse_cracker_output(output: &str, params: &Value) -> Vec<Value> {
                         "source": "cracked:hashcat",
                     }));
                 }
+            }
+            continue;
+        }
+
+        // Hashcat cracked NetNTLMv2 (Responder / relay captures).
+        // USER::DOMAIN:chal:ntproof:blob:plaintext — username and domain live in
+        // the hash. The NetNTLMv2 domain is the NetBIOS short name, so prefer the
+        // op's FQDN domain (params) for downstream tooling, falling back to it.
+        if let Some(caps) = RE_CRACKED_NETNTLMV2.captures(stripped) {
+            let user = caps.get(1).unwrap().as_str();
+            let netbios_domain = caps.get(2).unwrap().as_str();
+            let password = caps.get(3).unwrap().as_str();
+            let cred_domain = if domain.is_empty() {
+                netbios_domain
+            } else {
+                domain
+            };
+            let key = format!("{}@{}", user.to_lowercase(), cred_domain.to_lowercase());
+            if seen.insert(key) && is_valid_password(password) {
+                credentials.push(json!({
+                    "username": user,
+                    "password": password,
+                    "domain": cred_domain,
+                    "source": "cracked:hashcat",
+                }));
             }
             continue;
         }
@@ -360,5 +394,50 @@ $krb5asrep$23$alice@CONTOSO.LOCAL:ef961e2fd18a412...6bf150
         let params = json!({"domain": "contoso.local"});
         let creds = parse_cracker_output(output, &params);
         assert!(creds.is_empty());
+    }
+
+    #[test]
+    fn parse_hashcat_netntlmv2_cracked() {
+        // Regression: a NetNTLMv2 hash (Responder capture) cracked by hashcat
+        // produced ZERO credentials because no regex matched the
+        // USER::DOMAIN:chal:ntproof:blob:plaintext format, so the password never
+        // reached state.credentials and lateral/secretsdump automation never fired.
+        let output = "--- hashcat --show ---\n\
+            bob::CONTOSO:1122334455667788:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d:0101000000000000aabbccddeeff00112233445566778899:P@ssw0rd!\n";
+        let params = json!({"domain": "contoso.local"});
+        let creds = parse_cracker_output(output, &params);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["username"], "bob");
+        assert_eq!(creds[0]["password"], "P@ssw0rd!");
+        // FQDN from params is preferred over the NetBIOS name in the hash.
+        assert_eq!(creds[0]["domain"], "contoso.local");
+        assert_eq!(creds[0]["source"], "cracked:hashcat");
+    }
+
+    #[test]
+    fn netntlmv2_falls_back_to_netbios_domain() {
+        // No domain in params -> use the NetBIOS domain embedded in the hash.
+        let output = "--- hashcat --show ---\n\
+            alice::CONTOSO:1122334455667788:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d:0101000000000000aabbccddeeff00112233445566778899:Spr1ng!\n";
+        let params = json!({});
+        let creds = parse_cracker_output(output, &params);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["username"], "alice");
+        assert_eq!(creds[0]["password"], "Spr1ng!");
+        assert_eq!(creds[0]["domain"], "CONTOSO");
+    }
+
+    #[test]
+    fn netntlmv2_uncracked_hash_not_parsed() {
+        // An UNcracked NetNTLMv2 hash line (no trailing :plaintext) must not be
+        // mistaken for a credential — the hash belongs in state.hashes only.
+        let output = "--- hashcat --show ---\n\
+            bob::CONTOSO:1122334455667788:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d:0101000000000000aabbccddeeff00112233445566778899\n";
+        let params = json!({"domain": "contoso.local"});
+        let creds = parse_cracker_output(output, &params);
+        assert!(
+            creds.is_empty(),
+            "uncracked NetNTLMv2 hash must not become a credential, got: {creds:?}"
+        );
     }
 }
