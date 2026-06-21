@@ -76,6 +76,9 @@ pub const DEDUP_DACL_ABUSE: &str = "dacl_abuse";
 pub const DEDUP_SMBCLIENT_ENUM: &str = "smbclient_enum";
 pub const DEDUP_ACL_DISCOVERY: &str = "acl_discovery";
 pub const DEDUP_CROSS_FOREST_ENUM: &str = "cross_forest_enum";
+/// Dedup for `auto_seimpersonate` — one SYSTEM-escalation follow-up per host
+/// where a `seimpersonate` primitive was credited.
+pub const DEDUP_SEIMPERSONATE: &str = "seimpersonate_escalation";
 pub const DEDUP_CROSS_REALM_LATERAL: &str = "cross_realm_lateral";
 pub const DEDUP_GOLDEN_CERT: &str = "golden_cert";
 /// Per-(vuln_id, credential) dedup for re-dispatching MSSQL exploits when

@@ -64,6 +64,7 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_nopac);
     spawn_auto!(auto_zerologon);
     spawn_auto!(auto_print_nightmare);
+    spawn_auto!(auto_seimpersonate);
     spawn_auto!(auto_smb_signing_detection);
     spawn_auto!(auto_share_coercion);
     spawn_auto!(auto_mssql_coercion);

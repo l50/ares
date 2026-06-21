@@ -426,9 +426,11 @@ pub async fn process_completed_task(
     // `whoami /priv` (or equivalent) showing SeImpersonatePrivilege held
     // (and enabled), we have everything needed to escalate to SYSTEM via
     // PrintSpoofer / GodPotato. Surface this as `seimpersonate_<host>` and
-    // mark exploited so the scoreboard credits the primitive. The follow-on
-    // potato dispatch is left for the existing privesc agent (already wired
-    // with godpotato / printspoofer tools) to consume opportunistically.
+    // mark exploited so the scoreboard credits the primitive. The credited
+    // token is consumed by `auto_seimpersonate`, which dispatches the actual
+    // SYSTEM escalation + privilege-bearing follow-up (the generic
+    // exploitation path intentionally skips `seimpersonate` via
+    // `is_automation_owned_vuln`).
     if result_has_seimpersonate_signal(&result.result) {
         let host_label =
             derive_seimpersonate_host_label(dispatcher, task_target_ip.as_deref()).await;
