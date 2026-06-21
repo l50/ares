@@ -18,16 +18,29 @@
 //! and then chains a SYSTEM-context win (local SAM/LSA secrets, machine-account
 //! RBCD, or coerce+relay of a signing-disabled DC).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::automation::mssql_exploitation::find_mssql_credential;
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
+
+/// Cooldown before re-dispatching a SeImpersonate escalation that failed to land
+/// SYSTEM. Failures here are environmental (AV blocked the potato, no writable
+/// path, binary staging failed) rather than account lockouts, so the wait is
+/// shorter than the S4U cooldown — a retry can plausibly succeed on the next pass.
+const SEIMPERSONATE_FAILURE_COOLDOWN: Duration = Duration::from_secs(180);
+
+/// Maximum dispatch attempts per host before giving up. A potato that cannot
+/// land after a few tries is a deterministic dead-end (hardened host, AV); the
+/// `task_complete` failure summary lets the operator/LLM route an alternative.
+const SEIMPERSONATE_MAX_FAILURES: u32 = 3;
 
 /// A SYSTEM-escalation follow-up for one host with a credited `seimpersonate`
 /// primitive.
@@ -56,7 +69,17 @@ fn domain_from_hostname(hostname: &str) -> String {
 /// (present in `exploited_vulnerabilities`), we can resolve a target IP, we
 /// don't already have admin on that host (an existing secretsdump means SYSTEM
 /// is moot), and we hold a usable credential to re-establish code execution.
-fn collect_seimpersonate_work(state: &StateInner) -> Vec<SeImpersonateWork> {
+///
+/// `dispatch_tracker` (vuln_id -> last-dispatch instant + failure count) gates
+/// retries: a host that has not yet succeeded is re-dispatched after
+/// [`SEIMPERSONATE_FAILURE_COOLDOWN`] until [`SEIMPERSONATE_MAX_FAILURES`] is
+/// reached. A *successful* escalation is recorded permanently in
+/// `DEDUP_SEIMPERSONATE` (checked here) so it is never retried.
+fn collect_seimpersonate_work(
+    state: &StateInner,
+    dispatch_tracker: &HashMap<String, (Instant, u32)>,
+    now: Instant,
+) -> Vec<SeImpersonateWork> {
     state
         .discovered_vulnerabilities
         .values()
@@ -68,9 +91,20 @@ fn collect_seimpersonate_work(state: &StateInner) -> Vec<SeImpersonateWork> {
             if !state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
                 return None;
             }
-            // One escalation attempt per host.
+            // Terminal: a prior attempt already escalated this host.
             if state.is_processed(DEDUP_SEIMPERSONATE, &vuln.vuln_id) {
                 return None;
+            }
+            // Retry gating: give up after MAX failures, and respect the cooldown
+            // between attempts so a transient failure doesn't burn the primitive
+            // but a deterministic dead-end eventually stops.
+            if let Some((last_dispatch, failures)) = dispatch_tracker.get(&vuln.vuln_id) {
+                if *failures >= SEIMPERSONATE_MAX_FAILURES {
+                    return None;
+                }
+                if now.duration_since(*last_dispatch) < SEIMPERSONATE_FAILURE_COOLDOWN {
+                    return None;
+                }
             }
 
             // Resolve the target IP from details first, then the vuln target.
@@ -159,6 +193,14 @@ pub async fn auto_seimpersonate(dispatcher: Arc<Dispatcher>, mut shutdown: watch
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // vuln_id -> (last dispatch instant, dispatch/failure count). Gates retries
+    // so a failed escalation is re-attempted after a cooldown rather than
+    // permanently consuming the primitive on the first dispatch.
+    let mut dispatch_tracker: HashMap<String, (Instant, u32)> = HashMap::new();
+    // task_id -> vuln_id, so a completed task's success can be promoted to the
+    // terminal DEDUP_SEIMPERSONATE marker (and stop further retries).
+    let mut task_vuln_map: HashMap<String, String> = HashMap::new();
+
     loop {
         tokio::select! {
             _ = interval.tick() => {},
@@ -172,9 +214,45 @@ pub async fn auto_seimpersonate(dispatcher: Arc<Dispatcher>, mut shutdown: watch
             continue;
         }
 
+        // Promote any completed escalation that succeeded to the terminal marker
+        // so it is never retried; failures fall through to cooldown-gated retry.
+        let succeeded: Vec<(String, String)> = {
+            let state = dispatcher.state.read().await;
+            task_vuln_map
+                .iter()
+                .filter(|(tid, _)| {
+                    state
+                        .completed_tasks
+                        .get(tid.as_str())
+                        .map(|r| r.success)
+                        .unwrap_or(false)
+                })
+                .map(|(tid, vid)| (tid.clone(), vid.clone()))
+                .collect()
+        };
+        for (tid, vid) in succeeded {
+            task_vuln_map.remove(&tid);
+            dispatch_tracker.remove(&vid);
+            {
+                let mut state = dispatcher.state.write().await;
+                state.mark_processed(DEDUP_SEIMPERSONATE, vid.clone());
+            }
+            let _ = dispatcher
+                .state
+                .persist_dedup(&dispatcher.queue, DEDUP_SEIMPERSONATE, &vid)
+                .await;
+            info!(vuln_id = %vid, "SeImpersonate escalation succeeded — marked complete");
+        }
+        // Drop mappings for failed/finished tasks so the map doesn't grow
+        // unbounded; the failure count recorded at dispatch already gates retry.
+        {
+            let state = dispatcher.state.read().await;
+            task_vuln_map.retain(|tid, _| !state.completed_tasks.contains_key(tid.as_str()));
+        }
+
         let work: Vec<SeImpersonateWork> = {
             let state = dispatcher.state.read().await;
-            collect_seimpersonate_work(&state)
+            collect_seimpersonate_work(&state, &dispatch_tracker, Instant::now())
         };
 
         for item in work {
@@ -192,15 +270,15 @@ pub async fn auto_seimpersonate(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                         "SeImpersonate -> SYSTEM escalation dispatched"
                     );
 
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_SEIMPERSONATE, item.vuln_id.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_SEIMPERSONATE, &item.vuln_id)
-                        .await;
+                    // Record the dispatch: bump the failure count (cleared only
+                    // when the task completes successfully) and stamp the time so
+                    // the cooldown gate applies before the next attempt.
+                    let entry = dispatch_tracker
+                        .entry(item.vuln_id.clone())
+                        .or_insert((Instant::now(), 0));
+                    entry.0 = Instant::now();
+                    entry.1 += 1;
+                    task_vuln_map.insert(task_id, item.vuln_id.clone());
                 }
                 Ok(None) => {
                     debug!(target = %item.target_ip, "SeImpersonate escalation task deferred");
@@ -218,6 +296,12 @@ mod tests {
     use super::*;
     use ares_core::models::{Credential, Host, VulnerabilityInfo};
     use std::collections::HashMap;
+
+    /// Collect with no prior dispatches (fresh tracker, current instant) — the
+    /// common case for the guard tests below.
+    fn collect(state: &StateInner) -> Vec<SeImpersonateWork> {
+        collect_seimpersonate_work(state, &HashMap::new(), Instant::now())
+    }
 
     fn make_cred(username: &str, domain: &str) -> Credential {
         Credential {
@@ -286,13 +370,13 @@ mod tests {
     #[test]
     fn collect_empty_state_produces_no_work() {
         let state = StateInner::new("test".into());
-        assert!(collect_seimpersonate_work(&state).is_empty());
+        assert!(collect(&state).is_empty());
     }
 
     #[test]
     fn collect_credited_primitive_produces_work() {
         let state = primed_state();
-        let work = collect_seimpersonate_work(&state);
+        let work = collect(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].target_ip, "192.168.58.20");
         assert_eq!(work[0].host_label, "sql01");
@@ -307,14 +391,14 @@ mod tests {
         // Discovered but not yet in exploited_vulnerabilities -> not actionable.
         let mut state = primed_state();
         state.exploited_vulnerabilities.clear();
-        assert!(collect_seimpersonate_work(&state).is_empty());
+        assert!(collect(&state).is_empty());
     }
 
     #[test]
     fn collect_skips_already_dispatched() {
         let mut state = primed_state();
         state.mark_processed(DEDUP_SEIMPERSONATE, "seimpersonate_sql01".into());
-        assert!(collect_seimpersonate_work(&state).is_empty());
+        assert!(collect(&state).is_empty());
     }
 
     #[test]
@@ -327,7 +411,52 @@ mod tests {
             DEDUP_SECRETSDUMP,
             "192.168.58.20:contoso.local:administrator".into(),
         );
-        assert!(collect_seimpersonate_work(&state).is_empty());
+        assert!(collect(&state).is_empty());
+    }
+
+    #[test]
+    fn collect_respects_cooldown_after_recent_dispatch() {
+        // A dispatch 5s ago is well within the cooldown -> no re-dispatch yet.
+        let state = primed_state();
+        let now = Instant::now();
+        let mut tracker = HashMap::new();
+        tracker.insert(
+            "seimpersonate_sql01".to_string(),
+            (now - Duration::from_secs(5), 1),
+        );
+        assert!(collect_seimpersonate_work(&state, &tracker, now).is_empty());
+    }
+
+    #[test]
+    fn collect_allows_retry_after_cooldown_expires() {
+        // Once the cooldown has elapsed, a failed host is eligible again.
+        let state = primed_state();
+        let now = Instant::now();
+        let mut tracker = HashMap::new();
+        tracker.insert(
+            "seimpersonate_sql01".to_string(),
+            (
+                now - (SEIMPERSONATE_FAILURE_COOLDOWN + Duration::from_secs(1)),
+                1,
+            ),
+        );
+        assert_eq!(collect_seimpersonate_work(&state, &tracker, now).len(), 1);
+    }
+
+    #[test]
+    fn collect_gives_up_after_max_failures() {
+        // At the failure cap the primitive is abandoned even past cooldown.
+        let state = primed_state();
+        let now = Instant::now();
+        let mut tracker = HashMap::new();
+        tracker.insert(
+            "seimpersonate_sql01".to_string(),
+            (
+                now - (SEIMPERSONATE_FAILURE_COOLDOWN + Duration::from_secs(1)),
+                SEIMPERSONATE_MAX_FAILURES,
+            ),
+        );
+        assert!(collect_seimpersonate_work(&state, &tracker, now).is_empty());
     }
 
     #[test]
@@ -338,14 +467,14 @@ mod tests {
             DEDUP_SECRETSDUMP,
             "192.168.58.99:contoso.local:administrator".into(),
         );
-        assert_eq!(collect_seimpersonate_work(&state).len(), 1);
+        assert_eq!(collect(&state).len(), 1);
     }
 
     #[test]
     fn collect_requires_a_credential() {
         let mut state = primed_state();
         state.credentials.clear();
-        assert!(collect_seimpersonate_work(&state).is_empty());
+        assert!(collect(&state).is_empty());
     }
 
     #[test]
@@ -355,7 +484,7 @@ mod tests {
         for v in state.discovered_vulnerabilities.values_mut() {
             v.vuln_type = "esc1".into();
         }
-        assert!(collect_seimpersonate_work(&state).is_empty());
+        assert!(collect(&state).is_empty());
     }
 
     #[test]
@@ -368,7 +497,7 @@ mod tests {
             .discovered_vulnerabilities
             .insert(vuln.vuln_id.clone(), vuln);
         state.credentials.push(make_cred("bob", "contoso.local"));
-        let work = collect_seimpersonate_work(&state);
+        let work = collect(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].target_ip, "192.168.58.21");
         // No matching host record -> empty hostname/domain, still dispatchable.
@@ -378,7 +507,7 @@ mod tests {
 
     #[test]
     fn payload_structure_is_well_formed() {
-        let work = &collect_seimpersonate_work(&primed_state())[0..1][0];
+        let work = &collect(&primed_state())[0..1][0];
         let payload = build_seimpersonate_payload(work);
         assert_eq!(payload["technique"], "seimpersonate_escalation");
         assert_eq!(payload["vuln_type"], "seimpersonate");
