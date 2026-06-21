@@ -885,13 +885,12 @@ HTTP/web01.contoso.local                svc_web            2024-01-02 03:04:05";
             .filter_map(|v| v.as_str())
             .collect();
         assert!(services.iter().any(|s| s.contains("1433")));
-        let roles: Vec<&str> = hosts[0]["roles"]
+        assert!(hosts[0]["roles"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|v| v.as_str())
-            .collect();
-        assert!(roles.contains(&"mssql"));
+            .any(|x| x == "mssql"));
     }
 
     #[test]
