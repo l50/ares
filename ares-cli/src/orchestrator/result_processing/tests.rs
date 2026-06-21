@@ -3,7 +3,10 @@ use super::admin_checks::{
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
 use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
-use super::{result_has_credential_evidence, result_has_mssql_session, result_has_parser_evidence};
+use super::{
+    extract_created_machine_accounts, result_has_credential_evidence, result_has_mssql_session,
+    result_has_parser_evidence,
+};
 use ares_core::models::{Credential, Hash};
 use serde_json::json;
 
@@ -47,6 +50,32 @@ fn mssql_session_rejects_bare_llm_claim() {
     let result = Some(json!({"summary": "Connected to MSSQL and confirmed access"}));
     assert!(!result_has_mssql_session(&result));
     assert!(!result_has_mssql_session(&None));
+}
+
+#[test]
+fn extract_created_machine_accounts_from_impacket_addcomputer() {
+    let output = "Impacket v0.12.0 - Copyright Fortra, LLC\n\
+        [*] Successfully added machine account ARESATK01$ with password somepass.\n";
+    let names = extract_created_machine_accounts(output);
+    assert_eq!(names, vec!["ARESATK01$".to_string()]);
+}
+
+#[test]
+fn extract_created_machine_accounts_handles_multiple_and_case() {
+    let output = "[*] SUCCESSFULLY ADDED MACHINE ACCOUNT ARESATTACK01$ with password x\n\
+        noise line\n\
+        [*] Successfully added machine account KRBUJS01$ with password y\n";
+    let names = extract_created_machine_accounts(output);
+    assert_eq!(
+        names,
+        vec!["ARESATTACK01$".to_string(), "KRBUJS01$".to_string()]
+    );
+}
+
+#[test]
+fn extract_created_machine_accounts_none_on_unrelated_output() {
+    assert!(extract_created_machine_accounts("[-] Failed to add machine account").is_empty());
+    assert!(extract_created_machine_accounts("").is_empty());
 }
 
 #[test]

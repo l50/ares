@@ -163,11 +163,13 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             .or_else(|| vuln.details.get("to"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if is_ghost_machine_account(target_name) {
+        if is_ghost_machine_account(target_name)
+            || state.is_self_created_machine_account(target_name)
+        {
             debug!(
                 vuln_id = %vuln.vuln_id,
                 target = %target_name,
-                "Skipping ACL abuse for ghost machine account target"
+                "Skipping ACL abuse for ghost or ares-created machine account target"
             );
             continue;
         }
@@ -540,6 +542,35 @@ mod tests {
     #[test]
     fn ghost_machine_targets_rejected() {
         assert!(is_ghost_machine_account("WIN-DPPJMLU3XS6$"));
+    }
+
+    #[tokio::test]
+    async fn collect_skips_ares_created_machine_account_target() {
+        // A GenericAll edge whose target is a machine account ares created
+        // itself (e.g. ARESATK01$ via addcomputer) must NOT be actioned —
+        // attacking our own planted account burns cycles for nothing.
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("user1", "contoso.local"));
+            // Record the account as self-created (as result processing would
+            // from the impacket-addcomputer success line).
+            state.record_created_machine_account("ARESATK01$");
+            let details = acl_details("user1", "ARESATK01$", "contoso.local");
+            let vuln = make_vuln("vuln-decoy-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(
+            work.is_empty(),
+            "ares-created machine account target must be skipped"
+        );
     }
 
     #[test]

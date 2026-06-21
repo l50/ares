@@ -162,7 +162,9 @@ pub(crate) fn select_rbcd_work(state: &StateInner) -> Vec<RbcdWork> {
                 .or_else(|| vuln.details.get("victim"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())?;
-            if is_ghost_machine_account(&target_computer) {
+            if is_ghost_machine_account(&target_computer)
+                || state.is_self_created_machine_account(&target_computer)
+            {
                 return None;
             }
 

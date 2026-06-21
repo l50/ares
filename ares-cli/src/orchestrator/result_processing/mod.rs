@@ -959,6 +959,35 @@ fn result_has_mssql_session(result: &Option<Value>) -> bool {
     false
 }
 
+/// Extract machine-account names ares created from raw tool output.
+///
+/// `impacket-addcomputer` (used by `add_computer` in the RBCD / shadow-cred /
+/// KrbRelayUp chains) prints `[*] Successfully added machine account <NAME>$
+/// with password ...` on success. Recording `<NAME>` lets the ACL/RBCD
+/// chain-followers skip accounts ares planted itself instead of burning cycles
+/// attacking them (the live-op symptom: repeated `bloodyad_set_password`
+/// against `ARESATK01$` / `ARESATTACK01$` decoy accounts).
+fn extract_created_machine_accounts(output: &str) -> Vec<String> {
+    const MARKER: &str = "successfully added machine account";
+    let mut names = Vec::new();
+    for line in output.lines() {
+        let lower = line.to_lowercase();
+        let Some(idx) = lower.find(MARKER) else {
+            continue;
+        };
+        // The account name is the first whitespace-delimited token after the
+        // marker phrase. Use the original (non-lowercased) slice to preserve
+        // case for logging; normalization happens in `record_created_machine_account`.
+        let tail = line[idx + MARKER.len()..].trim_start();
+        if let Some(name) = tail.split_whitespace().next() {
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 fn result_has_parser_evidence(result: &Option<Value>) -> bool {
     let Some(payload) = result.as_ref() else {
         return false;
@@ -1669,6 +1698,17 @@ async fn extract_from_raw_text(
     for ctx in &tool_outputs {
         if ctx.output.contains("Pwn3d!") {
             detect_and_upgrade_admin_credentials(ctx.output, dispatcher).await;
+        }
+        // Record machine accounts ares just created so the ACL/RBCD
+        // chain-followers never attack their own planted helper accounts.
+        for name in extract_created_machine_accounts(ctx.output) {
+            let newly = {
+                let mut state = dispatcher.state.write().await;
+                state.record_created_machine_account(&name)
+            };
+            if newly {
+                info!(machine_account = %name, "Recorded ares-created machine account — excluded from ACL/RBCD targeting");
+            }
         }
     }
 
