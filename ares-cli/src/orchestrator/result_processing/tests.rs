@@ -66,7 +66,10 @@ fn extract_created_machine_accounts_handles_multiple_and_case() {
         noise line\n\
         [*] Successfully added machine account KRBUJS01$ with password y\n";
     let names = extract_created_machine_accounts(output);
-    assert_eq!(names, vec!["ARESATTACK01$".to_string(), "KRBUJS01$".to_string()]);
+    assert_eq!(
+        names,
+        vec!["ARESATTACK01$".to_string(), "KRBUJS01$".to_string()]
+    );
 }
 
 #[test]

@@ -176,16 +176,30 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             // Same-domain creds first, same-forest cross-domain creds second,
             // and stop at the first unprocessed dedup key. Chained iterators —
             // no intermediate Vec — to satisfy clippy::needless_collect.
+            //
+            // Within each tier we iterate NEWEST-first (`.rev()` over the
+            // insertion-ordered credential list). A principal freshly owned via
+            // an ACL kill-chain (e.g. ForceChangePassword / shadow credentials
+            // on a target user) is appended last; the per-identity ADCS dedup
+            // means each new identity earns its own `certipy_find` shot, but
+            // only one credential is dispatched per CA host per 30s tick. Oldest
+            // -first ordering parks the just-gained principal at the back of the
+            // backlog, so in a time-bounded op it never gets re-enumerated as
+            // itself and its ESC4-controlled templates stay invisible. Newest-
+            // first hands the fresh win priority so the ACL→ADCS(ESC4) re-enum
+            // fires on the next tick. Dedup still guarantees older creds each
+            // get their turn — this only reorders, never drops.
             let cred = state
                 .credentials
                 .iter()
+                .rev()
                 .filter(|c| {
                     !c.password.is_empty()
                         && c.domain.to_lowercase() == domain_lower
                         && !state.is_delegation_account(&c.username)
                         && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
-                .chain(state.credentials.iter().filter(|c| {
+                .chain(state.credentials.iter().rev().filter(|c| {
                     let cd = c.domain.to_lowercase();
                     !c.password.is_empty()
                         && cd != domain_lower
@@ -710,6 +724,34 @@ mod tests {
             .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
         let work = collect_adcs_work(&state);
         assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_prefers_newest_same_domain_credential() {
+        // GAP 4b: a principal freshly owned via an ACL kill-chain is appended
+        // last to state.credentials. It must win the ADCS re-enum slot over
+        // older same-domain creds so its ESC4-controlled templates surface
+        // promptly (certipy_find runs as that identity), instead of starving
+        // at the back of the per-tick cycle.
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        // Older credential first, then the freshly-owned principal.
+        state
+            .credentials
+            .push(make_credential("olduser", "Old!Pass1", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("carol", "Reset!Pass1", "contoso.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            work[0].credential.username, "carol",
+            "newest same-domain cred (freshly owned via ACL) must get the ADCS re-enum slot first"
+        );
     }
 
     #[test]
