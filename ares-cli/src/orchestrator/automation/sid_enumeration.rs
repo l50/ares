@@ -9,7 +9,7 @@
 //! ExtraSid attacks.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -77,6 +77,10 @@ pub async fn auto_sid_enumeration(
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -96,7 +100,11 @@ pub async fn auto_sid_enumeration(
             collect_sid_enum_work(&state)
         };
 
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             // Cross-forest authenticated RPC/LDAP from the source forest's
             // credential typically returns ACCESS_DENIED — but `rpcclient
             // -U "" -N -c lsaquery` over a null session usually succeeds
@@ -161,6 +169,7 @@ pub async fn auto_sid_enumeration(
                         dc = %item.dc_ip,
                         "SID enumeration dispatched"
                     );
+                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -173,6 +182,7 @@ pub async fn auto_sid_enumeration(
                 }
                 Ok(None) => {
                     debug!(domain = %item.domain, "SID enumeration deferred");
+                    cooldown.record(&item.dedup_key, now);
                 }
                 Err(e) => {
                     warn!(err = %e, domain = %item.domain, "Failed to dispatch SID enumeration");

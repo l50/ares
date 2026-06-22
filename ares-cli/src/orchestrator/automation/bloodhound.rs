@@ -1,7 +1,7 @@
 //! auto_bloodhound -- BloodHound collection per domain.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -51,6 +51,10 @@ pub(crate) fn select_bloodhound_work(
 pub async fn auto_bloodhound(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -69,10 +73,15 @@ pub async fn auto_bloodhound(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             continue;
         }
 
+        let now = Instant::now();
         for (domain, dc_ip, cred) in work {
+            if cooldown.active(&domain, now) {
+                continue;
+            }
             match dispatcher.request_bloodhound(&domain, &dc_ip, &cred).await {
                 Ok(Some(task_id)) => {
                     info!(task_id = %task_id, domain = %domain, "BloodHound collection dispatched");
+                    cooldown.clear(&domain);
                     dispatcher
                         .state
                         .write()
@@ -83,7 +92,7 @@ pub async fn auto_bloodhound(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         .persist_dedup(&dispatcher.queue, DEDUP_BLOODHOUND_DOMAINS, &domain)
                         .await;
                 }
-                Ok(None) => {}
+                Ok(None) => cooldown.record(&domain, now),
                 Err(e) => warn!(err = %e, "Failed to dispatch BloodHound"),
             }
         }
