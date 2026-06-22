@@ -46,7 +46,10 @@ vars:
   DEFAULT_IPS: '{{.DEFAULT_IPS | default "10.1.10.10,10.1.10.11,10.1.10.12,10.1.10.22,10.1.10.23"}}'
   DEFAULT_DOMAIN: '{{.DEFAULT_DOMAIN | default "sevenkingdoms.local"}}'
   DEFAULT_TARGET_LABEL: '{{.DEFAULT_TARGET_LABEL | default "goad-ludus"}}'
-  DEFAULT_MODEL: '{{.DEFAULT_MODEL | default "openai/gpt-5"}}'
+  # Model: derived from config/ares.yaml (agents.orchestrator.model) so the
+  # whole pipeline tracks one source of truth. Override per submit with MODEL=.
+  DEFAULT_MODEL:
+    sh: awk '/^  orchestrator:/{f=1} f&&/^[[:space:]]*model:/{gsub(/[",]/,"",$2); print $2; exit}' config/ares.yaml 2>/dev/null || echo "openai/gpt-5"
   # Build target — attacker-1 is x86_64
   RUST_TARGET: '{{.RUST_TARGET | default "x86_64-unknown-linux-gnu"}}'
   # Local binary path produced by `task remote:rust:build`
@@ -122,6 +125,7 @@ tasks:
     cmds:
       - task: deploy:build
       - task: deploy:push
+      - task: deploy:env
       - task: deploy:restart
 
   deploy:build:
@@ -147,6 +151,42 @@ tasks:
         scp -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.LOCAL_BIN}} {{.ATTACKER_USER}}@$IP:/tmp/ares
         ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP 'sudo install -m 755 /tmp/ares {{.REMOTE_BIN}} && rm /tmp/ares && ares --version'
         echo -e "{{.SUCCESS}} binary installed"
+
+  deploy:env:
+    desc: "Sync /etc/default/ares from config/ares.yaml: ARES_LLM_MODEL (orchestrator model) plus the matching *_BASE_URL for the active provider (llm.ollama_base_url / llm.openai_base_url); strips stale base URLs so a real API never inherits a dead LAN endpoint. Run after changing the model or endpoint."
+    silent: true
+    cmds:
+      - |
+        IP="{{.ATTACKER_IP}}"
+        if [ -z "$IP" ]; then echo -e "{{.ERROR}} Could not resolve attacker IP"; exit 1; fi
+        MODEL_SPEC="{{.DEFAULT_MODEL}}"
+        # Pull optional endpoint overrides from the config `llm:` block (empty if commented/absent).
+        cfg_url() { awk -v k="$1" '/^llm:/{f=1;next} f&&/^[^[:space:]#]/{f=0} f&&$0 ~ "^[[:space:]]*"k":[[:space:]]*"{sub("^[[:space:]]*"k":[[:space:]]*","");gsub(/"/,"");print;exit}' config/ares.yaml; }
+        # Pick the base URL matching the active provider; blank => remove the key from the env.
+        WANT_OPENAI=""; WANT_OLLAMA=""
+        case "$MODEL_SPEC" in
+          ollama/*)
+            WANT_OLLAMA="$(cfg_url ollama_base_url)"
+            [ -z "$WANT_OLLAMA" ] && echo -e "{{.WARN}} model is ollama/* but llm.ollama_base_url is unset — provider falls back to http://localhost:11434 on the attacker" ;;
+          openai/*) WANT_OPENAI="$(cfg_url openai_base_url)" ;;
+        esac
+        echo -e "{{.INFO}} Syncing -> {{.REMOTE_ENV_FILE}}: ARES_LLM_MODEL=$MODEL_SPEC  OPENAI_BASE_URL=${WANT_OPENAI:-<unset>}  OLLAMA_BASE_URL=${WANT_OLLAMA:-<unset>}"
+        # reconcile KEY VALUE: upsert when VALUE is set, delete the line when blank. 0600 root file, other lines untouched.
+        ssh -o ConnectTimeout=15 -J {{.PROXMOX_SSH_HOST}} {{.ATTACKER_USER}}@$IP \
+          "sudo bash -c '
+            f={{.REMOTE_ENV_FILE}};
+            touch \"\$f\"; chmod 600 \"\$f\"; chown root:root \"\$f\";
+            reconcile() {
+              k=\"\$1\"; v=\"\$2\";
+              if [ -z \"\$v\" ]; then sed -i \"/^\${k}=/d\" \"\$f\";
+              elif grep -q \"^\${k}=\" \"\$f\"; then sed -i \"s|^\${k}=.*|\${k}=\${v}|\" \"\$f\";
+              else echo \"\${k}=\${v}\" >> \"\$f\"; fi;
+            };
+            reconcile ARES_LLM_MODEL \"$MODEL_SPEC\";
+            reconcile OPENAI_BASE_URL \"$WANT_OPENAI\";
+            reconcile OLLAMA_BASE_URL \"$WANT_OLLAMA\";
+            grep -E \"^(ARES_LLM_MODEL|OPENAI_BASE_URL|OLLAMA_BASE_URL)=\" \"\$f\" || true'"
+        echo -e "{{.SUCCESS}} env synced — restart the orchestrator to pick it up (task proxmox:deploy:restart)"
 
   deploy:restart:
     desc: "Kill orchestrator + dispatcher, clear stale lock, restart dispatcher"

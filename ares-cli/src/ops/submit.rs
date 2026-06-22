@@ -41,14 +41,6 @@ pub(crate) const OPS_ENV_VAR_NAMES: &[&str] = &[
     "GRAFANA_URL",
     "ARES_MODEL",
     "ARES_ORCHESTRATOR_MODEL",
-    "ARES_WORKER_MODEL",
-    "ARES_AGENT_RECON_MODEL",
-    "ARES_AGENT_CREDENTIAL_ACCESS_MODEL",
-    "ARES_AGENT_CRACKER_MODEL",
-    "ARES_AGENT_ACL_MODEL",
-    "ARES_AGENT_PRIVESC_MODEL",
-    "ARES_AGENT_LATERAL_MODEL",
-    "ARES_AGENT_COERCION_MODEL",
 ];
 
 /// Collect environment variables that are set, returning a map of name->value.

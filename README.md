@@ -467,10 +467,11 @@ Clamp before running `ec2:deploy`: `ulimit -n 65536`.
 
 ### Config File
 
-The master config lives at `config/ares.yaml`. It defines:
+The master config lives at `config/ares.yaml` and is the **single source of truth** for the model. It defines:
 
 - **[Attack strategy](docs/strategy.md)** - technique weights, path diversity, completion modes
 - Per-role LLM model assignments
+- Optional LLM endpoint overrides (`llm.ollama_base_url` / `llm.openai_base_url`)
 - Agent capabilities and tool inventories
 - Operation timeouts and limits
 - Vulnerability exploitation priorities
@@ -483,6 +484,33 @@ ares config set-model --all gpt-5.2
 ares config validate
 ```
 
+#### Changing the model
+
+Edit `config/ares.yaml` once — everything else derives from it, so you never
+hand-edit Taskfiles or the attacker env file:
+
+```bash
+task config:set-model-all -- anthropic/claude-opus-4-8   # writes agents.*.model
+```
+
+- **Taskfile defaults** (`MODEL`, proxmox `DEFAULT_MODEL`) are read from
+  `agents.orchestrator.model` at runtime — no hardcoded value. A per-invocation
+  `MODEL=<spec>` still overrides.
+- **Attacker VM env** (`/etc/default/ares`, which wins at runtime) is regenerated
+  from config by `task proxmox:deploy:env` — run via `task proxmox:deploy`
+  (build → push → env → restart) or standalone followed by `deploy:restart`.
+
+For local / OpenAI-compatible models, also set the endpoint in the `llm:` block
+(commented out by default). `deploy:env` writes the matching `*_BASE_URL` for the
+active provider and **strips the stale one** so a hosted API never inherits a dead
+LAN endpoint:
+
+```yaml
+llm:
+  # ollama_base_url: "http://192.168.58.25:11434"   # for ollama/<model>
+  # openai_base_url: "http://192.168.58.25:8080/v1" # for openai/<model> (llama-server, vLLM, Gemini-compat)
+```
+
 ### Environment Variables
 
 **LLM Providers** (at least one required):
@@ -491,21 +519,32 @@ ares config validate
 | ------------------- | ------------------------ | --------------------------------- |
 | `ANTHROPIC_API_KEY` |                          | Anthropic API key (Claude models) |
 | `OPENAI_API_KEY`    |                          | OpenAI API key (GPT models)       |
-| `OLLAMA_BASE_URL`   | `http://localhost:11434` | Local Ollama server URL           |
+| `OLLAMA_BASE_URL`   | `http://localhost:11434` | Ollama server URL (`ollama/<model>`)              |
+| `OPENAI_BASE_URL`   |                          | Override for OpenAI-compatible endpoints (llama-server, vLLM, Gemini's `/v1beta/openai`) |
+
+> On the proxmox attacker VM these base URLs are populated in `/etc/default/ares`
+> by `task proxmox:deploy:env` from the `llm:` block in `config/ares.yaml` — see
+> [Changing the model](#changing-the-model).
 
 **Model Selection:**
 
-| Variable                  | Default | Description                                                             |
-| ------------------------- | ------- | ----------------------------------------------------------------------- |
-| `ARES_LLM_MODEL`          |         | Primary model (`anthropic/<model>`, `openai/<model>`, `ollama/<model>`) |
-| `ARES_ORCHESTRATOR_MODEL` |         | Override model for orchestrator                                         |
-| `ARES_WORKER_MODEL`       |         | Override model for workers                                              |
-| `ARES_BLUE_LLM_MODEL`     |         | Override model for blue team                                            |
-| `ARES_MODEL`              |         | Generic fallback for both sides                                         |
-| `ARES_AGENT_<ROLE>_MODEL` |         | Per-role override (e.g. `ARES_AGENT_RECON_MODEL`)                       |
+The base model comes from `config/ares.yaml` (see [Changing the model](#changing-the-model)).
+These env vars override it; they apply in different contexts rather than as one
+linear chain:
 
-Precedence (highest first):
-`ARES_AGENT_<ROLE>_MODEL` > `ARES_ORCHESTRATOR_MODEL`/`ARES_WORKER_MODEL` > `ARES_MODEL` > `ARES_LLM_MODEL` > config file.
+| Variable                     | Applies to                  | Description                                                                 |
+| ---------------------------- | --------------------------- | -------------------------------------------------------------------------- |
+| `ARES_LLM_MODEL`             | orchestrator process        | Wins over the config YAML at runtime. Auto-synced from config by `proxmox:deploy:env`. |
+| `ARES_BLUE_LLM_MODEL`        | blue team orchestrator      | Blue-side model (falls back to the red model if unset).                     |
+| `ARES_MODEL_FOR_<ROLE>`      | orchestrator (per role)     | Routes one role to a cheaper/different model, e.g. `ARES_MODEL_FOR_RECON=openai/gpt-5-mini`. Logged at INFO when it fires. |
+| `ARES_MODEL_FOR_DEFAULT`     | orchestrator (per role)     | Applies to roles not individually overridden by `ARES_MODEL_FOR_<ROLE>`.    |
+| `ARES_ORCHESTRATOR_MODEL` / `ARES_MODEL` | `ops submit` (no `--model`) | Fallback the submit CLI uses when `--model` is omitted: `--model` > `ARES_ORCHESTRATOR_MODEL` > `ARES_MODEL`. |
+
+Precedence is per-context, not a single chain:
+
+- **`ops submit`** picks the op's model: `--model` flag > `ARES_ORCHESTRATOR_MODEL` > `ARES_MODEL`.
+- **orchestrator process** (standalone / proxmox): `ARES_LLM_MODEL` > `config/ares.yaml`.
+- **per-role** (within the orchestrator): `ARES_MODEL_FOR_<ROLE>` > `ARES_MODEL_FOR_DEFAULT` > the resolved base model.
 
 **Infrastructure:**
 

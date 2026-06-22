@@ -9,11 +9,11 @@ pub(crate) fn run_config(cmd: ConfigCommands) -> Result<()> {
         ConfigCommands::Show { models, config } => config_show(config, models),
         ConfigCommands::Validate { config } => config_validate(config),
         ConfigCommands::SetModel {
-            role,
-            model,
+            arg1,
+            arg2,
             all,
             config,
-        } => config_set_model(config, role, model, all),
+        } => config_set_model(config, arg1, arg2, all),
     }
 }
 
@@ -204,10 +204,12 @@ fn config_validate(config_path: Option<String>) -> Result<()> {
 
 fn config_set_model(
     config_path: Option<String>,
-    role: Option<String>,
-    model: String,
+    arg1: Option<String>,
+    arg2: Option<String>,
     all: bool,
 ) -> Result<()> {
+    let (role, model) = resolve_set_model_args(arg1, arg2, all)?;
+
     let path = resolve_config_path(config_path)?;
 
     // Read the raw YAML to do text-level replacement (preserves comments and formatting).
@@ -248,6 +250,38 @@ fn config_set_model(
 
     println!("{role}: {old_model} -> {model}");
     Ok(())
+}
+
+/// Reinterpret the two positional args of `config set-model` based on `--all`.
+///
+/// clap binds a lone positional to the first field (`arg1`), so the two forms
+/// must be disambiguated here:
+///   `set-model <role> <model>` → `(Some(role), model)`
+///   `set-model --all <model>`  → `(None, model)`  (model arrives as `arg1`)
+fn resolve_set_model_args(
+    arg1: Option<String>,
+    arg2: Option<String>,
+    all: bool,
+) -> Result<(Option<String>, String)> {
+    if all {
+        let model = arg1
+            .filter(|s| !s.is_empty())
+            .context("Model argument is required: `config set-model --all <model>`")?;
+        if arg2.is_some() {
+            anyhow::bail!(
+                "Unexpected extra argument with --all. Usage: config set-model --all <model>"
+            );
+        }
+        Ok((None, model))
+    } else {
+        let role = arg1.filter(|s| !s.is_empty()).context(
+            "Role argument is required (or pass --all). Usage: config set-model <role> <model>",
+        )?;
+        let model = arg2
+            .filter(|s| !s.is_empty())
+            .context("Model argument is required. Usage: config set-model <role> <model>")?;
+        Ok((Some(role), model))
+    }
 }
 
 /// Replace the model value for a specific role in the YAML text.
@@ -309,6 +343,44 @@ fn replace_model_in_yaml(yaml: &str, role: &str, _old_model: &str, new_model: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn set_model_args_all_form() {
+        // `set-model --all <model>`: clap binds model to arg1.
+        let (role, model) =
+            resolve_set_model_args(s("anthropic/claude-opus-4-8"), None, true).unwrap();
+        assert_eq!(role, None);
+        assert_eq!(model, "anthropic/claude-opus-4-8");
+    }
+
+    #[test]
+    fn set_model_args_per_role_form() {
+        let (role, model) =
+            resolve_set_model_args(s("orchestrator"), s("openai/gpt-5"), false).unwrap();
+        assert_eq!(role.as_deref(), Some("orchestrator"));
+        assert_eq!(model, "openai/gpt-5");
+    }
+
+    #[test]
+    fn set_model_args_all_rejects_extra_positional() {
+        assert!(resolve_set_model_args(s("model-a"), s("model-b"), true).is_err());
+    }
+
+    #[test]
+    fn set_model_args_missing_model() {
+        // `set-model --all` with nothing, and `set-model <role>` with no model.
+        assert!(resolve_set_model_args(None, None, true).is_err());
+        assert!(resolve_set_model_args(s("orchestrator"), None, false).is_err());
+    }
+
+    #[test]
+    fn set_model_args_missing_role() {
+        assert!(resolve_set_model_args(None, None, false).is_err());
+    }
 
     #[test]
     fn replace_model_basic() {
