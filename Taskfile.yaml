@@ -78,7 +78,12 @@ includes:
 vars:
   API_DIR: "."
   # Ares configuration
-  MODEL: '{{.MODEL | default "openai/gpt-5"}}'
+  # Model: single source of truth is config/ares.yaml (agents.orchestrator.model).
+  # The default tracks the config file so changing the model is a one-liner
+  # (`task config:set-model-all -- <model>`); `MODEL=` still overrides per call.
+  CONFIG_MODEL:
+    sh: awk '/^  orchestrator:/{f=1} f&&/^[[:space:]]*model:/{gsub(/[",]/,"",$2); print $2; exit}' config/ares.yaml 2>/dev/null || echo "openai/gpt-5"
+  MODEL: '{{.MODEL | default .CONFIG_MODEL}}'
   GRAFANA_URL: '{{.GRAFANA_URL}}'
   LOKI_URL: '{{.LOKI_URL}}'
   POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'

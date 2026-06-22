@@ -21,14 +21,17 @@ pub(crate) enum ConfigCommands {
     },
 
     /// Set the model for one or all agent roles (edits the YAML in-place)
+    ///
+    /// Forms: `set-model <role> <model>` or `set-model --all <model>`.
     SetModel {
-        /// Agent role (e.g. orchestrator, recon). Omit when using --all.
-        role: Option<String>,
+        /// Without --all: the agent role (e.g. orchestrator, recon).
+        /// With --all: the model identifier.
+        arg1: Option<String>,
 
-        /// Model identifier (e.g. gpt-5.2, gpt-4.1)
-        model: String,
+        /// The model identifier when setting a single role (omit with --all).
+        arg2: Option<String>,
 
-        /// Set all roles to the given model
+        /// Set all roles to the given model: `set-model --all <model>`
         #[arg(long)]
         all: bool,
 

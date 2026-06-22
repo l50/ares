@@ -2,6 +2,21 @@
 # Ares Red Team Configuration
 # Operational parameters for red team multi-agent operations.
 
+# LLM endpoint overrides (optional, operator-side).
+# Consumed by `task proxmox:deploy:env` to populate /etc/default/ares so that
+# local / OpenAI-compatible models reach the right host. The model itself is set
+# under agents.*.model (change it with `task config:set-model-all -- <model>`).
+# Leave these commented for hosted APIs (real OpenAI / Anthropic) — deploy:env
+# then strips any stale *_BASE_URL from the env so a real provider never inherits
+# a dead LAN endpoint.
+llm:
+  # Used when the orchestrator model is `ollama/<model>`. If left unset, the
+  # provider defaults to http://localhost:11434 on the attacker itself.
+  # ollama_base_url: "http://192.168.58.25:11434"
+  # Used when the orchestrator model is `openai/<model>` against an
+  # OpenAI-compatible endpoint (llama-server, vLLM, Gemini's /v1beta/openai, ...).
+  # openai_base_url: "http://192.168.58.25:8080/v1"
+
 operation:
   name: "ares-multi-agent"
   namespace: "attack-simulation"
@@ -64,7 +79,7 @@ operation:
 # Agent configurations
 agents:
   orchestrator:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 200
     pod_selector: "app.kubernetes.io/name=ares-orchestrator"
     # Tools: OrchestratorTools, RedTeamReportingTools
@@ -94,7 +109,7 @@ agents:
       - complete_operation
 
   recon:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=recon"
     # Provisioned by: ansible/playbooks/ares/recon.yml → dreadnode.nimbus_range.recon_tools
@@ -122,7 +137,7 @@ agents:
       - impacket-GetUserSPNs
 
   credential_access:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=credential_access"
     # Provisioned by: ansible/playbooks/ares/credential_access.yml → dreadnode.nimbus_range.credential_access_tools
@@ -144,7 +159,7 @@ agents:
       - impacket-secretsdump
 
   cracker:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 150
     pod_selector: "ares.dreadnode.io/role=cracker"
     # Provisioned by: ansible/playbooks/ares/cracker.yml → dreadnode.nimbus_range.cracking_tools
@@ -157,7 +172,7 @@ agents:
       - seclists
 
   acl:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 150  # ACL analysis requires complex path finding
     pod_selector: "ares.dreadnode.io/role=acl"
     # Provisioned by: ansible/playbooks/ares/acl_abuse.yml → dreadnode.nimbus_range.acl_tools
@@ -174,7 +189,7 @@ agents:
       - impacket-dacledit
 
   privesc:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=privesc"
     # Provisioned by: ansible/playbooks/ares/privesc.yml → dreadnode.nimbus_range.privesc_tools
@@ -228,7 +243,7 @@ agents:
       - SCMUACBypass          # UAC bypass (git: /opt/privesc/SCMUACBypass)
 
   lateral:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 300
     pod_selector: "ares.dreadnode.io/role=lateral"
     # Provisioned by: ansible/playbooks/ares/lateral_movement.yml → dreadnode.nimbus_range.lateral_movement_tools
@@ -258,7 +273,7 @@ agents:
       - impacket-secretsdump
 
   coercion:
-    model: "openai/gpt-5"
+    model: "anthropic/claude-opus-4-8"
     max_steps: 30
     pod_selector: "ares.dreadnode.io/role=coercion"
     # Provisioned by: ansible/playbooks/ares/coercion.yml → dreadnode.nimbus_range.coercion_tools
