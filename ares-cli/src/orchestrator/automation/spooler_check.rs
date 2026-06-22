@@ -8,7 +8,7 @@
 //! `spooler_enabled` vulnerabilities that downstream coercion/CVE modules target.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -64,6 +64,10 @@ fn collect_spooler_work(state: &StateInner) -> Vec<SpoolerWork> {
 pub async fn auto_spooler_check(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -83,7 +87,11 @@ pub async fn auto_spooler_check(dispatcher: Arc<Dispatcher>, mut shutdown: watch
             collect_spooler_work(&state)
         };
 
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             let payload = json!({
                 "technique": "spooler_check",
                 "target_ip": item.target_ip,
@@ -109,6 +117,7 @@ pub async fn auto_spooler_check(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                         "Print Spooler check dispatched"
                     );
 
+                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -166,6 +175,7 @@ pub async fn auto_spooler_check(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                     }
                 }
                 Ok(None) => {
+                    cooldown.record(&item.dedup_key, now);
                     debug!(target = %item.target_ip, "Spooler check deferred");
                 }
                 Err(e) => {

@@ -10,7 +10,7 @@
 //! - Domain Local groups with foreign members (the primary FSP container)
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -127,6 +127,10 @@ pub async fn auto_foreign_group_enum(
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -146,7 +150,11 @@ pub async fn auto_foreign_group_enum(
             collect_foreign_group_work(&state)
         };
 
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             let payload = json!({
                 "technique": "foreign_group_enumeration",
                 "target_ip": item.dc_ip,
@@ -195,6 +203,7 @@ pub async fn auto_foreign_group_enum(
                         dc = %item.dc_ip,
                         "Foreign group enumeration dispatched"
                     );
+                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -206,6 +215,7 @@ pub async fn auto_foreign_group_enum(
                         .await;
                 }
                 Ok(None) => {
+                    cooldown.record(&item.dedup_key, now);
                     debug!(domain = %item.domain, "Foreign group enum deferred");
                 }
                 Err(e) => {

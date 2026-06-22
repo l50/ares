@@ -1,7 +1,7 @@
 //! auto_credential_access -- kerberoast, AS-REP roast, password spray.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::watch;
@@ -461,6 +461,10 @@ pub async fn auto_credential_access(
     let notify = dispatcher.credential_access_notify.clone();
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -611,7 +615,11 @@ pub async fn auto_credential_access(
                 select_kerberoast_work(&state, max)
             };
 
+        let now = Instant::now();
         for (dedup_key, dc_ip, resolved_domain, cred) in kerberoast_work {
+            if cooldown.active(&dedup_key, now) {
+                continue;
+            }
             let priority = dispatcher.effective_priority("kerberoast");
             match dispatcher
                 .request_credential_access("kerberoast", &dc_ip, &resolved_domain, &cred, priority)
@@ -619,6 +627,7 @@ pub async fn auto_credential_access(
             {
                 Ok(Some(task_id)) => {
                     debug!(task_id = %task_id, domain = %resolved_domain, "Kerberoast dispatched");
+                    cooldown.clear(&dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -629,7 +638,9 @@ pub async fn auto_credential_access(
                         .persist_dedup(&dispatcher.queue, DEDUP_CRACK_REQUESTS, &dedup_key)
                         .await;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    cooldown.record(&dedup_key, now);
+                }
                 Err(e) => warn!(err = %e, "Failed to dispatch kerberoast"),
             }
         }
@@ -697,7 +708,11 @@ pub async fn auto_credential_access(
             select_low_hanging_work(&state, max)
         };
 
+        let now = Instant::now();
         for (dedup_key, dc_ip, cred) in low_hanging_work {
+            if cooldown.active(&dedup_key, now) {
+                continue;
+            }
             let priority = dispatcher.effective_priority("low_hanging_fruit");
             match dispatcher
                 .request_low_hanging_fruit(&dc_ip, &cred.domain, &cred, priority)
@@ -710,6 +725,7 @@ pub async fn auto_credential_access(
                         username = %cred.username,
                         "Low-hanging fruit credential discovery dispatched"
                     );
+                    cooldown.clear(&dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -720,7 +736,9 @@ pub async fn auto_credential_access(
                         .persist_dedup(&dispatcher.queue, DEDUP_LOW_HANGING, &dedup_key)
                         .await;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    cooldown.record(&dedup_key, now);
+                }
                 Err(e) => warn!(err = %e, "Failed to dispatch low-hanging fruit"),
             }
         }

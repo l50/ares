@@ -9,7 +9,7 @@
 //! (e.g., _msdcs, _kerberos, _ldap, _gc, _http).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -55,6 +55,10 @@ fn collect_dns_enum_work(state: &StateInner) -> Vec<DnsEnumWork> {
 pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -74,7 +78,11 @@ pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
             collect_dns_enum_work(&state)
         };
 
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             let mut payload = json!({
                 "technique": "dns_enumeration",
                 "target_ip": item.dc_ip,
@@ -113,6 +121,7 @@ pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
                         dc = %item.dc_ip,
                         "DNS enumeration dispatched"
                     );
+                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -124,6 +133,7 @@ pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
                         .await;
                 }
                 Ok(None) => {
+                    cooldown.record(&item.dedup_key, now);
                     debug!(domain = %item.domain, "DNS enumeration deferred");
                 }
                 Err(e) => {

@@ -6,7 +6,7 @@
 //! signing are enforced.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -54,6 +54,10 @@ fn collect_ldap_signing_work(state: &StateInner) -> Vec<LdapSigningWork> {
 pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -73,7 +77,11 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             collect_ldap_signing_work(&state)
         };
 
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
             let mut payload = json!({
                 "technique": "ldap_signing_check",
@@ -117,6 +125,7 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         "LDAP signing check dispatched"
                     );
 
+                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -172,6 +181,7 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     }
                 }
                 Ok(None) => {
+                    cooldown.record(&item.dedup_key, now);
                     info!(domain = %item.domain, dc = %item.dc_ip, "LDAP signing check deferred by throttler");
                 }
                 Err(e) => {
