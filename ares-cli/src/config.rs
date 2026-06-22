@@ -274,9 +274,9 @@ fn resolve_set_model_args(
         }
         Ok((None, model))
     } else {
-        let role = arg1
-            .filter(|s| !s.is_empty())
-            .context("Role argument is required (or pass --all). Usage: config set-model <role> <model>")?;
+        let role = arg1.filter(|s| !s.is_empty()).context(
+            "Role argument is required (or pass --all). Usage: config set-model <role> <model>",
+        )?;
         let model = arg2
             .filter(|s| !s.is_empty())
             .context("Model argument is required. Usage: config set-model <role> <model>")?;
@@ -359,7 +359,8 @@ mod tests {
 
     #[test]
     fn set_model_args_per_role_form() {
-        let (role, model) = resolve_set_model_args(s("orchestrator"), s("openai/gpt-5"), false).unwrap();
+        let (role, model) =
+            resolve_set_model_args(s("orchestrator"), s("openai/gpt-5"), false).unwrap();
         assert_eq!(role.as_deref(), Some("orchestrator"));
         assert_eq!(model, "openai/gpt-5");
     }
