@@ -185,7 +185,16 @@ impl OrchestratorConfig {
         // when no explicit override is set.
         let listener_ip = env::var("ARES_LISTENER_IP").ok();
 
-        let max_concurrent_tasks = parse_env("ARES_MAX_CONCURRENT_TASKS", 12);
+        // Source of truth is config/ares.yaml `operation.max_concurrent_tasks`.
+        // The `ARES_MAX_CONCURRENT_TASKS` env var overrides it for per-deployment
+        // tuning (e.g. a local 2-slot llama-server needs a far lower fan-out than
+        // the 8-worker-pod cloud deployment). Falls back to 12 only when neither
+        // the env var nor a yaml config is present.
+        let max_concurrent_tasks = env::var("ARES_MAX_CONCURRENT_TASKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or_else(|| yaml.map(|c| c.operation.max_concurrent_tasks as usize))
+            .unwrap_or(12);
         let heartbeat_interval_secs = parse_env("ARES_HEARTBEAT_INTERVAL_SECS", 30);
         let heartbeat_timeout_secs = parse_env("ARES_HEARTBEAT_TIMEOUT_SECS", 120);
         let result_poll_interval_ms = parse_env("ARES_RESULT_POLL_INTERVAL_MS", 500);
@@ -324,6 +333,28 @@ mod tests {
         }
     }
 
+    /// Build a minimal AresConfig with a chosen operation.max_concurrent_tasks.
+    fn ares_config_with_concurrency(max_concurrent_tasks: u32) -> ares_core::config::AresConfig {
+        let yaml_str = serde_yaml::to_string(&serde_json::json!({
+            "operation": {
+                "name": "test",
+                "namespace": "ns",
+                "max_concurrent_tasks": max_concurrent_tasks,
+            },
+            "agents": {},
+            "timeouts": {},
+            "recovery": {},
+            "phase_detection": {},
+            "context_management": {},
+            "vulnerability_priorities": {},
+            "logging": {},
+            "resources": {},
+            "security": {},
+        }))
+        .unwrap();
+        serde_yaml::from_str(&yaml_str).unwrap()
+    }
+
     #[test]
     fn hard_cap_is_1_5x() {
         assert_eq!(make_config(8).hard_cap(), 12);
@@ -406,6 +437,24 @@ mod tests {
         let c = OrchestratorConfig::from_env().unwrap();
         assert!(c.strategy.should_continue_after_da());
         assert!(c.strategy.is_comprehensive());
+
+        // max_concurrent_tasks: yaml `operation.max_concurrent_tasks` is the
+        // source of truth when the env var is unset.
+        std::env::remove_var("ARES_MAX_CONCURRENT_TASKS");
+        std::env::set_var("ARES_OPERATION_ID", "test-yaml-concurrency");
+        let yaml_cfg = ares_config_with_concurrency(7);
+        let c = OrchestratorConfig::from_env_with_yaml(Some(&yaml_cfg)).unwrap();
+        assert_eq!(c.max_concurrent_tasks, 7, "yaml value wins when env unset");
+
+        // The env var overrides the yaml value (per-deployment tuning).
+        std::env::set_var("ARES_MAX_CONCURRENT_TASKS", "3");
+        let c = OrchestratorConfig::from_env_with_yaml(Some(&yaml_cfg)).unwrap();
+        assert_eq!(c.max_concurrent_tasks, 3, "env overrides yaml");
+        std::env::remove_var("ARES_MAX_CONCURRENT_TASKS");
+
+        // No env var and no yaml → falls back to the hardcoded default.
+        let c = OrchestratorConfig::from_env_with_yaml(None).unwrap();
+        assert_eq!(c.max_concurrent_tasks, 12, "fallback when neither present");
 
         std::env::remove_var("ARES_OPERATION_ID");
         std::env::remove_var("ARES_INITIAL_CREDENTIAL");
