@@ -200,12 +200,8 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 discoveries["vulnerabilities"] = Value::Array(vulns);
             }
         }
-        "certipy_esc1_full_chain" => {
-            // Composite ESC1 tool: certipy req (with -upn/-sid) followed by
-            // certipy auth. On success the auth step emits a "Got hash for
-            // 'user@realm': <lm>:<nt>" line. Extract into a `Hash` discovery
-            // so `auto_credential_reuse` picks it up and DCSyncs the foreign
-            // DC — closes the chain end-to-end without an LLM round.
+        "certipy_esc1_full_chain" | "certipy_auth" => {
+            // Both emit "Got hash for 'user@realm': <lm>:<nt>" on success.
             let hashes = parse_certipy_esc1_chain(output, params);
             if !hashes.is_empty() {
                 discoveries["hashes"] = Value::Array(hashes);
@@ -898,6 +894,24 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
         let params = json!({"domain": "contoso.local"});
         let disc = parse_tool_output("secretsdump", output, &params);
         assert!(!disc["hashes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_tool_output_certipy_auth_extracts_hash() {
+        // Regression: bare `certipy_auth` must surface its "Got hash for" line
+        // into discoveries.hashes (was silently dropped by the default arm).
+        let output = "\
+[*] Using principal: 'dc02$@child.contoso.local'\n\
+[*] Trying to get TGT...\n\
+[*] Got TGT\n\
+[*] Got hash for 'dc02$@child.contoso.local': aad3b435b51404eeaad3b435b51404ee:8502bb1006c05667504ad00db6225150";
+        let params = json!({"domain": "child.contoso.local"});
+        let disc = parse_tool_output("certipy_auth", output, &params);
+        let hashes = disc["hashes"].as_array().expect("hashes array");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "dc02$");
+        assert_eq!(hashes[0]["domain"], "child.contoso.local");
+        assert_eq!(hashes[0]["hash_type"], "NTLM");
     }
 
     #[test]
