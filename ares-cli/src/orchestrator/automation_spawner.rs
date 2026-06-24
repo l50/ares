@@ -55,6 +55,7 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_credential_reuse);
     spawn_auto!(auto_shadow_credentials);
     spawn_auto!(auto_rbcd_exploitation);
+    spawn_auto!(auto_mssql_enum_bridge);
     spawn_auto!(auto_mssql_exploitation);
     spawn_auto!(auto_mssql_impersonation);
     spawn_auto!(auto_mssql_link_pivot);
