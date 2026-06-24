@@ -75,8 +75,10 @@ const MODEL_COSTS: &[(&str, f64, f64, f64)] = &[
     ("claude-sonnet-4-20250514", 3.0, 15.0, 0.30),
     ("claude-opus-4-20250514", 15.0, 75.0, 1.50),
     ("claude-haiku-3-5-20241022", 0.80, 4.0, 0.08),
+    ("claude-opus-4-8", 15.0, 75.0, 1.50),
     ("anthropic/claude-sonnet-4-20250514", 3.0, 15.0, 0.30),
     ("anthropic/claude-opus-4-20250514", 15.0, 75.0, 1.50),
+    ("anthropic/claude-opus-4-8", 15.0, 75.0, 1.50),
     // OpenAI GPT-4.1 — cached read at 25% of input (50% off vs Chat Completions
     // post-2024-10 cache pricing).
     ("gpt-4.1", 2.0, 8.0, 0.50),
