@@ -340,6 +340,28 @@ pub async fn process_completed_task(
                 // in reports (e.g. noPac patched, PrintNightmare patched, Certifried
                 // tool missing). This closes the "dispatched but no report evidence" gap.
                 let err_msg = result.error.as_deref().unwrap_or("unknown error");
+                // An agent `request_assistance` call surfaces here as an error
+                // string prefixed "Assistance needed:". That is the LLM's
+                // *unverified self-report* — not a parser-grounded exploit
+                // failure. Recording it as "Exploit attempted but failed" makes
+                // hallucinated blockers (claimed-missing tools/creds that are
+                // actually present in state) read like ground-truth failures in
+                // the report. Tag it as a distinct, explicitly-unverified event
+                // so report consumers don't treat the model's narrative as fact.
+                let is_assist = err_msg.starts_with("Assistance needed:");
+                let (source, description) = if is_assist {
+                    (
+                        "agent_requested_assistance",
+                        format!(
+                            "Agent requested assistance (unverified self-report, NOT a confirmed exploit failure): {vuln_id} — {err_msg}"
+                        ),
+                    )
+                } else {
+                    (
+                        "exploit_failed",
+                        format!("Exploit attempted but failed: {vuln_id} — {err_msg}"),
+                    )
+                };
                 let event_id = format!(
                     "evt-exploit-fail-{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -347,8 +369,8 @@ pub async fn process_completed_task(
                 let event = serde_json::json!({
                     "id": event_id,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "source": "exploit_failed",
-                    "description": format!("Exploit attempted but failed: {vuln_id} — {err_msg}"),
+                    "source": source,
+                    "description": description,
                     "mitre_techniques": ["T1210"],
                 });
                 let _ = dispatcher

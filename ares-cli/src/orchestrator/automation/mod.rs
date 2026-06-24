@@ -105,6 +105,7 @@ pub use lsassy_dump::auto_lsassy_dump;
 pub use machine_account_quota::auto_machine_account_quota;
 pub use mssql::auto_mssql_detection;
 pub use mssql_coercion::auto_mssql_coercion;
+pub use mssql_exploitation::auto_mssql_enum_bridge;
 pub use mssql_exploitation::auto_mssql_exploitation;
 pub use mssql_exploitation::auto_mssql_impersonation;
 pub use mssql_link_pivot::auto_mssql_link_pivot;

@@ -198,6 +198,39 @@ pub(crate) struct S4uWork {
 /// cooldown, account name extraction, credential matching) and asserting
 /// each one against a synthetic state is dramatically simpler than
 /// stubbing the entire Dispatcher.
+/// Derive a fallback `cifs/<host>` SPN for a constrained-delegation vuln that
+/// carries no explicit delegation target. S4U cannot run without a target SPN;
+/// rather than dispatch a blank payload (which forces the privesc agent to
+/// abandon the task), resolve the vuln's target to a hostname and synthesize
+/// the CIFS SPN. Prefers an explicit hostname on the vuln record, then resolves
+/// the target IP against known hosts. Returns `None` only when no hostname can
+/// be determined (callers then skip emitting `target_spn`, preserving prior
+/// behaviour).
+fn derive_default_spn(
+    state: &StateInner,
+    vuln: &ares_core::models::VulnerabilityInfo,
+) -> Option<String> {
+    let hostname = vuln
+        .details
+        .get("target_hostname")
+        .and_then(|v| v.as_str())
+        .or_else(|| vuln.details.get("TargetHostname").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            state
+                .hosts
+                .iter()
+                .find(|h| h.ip == vuln.target && !h.hostname.is_empty())
+                .map(|h| h.hostname.clone())
+        })?;
+
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        return None;
+    }
+    Some(format!("cifs/{hostname}"))
+}
+
 pub(crate) fn select_s4u_work_items(
     state: &StateInner,
     dispatch_tracker: &HashMap<String, (Instant, u32)>,
@@ -232,6 +265,13 @@ pub(crate) fn select_s4u_work_items(
                 .or_else(|| vuln.details.get("AccountName").and_then(|v| v.as_str()))
                 .map(|s| s.to_string());
 
+            // The SPN can live under any of three keys depending on who
+            // recorded the vuln: `delegation_target` (find_delegation parser),
+            // `AllowedToDelegate` (BloodHound-style), or `target_spn` (the CLI
+            // inject-vulnerability path). Check all three. When none is set,
+            // fall back to the CIFS SPN of the target host so a manually
+            // injected delegation vuln still dispatches a runnable payload
+            // instead of an empty SPN that forces the agent to bail.
             let target_spn = vuln
                 .details
                 .get("delegation_target")
@@ -241,7 +281,9 @@ pub(crate) fn select_s4u_work_items(
                         .get("AllowedToDelegate")
                         .and_then(|v| v.as_str())
                 })
-                .map(|s| s.to_string());
+                .or_else(|| vuln.details.get("target_spn").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .or_else(|| derive_default_spn(state, vuln));
 
             let credential = account_name.as_ref().and_then(|acct| {
                 state
@@ -818,6 +860,77 @@ mod tests {
             work[0].target_spn.as_deref(),
             Some("CIFS/host.contoso.local")
         );
+    }
+
+    #[test]
+    fn select_resolves_spn_from_target_spn_key() {
+        // The CLI inject-vulnerability path stores the SPN under `target_spn`
+        // (not `delegation_target`/`AllowedToDelegate`). Previously this key was
+        // ignored, dispatching a blank SPN. It must now be resolved.
+        let mut s = StateInner::new("op-test".into());
+        let mut details = std::collections::HashMap::new();
+        details.insert("account_name".into(), json!("svc_sql"));
+        details.insert("target_spn".into(), json!("cifs/dc01.contoso.local"));
+        let v = ares_core::models::VulnerabilityInfo {
+            vuln_id: "v-inject".into(),
+            vuln_type: "constrained_delegation".into(),
+            target: "192.168.58.50".into(),
+            discovered_by: "test".into(),
+            discovered_at: Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 1,
+        };
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.credentials
+            .push(make_cred("svc_sql", "Pw!", "contoso.local"));
+        let work = select_s4u_work_items(&s, &HashMap::new(), Instant::now());
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            work[0].target_spn.as_deref(),
+            Some("cifs/dc01.contoso.local")
+        );
+    }
+
+    #[test]
+    fn select_derives_default_cifs_spn_from_host() {
+        // No SPN key anywhere on the vuln, but the target IP resolves to a known
+        // host: fall back to `cifs/<hostname>` rather than dispatching blank.
+        let mut s = StateInner::new("op-test".into());
+        let v = make_delegation_vuln("v-nospn", "constrained_delegation", Some("svc_sql"), None);
+        let target_ip = v.target.clone();
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.credentials
+            .push(make_cred("svc_sql", "Pw!", "contoso.local"));
+        s.hosts.push(ares_core::models::Host {
+            ip: target_ip,
+            hostname: "dc01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: true,
+            owned: false,
+        });
+        let work = select_s4u_work_items(&s, &HashMap::new(), Instant::now());
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            work[0].target_spn.as_deref(),
+            Some("cifs/dc01.contoso.local")
+        );
+    }
+
+    #[test]
+    fn select_leaves_spn_none_when_unresolvable() {
+        // No SPN key and no matching host → target_spn stays None (caller omits
+        // it from the payload, preserving prior behaviour for this case).
+        let mut s = StateInner::new("op-test".into());
+        let v = make_delegation_vuln("v-blank", "constrained_delegation", Some("svc_sql"), None);
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.credentials
+            .push(make_cred("svc_sql", "Pw!", "contoso.local"));
+        let work = select_s4u_work_items(&s, &HashMap::new(), Instant::now());
+        assert_eq!(work.len(), 1);
+        assert!(work[0].target_spn.is_none());
     }
 
     #[test]
