@@ -108,11 +108,19 @@ pub async fn auto_acl_chain_follow(
                         continue;
                     }
 
-                    // Find credential for the source user
+                    // Find credential for the source user. A parent-domain
+                    // account is a valid principal against a child domain in
+                    // the same forest, so a cred whose realm is a parent of the
+                    // edge's `source_domain` also matches (e.g. a stored
+                    // `contoso.local` cred for a `child.contoso.local` edge).
                     let cred = state.credentials.iter().find(|c| {
                         c.username.to_lowercase() == source_user.to_lowercase()
                             && (source_domain.is_empty()
-                                || c.domain.to_lowercase() == source_domain.to_lowercase())
+                                || c.domain.to_lowercase() == source_domain.to_lowercase()
+                                || crate::worker::credential_resolver::is_parent_realm(
+                                    &c.domain,
+                                    source_domain,
+                                ))
                     });
 
                     if let Some(cred) = cred {

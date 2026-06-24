@@ -206,7 +206,11 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             .find(|c| {
                 c.username.to_lowercase() == source_user.to_lowercase()
                     && (source_domain.is_empty()
-                        || c.domain.to_lowercase() == source_domain.to_lowercase())
+                        || c.domain.to_lowercase() == source_domain.to_lowercase()
+                        || crate::worker::credential_resolver::is_parent_realm(
+                            &c.domain,
+                            source_domain,
+                        ))
             })
             .cloned()
             .or_else(|| resolve_sid_principal(state, source_user, source_domain));
@@ -1162,6 +1166,62 @@ mod tests {
         let work = collect_dacl_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[tokio::test]
+    async fn collect_matches_parent_domain_credential_for_child_source_domain() {
+        // The cross-realm killchain bug: a BloodHound ACL edge carries
+        // source_domain=child.contoso.local, but the only credential in state
+        // is for the parent (contoso.local). A parent-domain account is a valid
+        // principal against the child, so the work item must still be collected
+        // (previously the exact-domain predicate dropped it and the chain was
+        // silently skipped).
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("tony", "contoso.local"));
+            let details = acl_details("tony", "victim", "child.contoso.local");
+            let vuln = make_vuln("vuln-parent-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(
+            work.len(),
+            1,
+            "parent-domain credential must match a child-domain ACL edge"
+        );
+        assert_eq!(work[0].domain, "contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_skips_sibling_domain_credential_for_child_source_domain() {
+        // fabrikam.local is not a parent of child.contoso.local — a sibling /
+        // foreign-forest cred must not be matched to the edge.
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("tony", "fabrikam.local"));
+            let details = acl_details("tony", "victim", "child.contoso.local");
+            let vuln = make_vuln("vuln-sibling-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(
+            work.is_empty(),
+            "sibling-domain credential must not match a child-domain ACL edge"
+        );
     }
 
     #[tokio::test]
