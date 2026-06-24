@@ -887,7 +887,10 @@ fn split_user_realm(raw: &str) -> (String, Option<String>) {
 /// coincidence in the data.
 ///
 /// In `realm_strict` mode `CrossRealmFallback` is never produced — the
-/// finders refuse to fall back at all.
+/// finders refuse to fall back at an *arbitrary* realm. `ParentRealmFallback`
+/// IS still produced under `realm_strict`, because a parent-domain account is
+/// a valid principal against a child DC in the same forest (Kerberos referral
+/// / NTLM pass-through), unlike a sibling- or foreign-forest cred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MatchKind {
     /// Caller's `domain` matched the stored record (or was empty, in which
@@ -900,6 +903,24 @@ pub(crate) enum MatchKind {
     /// tool sends the principal qualified with the realm the DC will
     /// actually validate against.
     CrossRealmFallback,
+    /// No exact-realm record existed, but a record in a *parent* realm of the
+    /// requested domain matched on username (e.g. stored `contoso.local`,
+    /// requested `child.contoso.local`). Within one forest the child DC's KDC
+    /// accepts the parent-realm principal via referral, so this is a valid
+    /// credential even for `realm_strict` direct-bind tools. Like
+    /// `CrossRealmFallback`, the caller must rewrite `args.domain` to the
+    /// record's (parent) realm so the principal authenticates against the
+    /// realm it actually belongs to.
+    ParentRealmFallback,
+}
+
+/// True when `parent` is a strict parent realm of `child` — i.e. `child` is a
+/// subdomain of `parent` (`child.contoso.local` vs `contoso.local`). Equal
+/// realms and empty inputs are not "parent" relationships.
+pub(crate) fn is_parent_realm(parent: &str, child: &str) -> bool {
+    let parent = parent.to_lowercase();
+    let child = child.to_lowercase();
+    !parent.is_empty() && child != parent && child.ends_with(&format!(".{parent}"))
 }
 
 /// Rewrite `args.domain` to a credential or hash record's actual realm when
@@ -913,14 +934,20 @@ pub(crate) enum MatchKind {
 /// `find_hash`.
 ///
 /// No-ops when:
-///   - `realm_strict` is set (LDAP/RPC direct bind — the caller is required
-///     to pass the exact target realm; we never overwrite it).
 ///   - `MatchKind::Exact` (the record's realm matched what was requested,
 ///     or the caller requested an empty realm in which case the existing
 ///     value — or absence — is what the dispatch expects).
+///   - `MatchKind::CrossRealmFallback` under `realm_strict` (LDAP/RPC direct
+///     bind — for an *arbitrary* foreign realm the caller is required to pass
+///     the exact target realm; we never overwrite it).
 ///   - `record_realm` is empty (legacy ingestion / local-SAM records have
 ///     no domain; overwriting with `""` would tell the tool "no realm" and
 ///     usually break the auth that was previously working).
+///
+/// `MatchKind::ParentRealmFallback` always rewrites (even under `realm_strict`):
+/// the matched account lives in a parent realm of the requested child domain,
+/// so the dispatched principal must carry the parent realm to authenticate
+/// (the target host is addressed separately, so retargeting is not a concern).
 fn rewrite_domain_for_fallback(
     args: &mut Map<String, Value>,
     username: &str,
@@ -930,7 +957,12 @@ fn rewrite_domain_for_fallback(
     realm_strict: bool,
     source: &'static str,
 ) -> bool {
-    if realm_strict || kind != MatchKind::CrossRealmFallback || record_realm.is_empty() {
+    let allow = match kind {
+        MatchKind::Exact => false,
+        MatchKind::CrossRealmFallback => !realm_strict,
+        MatchKind::ParentRealmFallback => true,
+    };
+    if !allow || record_realm.is_empty() {
         return false;
     }
     args.insert(
@@ -963,6 +995,7 @@ fn find_credential<'a>(
     let domain_empty = domain_l.is_empty();
 
     let mut exact: Option<&Credential> = None;
+    let mut parent: Option<&Credential> = None;
     let mut any_user: Option<&Credential> = None;
     for cred in credentials {
         if cred.username.to_lowercase() != user_l {
@@ -978,6 +1011,12 @@ fn find_credential<'a>(
                 Some(prev) if cred.attack_step >= prev.attack_step => exact = Some(cred),
                 _ => {}
             }
+        } else if is_parent_realm(&cred.domain, &domain_l) {
+            match parent {
+                None => parent = Some(cred),
+                Some(prev) if cred.attack_step >= prev.attack_step => parent = Some(cred),
+                _ => {}
+            }
         }
         match any_user {
             None => any_user = Some(cred),
@@ -986,10 +1025,19 @@ fn find_credential<'a>(
         }
     }
     // Realm-strict callers (LDAP/RPC direct bind) MUST get an exact-realm
-    // match or nothing. A foreign-realm cred just produces 52e/775 at bind
-    // time and burns the dispatch.
+    // match — or a parent-realm account, which the child DC's KDC validates
+    // via in-forest referral. A foreign/sibling-realm cred just produces
+    // 52e/775 at bind time and burns the dispatch, so it stays suppressed.
     if realm_strict {
-        return exact.map(|c| (c, MatchKind::Exact));
+        if let Some(c) = exact {
+            return Some((c, MatchKind::Exact));
+        }
+        if !is_common_per_domain_account(&user_l) {
+            if let Some(c) = parent {
+                return Some((c, MatchKind::ParentRealmFallback));
+            }
+        }
+        return None;
     }
     if let Some(c) = exact {
         return Some((c, MatchKind::Exact));
@@ -1122,6 +1170,8 @@ fn find_hash<'a>(
 
     let mut exact: Option<&Hash> = None;
     let mut exact_aes: Option<&Hash> = None;
+    let mut parent: Option<&Hash> = None;
+    let mut parent_aes: Option<&Hash> = None;
     let mut any_user: Option<&Hash> = None;
     let mut any_user_aes: Option<&Hash> = None;
     for h in hashes {
@@ -1150,6 +1200,19 @@ fn find_hash<'a>(
                     _ => {}
                 }
             }
+        } else if is_parent_realm(&h_domain_l, &domain_l) {
+            match parent {
+                None => parent = Some(h),
+                Some(prev) if h.attack_step >= prev.attack_step => parent = Some(h),
+                _ => {}
+            }
+            if has_aes {
+                match parent_aes {
+                    None => parent_aes = Some(h),
+                    Some(prev) if h.attack_step >= prev.attack_step => parent_aes = Some(h),
+                    _ => {}
+                }
+            }
         }
         match any_user {
             None => any_user = Some(h),
@@ -1166,7 +1229,15 @@ fn find_hash<'a>(
     }
     let exact_pick = exact_aes.or(exact);
     if realm_strict {
-        return exact_pick.map(|h| (h, MatchKind::Exact));
+        if let Some(h) = exact_pick {
+            return Some((h, MatchKind::Exact));
+        }
+        if !is_common_per_domain_account(&user_l) {
+            if let Some(h) = parent_aes.or(parent) {
+                return Some((h, MatchKind::ParentRealmFallback));
+            }
+        }
+        return None;
     }
     if let Some(h) = exact_pick {
         return Some((h, MatchKind::Exact));
@@ -1668,6 +1739,46 @@ mod tests {
     }
 
     #[test]
+    fn find_credential_realm_strict_accepts_parent_domain_cred() {
+        // A credential for the parent domain (contoso.local) is a valid
+        // principal against a child domain (child.contoso.local) even for a
+        // realm_strict direct-bind tool — the child DC's KDC honours the
+        // parent realm via in-forest referral. The match must be flagged
+        // ParentRealmFallback so the caller rewrites args.domain to the
+        // credential's (parent) realm.
+        let creds = vec![cred("tony", "contoso.local", "P@ss!")];
+        let (found, kind) = find_credential(&creds, "tony", "child.contoso.local", true).unwrap();
+        assert_eq!(found.password, "P@ss!");
+        assert_eq!(found.domain, "contoso.local");
+        assert_eq!(kind, MatchKind::ParentRealmFallback);
+    }
+
+    #[test]
+    fn find_credential_realm_strict_rejects_sibling_domain_cred() {
+        // fabrikam.local is NOT a parent of child.contoso.local — a sibling /
+        // foreign-forest cred must stay suppressed under realm_strict (it would
+        // only produce 52e/775 at bind time).
+        let creds = vec![cred("tony", "fabrikam.local", "P@ss!")];
+        assert!(
+            find_credential(&creds, "tony", "child.contoso.local", true).is_none(),
+            "sibling-realm cred must not match in realm_strict mode"
+        );
+    }
+
+    #[test]
+    fn find_credential_realm_strict_prefers_exact_over_parent() {
+        // When both an exact-realm and a parent-realm cred exist, the exact
+        // one wins (and is flagged Exact, so no domain rewrite happens).
+        let creds = vec![
+            cred("tony", "contoso.local", "parent"),
+            cred("tony", "child.contoso.local", "exact"),
+        ];
+        let (found, kind) = find_credential(&creds, "tony", "child.contoso.local", true).unwrap();
+        assert_eq!(found.password, "exact");
+        assert_eq!(kind, MatchKind::Exact);
+    }
+
+    #[test]
     fn find_credential_netbios_form_matches_after_normalize() {
         // Cred stored with NetBIOS short-form domain ("CONTOSO"); after
         // `normalize_credential_domains` runs over the slice, the FQDN-form
@@ -1725,6 +1836,26 @@ mod tests {
             .map(|(h, _)| h)
             .unwrap();
         assert_eq!(found.hash_value, "conhash");
+    }
+
+    #[test]
+    fn find_hash_realm_strict_accepts_parent_domain_hash() {
+        // Parent-realm hash is valid against a child domain under realm_strict
+        // (same forest), flagged ParentRealmFallback for the domain rewrite.
+        let hashes = vec![hash("tony", "contoso.local", "deadbeef", None)];
+        let (found, kind) = find_hash(&hashes, "tony", "child.contoso.local", true).unwrap();
+        assert_eq!(found.hash_value, "deadbeef");
+        assert_eq!(found.domain, "contoso.local");
+        assert_eq!(kind, MatchKind::ParentRealmFallback);
+    }
+
+    #[test]
+    fn find_hash_realm_strict_rejects_sibling_domain_hash() {
+        let hashes = vec![hash("tony", "fabrikam.local", "deadbeef", None)];
+        assert!(
+            find_hash(&hashes, "tony", "child.contoso.local", true).is_none(),
+            "sibling-realm hash must not match in realm_strict mode"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1823,6 +1954,45 @@ mod tests {
             args.get("domain").and_then(|v| v.as_str()),
             Some("contoso.local"),
             "args.domain must remain unchanged when realms match"
+        );
+    }
+
+    #[test]
+    fn resolve_principal_rewrites_domain_for_parent_realm_under_realm_strict() {
+        // The recon-deferral / cross-realm bug repro: an op seeded with a
+        // parent-domain account (tony@contoso.local) drives an ACL step that a
+        // realm_strict tool (bloodyad/pywhisker/ldap) requests against the
+        // child realm (child.contoso.local). The resolver must inject the
+        // parent cred AND rewrite args.domain to contoso.local so the tool
+        // authenticates as the parent principal (not the nonexistent
+        // child.contoso.local\tony) — the target host is addressed separately.
+        let creds = vec![cred("tony", "contoso.local", "P@ssw0rd!")];
+        let hashes: Vec<Hash> = vec![];
+        let mut args = json!({
+            "username": "tony",
+            "domain": "child.contoso.local",
+            "target": "192.168.58.11",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        resolve_principal_credentials(
+            &mut args,
+            &creds,
+            &hashes,
+            "tony",
+            "child.contoso.local",
+            true,
+        );
+        assert_eq!(
+            args.get("password").and_then(|v| v.as_str()),
+            Some("P@ssw0rd!"),
+            "parent-realm password must be injected even under realm_strict"
+        );
+        assert_eq!(
+            args.get("domain").and_then(|v| v.as_str()),
+            Some("contoso.local"),
+            "args.domain must be rewritten to the parent realm under realm_strict"
         );
     }
 

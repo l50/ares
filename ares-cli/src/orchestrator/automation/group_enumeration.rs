@@ -9,7 +9,7 @@
 //! recursively, including Foreign Security Principals for cross-domain groups.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -147,6 +147,10 @@ pub async fn auto_group_enumeration(
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Suppress re-dispatch of items the throttler / credential-inflight cap just
+    // deferred, so the 20s tick doesn't flood the deferred queue with duplicates
+    // (dedup only commits on success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -173,7 +177,11 @@ pub async fn auto_group_enumeration(
                 "Group enumeration work items collected"
             );
         }
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             // When PTH hash is available, use the hash user's identity for the target domain
             // instead of a cross-domain credential that will fail LDAP simple bind.
             let (cred_user, cred_pass, cred_domain) = if item.ntlm_hash.is_some() {
@@ -264,6 +272,7 @@ pub async fn auto_group_enumeration(
                         "Group enumeration dispatched"
                     );
 
+                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -276,6 +285,7 @@ pub async fn auto_group_enumeration(
                 }
                 Ok(None) => {
                     info!(domain = %item.domain, dc = %item.dc_ip, "Group enumeration deferred by throttler");
+                    cooldown.record(&item.dedup_key, now);
                 }
                 Err(e) => {
                     warn!(err = %e, domain = %item.domain, "Failed to dispatch group enumeration");

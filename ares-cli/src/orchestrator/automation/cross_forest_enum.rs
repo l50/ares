@@ -14,7 +14,7 @@
 //! because initial recon only has primary-forest credentials.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -138,6 +138,11 @@ pub async fn auto_cross_forest_enum(
     // Wait for initial credential discovery and cross-domain pivots.
     tokio::time::sleep(Duration::from_secs(120)).await;
 
+    // Suppress re-dispatch of items the throttler just deferred, so the tick
+    // doesn't flood the deferred queue with duplicates (dedup only commits on
+    // success). See super::DeferCooldown.
+    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
+
     loop {
         tokio::select! {
             _ = interval.tick() => {},
@@ -159,7 +164,11 @@ pub async fn auto_cross_forest_enum(
             continue;
         }
 
+        let now = Instant::now();
         for item in work {
+            if cooldown.active(&item.dedup_key, now) {
+                continue;
+            }
             // Dispatch user enumeration
             let mut user_payload = json!({
                 "technique": "ldap_user_enumeration",
@@ -215,6 +224,7 @@ pub async fn auto_cross_forest_enum(
                     );
                 }
                 Ok(None) => {
+                    cooldown.record(&item.dedup_key, now);
                     debug!(domain = %item.domain, "Cross-forest user enum deferred");
                     continue; // Don't mark as processed if deferred
                 }
@@ -272,6 +282,7 @@ pub async fn auto_cross_forest_enum(
             }
 
             // Mark as processed
+            cooldown.clear(&item.dedup_key);
             dispatcher
                 .state
                 .write()
