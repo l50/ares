@@ -26,6 +26,38 @@ MSSQL impersonation/linked-server, delegation, advanced ADCS) and **Phase 3**
 (lab principals). Selection diversity is necessary but not sufficient for 80–100
 unique paths until the dark families actually enter the queue.
 
+## Phase 2 audit findings (recon→queue coverage)
+
+The original premise — "whole families are dark / never enumerated" — turned out
+to be **false** for the current codebase. MSSQL impersonation + linked-server,
+delegation (constrained/unconstrained/RBCD), and ADCS (ESC 1–15) are all
+enumerated → parsed → registered → queued → exploited by existing modules. The
+real gaps are **routing/parsing/provisioning correctness bugs**, not missing
+enumeration. Audited against the lab spec
+(`../DreadOps/apps/DreadGOAD/docs/domain-compromise-paths.md`); each item below is
+confirmed by reading code, with file:line.
+
+Done in this change:
+
+- **Queue rebalance** (`config/ares.yaml`). `acl_abuse` was priority 1 (top), so
+  the high-volume ACL graph drained first every run and starved the MSSQL
+  families (which fell back to 10/11). ACL de-dominated to 3; MSSQL
+  impersonation/linked lifted to 3. This is the "rebalance the ACL flood" lever.
+
+Outstanding (each its own validated fix — some need ansible/container changes,
+so deliberately *not* bundled into this PR):
+
+| # | Family | Gap | Fix site |
+|---|---|---|---|
+| 1 | ADCS | **ESC9 & ESC10 categorically fail** — routed to `privesc`, but the UPN-write tool `bloodyad_set_object_attr` is `acl`-only. Neither container has both `bloodyAD` *and* `certipy`. | split-dispatch automation, or add a tool to a container (`ansible/`) + `adcs_exploitation.rs:637-641` |
+| 2 | Delegation | Kerberos-only constrained (N6) parsed identically to protocol-transition (N4) → wrong S4U payload, always fails S4U2Self. | `ares-tools/src/parsers/delegation.rs:37-43` (add `protocol_transition` flag) + `s4u.rs` payload branch |
+| 3 | MSSQL | Impersonation target hardcoded to `"sa"` → grantee→non-sa logins (e.g. brandon→jon.snow) never fire deterministically. | `mssql_exploitation.rs:364` |
+| 4 | MSSQL | `vuln_id = mssql_impersonation_{host}` is per-host → `HSETNX` collapses multiple grants on one host into one. | `ares-tools/src/parsers/mssql.rs:59` (per-grantee key) |
+| 5 | MSSQL | DB-level `EXECUTE AS USER=dbo` never enumerated — parser queries `sys.server_permissions` only, not `sys.database_permissions`. | `ares-tools/src/parsers/mssql.rs:76` |
+| 6 | MSSQL | Linked-server objective steers the LLM to unparsed `mssql_command`/`mssql_exec_linked` → `mssql_linked_server` vulns often never register → cross-forest pivots don't trigger. | `mssql_exploitation.rs:222` + parser dispatch |
+| 7 | ADCS | ESC4 picks first same-domain cred instead of the GenericAll holder (parser drops the holder) → abandoned before the right cred lands. | `ares-tools/src/parsers/certipy.rs:63-103` |
+| 8 | Delegation | RBCD rows from findDelegation misclassified as constrained (latent; ACL path covers the live lab path). A correct classifier exists but is uncalled. | wire `ares-core/src/parsing/delegation.rs:92-103` into `parse_tool_output` |
+
 ## TL;DR
 
 The lab is not the limiter. The orchestrator is. Provisioning already supports

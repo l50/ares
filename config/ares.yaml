@@ -49,13 +49,23 @@ operation:
 
   # Per-technique priority overrides (lower = higher priority, 1-10).
   # Merged on top of the preset defaults. Overrides vulnerability_priorities below.
+  #
+  # Rebalanced for attack-path diversity (see docs/attack-path-diversity.md):
+  # acl_abuse was 1 (top priority), so the high-volume ACL graph drained first
+  # every run and crowded out the MSSQL families, which fell back to their
+  # vulnerability_priorities defaults of 10/11 and were effectively starved.
+  # ACL is de-dominated to 3 and the MSSQL impersonation/linked-server families
+  # are lifted to 3 so all three families compete on a level footing.
   technique_weights:
     esc1: 1
     esc4: 1
-    acl_abuse: 1
     constrained_delegation: 2
     unconstrained_delegation: 2
+    rbcd: 2
+    acl_abuse: 3
     mssql_access: 3
+    mssql_impersonation: 3
+    mssql_linked: 3
 
   # LLM temperature override (0.0-2.0). Higher values = more creative technique
   # selection. None/omit = provider default.
