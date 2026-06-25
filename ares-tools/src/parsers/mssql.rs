@@ -107,7 +107,11 @@ pub fn parse_mssql_impersonation(output: &str, params: &Value) -> Vec<Value> {
     });
 
     if has_impersonation {
-        let id_suffix = if username.is_empty() { "unknown" } else { username };
+        let id_suffix = if username.is_empty() {
+            "unknown"
+        } else {
+            username
+        };
         vulns.push(json!({
             "vuln_id": format!("mssql_impersonation_{}_{}", target, id_suffix.to_lowercase()),
             "vuln_type": "mssql_impersonation",
@@ -242,8 +246,10 @@ master  arya.stark       dbo
         let vulns = parse_mssql_impersonation(output, &params);
         assert_eq!(vulns.len(), 3, "got {vulns:?}");
         // Distinct vuln_ids (per grantee→target), not collapsed to one host key.
-        let ids: std::collections::HashSet<_> =
-            vulns.iter().map(|v| v["vuln_id"].as_str().unwrap()).collect();
+        let ids: std::collections::HashSet<_> = vulns
+            .iter()
+            .map(|v| v["vuln_id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids.len(), 3);
         // brandon → jon.snow target captured (not hardcoded sa).
         let brandon = vulns

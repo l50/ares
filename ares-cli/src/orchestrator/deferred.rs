@@ -23,8 +23,8 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
-use crate::orchestrator::diversity;
 use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::diversity;
 use crate::orchestrator::task_queue::TaskQueue;
 use crate::orchestrator::throttling::{ThrottleDecision, Throttler};
 
@@ -224,7 +224,10 @@ impl DeferredQueue {
 
         let temperature = self.config.strategy.selection_temperature;
         let idx = if temperature > 0.0 {
-            let priorities: Vec<f32> = candidates.iter().map(|(_, _, t)| t.priority as f32).collect();
+            let priorities: Vec<f32> = candidates
+                .iter()
+                .map(|(_, _, t)| t.priority as f32)
+                .collect();
             let mut rng = rand::thread_rng();
             diversity::softmax_select_index(&priorities, temperature, &mut rng).unwrap_or(0)
         } else {
