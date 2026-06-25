@@ -61,6 +61,28 @@ operation:
   # selection. None/omit = provider default.
   # llm_temperature: 1.0
 
+  # --- Attack-path diversity (see docs/attack-path-diversity.md) ---
+  # All knobs below default to today's deterministic behaviour. Omit them to
+  # reproduce current runs exactly; set them to spread the fleet across more of
+  # the available attack paths.
+  #
+  # Queue selection temperature for softmax sampling in the exploitation queue.
+  # 0.0 = deterministic argmin (current behaviour). Higher = more spread across
+  # near-equal-priority work. Distinct from llm_temperature above.
+  # selection_temperature: 0.0
+  #
+  # Cross-run novelty memory: bias each run away from path prefixes prior runs
+  # already walked, so the fleet covers more unique paths.
+  # novelty:
+  #   enabled: false
+  #   scope: per-campaign   # which runs share/reset novelty memory
+  #
+  # Randomize the entry foothold per run (cheapest diversity source).
+  # randomize_entry_foothold: false
+  #
+  # Emit structured per-run path records for coverage measurement (Phase 0).
+  # emit_path_records: false
+
 # Agent configurations
 agents:
   orchestrator:
