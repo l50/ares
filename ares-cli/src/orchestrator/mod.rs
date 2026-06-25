@@ -20,6 +20,7 @@ mod completion;
 mod config;
 mod cost_summary;
 mod deferred;
+mod diversity;
 mod dispatcher;
 mod exploitation;
 mod llm_runner;

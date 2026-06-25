@@ -4,6 +4,28 @@ How to get from "launch 100 runs, see ~1 path" to "launch 100 runs, get 80–100
 unique attack paths." This is a *diversity* objective, not a *success* objective —
 the levers are different.
 
+## Implementation status
+
+Landed (this change): the orchestrator-side levers and instrumentation —
+Phase 0 (path records + coverage) and Phase 1 (softmax selection, cross-run
+novelty memory, randomized entry foothold). All gated by `operation:` config
+keys in `config/ares.yaml` and **off by default**, so deterministic behaviour is
+unchanged until an operator opts in.
+
+- `selection_temperature` → softmax sampling in `pop_next_vuln`
+  (`exploitation.rs`) and `pop_best` (`deferred.rs`); 0.0 = exact argmin.
+- `novelty.enabled` / `novelty.scope` → cross-run prefix avoidance via a scoped
+  Redis set (`ares:novelty:{scope}:steps`), penalising already-walked
+  `(technique, target)` steps.
+- `emit_path_records` → per-run path record (`ares:op:{id}:path_record`) and
+  coverage set (`ares:op:{id}:coverage`) emitted on exploit success.
+- `randomize_entry_foothold` → shuffles the entry recon targets in `bootstrap.rs`.
+
+Still outstanding: **Phase 2** (recon→vuln enumeration of the dark families —
+MSSQL impersonation/linked-server, delegation, advanced ADCS) and **Phase 3**
+(lab principals). Selection diversity is necessary but not sufficient for 80–100
+unique paths until the dark families actually enter the queue.
+
 ## TL;DR
 
 The lab is not the limiter. The orchestrator is. Provisioning already supports
