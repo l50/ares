@@ -37,26 +37,23 @@ enumeration. Audited against the lab spec
 (`../DreadOps/apps/DreadGOAD/docs/domain-compromise-paths.md`); each item below is
 confirmed by reading code, with file:line.
 
-Done in this change:
+Fixed in this change:
 
 - **Queue rebalance** (`config/ares.yaml`). `acl_abuse` was priority 1 (top), so
   the high-volume ACL graph drained first every run and starved the MSSQL
   families (which fell back to 10/11). ACL de-dominated to 3; MSSQL
   impersonation/linked lifted to 3. This is the "rebalance the ACL flood" lever.
 
-Outstanding (each its own validated fix — some need ansible/container changes,
-so deliberately *not* bundled into this PR):
-
-| # | Family | Gap | Fix site |
+| # | Family | Gap | Fix |
 |---|---|---|---|
-| 1 | ADCS | **ESC9 & ESC10 categorically fail** — routed to `privesc`, but the UPN-write tool `bloodyad_set_object_attr` is `acl`-only. Neither container has both `bloodyAD` *and* `certipy`. | split-dispatch automation, or add a tool to a container (`ansible/`) + `adcs_exploitation.rs:637-641` |
-| 2 | Delegation | Kerberos-only constrained (N6) parsed identically to protocol-transition (N4) → wrong S4U payload, always fails S4U2Self. | `ares-tools/src/parsers/delegation.rs:37-43` (add `protocol_transition` flag) + `s4u.rs` payload branch |
-| 3 | MSSQL | Impersonation target hardcoded to `"sa"` → grantee→non-sa logins (e.g. brandon→jon.snow) never fire deterministically. | `mssql_exploitation.rs:364` |
-| 4 | MSSQL | `vuln_id = mssql_impersonation_{host}` is per-host → `HSETNX` collapses multiple grants on one host into one. | `ares-tools/src/parsers/mssql.rs:59` (per-grantee key) |
-| 5 | MSSQL | DB-level `EXECUTE AS USER=dbo` never enumerated — parser queries `sys.server_permissions` only, not `sys.database_permissions`. | `ares-tools/src/parsers/mssql.rs:76` |
-| 6 | MSSQL | Linked-server objective steers the LLM to unparsed `mssql_command`/`mssql_exec_linked` → `mssql_linked_server` vulns often never register → cross-forest pivots don't trigger. | `mssql_exploitation.rs:222` + parser dispatch |
-| 7 | ADCS | ESC4 picks first same-domain cred instead of the GenericAll holder (parser drops the holder) → abandoned before the right cred lands. | `ares-tools/src/parsers/certipy.rs:63-103` |
-| 8 | Delegation | RBCD rows from findDelegation misclassified as constrained (latent; ACL path covers the live lab path). A correct classifier exists but is uncalled. | wire `ares-core/src/parsing/delegation.rs:92-103` into `parse_tool_output` |
+| 1 | ADCS | ESC9 & ESC10 categorically failed — routed to `privesc`, but the only UPN-write tool was `acl`-only and that container lacks `certipy`. | Added a `certipy_account_update` tool (certipy *is* on privesc, so the whole chain runs on one worker) and repointed the ESC9/ESC10 instructions to it. |
+| 2 | Delegation | Kerberos-only constrained (N6) parsed identically to protocol-transition (N4) → wrong S4U payload, always failed S4U2Self. | Parser sets a `protocol_transition` flag (`w/o` ⇒ false); `build_s4u_payload` surfaces it with explicit S4U2Proxy-only guidance for kerberos-only accounts. |
+| 3 | MSSQL | Impersonation target hardcoded to `"sa"` → grantee→non-sa logins never fired. | `impersonate_target` captured per grant and threaded into the probe (falls back to `sa`). |
+| 4 | MSSQL | `vuln_id = mssql_impersonation_{host}` collapsed multiple grants via `HSETNX`. | vuln_id is now per `(scope, grantee, target)`. |
+| 5 | MSSQL | DB-level `EXECUTE AS USER` never enumerated (server view only). | Enum query resolves principal names and also queries `master`/`msdb` `sys.database_permissions`; parser emits a vuln per grant. |
+| 6 | MSSQL | Objectives steered the LLM to unparsed `mssql_command` → linked-server / impersonation vulns never registered. | Objectives #4/#5 now call the parsed `mssql_enum_impersonation` / `mssql_enum_linked_servers` tools. |
+| 7 | ADCS | ESC4 picked the first same-domain cred instead of the GenericAll holder. | certipy parser captures the write-holder principal into `account_name` for ESC4/7/9/10; `find_adcs_credential` prefers it and still falls back. |
+| 8 | Delegation | RBCD rows from findDelegation misclassified as constrained (latent). | Parser checks `resource`/`rbcd` before `constrained` and emits the bare `rbcd` type the automation watches. |
 
 ## TL;DR
 
