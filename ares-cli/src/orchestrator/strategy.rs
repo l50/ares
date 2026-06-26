@@ -264,10 +264,16 @@ fn fast_weights() -> HashMap<String, i32> {
     [
         ("dc_secretsdump", 1),
         ("golden_ticket", 1),
+        ("golden_cert", 1),
         ("forest_trust_escalation", 1),
         ("child_to_parent", 1),
         ("domain_admin", 1),
         ("secretsdump", 2),
+        // SeImpersonate -> SYSTEM is a decisive local escalation, not a
+        // "fallback" technique. Recon in fast dispatches as low as priority 2
+        // (acl_discovery, group_enumeration); seimpersonate must sit ABOVE that
+        // (=1) or the deferred queue serves recon first and starves it.
+        ("seimpersonate", 1),
         ("credential_reuse", 3),
         ("mssql_access", 4),
         ("mssql_linked_server", 4),
@@ -364,9 +370,11 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("certifried", 1),
         ("krbrelayup", 1),
         ("printnightmare", 1),
+        ("seimpersonate", 1),
         // --- Tier 2: Credential pipeline + lateral + persistence ---
         ("dc_secretsdump", 2),
         ("golden_ticket", 2),
+        ("golden_cert", 2),
         ("forest_trust_escalation", 2),
         ("child_to_parent", 2),
         ("domain_admin", 2),
@@ -421,6 +429,8 @@ fn stealth_weights() -> HashMap<String, i32> {
     [
         ("dc_secretsdump", 6),
         ("golden_ticket", 4),
+        ("golden_cert", 2),
+        ("seimpersonate", 3),
         ("forest_trust_escalation", 4),
         ("child_to_parent", 4),
         ("domain_admin", 3),
@@ -596,6 +606,38 @@ mod tests {
         // Tier 3: recon/enumeration
         assert_eq!(s.effective_priority("group_enumeration"), 3);
         assert_eq!(s.effective_priority("dns_enum"), 3);
+    }
+
+    /// Regression: every technique submitted as an `exploit`/`privesc` task
+    /// must outrank recon (tier 3 = 3) in comprehensive mode. A missing weights
+    /// entry falls through to `unwrap_or(5)`, which is *worse* than recon, so
+    /// the deferred queue (lowest-score-first) lets recon perpetually preempt
+    /// the exploit — observed live as `seimpersonate` (SeImpersonate→SYSTEM)
+    /// and `golden_cert` stalling at priority 5 behind priority-3 recon.
+    #[test]
+    fn comprehensive_exploit_techniques_outrank_recon() {
+        let s = Strategy::from_preset(StrategyPreset::Comprehensive);
+        const RECON_TIER: i32 = 3;
+        // Keys passed to effective_priority() at an exploit/privesc submit site.
+        for key in [
+            "seimpersonate",
+            "golden_cert",
+            "nopac",
+            "rbcd",
+            "printnightmare",
+            "shadow_credentials",
+            "unconstrained_delegation",
+            "mssql_access",
+            "adcs_esc1",
+            "adcs_esc8",
+        ] {
+            let p = s.effective_priority(key);
+            assert!(
+                p < RECON_TIER,
+                "exploit technique {key:?} has priority {p}, must be < recon tier {RECON_TIER} \
+                 or recon will starve it in the deferred queue"
+            );
+        }
     }
 
     #[test]
