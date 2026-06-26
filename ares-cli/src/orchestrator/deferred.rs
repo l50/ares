@@ -527,6 +527,36 @@ mod tests {
     }
 
     #[test]
+    fn seimpersonate_outranks_recon_in_deferred_order() {
+        // End-to-end ordering proof (not just "a function returns N"):
+        // pop_best() selects the lowest score(), and score() = priority*1e9 +
+        // time*1000. So whichever of two same-time tasks has the lower
+        // effective_priority is dispatched first. This pins that a SeImpersonate
+        // escalation is served BEFORE recon — the behavior the strategy-weight
+        // fix exists to guarantee — in both presets that run in the field.
+        use crate::orchestrator::strategy::{Strategy, StrategyPreset};
+
+        // Highest-priority (lowest-numbered) recon actually dispatched is 2:
+        // acl_discovery hardcodes priority 2; group_enumeration and
+        // domain_user_enumeration resolve to 2. If recon ever outranks this,
+        // update here — the invariant is "seimpersonate beats the best recon".
+        const HIGHEST_RECON_PRIORITY: i32 = 2;
+        let t = 1_700_000_000.0; // identical enqueue time -> pure priority compare
+
+        for preset in [StrategyPreset::Fast, StrategyPreset::Comprehensive] {
+            let s = Strategy::from_preset(preset);
+            let seimp_prio = s.effective_priority("seimpersonate");
+            let seimp = make_task(seimp_prio, t);
+            let recon = make_task(HIGHEST_RECON_PRIORITY, t);
+            assert!(
+                seimp.score() < recon.score(),
+                "{preset:?}: seimpersonate (p{seimp_prio}) must score below the \
+                 highest-priority recon (p{HIGHEST_RECON_PRIORITY}) so pop_best serves it first"
+            );
+        }
+    }
+
+    #[test]
     fn same_priority_fifo_ordering() {
         let earlier = make_task(5, 1000.0);
         let later = make_task(5, 1010.0);

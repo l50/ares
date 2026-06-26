@@ -21,7 +21,7 @@ use ares_llm::{ToolCall, ToolExecResult};
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 
-use super::domain_validator::check_domain_arg;
+use super::domain_validator::{check_domain_arg, check_unauthable_realm};
 use super::{
     extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
     ToolExecRequest, ToolExecResponse,
@@ -143,6 +143,14 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
             // domain — catches LLM typos before they pollute credential
             // records or misroute downstream tooling.
             if let Some(rejection) = check_domain_arg(&self.queue, &self.operation_id, call).await {
+                return Ok(rejection);
+            }
+
+            // Reject authenticated exact-realm binds against a domain we own no
+            // usable principal for — they fail 0x52e and requeue endlessly.
+            if let Some(rejection) =
+                check_unauthable_realm(&self.queue, &self.operation_id, call).await
+            {
                 return Ok(rejection);
             }
 

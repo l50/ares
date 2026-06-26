@@ -73,7 +73,15 @@ pub async fn mssql_enable_xp_cmdshell(args: &Value) -> Result<ToolOutput> {
 /// Required args: `target`, `username`
 /// Optional args: `password`, `domain`, `windows_auth`
 pub async fn mssql_enum_impersonation(args: &Value) -> Result<ToolOutput> {
-    let query = "SELECT * FROM sys.server_permissions WHERE type = 'IM';";
+    // First column is the impersonable login's NAME (the securable `major_id`
+    // for an IMPERSONATE grant), so the parser can record WHICH login to
+    // `EXECUTE AS` — not just that some grant exists. LEFT JOIN keeps every
+    // `type = 'IM'` row even when `major_id` doesn't resolve, so impersonation
+    // detection never regresses versus the old `SELECT *`.
+    let query = "SELECT pr.name AS impersonable_login, perm.* \
+                 FROM sys.server_permissions perm \
+                 LEFT JOIN sys.server_principals pr ON perm.major_id = pr.principal_id \
+                 WHERE perm.type = 'IM';";
 
     mssql_query(mssql_from_args(args)?, query).await
 }

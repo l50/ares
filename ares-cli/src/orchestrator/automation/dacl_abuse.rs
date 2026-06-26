@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::dedup::is_ghost_machine_account;
+use crate::dedup::{is_ghost_machine_account, is_low_value_acl_target};
 use crate::orchestrator::dispatcher::{Dispatcher, SubmissionOutcome};
 use crate::orchestrator::state::*;
 
@@ -170,6 +170,19 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
                 vuln_id = %vuln.vuln_id,
                 target = %target_name,
                 "Skipping ACL abuse for ghost or ares-created machine account target"
+            );
+            continue;
+        }
+
+        // Drop ACL edges whose target is a well-known non-escalating built-in
+        // group (Cloneable Domain Controllers, IIS_IUSRS, …). BloodHound emits
+        // these by the dozen; each became a doomed priority-1 exploit task that
+        // flooded the queue and starved decisive escalations (e.g. seimpersonate).
+        if is_low_value_acl_target(target_name) {
+            debug!(
+                vuln_id = %vuln.vuln_id,
+                target = %target_name,
+                "Skipping ACL abuse: target is a non-escalating built-in group"
             );
             continue;
         }
@@ -331,8 +344,17 @@ fn is_privileged_well_known_rid(rid: u32) -> bool {
 ///   1. Parse `S-1-5-21-X-Y-Z-RID` and extract the domain SID prefix and RID.
 ///   2. Reverse-look up the domain via `state.domain_sids` (or fall back to
 ///      `source_domain` from the vuln details).
-///   3. For privileged well-known RIDs, return any `is_admin` credential in
-///      that domain. As a last resort, return any credential in the domain.
+///   3. For privileged well-known RIDs, return an `is_admin` credential in
+///      that domain — i.e. a credential that could plausibly act as that
+///      privileged group. If we hold no such credential, return `None`.
+///
+/// The old behavior fell back to "any credential in the domain", which
+/// fabricated a doomed exploit task for every `Enterprise Admins -> GenericAll
+/// -> X` edge BloodHound emits (abuse attempted as e.g. a low-priv user that is
+/// not a member of the group — it always fails). At hundreds of such edges this
+/// flooded the priority-1 ACL queue and starved real escalations. We only
+/// synthesize work from a privileged-group source when we actually hold an
+/// admin credential in that domain.
 fn resolve_sid_principal(
     state: &StateInner,
     source: &str,
@@ -361,19 +383,13 @@ fn resolve_sid_principal(
         return None;
     }
 
-    let admin = state
-        .credentials
-        .iter()
-        .find(|c| c.is_admin && c.domain.to_lowercase() == resolved_domain)
-        .cloned();
-    if admin.is_some() {
-        return admin;
-    }
-
+    // Only an admin credential can plausibly exercise a privileged group's
+    // rights. No "any credential" fallback — that fabricated doomed work for
+    // every privileged-group-source edge and flooded the ACL queue.
     state
         .credentials
         .iter()
-        .find(|c| c.domain.to_lowercase() == resolved_domain)
+        .find(|c| c.is_admin && c.domain.to_lowercase() == resolved_domain)
         .cloned()
 }
 
@@ -770,6 +786,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_skips_low_value_builtin_group_target() {
+        // GenericAll over a non-escalating built-in group must NOT become work;
+        // an identically-shaped edge against a real target must. This is the
+        // ACL-flood guard — dozens of these built-in-group edges otherwise
+        // saturate the priority-1 exploit queue and starve real escalations.
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("alice", "contoso.local"));
+            let noise = make_vuln(
+                "vuln-noise-001",
+                "GenericAll",
+                acl_details("alice", "Cloneable Domain Controllers", "contoso.local"),
+            );
+            let real = make_vuln(
+                "vuln-real-001",
+                "GenericAll",
+                acl_details("alice", "carol", "contoso.local"),
+            );
+            state
+                .discovered_vulnerabilities
+                .insert(noise.vuln_id.clone(), noise);
+            state
+                .discovered_vulnerabilities
+                .insert(real.vuln_id.clone(), real);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(
+            work.len(),
+            1,
+            "only the real-target edge should produce work"
+        );
+        assert_eq!(work[0].target_user, "carol");
+    }
+
+    #[tokio::test]
     async fn collect_genericwrite_produces_work() {
         let shared = SharedState::new("test".into());
         {
@@ -905,6 +961,39 @@ mod tests {
         // credential_resolver looks up password by `(username, domain)`, and
         // a SID never matches a credential record.
         assert_eq!(work[0].source_user, "admin");
+    }
+
+    #[tokio::test]
+    async fn collect_sid_source_no_admin_cred_yields_no_work() {
+        // The ACL-flood regression: a privileged-group source SID (Enterprise
+        // Admins, -519) must NOT be resolved to a non-admin credential. With no
+        // admin cred in the domain the edge is doomed (a low-priv user can't
+        // exercise EA's rights), so it must produce zero work rather than flood
+        // the priority-1 queue. Before the fix this fell back to "any cred".
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            // only a NON-admin credential in the domain
+            state
+                .credentials
+                .push(make_credential("alice", "contoso.local"));
+            state.domain_sids.insert(
+                "contoso.local".to_string(),
+                "S-1-5-21-111-222-333".to_string(),
+            );
+            let details = acl_details("S-1-5-21-111-222-333-519", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-sid-flood-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(
+            work.is_empty(),
+            "privileged-group source SID with no admin cred must not produce ACL work"
+        );
     }
 
     #[tokio::test]
