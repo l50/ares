@@ -100,7 +100,7 @@ async fn resolve_grafana_proxy() -> Option<LokiConfig> {
 /// Shared HTTP client — reuses connection pool across all Loki calls.
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         let timeout_secs = std::env::var("LOKI_TIMEOUT_SECS")
             .ok()
@@ -144,13 +144,13 @@ fn make_error(msg: &str) -> ToolOutput {
 /// Max retry attempts for transient Loki failures.
 /// Loki queries through the Grafana proxy take 20-50s from EC2,
 /// so we allow 3 attempts to ride through transient proxy hiccups.
-const MAX_RETRIES: u32 = 3;
+pub(crate) const MAX_RETRIES: u32 = 3;
 
 /// Base backoff delay between retries.
-const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Check whether an HTTP status code is transient and worth retrying.
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
 }
 

@@ -4,6 +4,8 @@
 //! subcommands: `ares ops`, `ares orchestrator`, `ares worker`, etc.
 
 #[cfg(feature = "blue")]
+mod benchmark;
+#[cfg(feature = "blue")]
 mod blue;
 mod cli;
 mod config;
@@ -106,6 +108,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Ops(cmd) => ops::run_ops(cmd, cli.redis_url).await,
         #[cfg(feature = "blue")]
         Commands::Blue(cmd) => blue::run_blue(cmd, cli.redis_url).await,
+        #[cfg(feature = "blue")]
+        Commands::Benchmark(cmd) => benchmark::run_benchmark(cmd, cli.redis_url).await,
         Commands::History(cmd) => history::run_history(cmd).await,
         Commands::Config(cmd) => config::run_config(cmd),
         Commands::Orchestrator => orchestrator::run().await,

@@ -10,6 +10,7 @@ pub mod grafana;
 pub mod investigation;
 pub mod learning;
 pub mod loki;
+pub mod loki_bulk;
 pub mod persistence;
 pub mod prometheus;
 pub mod validation;
