@@ -58,12 +58,20 @@ provisioners:
     source: ${sources.ansible}
     destination: /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
 
-  # Install NVIDIA drivers for GPU-accelerated hashcat on g4dn (T4 GPU)
+  # NVIDIA driver for GPU-accelerated hashcat on g4dn (T4).
+  # The Kali cloud AMI's *running* kernel often has no matching headers in-repo,
+  # so DKMS can't build against it. Install the cloud kernel meta + its headers
+  # (which are in sync in-repo), then the driver — DKMS builds the module for the
+  # INSTALLED kernel. No reboot needed at build time: the AMI boots that kernel
+  # and the module loads on first boot (verified: nvidia 550 builds on 6.19.x,
+  # ~40 GH/s NTLM on a T4). nvidia-smi is intentionally not run here (no GPU
+  # loaded on the builder's running kernel — expected).
   - type: shell
     inline:
       - apt-get update
-      - apt-get install -y --no-install-recommends nvidia-driver firmware-misc-nonfree
-      - nvidia-smi || echo "nvidia-smi not available during AMI build (expected if no GPU attached)"
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-image-cloud-amd64 linux-headers-cloud-amd64 dkms
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nvidia-driver nvidia-opencl-icd firmware-misc-nonfree
+      - dkms status
 
   # Attack Box - all red team tools + Alloy telemetry
   # NOTE: Using shell instead of ansible provisioner because the playbook
@@ -71,15 +79,11 @@ provisioners:
   - type: shell
     inline:
       - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
-      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true
-
-  # NVIDIA GPU drivers + CUDA toolkit for hashcat GPU acceleration.
-  # Kernel headers + dkms are required so the nvidia module builds for the
-  # running kernel. The AMI then works on GPU instances (e.g. g4dn.xlarge)
-  # without manual driver setup.
-  - type: shell
-    inline:
-      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-headers-$(uname -r) dkms nvidia-driver nvidia-cuda-toolkit
+      # Driver is already installed in the previous step. Tell cracking_tools NOT
+      # to reinstall it (that reboots the box mid-component and kills this local
+      # run) and NOT to install nvidia-cuda-toolkit (not a real Kali package; the
+      # OpenCL backend is enough — ~40 GH/s on a T4). hashcat from apt, not source.
+      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=false -e cracking_tools_install_cuda_toolkit=false -e cracking_tools_hashcat_from_source=false
 
   # Cleanup
   - type: shell
@@ -90,7 +94,7 @@ provisioners:
 
 targets:
   - type: ami
-    region: us-west-1
+    region: us-east-1
     instance_type: g4dn.xlarge
     ami_name: "ares-golden-image-{{timestamp}}"
     volume_size: 100
