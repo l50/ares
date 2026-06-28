@@ -5,18 +5,18 @@ pub(crate) mod history;
 pub(crate) mod ops;
 
 #[cfg(feature = "blue")]
-pub(crate) mod blue;
-#[cfg(feature = "blue")]
 pub(crate) mod benchmark;
+#[cfg(feature = "blue")]
+pub(crate) mod blue;
 
 pub(crate) use config::ConfigCommands;
 pub(crate) use history::HistoryCommands;
 pub(crate) use ops::{OpsCommands, SessionsCommands};
 
 #[cfg(feature = "blue")]
-pub(crate) use blue::BlueCommands;
-#[cfg(feature = "blue")]
 pub(crate) use benchmark::BenchmarkCommands;
+#[cfg(feature = "blue")]
+pub(crate) use blue::BlueCommands;
 
 #[derive(Parser)]
 #[command(

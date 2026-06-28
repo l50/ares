@@ -66,6 +66,10 @@ jobs:
 
       - name: Upload SARIF to GitHub Security tab
         if: always()
+        # Code scanning requires GitHub Advanced Security, which is not enabled
+        # on this internal repo. Don't fail the job when the upload is rejected;
+        # the semgrep scan itself still gates on blocking findings.
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           sarif_file: semgrep-results.sarif

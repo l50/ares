@@ -120,10 +120,15 @@ pub(crate) async fn run_capture(
         let mut writer = BufWriter::new(file);
 
         info!("exporting stream {selector}");
-        let entries =
-            loki_bulk::export_stream(&loki_config, &selector, export_start, export_end, &mut writer)
-                .await
-                .with_context(|| format!("export stream {selector}"))?;
+        let entries = loki_bulk::export_stream(
+            &loki_config,
+            &selector,
+            export_start,
+            export_end,
+            &mut writer,
+        )
+        .await
+        .with_context(|| format!("export stream {selector}"))?;
 
         info!("  {job}: {entries} entries");
         total_entries += entries;
@@ -136,16 +141,16 @@ pub(crate) async fn run_capture(
         });
     }
 
-    info!("total: {total_entries} log entries across {} streams", streams.len());
+    info!(
+        "total: {total_entries} log entries across {} streams",
+        streams.len()
+    );
 
     // ── Export fired Grafana alerts ──────────────────────────────────────
     let fired_alerts = export_grafana_alerts(export_start, export_end).await?;
     let alerts_path = snapshot_dir.join("fired-alerts.json");
-    fs::write(
-        &alerts_path,
-        serde_json::to_string_pretty(&fired_alerts)?,
-    )
-    .context("write fired-alerts.json")?;
+    fs::write(&alerts_path, serde_json::to_string_pretty(&fired_alerts)?)
+        .context("write fired-alerts.json")?;
     info!("captured {} fired alerts", fired_alerts.len());
 
     // ── Write manifest ──────────────────────────────────────────────────
@@ -180,11 +185,8 @@ pub(crate) async fn run_capture(
     };
 
     let manifest_path = snapshot_dir.join("manifest.json");
-    fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest)?,
-    )
-    .context("write manifest.json")?;
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .context("write manifest.json")?;
     info!("wrote {}", manifest_path.display());
 
     // ── Optional S3 sync ─────────────────────────────────────────────────
@@ -287,21 +289,17 @@ async fn export_grafana_alerts(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<FiredAlert>> {
-    let grafana_url = match std::env::var("GRAFANA_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            info!("GRAFANA_URL not set — skipping alert export");
-            return Ok(Vec::new());
-        }
+    let Ok(grafana_url) = std::env::var("GRAFANA_URL") else {
+        info!("GRAFANA_URL not set — skipping alert export");
+        return Ok(Vec::new());
     };
     let api_key = std::env::var("GRAFANA_SERVICE_ACCOUNT_TOKEN").ok();
 
     let from_ms = start.timestamp_millis();
     let to_ms = end.timestamp_millis();
 
-    let url = format!(
-        "{grafana_url}/api/annotations?from={from_ms}&to={to_ms}&type=alert&limit=1000"
-    );
+    let url =
+        format!("{grafana_url}/api/annotations?from={from_ms}&to={to_ms}&type=alert&limit=1000");
 
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
@@ -329,15 +327,16 @@ async fn export_grafana_alerts(
             .to_string();
 
         let time_ms = ann.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-        let fired_at = chrono::DateTime::from_timestamp_millis(time_ms)
-            .unwrap_or_else(|| chrono::Utc::now());
+        let fired_at =
+            chrono::DateTime::from_timestamp_millis(time_ms).unwrap_or_else(chrono::Utc::now);
 
         // Extract labels from tags array (format: "key:value" or "key=value")
         let mut labels = serde_json::Map::new();
         if let Some(tags) = ann.get("tags").and_then(|t| t.as_array()) {
             for tag in tags {
                 if let Some(tag_str) = tag.as_str() {
-                    if let Some((k, v)) = tag_str.split_once(':').or_else(|| tag_str.split_once('='))
+                    if let Some((k, v)) =
+                        tag_str.split_once(':').or_else(|| tag_str.split_once('='))
                     {
                         labels.insert(k.to_string(), serde_json::Value::String(v.to_string()));
                     }

@@ -75,7 +75,10 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let run_started_at = Utc::now();
     let run_id = format!("inv-{}", run_started_at.format("%Y%m%d-%H%M%S"));
 
-    info!("benchmark run {run_id} for operation {}", manifest.operation_id);
+    info!(
+        "benchmark run {run_id} for operation {}",
+        manifest.operation_id
+    );
 
     // ── Provision Loki ───────────────────────────────────────────────────
     let mut ephemeral_loki: Option<EphemeralLoki> = None;
@@ -274,7 +277,10 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     println!("  Run ID:         {run_id}");
     println!("  Operation:      {}", manifest.operation_id);
     println!("  Grade:          {}", eval_result.grade());
-    println!("  Overall score:  {:.1}%", eval_result.overall_score * 100.0);
+    println!(
+        "  Overall score:  {:.1}%",
+        eval_result.overall_score * 100.0
+    );
     println!(
         "  Technique coverage: {:.1}%",
         eval_result.technique_coverage * 100.0
@@ -297,8 +303,7 @@ fn load_manifest(snapshot_dir: &str) -> Result<SnapshotManifest> {
     let manifest_path = Path::new(snapshot_dir).join("manifest.json");
     let raw = fs::read_to_string(&manifest_path)
         .with_context(|| format!("read {}", manifest_path.display()))?;
-    let manifest: SnapshotManifest =
-        serde_json::from_str(&raw).context("parse manifest.json")?;
+    let manifest: SnapshotManifest = serde_json::from_str(&raw).context("parse manifest.json")?;
     info!(
         "loaded manifest: op={}, streams={}, entries={}",
         manifest.operation_id,
@@ -323,8 +328,8 @@ async fn import_all_streams(
             continue;
         }
 
-        let file = fs::File::open(&file_path)
-            .with_context(|| format!("open {}", file_path.display()))?;
+        let file =
+            fs::File::open(&file_path).with_context(|| format!("open {}", file_path.display()))?;
         let reader = BufReader::new(file);
 
         info!("importing stream {} from {}", stream.job, stream.file);

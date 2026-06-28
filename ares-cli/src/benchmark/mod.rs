@@ -14,10 +14,7 @@ use anyhow::Result;
 
 use crate::cli::BenchmarkCommands;
 
-pub(crate) async fn run_benchmark(
-    cmd: BenchmarkCommands,
-    redis_url: Option<String>,
-) -> Result<()> {
+pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<String>) -> Result<()> {
     match cmd {
         BenchmarkCommands::Capture {
             operation_id,

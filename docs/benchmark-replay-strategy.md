@@ -178,6 +178,7 @@ ares benchmark capture <operation-id> \
 ```
 
 Steps:
+
 1. Load operation from Postgres (timestamps, config, strategy)
 2. Export red team state -> `red-state.json`
 3. Generate ground truth -> `ground-truth.json`
@@ -321,6 +322,7 @@ ares benchmark run <snapshot-path> \
 ```
 
 Steps:
+
 1. Create ephemeral Loki K8s Job
 2. Wait for readiness
 3. Import snapshot data (`ares benchmark load`)

@@ -44,8 +44,8 @@ impl BulkLokiConfig {
     /// Does NOT resolve the Grafana proxy — bulk operations should target
     /// Loki directly to avoid proxy timeouts on large exports.
     pub fn from_env() -> Self {
-        let base_url = std::env::var("LOKI_URL")
-            .unwrap_or_else(|_| "http://localhost:3100".to_string());
+        let base_url =
+            std::env::var("LOKI_URL").unwrap_or_else(|_| "http://localhost:3100".to_string());
         let auth_token = std::env::var("LOKI_AUTH_TOKEN").ok();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -114,16 +114,8 @@ pub async fn export_stream(
             break;
         }
 
-        let page_entries = export_page(
-            client,
-            config,
-            &url,
-            logql,
-            &start_str,
-            &end_nanos,
-            writer,
-        )
-        .await?;
+        let page_entries =
+            export_page(client, config, &url, logql, &start_str, &end_nanos, writer).await?;
 
         if page_entries.count == 0 {
             break;
@@ -133,10 +125,8 @@ pub async fn export_stream(
         current_start_nanos = page_entries.last_timestamp_nanos + 1;
         page += 1;
 
-        if page % 10 == 0 {
-            info!(
-                "export progress: {total_entries} entries across {page} pages for {logql}"
-            );
+        if page.is_multiple_of(10) {
+            info!("export progress: {total_entries} entries across {page} pages for {logql}");
         }
     }
 
@@ -205,21 +195,22 @@ async fn export_page(
 
             let streams = match result {
                 Some(s) if !s.is_empty() => s,
-                _ => return Ok(PageResult { count: 0, last_timestamp_nanos: 0 }),
+                _ => {
+                    return Ok(PageResult {
+                        count: 0,
+                        last_timestamp_nanos: 0,
+                    })
+                }
             };
 
             for stream_obj in streams {
                 let stream_labels = match stream_obj.get("stream") {
-                    Some(s) => s
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
+                    Some(s) => s.as_object().cloned().unwrap_or_default(),
                     None => continue,
                 };
 
-                let values = match stream_obj.get("values").and_then(|v| v.as_array()) {
-                    Some(v) => v,
-                    None => continue,
+                let Some(values) = stream_obj.get("values").and_then(|v| v.as_array()) else {
+                    continue;
                 };
 
                 for entry in values {
@@ -243,8 +234,7 @@ async fn export_page(
                         stream: stream_labels.clone(),
                         values: vec![vec![ts_str.to_string(), line.to_string()]],
                     };
-                    serde_json::to_writer(&mut *writer, &entry)
-                        .context("write JSONL entry")?;
+                    serde_json::to_writer(&mut *writer, &entry).context("write JSONL entry")?;
                     writer.write_all(b"\n").context("write newline")?;
                     count += 1;
                 }
@@ -288,7 +278,11 @@ pub async fn import_stream(
 ) -> Result<u64> {
     let client = http_client();
     let url = format!("{}/loki/api/v1/push", config.base_url);
-    let batch_size = if batch_size == 0 { DEFAULT_IMPORT_BATCH } else { batch_size };
+    let batch_size = if batch_size == 0 {
+        DEFAULT_IMPORT_BATCH
+    } else {
+        batch_size
+    };
 
     let mut total_entries: u64 = 0;
     let mut batch_entries: Vec<PushEntry> = Vec::with_capacity(batch_size);
@@ -321,7 +315,7 @@ pub async fn import_stream(
             total_entries += pushed;
             batch_count += 1;
 
-            if batch_count % 10 == 0 {
+            if batch_count.is_multiple_of(10) {
                 info!("import progress: {total_entries} entries in {batch_count} batches");
             }
         }

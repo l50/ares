@@ -81,7 +81,14 @@ impl EphemeralLoki {
             let stderr = String::from_utf8_lossy(&wait_output.stderr);
             // Try to clean up on failure
             let _ = Command::new("kubectl")
-                .args(["delete", "pod", &name, "-n", namespace, "--ignore-not-found"])
+                .args([
+                    "delete",
+                    "pod",
+                    &name,
+                    "-n",
+                    namespace,
+                    "--ignore-not-found",
+                ])
                 .output();
             let _ = Command::new("kubectl")
                 .args([
