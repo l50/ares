@@ -399,7 +399,9 @@ pub fn render_agent_instructions_with_extras(
     ctx.insert("undominated_forests", undominated_forests);
     op.insert_into(&mut ctx);
     for (k, v) in extras {
-        ctx.insert(*k, v);
+        // tera 2.0's `Context::insert` keys require `Into<Cow<'static, str>>`,
+        // so borrowed `&str` keys must be promoted to owned `String`.
+        ctx.insert((*k).to_string(), v);
     }
 
     TEMPLATES
@@ -453,7 +455,8 @@ pub fn render_task_template(
 ) -> Result<String> {
     let mut ctx = Context::new();
     for (key, value) in variables {
-        ctx.insert(key.as_str(), value);
+        // tera 2.0 requires owned (`'static`) keys; `key` is borrowed from the map.
+        ctx.insert(key.clone(), value);
     }
     render_template_with_context(template_name, &ctx)
 }
