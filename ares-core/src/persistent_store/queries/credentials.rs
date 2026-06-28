@@ -201,14 +201,14 @@ impl HistoricalQueryService {
             // so we use query_scalar pattern with explicit bind count
             match bind_values.len() {
                 1 => {
-                    sqlx::query_as::<_, HashRow>(&sql)
+                    sqlx::query_as::<_, HashRow>(sqlx::AssertSqlSafe(sql.as_str()))
                         .bind(&bind_values[0])
                         .bind(limit)
                         .fetch_all(&self.pool)
                         .await?
                 }
                 2 => {
-                    sqlx::query_as::<_, HashRow>(&sql)
+                    sqlx::query_as::<_, HashRow>(sqlx::AssertSqlSafe(sql.as_str()))
                         .bind(&bind_values[0])
                         .bind(&bind_values[1])
                         .bind(limit)
@@ -216,7 +216,7 @@ impl HistoricalQueryService {
                         .await?
                 }
                 3 => {
-                    sqlx::query_as::<_, HashRow>(&sql)
+                    sqlx::query_as::<_, HashRow>(sqlx::AssertSqlSafe(sql.as_str()))
                         .bind(&bind_values[0])
                         .bind(&bind_values[1])
                         .bind(&bind_values[2])
