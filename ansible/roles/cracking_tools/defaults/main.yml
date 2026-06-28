@@ -95,5 +95,5 @@ cracking_tools_crackd_url: ""
 # special characters — use a slug-style title.
 cracking_tools_crackd_op_path: ""
 # systemd unit family that should receive the env file via drop-in.
-# attacker-1 uses templated ares@<role>.service workers.
-cracking_tools_crackd_systemd_unit: "ares@.service"
+# attacker-1 uses templated ares-worker@<role>.service workers.
+cracking_tools_crackd_systemd_unit: "ares-worker@.service"
