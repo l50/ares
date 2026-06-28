@@ -68,7 +68,7 @@ Install and configure password cracking tools for Ares agents
 | `cracking_tools_install_crackd_client` | bool | <code>False</code> | No description |
 | `cracking_tools_crackd_url` | str | <code></code> | No description |
 | `cracking_tools_crackd_op_path` | str | <code></code> | No description |
-| `cracking_tools_crackd_systemd_unit` | str | <code>ares@.service</code> | No description |
+| `cracking_tools_crackd_systemd_unit` | str | <code>ares-worker@.service</code> | No description |
 
 ## Tasks
 

@@ -125,6 +125,13 @@
     # on Azure).
     - role: dreadnode.nimbus_range.aws_ssm_agent
       when: cloud_provider | default('aws') == 'aws'
+      vars:
+        # This is a GPU cracking box and hashcat is driven via SSM, so its
+        # workers run INSIDE the amazon-ssm-agent cgroup. The role's default
+        # 512M MemoryMax then OOM-kills hashcat during kernel build (RC=137,
+        # looks like a "GPU hang" after "Generated bitmap tables"). Uncap the
+        # agent cgroup on the attack box so SSM-launched hashcat can use GPU/RAM.
+        aws_ssm_agent_memory_max: "infinity"
     - role: dreadnode.nimbus_range.aws_cloudwatch_agent
       when: cloud_provider | default('aws') == 'aws'
 
