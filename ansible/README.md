@@ -33,6 +33,7 @@ graph TD
     Roles --> R13[privesc_tools *]
     Roles --> R14[recon_tools *]
     Roles --> R15[redis]
+    Roles --> R16[vector]
     Collection --> Playbooks[Playbooks]
     Playbooks --> PB0[ares]
     Playbooks --> PB1[linux]
