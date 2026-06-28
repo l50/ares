@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  role_name: sysmon
+  author: Dreadnode
+  description: Install and configure Sysinternals Sysmon on Windows hosts
+  company: Dreadnode
+  license: MIT
+  min_ansible_version: "2.13"
+  platforms:
+    - name: Windows
+      versions:
+        - all
+  galaxy_tags:
+    - sysmon
+    - sysinternals
+    - windows
+    - security
+    - telemetry
+    - detection
+
+dependencies: []

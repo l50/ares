@@ -1,6 +1,6 @@
 ---
 # Alloy version configuration
-alloy_version: "1.10.1"
+alloy_version: "1.17.0"
 
 # Alloy configuration
 alloy_env: "dev"
@@ -31,6 +31,15 @@ alloy_service_name: "Alloy"
 alloy_service_user: "NT AUTHORITY\\LocalSystem"
 alloy_runtime_priority: "normal"
 alloy_stability: "generally-available"
+
+# Optional Windows event channels. Default off — enabling a channel that
+# doesn't exist on the host causes Alloy to fail to start. Opt in per-host:
+#   alloy_enable_sysmon: true              # only where Sysmon is installed
+#   alloy_enable_directory_service: true   # domain controllers
+#   alloy_enable_dns_server: true          # hosts running the DNS Server role
+alloy_enable_sysmon: false
+alloy_enable_directory_service: false
+alloy_enable_dns_server: false
 
 # Log sources configuration
 alloy_log_sources:
