@@ -39,6 +39,7 @@ loki.source.windowsevent "security_events" {
   }
 }
 
+{% if alloy_enable_directory_service %}
 // Directory Service logs - LDAP query auditing (Event ID 1644)
 // Critical for detecting LDAP enumeration attacks like "Credential in User Description"
 loki.source.windowsevent "directory_service_events" {
@@ -50,6 +51,7 @@ loki.source.windowsevent "directory_service_events" {
     job = "windows-directory-service",
   }
 }
+{% endif %}
 
 // PowerShell logs - Script block logging and module logging
 // Critical for detecting malicious PowerShell execution
@@ -63,6 +65,7 @@ loki.source.windowsevent "powershell_events" {
   }
 }
 
+{% if alloy_enable_sysmon %}
 // Sysmon logs - Detailed process and network monitoring
 // Provides visibility into process creation, network connections, file modifications
 loki.source.windowsevent "sysmon_events" {
@@ -74,6 +77,7 @@ loki.source.windowsevent "sysmon_events" {
     job = "windows-sysmon",
   }
 }
+{% endif %}
 
 // Windows Defender logs - Malware detection events
 loki.source.windowsevent "defender_events" {
@@ -86,6 +90,7 @@ loki.source.windowsevent "defender_events" {
   }
 }
 
+{% if alloy_enable_dns_server %}
 // DNS Server logs (for Domain Controllers)
 loki.source.windowsevent "dns_server_events" {
   eventlog_name = "DNS Server"
@@ -96,6 +101,7 @@ loki.source.windowsevent "dns_server_events" {
     job = "windows-dns-server",
   }
 }
+{% endif %}
 
 // Process Windows logs
 loki.process "windows" {

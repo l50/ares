@@ -16,7 +16,7 @@ Install and configure Grafana Alloy for Windows hosts
 
 | Variable | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
-| `alloy_version` | str | <code>1.10.1</code> | No description |
+| `alloy_version` | str | <code>1.17.0</code> | No description |
 | `alloy_env` | str | <code>dev</code> | No description |
 | `alloy_deployment_name` | str | <code></code> | No description |
 | `alloy_instance_id` | str | <code></code> | No description |
@@ -34,6 +34,9 @@ Install and configure Grafana Alloy for Windows hosts
 | `alloy_service_user` | str | <code>NT AUTHORITY\LocalSystem</code> | No description |
 | `alloy_runtime_priority` | str | <code>normal</code> | No description |
 | `alloy_stability` | str | <code>generally-available</code> | No description |
+| `alloy_enable_sysmon` | bool | <code>False</code> | No description |
+| `alloy_enable_directory_service` | bool | <code>False</code> | No description |
+| `alloy_enable_dns_server` | bool | <code>False</code> | No description |
 | `alloy_log_sources` | list | <code>&#91;&#93;</code> | No description |
 | `alloy_log_sources.0` | dict | <code>{}</code> | No description |
 | `alloy_log_sources.1` | dict | <code>{}</code> | No description |
@@ -49,10 +52,12 @@ Install and configure Grafana Alloy for Windows hosts
 ### windows.yml
 
 
-- **Check if Alloy is already installed** (ansible.windows.win_service)
+- **Check if Alloy service is already installed** (ansible.windows.win_service)
+- **Detect installed Alloy version** (ansible.windows.win_powershell) - Conditional
+- **Decide whether (re)install is needed** (ansible.builtin.set_fact)
 - **Download Alloy installer** (ansible.windows.win_get_url) - Conditional
 - **Extract Alloy installer** (community.windows.win_unzip) - Conditional
-- **Install Alloy silently** (ansible.windows.win_command) - Conditional
+- **Install Alloy silently (installer handles in-place upgrade)** (ansible.windows.win_command) - Conditional
 - **Wait for Alloy service to be created** (ansible.windows.win_service) - Conditional
 - **Create Alloy configuration file** (ansible.windows.win_template)
 - **Ensure Alloy service is running** (ansible.windows.win_service)
