@@ -61,10 +61,11 @@ Install and configure AWS SSM Agent
 ### windows.yml
 
 
-- **Download SSM agent installer (Windows)** (ansible.windows.win_get_url)
-- **Install SSM agent (Windows)** (ansible.windows.win_package)
+- **Check if SSM agent service is already installed (Windows)** (ansible.windows.win_service)
+- **Download SSM agent installer (Windows)** (ansible.windows.win_get_url) - Conditional
+- **Install SSM agent (Windows)** (ansible.windows.win_package) - Conditional
 - **Make sure SSM agent service is running (Windows)** (ansible.windows.win_service)
-- **Clean up temporary files (Windows)** (ansible.windows.win_file)
+- **Clean up temporary files (Windows)** (ansible.windows.win_file) - Conditional
 
 ## Example Playbook
 
