@@ -403,27 +403,72 @@ async fn run_inner() -> Result<()> {
         warn!(err = %e, "Deferred queue counter reconcile failed at startup");
     }
 
-    // Priority: ARES_LLM_MODEL env var > config YAML agents.orchestrator.model
-    let model_spec = std::env::var("ARES_LLM_MODEL").ok().or_else(|| {
-        let config_path = std::env::var("ARES_CONFIG")
-            .unwrap_or_else(|_| "/ares/config/ares.yaml".to_string());
+    // Build per-role provider map. The orchestrator's model is required (used
+    // as fallback for any role missing an entry). All other roles default to
+    // the orchestrator's model when their YAML block omits `model:`.
+    //
+    // Priority: ARES_LLM_MODEL env var > config YAML agents.{role}.model
+    let yaml_doc: Option<serde_yaml::Value> = {
+        let config_path =
+            std::env::var("ARES_CONFIG").unwrap_or_else(|_| "/ares/config/ares.yaml".to_string());
         std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|content| {
-                let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-                let model = yaml["agents"]["orchestrator"]["model"].as_str()?;
-                // Prefix with "openai/" if no provider prefix present
-                let spec = if model.contains('/') {
-                    model.to_string()
-                } else {
-                    format!("openai/{model}")
-                };
-                info!(config = %config_path, model = %spec, "Model loaded from config YAML");
-                Some(spec)
-            })
-    }).context("No LLM model configured — set ARES_LLM_MODEL or agents.orchestrator.model in config YAML")?;
-    let (provider, model_name) =
-        ares_llm::create_provider(&model_spec).context("Failed to create LLM provider")?;
+            .and_then(|content| serde_yaml::from_str(&content).ok())
+    };
+    let env_override = std::env::var("ARES_LLM_MODEL").ok();
+    let orch_spec = env_override
+        .clone()
+        .or_else(|| read_role_model(yaml_doc.as_ref(), "orchestrator"))
+        .context(
+            "No LLM model configured — set ARES_LLM_MODEL or agents.orchestrator.model in config YAML",
+        )?;
+    info!(model = %orch_spec, "Orchestrator model");
+
+    let mut providers: std::collections::HashMap<
+        ares_llm::tool_registry::AgentRole,
+        llm_runner::RoleProvider,
+    > = std::collections::HashMap::new();
+    let role_yaml_names: &[(ares_llm::tool_registry::AgentRole, &str)] = &[
+        (
+            ares_llm::tool_registry::AgentRole::Orchestrator,
+            "orchestrator",
+        ),
+        (ares_llm::tool_registry::AgentRole::Recon, "recon"),
+        (
+            ares_llm::tool_registry::AgentRole::CredentialAccess,
+            "credential_access",
+        ),
+        (ares_llm::tool_registry::AgentRole::Cracker, "cracker"),
+        (ares_llm::tool_registry::AgentRole::Acl, "acl"),
+        (ares_llm::tool_registry::AgentRole::Privesc, "privesc"),
+        (ares_llm::tool_registry::AgentRole::Lateral, "lateral"),
+        (ares_llm::tool_registry::AgentRole::Coercion, "coercion"),
+    ];
+    for (role, yaml_key) in role_yaml_names {
+        let spec = if *role == ares_llm::tool_registry::AgentRole::Orchestrator {
+            orch_spec.clone()
+        } else {
+            read_role_model(yaml_doc.as_ref(), yaml_key).unwrap_or_else(|| orch_spec.clone())
+        };
+        let (provider, model_name) = ares_llm::create_provider(&spec)
+            .with_context(|| format!("Failed to create LLM provider for role '{yaml_key}'"))?;
+        let cfg = ares_llm::AgentLoopConfig::from_env(model_name, config.strategy.llm_temperature);
+        if *role != ares_llm::tool_registry::AgentRole::Orchestrator {
+            info!(role = %yaml_key, model = %spec, "Per-role model");
+        }
+        providers.insert(
+            *role,
+            llm_runner::RoleProvider {
+                provider: Arc::from(provider),
+                config: cfg,
+            },
+        );
+    }
+    // Capture orchestrator's resolved model name for downstream logging.
+    let model_name = providers
+        .get(&ares_llm::tool_registry::AgentRole::Orchestrator)
+        .map(|rp| rp.config.model.clone())
+        .unwrap_or_default();
 
     // Credential auth throttle — prevents AD account lockout by rate-limiting
     // auth-bearing tool calls per credential. Max 3 attempts per 30s window.
@@ -466,14 +511,29 @@ async fn run_inner() -> Result<()> {
         .collect();
     technique_priorities.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
+    // Snapshot the operation's target context once at runner creation so the
+    // LLM system prompt stays byte-stable across every step (prefix caching).
+    // Current discoveries — including target_dc_ip if recon updates it later —
+    // flow through the task prompt's dynamic context block instead.
+    let init_snapshot = shared_state.snapshot().await;
+    let frozen_target_domain = if init_snapshot.target_domain.is_empty() {
+        config.target_domain.clone()
+    } else {
+        init_snapshot.target_domain.clone()
+    };
+    let frozen_target_dc_ip = init_snapshot.target_dc_ip.clone();
+    let frozen_target_dc_fqdn = init_snapshot.target_dc_fqdn.clone();
     let llm_runner = Arc::new(llm_runner::LlmTaskRunner::new(
-        provider,
-        model_name.clone(),
+        providers,
         tool_disp,
         shared_state.clone(),
-        config.strategy.llm_temperature,
         technique_priorities,
-        config.listener_ip.clone().unwrap_or_default(),
+        llm_runner::FrozenOpContext {
+            target_domain: frozen_target_domain,
+            target_dc_ip: frozen_target_dc_ip,
+            target_dc_fqdn: frozen_target_dc_fqdn,
+            listener_ip: config.listener_ip.clone().unwrap_or_default(),
+        },
     ));
     info!(
         model = %model_name,
@@ -591,7 +651,7 @@ async fn run_inner() -> Result<()> {
         let blue_model_spec = std::env::var("ARES_BLUE_LLM_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| model_spec.clone());
+            .unwrap_or_else(|| orch_spec.clone());
         let (blue_provider, blue_model) = ares_llm::create_provider(&blue_model_spec)
             .context("Failed to create blue team LLM provider")?;
 
@@ -889,6 +949,22 @@ async fn run_inner() -> Result<()> {
 
     info!("ares-orchestrator stopped");
     Ok(())
+}
+
+/// Look up the model spec for a role from a parsed YAML doc.
+///
+/// Reads `agents.{role}.model`. If the value is a bare model name without a
+/// provider prefix (e.g. `gpt-5.2`), prepends `openai/` so downstream
+/// provider routing works.
+fn read_role_model(yaml: Option<&serde_yaml::Value>, role: &str) -> Option<String> {
+    let doc = yaml?;
+    let model = doc["agents"][role]["model"].as_str()?;
+    let spec = if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("openai/{model}")
+    };
+    Some(spec)
 }
 
 /// Run in blue-only mode: just the investigation poller, no red team.

@@ -126,6 +126,14 @@ struct ApiResponseFunction {
 struct ApiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -366,18 +374,30 @@ impl LlmProvider for OpenAiProvider {
             })
             .unwrap_or_default();
 
-        let usage = api_response
-            .usage
-            .map_or_else(TokenUsage::default, |u| TokenUsage {
-                input_tokens: u.prompt_tokens,
+        let usage = api_response.usage.map_or_else(TokenUsage::default, |u| {
+            let cached = u
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
+            // OpenAI reports prompt_tokens as the full input count and
+            // cached_tokens as the cached portion of that count. Subtract
+            // so downstream cost math bills cached input at the cached
+            // rate and the remainder at the full input rate.
+            let uncached_input = u.prompt_tokens.saturating_sub(cached);
+            TokenUsage {
+                input_tokens: uncached_input,
                 output_tokens: u.completion_tokens,
+                cache_read_input_tokens: cached,
                 ..Default::default()
-            });
+            }
+        });
 
         let stop_reason = parse_stop_reason(choice.finish_reason.as_deref());
 
         info!(
             input_tokens = usage.input_tokens,
+            cache_read_input_tokens = usage.cache_read_input_tokens,
             output_tokens = usage.output_tokens,
             tool_calls = tool_calls.len(),
             stop = ?stop_reason,
@@ -461,6 +481,28 @@ mod tests {
         let api_tools = convert_tools(&tools);
         assert_eq!(api_tools[0].tool_type, "function");
         assert_eq!(api_tools[0].function.name, "nmap_scan");
+    }
+
+    #[test]
+    fn parse_usage_with_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 768}
+        }"#;
+        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
+            768
+        );
+    }
+
+    #[test]
+    fn parse_usage_without_cached_tokens() {
+        let json = r#"{"prompt_tokens": 100, "completion_tokens": 50}"#;
+        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        assert!(usage.prompt_tokens_details.is_none());
     }
 
     #[test]

@@ -64,6 +64,7 @@ pub async fn process_task(
                     conn,
                     op_id,
                     usage.input_tokens,
+                    usage.cache_read_input_tokens,
                     usage.output_tokens,
                     model,
                 )
@@ -273,6 +274,7 @@ mod tests {
                 input_tokens: 12,
                 output_tokens: 34,
                 total_tokens: 46,
+                cache_read_input_tokens: 0,
                 model: Some("openai/gpt-4.1-mini".into()),
             }),
             discoveries: None,

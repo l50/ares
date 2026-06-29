@@ -94,7 +94,9 @@ agents:
       - complete_operation
 
   recon:
-    model: "gpt-5.2"
+    # Recon is enumerate-and-emit — mechanical tool dispatch over a known matrix.
+    # gpt-5-mini is ~7x cheaper than gpt-5.2 with negligible quality loss here.
+    model: "gpt-5-mini"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=recon"
     # Provisioned by: ansible/playbooks/ares/recon.yml → dreadnode.nimbus_range.recon_tools
@@ -122,7 +124,9 @@ agents:
       - impacket-GetUserSPNs
 
   credential_access:
-    model: "gpt-5.2"
+    # Credential-access mostly picks a tool + target from a known matrix.
+    # gpt-5 is ~29% cheaper than gpt-5.2 and handles this shape well.
+    model: "gpt-5"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=credential_access"
     # Provisioned by: ansible/playbooks/ares/credential_access.yml → dreadnode.nimbus_range.credential_access_tools
@@ -144,7 +148,9 @@ agents:
       - impacket-secretsdump
 
   cracker:
-    model: "gpt-5.2"
+    # Cracker dispatches hashcat and parses its output — fire-the-tool loop.
+    # gpt-5-mini is ~7x cheaper and sufficient for this mechanical role.
+    model: "gpt-5-mini"
     max_steps: 150
     pod_selector: "ares.dreadnode.io/role=cracker"
     # Provisioned by: ansible/playbooks/ares/cracker.yml → dreadnode.nimbus_range.cracking_tools
@@ -228,7 +234,9 @@ agents:
       - SCMUACBypass          # UAC bypass (git: /opt/privesc/SCMUACBypass)
 
   lateral:
-    model: "gpt-5.2"
+    # Lateral picks a host + an execution tool from a known matrix.
+    # gpt-5 is ~29% cheaper than gpt-5.2 without sacrificing decision quality.
+    model: "gpt-5"
     max_steps: 300
     pod_selector: "ares.dreadnode.io/role=lateral"
     # Provisioned by: ansible/playbooks/ares/lateral_movement.yml → dreadnode.nimbus_range.lateral_movement_tools
@@ -258,7 +266,9 @@ agents:
       - impacket-secretsdump
 
   coercion:
-    model: "gpt-5.2"
+    # Coercion is a tight fire-the-coercion-tool loop (responder + relay).
+    # gpt-5-mini is ~7x cheaper than gpt-5.2 and handles this fine.
+    model: "gpt-5-mini"
     max_steps: 30
     pod_selector: "ares.dreadnode.io/role=coercion"
     # Provisioned by: ansible/playbooks/ares/coercion.yml → dreadnode.nimbus_range.coercion_tools

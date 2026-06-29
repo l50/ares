@@ -61,15 +61,26 @@ pub(crate) async fn ops_runtime(
     match ares_core::token_usage::get_token_usage(&mut conn, &op_id).await {
         Ok(Some(usage)) if usage.input_tokens > 0 || usage.output_tokens > 0 => {
             let in_tok = usage.input_tokens;
+            let cached_tok = usage.cache_read_input_tokens;
             let out_tok = usage.output_tokens;
-            let total_tok = in_tok + out_tok;
+            let total_tok = in_tok + cached_tok + out_tok;
+            let total_input = in_tok + cached_tok;
 
             println!(
                 "\nTokens: {} (in: {}  out: {})",
                 format_number(total_tok),
-                format_number(in_tok),
+                format_number(total_input),
                 format_number(out_tok)
             );
+            if total_input > 0 {
+                let pct = (cached_tok as f64 / total_input as f64) * 100.0;
+                println!(
+                    "Cache:  hit {} / {} tokens ({:.1}%)",
+                    format_number(cached_tok),
+                    format_number(total_input),
+                    pct
+                );
+            }
 
             if !usage.models.is_empty() {
                 let mut model_names: Vec<_> = usage.models.keys().collect();

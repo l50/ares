@@ -121,6 +121,7 @@ impl CallbackHandler for SubAgentCallbackHandler {
                     &mut conn,
                     &self.investigation_id,
                     usage.input_tokens.into(),
+                    usage.cache_read_input_tokens.into(),
                     usage.output_tokens.into(),
                     model,
                 )
