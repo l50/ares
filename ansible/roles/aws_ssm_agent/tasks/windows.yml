@@ -1,14 +1,22 @@
 ---
+- name: Check if SSM agent service is already installed (Windows)
+  ansible.windows.win_service:
+    name: AmazonSSMAgent
+  register: aws_ssm_agent_service
+  failed_when: false
+
 - name: Download SSM agent installer (Windows)
   ansible.windows.win_get_url:
     url: "{{ aws_ssm_agent_windows_install_url }}"
     dest: "{{ aws_ssm_agent_windows_temp_dir }}\\{{ aws_ssm_agent_windows_installer }}"
+  when: not (aws_ssm_agent_service.exists | default(false))
 
 - name: Install SSM agent (Windows)
   ansible.windows.win_package:
     path: "{{ aws_ssm_agent_windows_temp_dir }}\\{{ aws_ssm_agent_windows_installer }}"
     arguments: /S
     state: present
+  when: not (aws_ssm_agent_service.exists | default(false))
 
 - name: Make sure SSM agent service is running (Windows)
   ansible.windows.win_service:
@@ -22,3 +30,4 @@
     state: absent
   register: aws_ssm_agent_cleanup
   failed_when: false
+  when: not (aws_ssm_agent_service.exists | default(false))

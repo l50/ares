@@ -6,16 +6,18 @@
   failed_when: false
 
 - name: Detect installed Alloy version
-  ansible.windows.win_powershell:
-    script: |
-      $exe = "{{ alloy_windows_install_dir }}\\alloy-windows-amd64.exe"
-      if (Test-Path $exe) {
-        (Get-Item $exe).VersionInfo.ProductVersion
-      } else {
-        ""
-      }
+  # Grafana doesn't populate Windows VersionInfo on the alloy binary, so
+  # parse `alloy --version` output instead. First line looks like:
+  #   alloy, version v1.17.0 (branch: HEAD, revision: b5632ed)
+  ansible.windows.win_shell: |
+    $exe = "{{ alloy_windows_install_dir }}\alloy-windows-amd64.exe"
+    if (Test-Path $exe) {
+      $line = & $exe --version 2>&1 | Select-Object -First 1
+      if ($line -match 'version v([\d\.]+)') { $Matches[1] }
+    }
   register: alloy_installed_version
   changed_when: false
+  failed_when: false
   when: alloy_service_info.exists | default(false)
 
 - name: Decide whether (re)install is needed
@@ -24,7 +26,7 @@
       {{
         (not (alloy_service_info.exists | default(false)))
         or
-        (((alloy_installed_version.output | default([''])) | first | default('')) != alloy_version)
+        ((alloy_installed_version.stdout | default('') | trim) != alloy_version)
       }}
 
 - name: Download Alloy installer

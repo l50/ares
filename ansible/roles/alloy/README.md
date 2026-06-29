@@ -53,7 +53,7 @@ Install and configure Grafana Alloy for Windows hosts
 
 
 - **Check if Alloy service is already installed** (ansible.windows.win_service)
-- **Detect installed Alloy version** (ansible.windows.win_powershell) - Conditional
+- **Detect installed Alloy version** (ansible.windows.win_shell) - Conditional
 - **Decide whether (re)install is needed** (ansible.builtin.set_fact)
 - **Download Alloy installer** (ansible.windows.win_get_url) - Conditional
 - **Extract Alloy installer** (community.windows.win_unzip) - Conditional
