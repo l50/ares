@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
@@ -131,6 +132,19 @@ pub struct StateInner {
     // so we don't defer indefinitely if AES never arrives.
     pub forge_aes_defers: HashMap<String, u32>,
 
+    // Per-(trust_follow dedup key) timestamp recording when the
+    // cross-forest forge dispatch was marked-processed. `auto_trust_follow`
+    // marks dedup *before* spawning the dispatch so the next 30s tick
+    // doesn't double-fire, but if the spawn never actually runs the tool
+    // (tracing event drop, runtime cancellation, panic between mark and
+    // spawn body) the dedup persists and the cross-forest pivot is
+    // permanently lost for this op. This map lets the planner detect
+    // stale marks and unmark them after `FORGE_STALENESS_LIMIT`, so a
+    // later tick re-dispatches. In-memory only — restart resilience
+    // isn't required because the persistence layer reclears
+    // `trust_follow` on op load anyway.
+    pub forge_in_flight: HashMap<String, Instant>,
+
     // Per-(linked_server vuln) failed-attempt counter for
     // `auto_mssql_link_pivot`. Bounded retries before we mark the
     // pivot dedup'd — keeps a flaky link from looping forever while
@@ -208,6 +222,7 @@ impl StateInner {
             completed_tasks: HashMap::new(),
             quarantined_principals: HashMap::new(),
             forge_aes_defers: HashMap::new(),
+            forge_in_flight: HashMap::new(),
             mssql_link_pivot_attempts: HashMap::new(),
             crack_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),
