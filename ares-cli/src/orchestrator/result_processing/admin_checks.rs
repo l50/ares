@@ -9,75 +9,7 @@ use tracing::{info, warn};
 use super::parsing::has_domain_admin_indicator;
 use super::timeline::{create_admin_upgrade_timeline_event, create_domain_admin_timeline_event};
 use crate::orchestrator::dispatcher::Dispatcher;
-use crate::orchestrator::state::StateInner;
-
-/// Resolve a NetBIOS/flat domain name (e.g. `FABRIKAM`) to a known FQDN.
-///
-/// Checks three sources, in order:
-/// 1. `state.trusted_domains`: each `TrustInfo` carries an explicit `flat_name`.
-/// 2. `state.netbios_to_fqdn`: published mappings from host short names; useful
-///    when the flat name happens to match a hostname mapping.
-/// 3. `state.domains`: derive each FQDN's first label and compare. Catches the
-///    primary domain (which is rarely in `trusted_domains`).
-///
-/// Returns `None` when the flat name does not correspond to any known domain.
-/// Callers must treat that as "skip caching" — guessing risks attributing the
-/// SID to the wrong domain.
-fn resolve_flat_to_fqdn(flat: &str, state: &StateInner) -> Option<String> {
-    let target = flat.to_uppercase();
-
-    if let Some(t) = state
-        .trusted_domains
-        .values()
-        .find(|t| !t.flat_name.is_empty() && t.flat_name.to_uppercase() == target)
-    {
-        return Some(t.domain.to_lowercase());
-    }
-
-    if let Some(fqdn) = state
-        .netbios_to_fqdn
-        .get(&target)
-        .or_else(|| state.netbios_to_fqdn.get(flat))
-    {
-        // Only accept the mapping if it looks like a domain FQDN, not a host
-        // FQDN (e.g. "DC02" → "dc02.contoso.local" should NOT yield "dc02…").
-        let lower = fqdn.to_lowercase();
-        if is_valid_domain_fqdn(&lower) && state.domains.iter().any(|d| d.to_lowercase() == lower) {
-            return Some(lower);
-        }
-    }
-
-    state
-        .domains
-        .iter()
-        .find(|d| {
-            d.split('.')
-                .next()
-                .map(|first| first.eq_ignore_ascii_case(flat))
-                .unwrap_or(false)
-        })
-        .map(|d| d.to_lowercase())
-}
-
-/// Validate that a string looks like a domain FQDN.
-///
-/// Rejects empty strings, IP-like patterns, strings with whitespace, and strings
-/// without at least one dot. Used to filter out malformed domain values that
-/// occasionally appear in tool payloads (e.g. `"192.168.58.30 - dc01"`).
-fn is_valid_domain_fqdn(s: &str) -> bool {
-    if s.is_empty() || s.contains(' ') || s.contains(':') || s.contains('/') {
-        return false;
-    }
-    if !s.contains('.') {
-        return false;
-    }
-    let first_label = s.split('.').next().unwrap_or("");
-    if first_label.is_empty() || first_label.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-}
+use crate::orchestrator::state::{is_valid_domain_fqdn, resolve_flat_to_fqdn};
 
 /// Determine the domain admin path from a payload.
 pub(crate) fn resolve_da_path(_payload: &Value) -> Option<String> {
@@ -533,81 +465,7 @@ pub(crate) async fn extract_and_cache_domain_sid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ares_core::models::TrustInfo;
     use serde_json::json;
-
-    fn make_trust(domain: &str, flat: &str) -> TrustInfo {
-        TrustInfo {
-            domain: domain.to_string(),
-            flat_name: flat.to_string(),
-            direction: "bidirectional".to_string(),
-            trust_type: "forest".to_string(),
-            sid_filtering: true,
-            security_identifier: None,
-        }
-    }
-
-    // -- resolve_flat_to_fqdn -----------------------------------------------
-
-    #[test]
-    fn resolve_flat_uses_trusted_domain_metadata() {
-        let mut state = StateInner::new("op-test".into());
-        state.trusted_domains.insert(
-            "fabrikam.local".into(),
-            make_trust("fabrikam.local", "FABRIKAM"),
-        );
-        assert_eq!(
-            resolve_flat_to_fqdn("FABRIKAM", &state).as_deref(),
-            Some("fabrikam.local")
-        );
-    }
-
-    #[test]
-    fn resolve_flat_falls_back_to_primary_domain_label() {
-        let mut state = StateInner::new("op-test".into());
-        state.domains.push("contoso.local".into());
-        assert_eq!(
-            resolve_flat_to_fqdn("CONTOSO", &state).as_deref(),
-            Some("contoso.local")
-        );
-    }
-
-    #[test]
-    fn resolve_flat_unknown_returns_none() {
-        let state = StateInner::new("op-test".into());
-        assert_eq!(resolve_flat_to_fqdn("UNKNOWN", &state), None);
-    }
-
-    #[test]
-    fn resolve_flat_does_not_match_host_short_name() {
-        // netbios_to_fqdn maps DC02 → dc02.contoso.local (a host, not domain).
-        // resolve_flat_to_fqdn must reject this — dc02.contoso.local is not in
-        // state.domains, so it cannot be a domain FQDN.
-        let mut state = StateInner::new("op-test".into());
-        state.domains.push("contoso.local".into());
-        state
-            .netbios_to_fqdn
-            .insert("DC02".into(), "dc02.contoso.local".into());
-        assert_eq!(resolve_flat_to_fqdn("DC02", &state), None);
-    }
-
-    #[test]
-    fn resolve_flat_prefers_trust_metadata_over_primary_label() {
-        // Both child.contoso.local and contoso.local are known.
-        // Flat "CONTOSO" should resolve to the parent FQDN even when
-        // both could plausibly match by first-label heuristic.
-        let mut state = StateInner::new("op-test".into());
-        state.domains.push("child.contoso.local".into());
-        state.domains.push("contoso.local".into());
-        state.trusted_domains.insert(
-            "contoso.local".into(),
-            make_trust("contoso.local", "CONTOSO"),
-        );
-        assert_eq!(
-            resolve_flat_to_fqdn("CONTOSO", &state).as_deref(),
-            Some("contoso.local")
-        );
-    }
 
     // -- resolve_da_path ----------------------------------------------------
 
@@ -758,58 +616,6 @@ mod tests {
     #[test]
     fn extract_ip_not_fooled_by_version() {
         assert!(extract_ip_from_line("version 1.2.3 released").is_none());
-    }
-
-    // ── is_valid_domain_fqdn ──────────────────────────────────────────
-
-    #[test]
-    fn valid_fqdn_accepts_standard_domain() {
-        assert!(is_valid_domain_fqdn("contoso.local"));
-        assert!(is_valid_domain_fqdn("fabrikam.local"));
-        assert!(is_valid_domain_fqdn("child.contoso.local"));
-    }
-
-    #[test]
-    fn valid_fqdn_rejects_empty_string() {
-        assert!(!is_valid_domain_fqdn(""));
-    }
-
-    #[test]
-    fn valid_fqdn_rejects_no_dot() {
-        // A flat name (e.g. "CONTOSO") has no dot — not a valid FQDN.
-        assert!(!is_valid_domain_fqdn("CONTOSO"));
-        assert!(!is_valid_domain_fqdn("localonly"));
-    }
-
-    #[test]
-    fn valid_fqdn_rejects_strings_with_spaces() {
-        assert!(!is_valid_domain_fqdn("contoso .local"));
-        assert!(!is_valid_domain_fqdn("192.168.58.30 - dc01"));
-    }
-
-    #[test]
-    fn valid_fqdn_rejects_strings_with_colons_or_slashes() {
-        assert!(!is_valid_domain_fqdn("http://contoso.local"));
-        assert!(!is_valid_domain_fqdn("contoso:local"));
-    }
-
-    #[test]
-    fn valid_fqdn_rejects_ip_like_strings() {
-        // First label is all digits → looks like an IP, not a domain.
-        assert!(!is_valid_domain_fqdn("192.168.58.10"));
-        assert!(!is_valid_domain_fqdn("10.0.0.1"));
-    }
-
-    #[test]
-    fn valid_fqdn_rejects_leading_dot() {
-        // First label is empty → ".contoso.local" is malformed.
-        assert!(!is_valid_domain_fqdn(".contoso.local"));
-    }
-
-    #[test]
-    fn valid_fqdn_accepts_domain_with_hyphens_and_underscores() {
-        assert!(is_valid_domain_fqdn("my-domain.local"));
-        assert!(is_valid_domain_fqdn("_kerberos.contoso.local"));
     }
 
     // ── collect_payload_text_parts ─────────────────────────────────────

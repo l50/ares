@@ -7,6 +7,7 @@
 //! State is loaded from Redis at startup and updated incrementally as results
 //! arrive. Dedup sets are persisted to Redis so they survive orchestrator restarts.
 
+mod canonicalize;
 mod dedup;
 pub mod domain_probe;
 mod inner;
@@ -16,6 +17,9 @@ pub(crate) mod replay;
 mod shared;
 
 // Re-export everything that was publicly visible from the old single file.
+pub(crate) use canonicalize::{
+    canonicalize_domain_label, is_valid_domain_fqdn, resolve_flat_to_fqdn,
+};
 pub use dedup::MAX_EXPLOIT_FAILURES;
 pub use inner::StateInner;
 pub use shared::SharedState;

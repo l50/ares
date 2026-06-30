@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
-use crate::orchestrator::state::StateInner;
+use crate::orchestrator::state::{canonicalize_domain_label, StateInner};
 
 /// Collect the set of domains that have a captured `krbtgt` hash but no
 /// successful golden-ticket forge yet. Returns lowercased domain names in
@@ -29,8 +29,16 @@ pub(crate) fn collect_pending_golden_ticket_domains(state: &StateInner) -> Vec<S
         if !h.username.eq_ignore_ascii_case("krbtgt") {
             continue;
         }
+        // Canonicalize before the SID lookup downstream: secretsdump can emit a
+        // krbtgt hash with `hash.domain="NORTH"` (NetBIOS flat) when the parent
+        // suffix wasn't visible to the parser. `domain_sids` is always
+        // FQDN-keyed, so passing the flat label straight through would miss the
+        // SID and defer the forge forever.
         let domain = if !h.domain.is_empty() {
-            h.domain.to_lowercase()
+            match canonicalize_domain_label(&h.domain, state) {
+                Some(d) => d,
+                None => continue,
+            }
         } else if let Some(d) = state.domains.first() {
             d.to_lowercase()
         } else {
@@ -598,6 +606,37 @@ mod tests {
         let mut v = collect_pending_golden_ticket_domains(&s);
         v.sort();
         assert_eq!(v, vec!["contoso.local", "fabrikam.local"]);
+    }
+
+    #[test]
+    fn collect_pending_canonicalizes_flat_netbios_domain_to_fqdn() {
+        // Regression: secretsdump on a child realm can emit hash.domain="NORTH"
+        // when the parent suffix isn't visible to the parser. The collector
+        // previously returned the bare "north" label, which downstream
+        // domain_sids lookups (always FQDN-keyed) missed forever and the forge
+        // deferred indefinitely. Now the flat label is resolved against
+        // state.domains before dedup.
+        let mut s = StateInner::new("op-test".into());
+        s.has_domain_admin = true;
+        s.domains.push("north.contoso.local".into());
+        s.domains.push("contoso.local".into());
+        s.hashes
+            .push(krbtgt_hash("NORTH", "31d6cfe0d16ae931b73c59d7e0c089c0"));
+        let v = collect_pending_golden_ticket_domains(&s);
+        assert_eq!(v, vec!["north.contoso.local"]);
+    }
+
+    #[test]
+    fn collect_pending_skips_unresolvable_flat_domain() {
+        // If a flat name has no matching FQDN in state, we must skip rather
+        // than guess (e.g. forging against state.domains[0] would attribute
+        // the krbtgt to the wrong realm).
+        let mut s = StateInner::new("op-test".into());
+        s.has_domain_admin = true;
+        s.domains.push("contoso.local".into());
+        s.hashes
+            .push(krbtgt_hash("MYSTERY", "31d6cfe0d16ae931b73c59d7e0c089c0"));
+        assert!(collect_pending_golden_ticket_domains(&s).is_empty());
     }
 
     // --- gather_golden_ticket_inputs --------------------------------------

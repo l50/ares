@@ -1508,7 +1508,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
 
                     // Resolve source domain — fall back to first dominated domain
                     // with a DC when secretsdump output lacks domain prefix
-                    let source_domain = if hash.domain.is_empty() {
+                    let source_domain_raw = if hash.domain.is_empty() {
                         state
                             .domain_controllers
                             .keys()
@@ -1518,9 +1518,17 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     } else {
                         hash.domain.clone()
                     };
-                    if source_domain.is_empty() {
+                    if source_domain_raw.is_empty() {
                         return None;
                     }
+                    // Canonicalize: secretsdump can emit `hash.domain="NORTH"`
+                    // (NetBIOS flat) when the parent suffix isn't visible to the
+                    // parser. Downstream lookups against `domain_sids` /
+                    // `domain_controllers` are FQDN-keyed, so the flat label
+                    // misses every cache and the cross-forest forge defers
+                    // forever. Skip the item when the label can't be resolved
+                    // to a known FQDN rather than guessing.
+                    let source_domain = canonicalize_domain_label(&source_domain_raw, &state)?;
                     let source_lower = source_domain.to_lowercase();
 
                     // Resolve target FQDN in three tiers:
