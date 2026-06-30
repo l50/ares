@@ -30,87 +30,100 @@ pub fn parse_mssql_impersonation(output: &str, params: &Value) -> Vec<Value> {
         return vulns;
     }
 
-    // Look for IMPERSONATE permission rows in tabular output.
-    // Impacket-mssqlclient formats SQL results as space-separated columns.
-    // We look for lines containing "IMPERSONATE" or "IM" permission type
-    // with a "GRANT" state, and collect the impersonable login name from the
-    // first column (the `mssql_enum_impersonation` query selects
-    // `pr.name AS impersonable_login` first).
-    let mut has_impersonation = false;
-    let mut impersonable_logins: Vec<String> = Vec::new();
+    // Preferred path: structured rows from the enriched query, tagged by a
+    // literal `scope` column ("server"/"master"/"msdb"), then grantee, then the
+    // impersonation TARGET login. One vuln per (grantee → target) pair so
+    // multiple grants on the same host are tracked independently (a per-host
+    // vuln_id would be collapsed by Redis HSETNX, hiding all but the first).
+    let mut seen = std::collections::HashSet::new();
     for line in output.lines() {
-        let line = line.trim();
-        // Skip header/separator lines
-        if line.starts_with('-') || line.is_empty() || line.starts_with('[') {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
             continue;
         }
+        let scope = parts[0];
+        if !matches!(scope, "server" | "master" | "msdb") {
+            continue;
+        }
+        let grantee = parts[1];
+        let impersonate_target = parts[2];
+        if grantee.eq_ignore_ascii_case(impersonate_target) {
+            continue;
+        }
+        let dedup_key = format!(
+            "{}:{}:{}",
+            scope,
+            grantee.to_lowercase(),
+            impersonate_target.to_lowercase()
+        );
+        if !seen.insert(dedup_key) {
+            continue;
+        }
+        vulns.push(json!({
+            "vuln_id": format!(
+                "mssql_impersonation_{}_{}_{}_{}",
+                target, scope, grantee.to_lowercase(), impersonate_target.to_lowercase()
+            ),
+            "vuln_type": "mssql_impersonation",
+            "target": target,
+            "discovered_by": "mssql_enum_impersonation",
+            "priority": 3,
+            "recommended_agent": "privesc",
+            "details": {
+                "account_name": grantee,
+                "impersonate_target": impersonate_target,
+                "scope": scope,
+                "domain": domain,
+                "hostname": target,
+                "note": format!(
+                    "MSSQL IMPERSONATE: {grantee} can EXECUTE AS {} '{impersonate_target}'",
+                    if scope == "server" { "LOGIN" } else { "USER" }
+                )
+            }
+        }));
+    }
+    if !vulns.is_empty() {
+        return vulns;
+    }
+
+    // Legacy fallback: older `SELECT * FROM sys.server_permissions WHERE type='IM'`
+    // output exposes no principal names. Emit a single grant keyed by the
+    // authenticating user (not the host) so distinct credentials still produce
+    // distinct vulns.
+    let has_impersonation = output.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with('-') || line.is_empty() || line.starts_with('[') {
+            return false;
+        }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        // The query output has columns like:
-        // impersonable_login class class_desc major_id minor_id
-        //   grantee_principal_id grantor_principal_id type permission_name
-        //   state state_desc
-        // We look for "IM" or "IMPERSONATE" anywhere in the row with "GRANT".
         let has_im = parts
             .iter()
             .any(|p| *p == "IM" || p.eq_ignore_ascii_case("IMPERSONATE"));
         let has_grant = parts
             .iter()
             .any(|p| p.eq_ignore_ascii_case("GRANT") || *p == "G");
-        if !(has_im && has_grant) {
-            continue;
-        }
-        has_impersonation = true;
-
-        // First column is the impersonable login NAME. Skip a NULL (LEFT JOIN
-        // miss) and a purely-numeric first column (legacy `SELECT *` output
-        // begins with the class id) so we never record a bogus target — in
-        // those cases `impersonate_target` is simply omitted and the consumer
-        // falls back to probing `sa`.
-        if let Some(name) = parts.first().map(|s| s.trim()) {
-            if !name.is_empty()
-                && !name.eq_ignore_ascii_case("null")
-                && !name.chars().all(|c| c.is_ascii_digit())
-            {
-                impersonable_logins.push(name.to_string());
-            }
-        }
-    }
-
-    // Prefer `sa` (direct sysadmin) when it's among the impersonable logins;
-    // otherwise the first login that isn't the authenticating account itself
-    // (impersonating yourself is a no-op); else the first available.
-    let impersonate_target = impersonable_logins
-        .iter()
-        .find(|n| n.eq_ignore_ascii_case("sa"))
-        .or_else(|| {
-            impersonable_logins
-                .iter()
-                .find(|n| !n.eq_ignore_ascii_case(username))
-        })
-        .or_else(|| impersonable_logins.first())
-        .cloned();
+        has_im && has_grant
+    });
 
     if has_impersonation {
-        let mut details = json!({
-            "account_name": username,
-            "domain": domain,
-            "hostname": target,
-            "note": "MSSQL IMPERSONATE permission found — EXECUTE AS LOGIN escalation possible"
-        });
-        if let Some(target_login) = &impersonate_target {
-            details["impersonate_target"] = json!(target_login);
-            details["note"] = json!(format!(
-                "MSSQL IMPERSONATE permission found — EXECUTE AS LOGIN = '{target_login}' escalation possible"
-            ));
-        }
+        let id_suffix = if username.is_empty() {
+            "unknown"
+        } else {
+            username
+        };
         vulns.push(json!({
-            "vuln_id": format!("mssql_impersonation_{}", target),
+            "vuln_id": format!("mssql_impersonation_{}_{}", target, id_suffix.to_lowercase()),
             "vuln_type": "mssql_impersonation",
             "target": target,
             "discovered_by": "mssql_enum_impersonation",
             "priority": 3,
             "recommended_agent": "privesc",
-            "details": details,
+            "details": {
+                "account_name": username,
+                "domain": domain,
+                "hostname": target,
+                "note": "MSSQL IMPERSONATE permission found — EXECUTE AS LOGIN escalation possible"
+            }
         }));
     }
 
@@ -216,6 +229,43 @@ class   class_desc   major_id   minor_id   grantee_principal_id   grantor_princi
     }
 
     #[test]
+    fn parse_impersonation_structured_per_grantee() {
+        // Enriched query output: scope, grantee, impersonate_target columns.
+        // Two distinct grants on one host must yield two distinct vulns with
+        // the right impersonate_target captured.
+        let output = r#"Impacket v0.12.0
+SQL> SELECT 'server' AS scope, gr.name ...
+scope   grantee          impersonate_target
+------  ---------------  ------------------
+server  samwell.tarly    sa
+server  brandon.stark    jon.snow
+master  arya.stark       dbo
+"#;
+        let params = json!({"target": "192.168.58.51", "domain": "north.local", "username": "samwell.tarly"});
+        let vulns = parse_mssql_impersonation(output, &params);
+        assert_eq!(vulns.len(), 3, "got {vulns:?}");
+        // Distinct vuln_ids (per grantee→target), not collapsed to one host key.
+        let ids: std::collections::HashSet<_> = vulns
+            .iter()
+            .map(|v| v["vuln_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        // brandon → jon.snow target captured (not hardcoded sa).
+        let brandon = vulns
+            .iter()
+            .find(|v| v["details"]["account_name"] == "brandon.stark")
+            .unwrap();
+        assert_eq!(brandon["details"]["impersonate_target"], "jon.snow");
+        // Database-scope grant captured.
+        let arya = vulns
+            .iter()
+            .find(|v| v["details"]["account_name"] == "arya.stark")
+            .unwrap();
+        assert_eq!(arya["details"]["scope"], "master");
+        assert_eq!(arya["details"]["impersonate_target"], "dbo");
+    }
+
+    #[test]
     fn parse_impersonation_none() {
         let output = r#"Impacket v0.12.0
 SQL> SELECT * FROM sys.server_permissions WHERE type = 'IM';
@@ -233,41 +283,6 @@ class   class_desc   major_id   minor_id   grantee_principal_id   grantor_princi
         let params = json!({"target": "192.168.58.12", "username": "test"});
         let vulns = parse_mssql_impersonation(output, &params);
         assert!(vulns.is_empty());
-    }
-
-    #[test]
-    fn parse_impersonation_extracts_named_target_prefers_sa() {
-        // New query output: first column is the impersonable login name.
-        // `sa` is preferred when present (direct sysadmin).
-        let output = r#"Impacket v0.12.0
-SQL> SELECT pr.name AS impersonable_login, perm.* FROM sys.server_permissions perm ...
-impersonable_login   class   class_desc         major_id   minor_id   grantee_principal_id   grantor_principal_id   type   permission_name   state   state_desc
-------------------   -----   ----------         --------   --------   --------------------   --------------------   ----   ---------------   -----   ----------
-svc_admin            101     SERVER_PRINCIPAL   261        0          267                    1                      IM     IMPERSONATE       G       GRANT
-sa                   101     SERVER_PRINCIPAL   1          0          267                    1                      IM     IMPERSONATE       G       GRANT
-"#;
-        let params =
-            json!({"target": "192.168.58.51", "username": "svc_sql", "domain": "contoso.local"});
-        let vulns = parse_mssql_impersonation(output, &params);
-        assert_eq!(vulns.len(), 1);
-        assert_eq!(vulns[0]["details"]["impersonate_target"], "sa");
-    }
-
-    #[test]
-    fn parse_impersonation_extracts_non_sa_login() {
-        // No direct `sa` grant — the indirect target (e.g. a sysadmin service
-        // login) must be recorded so the probe doesn't fall back to `sa` and
-        // miss the chain. This is the case the producer wiring exists for.
-        let output = r#"Impacket v0.12.0
-impersonable_login   class   class_desc         major_id   minor_id   grantee_principal_id   grantor_principal_id   type   permission_name   state   state_desc
-------------------   -----   ----------         --------   --------   --------------------   --------------------   ----   ---------------   -----   ----------
-svc_admin            101     SERVER_PRINCIPAL   261        0          267                    1                      IM     IMPERSONATE       G       GRANT
-"#;
-        let params =
-            json!({"target": "192.168.58.51", "username": "carol", "domain": "contoso.local"});
-        let vulns = parse_mssql_impersonation(output, &params);
-        assert_eq!(vulns.len(), 1);
-        assert_eq!(vulns[0]["details"]["impersonate_target"], "svc_admin");
     }
 
     #[test]
