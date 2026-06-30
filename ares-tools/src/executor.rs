@@ -86,6 +86,27 @@ impl CommandBuilder {
         self
     }
 
+    /// Test accessor for the positional/flag arg vector. Used by unit tests
+    /// (in this crate and downstream callers) to assert on the constructed
+    /// command line without actually spawning the binary — e.g., that
+    /// `-k -no-pass` is present when a Kerberos ccache is supplied.
+    ///
+    /// Exposed (rather than `#[cfg(test)]`-gated) so the ares-cli worker
+    /// crate can write the Bug-B contract test that walks the resolver's
+    /// `tool_consumes_ticket_path` allowlist.
+    #[doc(hidden)]
+    pub fn args_for_test(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Test accessor for the environment-variable list. Used to assert that
+    /// tools wire `KRB5CCNAME` into the child process when the caller
+    /// supplies a `ticket_path` — Bug B silent-drop guard.
+    #[doc(hidden)]
+    pub fn env_vars_for_test(&self) -> &[(String, String)] {
+        &self.env_vars
+    }
+
     pub async fn execute(self) -> Result<ToolOutput> {
         #[cfg(test)]
         {

@@ -16,6 +16,7 @@
 //! ```
 //!
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -31,6 +32,7 @@ use ares_core::telemetry::spans::{
 use ares_core::telemetry::target::{extract_target_info, infer_target_type_from_info};
 
 use crate::worker::config::WorkerConfig;
+use crate::worker::credential_resolver::resolve_credentials;
 use crate::worker::heartbeat::WorkerStatus;
 
 // ─── Wire types (match orchestrator's tool_dispatcher.rs exactly) ────────────
@@ -69,7 +71,7 @@ struct ToolExecResponse {
 /// goes to exactly one worker. Replies on the request's reply inbox.
 pub async fn run_tool_exec_loop(
     config: &WorkerConfig,
-    _conn: redis::aio::ConnectionManager,
+    conn: redis::aio::ConnectionManager,
     nats: NatsBroker,
     status_tx: tokio::sync::watch::Sender<WorkerStatus>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -156,10 +158,21 @@ pub async fn run_tool_exec_loop(
 
         let reply_to = msg.reply.clone();
         let client_for_reply = client.clone();
+        // Clone the resolver-side Redis connection per-request. ConnectionManager
+        // is cheap to clone (it wraps an Arc) and resolve_credentials mutates
+        // the borrow during state reads — keeping a per-request copy avoids
+        // interleaving with the next iteration's `sub.next()` await.
+        let conn_for_resolver = conn.clone();
 
-        execute_and_respond(client_for_reply, reply_to, &request, &mut unavailable_tools)
-            .instrument(exec_span)
-            .await;
+        execute_and_respond(
+            client_for_reply,
+            reply_to,
+            &request,
+            &mut unavailable_tools,
+            conn_for_resolver,
+        )
+        .instrument(exec_span)
+        .await;
 
         let _ = status_tx.send(WorkerStatus {
             status: "idle".to_string(),
@@ -262,11 +275,22 @@ fn build_error_response(call_id: &str, err_str: String) -> ToolExecResponse {
 }
 
 /// Execute a tool call and reply on the NATS inbox.
+///
+/// Resolves credentials and Kerberos tickets from operation state before
+/// dispatch. Pre-fix this path called `ares_tools::dispatch` directly with
+/// the orchestrator-supplied arguments, which meant the entire credential
+/// resolution layer (`worker::credential_resolver::resolve_credentials`) was
+/// bypassed in production NATS mode — every cred-injection fix the
+/// orchestrator made (Bug B's KRB5CCNAME wiring, Bug I's same-realm cred
+/// precedence, etc.) only affected the in-process `LocalToolDispatcher` and
+/// never reached real workers. The injection now mirrors
+/// `LocalToolDispatcher::dispatch_tool` so the two paths stay in lock-step.
 async fn execute_and_respond(
     client: async_nats::Client,
     reply_to: Option<async_nats::Subject>,
     request: &ToolExecRequest,
     unavailable_tools: &mut std::collections::HashSet<String>,
+    mut conn: redis::aio::ConnectionManager,
 ) {
     if unavailable_tools.contains(&request.tool_name) {
         debug!(
@@ -289,7 +313,44 @@ async fn execute_and_respond(
     let di = extract_target_info(&request.arguments);
     let dt = infer_target_type_from_info(&di);
 
-    let response = match ares_tools::dispatch(&request.tool_name, &request.arguments).await {
+    // Resolve credentials from operation state. The LLM never passes secret
+    // material — usernames + domains only. A cross-forest Kerberos coercion
+    // may redirect to a `*_kerberos` variant (e.g. psexec → psexec_kerberos),
+    // so track the effective tool name for the dispatch + parser calls.
+    // On resolver error, fall back to the original arguments so the worker
+    // never silently drops a tool call.
+    let mut resolved_arguments = request.arguments.clone();
+    let mut effective_tool_name: Cow<'_, str> = Cow::Borrowed(request.tool_name.as_str());
+    match resolve_credentials(
+        &mut conn,
+        request.operation_id.as_deref(),
+        &request.tool_name,
+        &mut resolved_arguments,
+    )
+    .await
+    {
+        Ok(Some(renamed)) => {
+            info!(
+                from = %request.tool_name,
+                to = %renamed,
+                call_id = %request.call_id,
+                "worker tool_executor: applying Kerberos variant redirect from credential_resolver"
+            );
+            effective_tool_name = Cow::Owned(renamed);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                tool = %request.tool_name,
+                call_id = %request.call_id,
+                err = %e,
+                "worker credential_resolver failed; continuing with original arguments"
+            );
+            resolved_arguments = request.arguments.clone();
+        }
+    }
+
+    let response = match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
         Ok(output) => {
             let raw = output.combined_raw();
             let combined = output.combined();
@@ -297,16 +358,16 @@ async fn execute_and_respond(
             let exit_code = output.exit_code;
 
             let discoveries = discoveries_or_none(ares_tools::parsers::parse_tool_output(
-                &request.tool_name,
+                &effective_tool_name,
                 &raw,
-                &request.arguments,
+                &resolved_arguments,
             ));
 
             if let Some(ref disc) = discoveries {
                 for (disc_type, _count) in count_discovery_entries(disc) {
                     let span = trace_discovery(TraceDiscoveryParams {
                         discovery_type: &disc_type,
-                        source_agent: &request.tool_name,
+                        source_agent: &effective_tool_name,
                         target_user: di.target_user.as_deref(),
                         target_domain: None,
                         target_ip: di.target_ip.as_deref(),
@@ -325,13 +386,13 @@ async fn execute_and_respond(
             let err_str = e.to_string();
             if is_tool_unavailable_error(&err_str) {
                 warn!(
-                    tool = %request.tool_name,
+                    tool = %effective_tool_name,
                     "Tool binary not found — marking as unavailable for this session"
                 );
-                unavailable_tools.insert(request.tool_name.clone());
+                unavailable_tools.insert(effective_tool_name.to_string());
             }
             warn!(
-                tool = %request.tool_name,
+                tool = %effective_tool_name,
                 call_id = %request.call_id,
                 err = %e,
                 "Tool execution failed"
@@ -341,7 +402,7 @@ async fn execute_and_respond(
     };
 
     debug!(
-        tool = %request.tool_name,
+        tool = %effective_tool_name,
         call_id = %request.call_id,
         has_error = response.error.is_some(),
         "Tool result ready"

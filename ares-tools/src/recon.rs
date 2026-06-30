@@ -277,6 +277,19 @@ pub async fn run_bloodhound(args: &Value) -> Result<ToolOutput> {
 /// from a different domain than the one being searched — e.g. querying
 /// a parent DC with a child-domain credential. Defaults to `domain`.
 pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
+    build_ldap_search(args)?.execute().await
+}
+
+/// Build the `ldapsearch` invocation for [`ldap_search`].
+///
+/// Exposed so the resolver-side Bug B contract test can verify the
+/// `ticket_path` arg actually surfaces as `KRB5CCNAME` in the spawned
+/// subprocess (and that an injected `password` actually reaches `-w`).
+/// Without that pin, a future refactor could drop the cred read on the
+/// tool side while leaving the resolver-side allowlist intact —
+/// silently dropping every cross-forest LDAP enumeration.
+#[doc(hidden)]
+pub fn build_ldap_search(args: &Value) -> Result<CommandBuilder> {
     let target = required_str(args, "target")?;
     let domain = required_str(args, "domain")?;
     let username = optional_str(args, "username");
@@ -285,7 +298,7 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
     let base_dn = optional_str(args, "base_dn");
     let filter = optional_str(args, "filter");
     let attributes = optional_str(args, "attributes");
-    let ticket_path = optional_str(args, "ticket_path");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let computed_base_dn = match base_dn {
         Some(dn) => dn.to_string(),
@@ -299,8 +312,10 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
         .timeout_secs(120);
 
     if let Some(ccache) = ticket_path {
-        // Kerberos GSSAPI bind via cached ticket. Caller must ensure `target`
-        // is an FQDN so ldapsearch can derive the ldap/<host>@<REALM> SPN.
+        // Kerberos GSSAPI bind via cached ticket — preferred over simple
+        // bind when both are available because forged inter-realm tickets
+        // only authenticate via GSSAPI. Caller must ensure `target` is an
+        // FQDN so ldapsearch can derive the ldap/<host>@<REALM> SPN.
         cmd = cmd.env("KRB5CCNAME", ccache).arg("-Y").arg("GSSAPI");
     } else if let (Some(u), Some(p)) = (username, password) {
         let auth_domain = bind_domain.unwrap_or(domain);
@@ -325,7 +340,7 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
         }
     }
 
-    cmd.execute().await
+    Ok(cmd)
 }
 
 /// Execute an rpcclient command against a target.
@@ -402,17 +417,36 @@ pub async fn dig_query(args: &Value) -> Result<ToolOutput> {
 /// Enumerate Active Directory domain trusts via LDAP.
 ///
 /// Required args: `target`, `domain`
-/// Optional args: `username`, `password`, `hash`, `base_dn`
+/// Optional args: `username`, `password`, `hash`, `ticket_path`, `base_dn`
 ///
-/// When `hash` is provided (NTLM format `lm:nt`), uses `netexec ldap` for
-/// pass-the-hash authentication instead of `ldapsearch` simple bind.
+/// Auth precedence (first match wins):
+///   1. `ticket_path` → Kerberos GSSAPI bind via `KRB5CCNAME` + `-Y GSSAPI`.
+///      Required for cross-forest enumeration where the only usable cred is
+///      a forged inter-realm ticket; simple/NTLM binds get rejected with
+///      0x52e on a foreign DC.
+///   2. `username` + `hash` (NTLM `lm:nt` or bare nt) → impacket LDAP
+///      pass-the-hash.
+///   3. `username` + `password` → ldapsearch simple bind.
+///   4. Neither → anonymous bind (fails on hardened DCs).
 pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
+    build_enumerate_domain_trusts(args)?.execute().await
+}
+
+/// Build the subprocess invocation for [`enumerate_domain_trusts`].
+///
+/// Exposed for the resolver-side Bug B contract test — the helper lets the
+/// test assert that an injected `ticket_path` actually reaches the child
+/// process as `KRB5CCNAME`. Without this guard the ticket is injected into
+/// args but silently dropped by the tool impl.
+#[doc(hidden)]
+pub fn build_enumerate_domain_trusts(args: &Value) -> Result<CommandBuilder> {
     let target = required_str(args, "target")?;
     let domain = required_str(args, "domain")?;
     let username = optional_str(args, "username");
     let password = optional_str(args, "password");
     let hash = optional_str(args, "hash");
     let base_dn = optional_str(args, "base_dn");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
     // Cross-realm auth: orchestrator sets `bind_domain` to the cred's actual
     // realm when the credential lives in a different forest from the search
     // target (e.g. cred is `user@contoso.local` querying `fabrikam.local` DC).
@@ -420,12 +454,42 @@ pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
     // rejects with `invalidCredentials`. Falls back to `domain` when absent.
     let bind_domain = optional_str(args, "bind_domain").unwrap_or(domain);
 
+    let computed_base_dn = match base_dn {
+        Some(dn) => dn.to_string(),
+        None => domain_to_base_dn(domain),
+    };
+    let uri = format!("ldap://{target}");
+
+    // Kerberos GSSAPI bind via cached ticket — preferred over hash/password
+    // because forged inter-realm tickets only authenticate via GSSAPI. This
+    // is the load-bearing path for the child→parent forest enumeration
+    // sequence: the resolver injects `ticket_path` when an Administrator
+    // ccache exists for the target realm, but without this branch the tool
+    // silently falls through to NTLM and the foreign DC rejects the bind
+    // (Bug B silent-drop class).
+    if let Some(ccache) = ticket_path {
+        return Ok(CommandBuilder::new("ldapsearch")
+            .env("KRB5CCNAME", ccache)
+            .flag("-H", &uri)
+            .arg("-Y")
+            .arg("GSSAPI")
+            .timeout_secs(120)
+            .flag("-b", &computed_base_dn)
+            .arg("(objectClass=trustedDomain)")
+            .args([
+                "cn",
+                "trustDirection",
+                "trustType",
+                "trustAttributes",
+                "flatName",
+                // securityIdentifier comes back as base64 (binary SID); the
+                // parser decodes it. Required for child→parent forge.
+                "securityIdentifier",
+            ]));
+    }
+
     // Hash-based auth: use impacket LDAP client with pass-the-hash (NTLM)
     if let (Some(u), Some(h)) = (username, hash) {
-        let computed_base_dn = match base_dn {
-            Some(dn) => dn.to_string(),
-            None => domain_to_base_dn(domain),
-        };
         // Strip LM hash prefix if present (e.g. "aad3b435b51404ee:nthash" → "nthash")
         let nt_hash = if h.contains(':') {
             h.rsplit(':').next().unwrap_or(h)
@@ -479,19 +543,10 @@ for item in resp:
             nt_hash = nt_hash,
             base_dn = computed_base_dn,
         );
-        return CommandBuilder::new("bash")
+        return Ok(CommandBuilder::new("bash")
             .args(["-c", &ldap_query])
-            .timeout_secs(120)
-            .execute()
-            .await;
+            .timeout_secs(120));
     }
-
-    let computed_base_dn = match base_dn {
-        Some(dn) => dn.to_string(),
-        None => domain_to_base_dn(domain),
-    };
-
-    let uri = format!("ldap://{target}");
 
     let mut cmd = CommandBuilder::new("ldapsearch")
         .arg("-x")
@@ -503,7 +558,8 @@ for item in resp:
         cmd = cmd.flag("-D", bind_dn).flag("-w", p);
     }
 
-    cmd.flag("-b", computed_base_dn)
+    Ok(cmd
+        .flag("-b", computed_base_dn)
         .arg("(objectClass=trustedDomain)")
         .args([
             "cn",
@@ -515,9 +571,7 @@ for item in resp:
             // parser decodes it. Required for child→parent forge — see
             // the comment block above the impacket variant.
             "securityIdentifier",
-        ])
-        .execute()
-        .await
+        ]))
 }
 
 /// Check if RDP (port 3389) is reachable on a target.
@@ -615,21 +669,38 @@ pub async fn save_users_to_file(args: &Value) -> Result<ToolOutput> {
 /// Useful after obtaining a Kerberos ticket (e.g., via S4U, golden ticket, ADCS).
 ///
 /// Required args: `target`
-/// Optional args: `target_ip`
+/// Optional args: `target_ip`, `ticket_path`
+///
+/// When `ticket_path` is supplied the resolver-injected ccache is exported
+/// via `KRB5CCNAME` so smbclient.py can find it without relying on the
+/// default `/tmp/krb5cc_<uid>` location. Without this export the cross-forest
+/// inter-realm ticket injection is silently dropped (Bug B) — the worker
+/// inherits no Kerberos context and the bind fails with "CCache file is not
+/// found".
 pub async fn smbclient_kerberos_shares(args: &Value) -> Result<ToolOutput> {
+    build_smbclient_kerberos_shares(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_smbclient_kerberos_shares(args: &Value) -> Result<CommandBuilder> {
     let target = required_str(args, "target")?;
     let target_ip = optional_str(args, "target_ip");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let mut cmd = CommandBuilder::new("smbclient.py")
         .args(["-k", "-no-pass"])
         .timeout_secs(180);
+
+    if let Some(tpath) = ticket_path {
+        cmd = cmd.env("KRB5CCNAME", tpath);
+    }
 
     if let Some(ip) = target_ip {
         cmd = cmd.flag("-target-ip", ip);
     }
 
     // Impacket smbclient.py uses @host to list shares
-    cmd.arg(format!("@{target}")).execute().await
+    Ok(cmd.arg(format!("@{target}")))
 }
 
 /// Enumerate ACL attack paths via LDAP nTSecurityDescriptor queries.
@@ -641,13 +712,24 @@ pub async fn smbclient_kerberos_shares(args: &Value) -> Result<ToolOutput> {
 /// Required args: `target`, `domain`
 /// Optional args: `username`, `password`, `bind_domain`, `hash`
 pub async fn ldap_acl_enumeration(args: &Value) -> Result<ToolOutput> {
+    build_ldap_acl_enumeration(args)?.execute().await
+}
+
+/// Build the subprocess invocation for [`ldap_acl_enumeration`].
+///
+/// Exposed so the resolver-side Bug B contract test can verify the
+/// `ticket_path` arg surfaces as `KRB5CCNAME` and the injected password
+/// reaches `-w`. The hash branch builds a `bash -c "python3 -c ..."`
+/// invocation; the nthash is interpolated into the script body.
+#[doc(hidden)]
+pub fn build_ldap_acl_enumeration(args: &Value) -> Result<CommandBuilder> {
     let target = required_str(args, "target")?;
     let domain = required_str(args, "domain")?;
     let username = optional_str(args, "username");
     let password = optional_str(args, "password");
     let bind_domain = optional_str(args, "bind_domain");
     let hash = optional_str(args, "hash");
-    let ticket_path = optional_str(args, "ticket_path");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let base_dn = domain_to_base_dn(domain);
     let uri = format!("ldap://{target}");
@@ -656,7 +738,7 @@ pub async fn ldap_acl_enumeration(args: &Value) -> Result<ToolOutput> {
     // over hash/password — when a forged inter-realm ticket is present we MUST
     // use it, otherwise simple bind with source-realm cred fails 0x52e.
     if let Some(ccache) = ticket_path {
-        return CommandBuilder::new("ldapsearch")
+        return Ok(CommandBuilder::new("ldapsearch")
             .env("KRB5CCNAME", ccache)
             .flag("-H", &uri)
             .arg("-Y")
@@ -677,9 +759,7 @@ pub async fn ldap_acl_enumeration(args: &Value) -> Result<ToolOutput> {
                 // gpo_<right>_<GUID> vuln_id.
                 "cn",
                 "displayName",
-            ])
-            .execute()
-            .await;
+            ]));
     }
 
     // If hash is provided, use impacket LDAP for pass-the-hash
@@ -730,11 +810,9 @@ for item in resp:
             nt_hash = nt_hash,
             base_dn = base_dn,
         );
-        return CommandBuilder::new("bash")
+        return Ok(CommandBuilder::new("bash")
             .args(["-c", &ldap_query])
-            .timeout_secs(300)
-            .execute()
-            .await;
+            .timeout_secs(300));
     }
 
     // Password-based: use ldapsearch with LDAP_SERVER_SD_FLAGS_OID control
@@ -750,7 +828,7 @@ for item in resp:
         cmd = cmd.flag("-D", bind_dn).flag("-w", p);
     }
 
-    cmd = cmd
+    Ok(cmd
         .flag("-b", &base_dn)
         // Request DACL only via SD_FLAGS control (0x04 = DACL)
         // BER: SEQUENCE { INTEGER 4 } = 30 03 02 01 04 → base64 MAMCAQQ=
@@ -763,9 +841,7 @@ for item in resp:
             "nTSecurityDescriptor",
             "cn",
             "displayName",
-        ]);
-
-    cmd.execute().await
+        ]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,5 +1170,230 @@ mod tests {
         let args = json!({"target": "dc01.contoso.local", "target_ip": "192.168.58.1"});
         let result = smbclient_kerberos_shares(&args).await;
         assert!(result.is_ok());
+    }
+
+    // ── Bug B (ldap_search): ticket_path → KRB5CCNAME / password → -w ───
+
+    #[test]
+    fn ldap_search_invocation_exports_krb5ccname_when_ticket_path_set() {
+        // When the orchestrator dispatches ldap_search with a forged
+        // inter-realm ccache injected by the resolver, the tool impl must
+        // export KRB5CCNAME and switch ldapsearch into GSSAPI mode —
+        // otherwise the ccache is silently dropped and the bind falls back
+        // to anonymous.
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "domain": "fabrikam.local",
+            "ticket_path": "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache",
+            "filter": "(objectClass=user)",
+        });
+        let cmd = super::build_ldap_search(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test().iter().any(|(k, v)| k == "KRB5CCNAME"
+                && v
+                    == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
+            "ticket_path must export KRB5CCNAME so ldapsearch loads the cross-forest ccache"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-Y"));
+        assert!(args_vec.iter().any(|a| a == "GSSAPI"));
+        // No simple-bind flags when GSSAPI is in play.
+        assert!(args_vec.iter().all(|a| a != "-w"));
+        assert!(args_vec.iter().all(|a| a != "-D"));
+    }
+
+    #[test]
+    fn ldap_search_invocation_passes_password_to_w_flag() {
+        // The op-time bug: the orchestrator supplied
+        // `username=carol@fabrikam.local` + `password=fr3edom` and
+        // expected a simple bind. Without ticket_path the tool MUST issue
+        // `-x -D carol@fabrikam.local -w fr3edom`.
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "domain": "fabrikam.local",
+            "username": "carol",
+            "password": "fr3edom",
+            "filter": "(objectClass=user)",
+        });
+        let cmd = super::build_ldap_search(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(
+            args_vec.iter().any(|a| a == "-x"),
+            "expected simple-bind flag"
+        );
+        let w_idx = args_vec
+            .iter()
+            .position(|a| a == "-w")
+            .expect("password must reach -w flag");
+        assert_eq!(args_vec.get(w_idx + 1).map(String::as_str), Some("fr3edom"));
+        let d_idx = args_vec
+            .iter()
+            .position(|a| a == "-D")
+            .expect("bind DN must reach -D flag");
+        assert_eq!(
+            args_vec.get(d_idx + 1).map(String::as_str),
+            Some("carol@fabrikam.local")
+        );
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .all(|(k, _)| k != "KRB5CCNAME"),
+            "simple-bind branch must not export KRB5CCNAME"
+        );
+    }
+
+    #[test]
+    fn ldap_search_anonymous_when_no_creds() {
+        let args = json!({
+            "target": "192.168.58.1",
+            "domain": "contoso.local",
+        });
+        let cmd = super::build_ldap_search(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(
+            args_vec.iter().any(|a| a == "-x"),
+            "expected anonymous simple-bind"
+        );
+        assert!(args_vec.iter().all(|a| a != "-w"));
+        assert!(args_vec.iter().all(|a| a != "-Y"));
+    }
+
+    // ── Bug B (enumerate_domain_trusts): ticket_path → KRB5CCNAME ───────
+
+    #[test]
+    fn enumerate_domain_trusts_invocation_exports_krb5ccname_when_ticket_path_set() {
+        // enumerate_domain_trusts is on the Bug B allowlist; if the tool
+        // impl doesn't read `ticket_path` the resolver-injected ccache goes
+        // to /dev/null and cross-forest enumeration silently degrades to an
+        // unauthenticated bind.
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "domain": "fabrikam.local",
+            "ticket_path": "/tmp/ares-tickets/child_fabrikam_local__fabrikam_local__Administrator.ccache",
+        });
+        let cmd = super::build_enumerate_domain_trusts(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test().iter().any(|(k, v)| k == "KRB5CCNAME"
+                && v
+                    == "/tmp/ares-tickets/child_fabrikam_local__fabrikam_local__Administrator.ccache"),
+            "ticket_path must export KRB5CCNAME for enumerate_domain_trusts"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-Y"));
+        assert!(args_vec.iter().any(|a| a == "GSSAPI"));
+        assert!(
+            args_vec.iter().any(|a| a == "(objectClass=trustedDomain)"),
+            "GSSAPI branch must still issue the trustedDomain query filter"
+        );
+        // GSSAPI bind cannot also have simple-bind flags or NTLM bind would
+        // be re-attempted on a fallback.
+        assert!(args_vec.iter().all(|a| a != "-w"));
+        assert!(args_vec.iter().all(|a| a != "-D"));
+    }
+
+    #[test]
+    fn enumerate_domain_trusts_password_branch_unchanged() {
+        // Regression guard: without ticket_path the legacy simple-bind args
+        // are still produced. Pins the conditional in build_enumerate_domain_trusts.
+        let args = json!({
+            "target": "192.168.58.1",
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ss",
+        });
+        let cmd = super::build_enumerate_domain_trusts(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .all(|(k, _)| k != "KRB5CCNAME"),
+            "simple-bind branch must not export KRB5CCNAME"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-x"));
+        let w_idx = args_vec
+            .iter()
+            .position(|a| a == "-w")
+            .expect("password must reach -w");
+        assert_eq!(args_vec.get(w_idx + 1).map(String::as_str), Some("P@ss"));
+    }
+
+    #[test]
+    fn enumerate_domain_trusts_ticket_path_wins_over_password() {
+        // If both ticket_path AND password are in args (post-resolver state),
+        // GSSAPI must win — the forged inter-realm ticket is the only auth
+        // the foreign DC will honor.
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "domain": "fabrikam.local",
+            "username": "Administrator",
+            "password": "P@ss",
+            "ticket_path": "/tmp/ares-tickets/x.ccache",
+        });
+        let cmd = super::build_enumerate_domain_trusts(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "GSSAPI"));
+        assert!(
+            args_vec.iter().all(|a| a != "-w"),
+            "password must NOT reach -w when ticket_path is present"
+        );
+    }
+
+    // ── Bug B (ldap_acl_enumeration): ticket_path → KRB5CCNAME ──────────
+
+    #[test]
+    fn ldap_acl_enumeration_invocation_exports_krb5ccname_when_ticket_path_set() {
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "domain": "fabrikam.local",
+            "ticket_path": "/tmp/ares-tickets/y.ccache",
+        });
+        let cmd = super::build_ldap_acl_enumeration(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/y.ccache"),
+            "ticket_path must export KRB5CCNAME for ldap_acl_enumeration"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "GSSAPI"));
+    }
+
+    #[test]
+    fn ldap_acl_enumeration_password_branch_passes_w_flag() {
+        let args = json!({
+            "target": "192.168.58.1",
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ss",
+        });
+        let cmd = super::build_ldap_acl_enumeration(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        let w_idx = args_vec
+            .iter()
+            .position(|a| a == "-w")
+            .expect("password must reach -w for ldap_acl_enumeration");
+        assert_eq!(args_vec.get(w_idx + 1).map(String::as_str), Some("P@ss"));
+    }
+
+    #[test]
+    fn smbclient_kerberos_shares_invocation_receives_krb5ccname_env() {
+        // Bug B: resolver writes ticket_path into the args map, but if the
+        // tool impl doesn't surface it as KRB5CCNAME in the child env then
+        // smbclient.py inherits no Kerberos context and the inter-realm
+        // ccache injection is silently dropped.
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "ticket_path": "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache",
+        });
+        let cmd = super::build_smbclient_kerberos_shares(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test().iter().any(|(k, v)| k == "KRB5CCNAME"
+                && v
+                    == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
+            "ticket_path must export KRB5CCNAME so smbclient.py loads the cross-forest ccache"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
     }
 }

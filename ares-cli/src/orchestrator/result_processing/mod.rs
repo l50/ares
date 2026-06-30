@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::output_extraction;
 use crate::orchestrator::results::CompletedTask;
-use crate::orchestrator::state::SharedState;
+use crate::orchestrator::state::{SharedState, StateInner};
 use crate::orchestrator::task_queue::TaskQueueCore;
 use crate::orchestrator::throttling::Throttler;
 
@@ -46,6 +46,40 @@ use self::timeline::{
 /// Kerberos/SMB errors that indicate a credential is locked out.
 pub(crate) const LOCKOUT_PATTERNS: &[&str] =
     &["KDC_ERR_CLIENT_REVOKED", "STATUS_ACCOUNT_LOCKED_OUT"];
+
+/// True when the task result text contains the canonical etype-rejection
+/// markers a KDC returns when a SPN-bearing account has
+/// `msDS-SupportedEncryptionTypes` set to AES-only and the client requested
+/// (only) RC4. The default-etype kerberoast TGS-REQ trips this; the orchestrator
+/// then needs to re-dispatch with an AES etype hint. Bug E.
+pub(crate) fn result_text_indicates_etype_nosupp(result: &Option<Value>) -> bool {
+    let Some(payload) = result else {
+        return false;
+    };
+    let texts = collect_result_text_parts(payload);
+    texts.iter().any(|t| {
+        t.contains("KDC_ERR_ETYPE_NOSUPP")
+            || t.contains("KDC_ERR_ETYPE_NOTSUPP")
+            || t.contains("KDC has no support for encryption type")
+    })
+}
+
+/// True when the technique should trigger an AES-etype kerberoast retry on
+/// observing `KDC_ERR_ETYPE_NOSUPP`. Pure — extracted so the retry gate can
+/// be unit-tested without spinning up the orchestrator. Bug E.
+pub(crate) fn should_retry_kerberoast_with_aes(
+    technique: Option<&str>,
+    result: &Option<Value>,
+) -> bool {
+    let Some(tech) = technique else {
+        return false;
+    };
+    let t = tech.to_lowercase();
+    if t != "kerberoast" && t != "targeted_kerberoast" {
+        return false;
+    }
+    result_text_indicates_etype_nosupp(result)
+}
 
 /// Process a completed task result: extract discoveries and update state.
 pub async fn process_completed_task(
@@ -292,6 +326,35 @@ pub async fn process_completed_task(
                     warn!(err = %e, vuln_id = %vuln_id, "Failed to mark vulnerability exploited");
                 }
                 create_exploitation_timeline_event(dispatcher, &vuln_id, task_id).await;
+
+                // Attack-path diversity: record the walked
+                // (foothold, technique, target) step for coverage measurement
+                // and cross-run novelty bias. Inert unless emit_path_records or
+                // novelty_enabled is set (see docs/attack-path-diversity.md).
+                let strategy = &dispatcher.config.strategy;
+                if strategy.emit_path_records || strategy.novelty_enabled {
+                    let vuln_type = task_params_snapshot
+                        .get("vuln_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(vuln_id.as_str());
+                    let target = task_params_snapshot
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .or(task_target_ip.as_deref())
+                        .unwrap_or("");
+                    let mut conn = dispatcher.queue.connection();
+                    crate::orchestrator::diversity::record_step(
+                        &mut conn,
+                        &dispatcher.config.operation_id,
+                        &strategy.novelty_scope,
+                        cred_key.as_deref(),
+                        vuln_type,
+                        target,
+                        strategy.emit_path_records,
+                        strategy.novelty_enabled,
+                    )
+                    .await;
+                }
             } else {
                 // Record failed exploit attempts as timeline events so they appear
                 // in reports (e.g. noPac patched, PrintNightmare patched, Certifried
@@ -355,6 +418,11 @@ pub async fn process_completed_task(
     // username_as_password and password_spray test multiple users in one
     // task — when a specific user trips STATUS_ACCOUNT_LOCKED_OUT we
     // remember that principal so future enum tasks can skip it.
+    //
+    // Bug E: SPN-bearing principals get the ≥30-min AD-default quarantine
+    // window instead of the generic 5 min. The 5-min cycle doesn't outlast
+    // the real lockout policy, so the spray loop ends up re-hammering the
+    // same locked principal across neighbouring domains.
     if has_lockout_in_result(result) {
         let locked = extract_locked_usernames_from_result(&result.result);
         if !locked.is_empty() {
@@ -367,13 +435,28 @@ pub async fn process_completed_task(
                 let mut state = dispatcher.state.write().await;
                 for (user, dom_hint) in &locked {
                     let dom = dom_hint.as_deref().unwrap_or(&resolved_domain);
-                    warn!(
-                        user = %user,
-                        domain = %dom,
-                        task_id = %task_id,
-                        "User quarantined for 5 min: enumeration lockout detected"
-                    );
-                    state.quarantine_principal(user, dom);
+                    let is_spn = crate::orchestrator::automation::credential_access::is_kerberoastable_principal(&state, user, dom);
+                    if is_spn {
+                        warn!(
+                            user = %user,
+                            domain = %dom,
+                            task_id = %task_id,
+                            "SPN-bearing user quarantined for 30 min: AD lockout-policy default applies (kerberoast pivot recommended)"
+                        );
+                        state.quarantine_principal_for(
+                            user,
+                            dom,
+                            crate::orchestrator::automation::credential_access::SPN_LOCKOUT_QUARANTINE_SECS,
+                        );
+                    } else {
+                        warn!(
+                            user = %user,
+                            domain = %dom,
+                            task_id = %task_id,
+                            "User quarantined for 5 min: enumeration lockout detected"
+                        );
+                        state.quarantine_principal(user, dom);
+                    }
                 }
             }
         }
@@ -446,6 +529,73 @@ pub async fn process_completed_task(
     // Recognise the relay technique here and emit a synthetic token so the
     // scoreboard credits the primitive.
     let task_technique = task_technique_from_pending(dispatcher, task_id).await;
+
+    // Bug E: AES kerberoast retry on KDC_ERR_ETYPE_NOSUPP. When a kerberoast
+    // dispatch hits an AES-only SPN account, the default-etype TGS-REQ is
+    // rejected pre-TGS-REP. Re-dispatch with an AES etype hint so we extract
+    // a $krb5tgs$18$ hash before any password_spray touches the same principal
+    // and trips the AD lockout policy.
+    if should_retry_kerberoast_with_aes(task_technique.as_deref(), &result.result) {
+        let resolved_domain = if let Some(ref td) = task_domain {
+            td.clone()
+        } else {
+            resolve_domain_from_ip(dispatcher, task_target_ip.as_deref()).await
+        };
+        let dc_ip = task_target_ip.clone().unwrap_or_default();
+        let target_user = task_params_snapshot
+            .get("target_user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let cred = {
+            let state = dispatcher.state.read().await;
+            task_username
+                .as_deref()
+                .and_then(|u| {
+                    state
+                        .credentials
+                        .iter()
+                        .find(|c| {
+                            c.username.eq_ignore_ascii_case(u)
+                                && (resolved_domain.is_empty()
+                                    || c.domain.eq_ignore_ascii_case(&resolved_domain))
+                        })
+                        .cloned()
+                })
+        };
+        if let (false, false, Some(cred)) =
+            (resolved_domain.is_empty(), dc_ip.is_empty(), cred)
+        {
+            let payload =
+                crate::orchestrator::automation::credential_access::build_aes_kerberoast_retry_payload(
+                    &resolved_domain,
+                    &dc_ip,
+                    &cred,
+                    target_user.as_deref(),
+                );
+            match dispatcher
+                .throttled_submit("credential_access", "credential_access", payload, 1)
+                .await
+            {
+                Ok(Some(new_task_id)) => info!(
+                    parent_task = %task_id,
+                    chained_task = %new_task_id,
+                    target = %dc_ip,
+                    domain = %resolved_domain,
+                    "Kerberoast AES retry dispatched after KDC_ERR_ETYPE_NOSUPP"
+                ),
+                Ok(None) => {}
+                Err(e) => warn!(err = %e, "Failed to dispatch AES kerberoast retry"),
+            }
+        } else {
+            warn!(
+                task_id = %task_id,
+                domain = %resolved_domain,
+                dc_ip = %dc_ip,
+                "Cannot dispatch AES kerberoast retry: missing domain/dc_ip/credential"
+            );
+        }
+    }
+
     if let Some(ref tech) = task_technique {
         if (tech == "ntlm_relay_ldap" || tech == "ntlm_relay_adcs")
             && result.success
@@ -1096,6 +1246,21 @@ fn roast_exploit_token(hash_value: &str, username: &str, domain: &str) -> Option
     }
 }
 
+/// Returns true when an inter-realm referral ticket targeting `target_domain`
+/// cannot DCSync via DRSUAPI because the source forest's RID-519 ExtraSid is
+/// stripped from the referral PAC by the target's SID filtering.
+///
+/// Pure — extracted from `auto_chain_s4u_secretsdump` so the SID-filter guard
+/// can be unit-tested without a Dispatcher.
+fn is_dcsync_chain_blocked_by_sid_filter(state: &StateInner, target_domain: &str) -> bool {
+    let key = target_domain.to_lowercase();
+    state
+        .trusted_domains
+        .get(&key)
+        .map(|t| t.is_cross_forest() && t.sid_filtering)
+        .unwrap_or(false)
+}
+
 async fn auto_chain_s4u_secretsdump(
     payload: &Value,
     dispatcher: &Arc<Dispatcher>,
@@ -1167,6 +1332,31 @@ async fn auto_chain_s4u_secretsdump(
         .filter(|d| !d.is_empty())
         .or_else(|| get_param("domain"))
         .unwrap_or("");
+
+    // Bug C: cross-realm referral tickets cannot DCSync a SID-filtered target.
+    // The ccache from `create_inter_realm_ticket` contains ldap/cifs service
+    // tickets whose PAC has been stripped of the source forest's RID-519
+    // ExtraSid by the target KDC's SID filtering. impacket's secretsdump via
+    // DRSUAPI needs a DA-bound principal in the target domain — the referral
+    // PAC is not — so the dump is unwinnable no matter how cleanly the ticket
+    // loads. The ticket is still useful for LDAP enum, certipy auth, etc.
+    // (handled by other automation), so we don't drop the ticket — we just
+    // skip the doomed DCSync chain.
+    if !domain.is_empty() {
+        let skip = {
+            let state = dispatcher.state.read().await;
+            is_dcsync_chain_blocked_by_sid_filter(&state, domain)
+        };
+        if skip {
+            info!(
+                task_id = %task_id,
+                target_domain = %domain,
+                ticket = %ticket_path,
+                "S4U auto-chain: skipping secretsdump — cross-realm referral PAC cannot DCSync a SID-filtered target (LDAP/ADCS paths still active)"
+            );
+            return;
+        }
+    }
 
     // Dispatch secretsdump with ticket (no password needed).
     // Must include username — secretsdump requires it even with -k -no-pass.

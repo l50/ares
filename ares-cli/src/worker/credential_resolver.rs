@@ -113,8 +113,45 @@ pub async fn resolve_credentials(
 
     // Bulk-load state once per call. These are HASHes/LISTs cached in Redis,
     // so the cost is small relative to the subsequent tool execution.
-    let mut credentials = reader.get_credentials(conn).await.unwrap_or_default();
-    let mut hashes = reader.get_hashes(conn).await.unwrap_or_default();
+    //
+    // Errors here MUST be surfaced loudly rather than silently swallowed.
+    // A bare `.unwrap_or_default()` turns a transient Redis I/O failure
+    // (broken pipe, timeout, connection reset) into a `Vec::new()` and the
+    // resolver carries on as if no credentials existed — the downstream
+    // `cred_count=0` log line at the `resolving` info! call below is then
+    // indistinguishable from "operation truly has no creds" vs. "Redis is
+    // broken". When `ops inject-credential` lands a cred in Redis but the
+    // resolver can't read it, the only observable symptom is the wrong-realm
+    // / no-match warn firing. The explicit warn here pins the cause so a
+    // future cred-resolver lookup miss surfaces immediately.
+    let mut credentials = match reader.get_credentials(conn).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                tool = %tool_name,
+                op_id = %op_id,
+                err = %e,
+                "credential_resolver: Redis get_credentials failed — \
+                 continuing with empty credential list. Downstream tools will \
+                 see missing-credential errors. Check Redis connectivity and \
+                 that ARES_OPERATION_ID matches the orchestrator's operation."
+            );
+            Vec::new()
+        }
+    };
+    let mut hashes = match reader.get_hashes(conn).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                tool = %tool_name,
+                op_id = %op_id,
+                err = %e,
+                "credential_resolver: Redis get_hashes failed — \
+                 continuing with empty hash list"
+            );
+            Vec::new()
+        }
+    };
     let domain_sids = reader.get_domain_sids(conn).await.unwrap_or_default();
     let netbios_map = reader.get_netbios_map(conn).await.unwrap_or_default();
 
@@ -273,7 +310,15 @@ pub async fn resolve_credentials(
         };
         if let Some(ref realm) = target_realm {
             if let Some(renamed) =
-                resolve_cross_forest_ticket(args_obj, &reader, conn, tool_name, realm, &hashes)
+                resolve_cross_forest_ticket(
+                    args_obj,
+                    &reader,
+                    conn,
+                    tool_name,
+                    realm,
+                    &credentials,
+                    &hashes,
+                )
                     .await
             {
                 redirected_tool = Some(renamed);
@@ -843,6 +888,46 @@ pub(crate) fn supports_kerberos_auth_mode(tool_name: &str) -> bool {
     !matches!(kerberos_coercion(tool_name), KerberosCoercion::None)
 }
 
+/// True when the tool's tool-side implementation reads a `ticket_path` arg
+/// and either sets `KRB5CCNAME` in the spawned process environment or passes
+/// the ticket through impacket's `-k -no-pass` (or equivalent). Tools NOT in
+/// this set silently drop the injection: the resolver writes `ticket_path`
+/// into the args map, the tool's `optional_str("ticket_path")` returns None
+/// because the impl doesn't look for it, and the dispatched process inherits
+/// no Kerberos context. That silent drop is invisible in the dispatcher logs
+/// — Bug B.
+///
+/// This list must be kept in lock-step with the tool impls under
+/// `ares-tools/src/`:
+///   - `acl::bloodyad_*` (acl.rs)
+///   - `recon::ldap_search`, `recon::ldap_acl_enumeration`,
+///     `recon::enumerate_domain_trusts` (recon.rs)
+///   - `credential_access::secretsdump` (credential_access/secretsdump.rs)
+///   - `credential_access::misc::ldap_search_descriptions`
+///   - `lateral::execution::{psexec,wmiexec,smbexec}_kerberos`
+///   - `lateral::execution::secretsdump_kerberos`
+///
+/// Adding a Kerberos-capable tool means appending its name here AND wiring
+/// the `optional_str("ticket_path")` read in the impl.
+pub(crate) fn tool_consumes_ticket_path(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "secretsdump"
+            | "secretsdump_kerberos"
+            | "psexec_kerberos"
+            | "wmiexec_kerberos"
+            | "smbexec_kerberos"
+            | "ldap_search"
+            | "ldap_search_descriptions"
+            | "ldap_acl_enumeration"
+            | "enumerate_domain_trusts"
+            | "bloodyad_set_password"
+            | "bloodyad_add_group_member"
+            | "bloodyad_add_genericall"
+            | "smbclient_kerberos_shares"
+    )
+}
+
 /// Flip a tool's args into Kerberos auth mode: set `no_pass=true` and remove
 /// any `password` / `hash` that the principal resolver injected earlier.
 /// Returns `(stripped_password, stripped_hash)` so the caller can log
@@ -1020,12 +1105,16 @@ async fn resolve_cross_forest_ticket(
     conn: &mut ConnectionManager,
     tool_name: &str,
     target_domain: &str,
+    credentials: &[Credential],
     hashes: &[Hash],
 ) -> Option<String> {
-    // Only fire when the tool has no usable NTLM credential for the target
-    // domain (i.e. the realm_strict check already blocked cross-realm fallback).
-    // If there's already an exact-domain hash for a non-common account, NTLM
-    // bind will work and we don't need Kerberos.
+    // Only fire when no same-realm credential exists for the principal. The
+    // consumer tools (ldap_search, secretsdump, etc.) prefer `ticket_path`
+    // over `password`/`hash` when both are present, so injecting a cross-realm
+    // Administrator ccache shadows a working same-realm bind — and the foreign
+    // DC rejects the cross-realm principal's referral PAC under SID filtering.
+    // Skip whenever an exact-domain NTLM hash or plaintext password is already
+    // usable for the dispatched principal.
     let user_l = string_field(args, "username")
         .map(|u| u.to_lowercase())
         .unwrap_or_default();
@@ -1037,7 +1126,14 @@ async fn resolve_cross_forest_ticket(
             && is_authenticating_hash_type(&h.hash_type)
     });
     if has_ntlm {
-        // NTLM bind is available — no need to inject Kerberos ticket.
+        return None;
+    }
+    let has_plaintext = credentials.iter().any(|c| {
+        c.domain.to_lowercase() == domain_l
+            && (user_l.is_empty() || c.username.to_lowercase() == user_l)
+            && !c.password.is_empty()
+    });
+    if has_plaintext {
         return None;
     }
 
@@ -1082,6 +1178,25 @@ async fn resolve_cross_forest_ticket(
         coercion = ?coercion,
         "credential_resolver: injecting inter-realm Kerberos ticket for cross-forest tool"
     );
+    // Bug B: surface the silent-drop path. If the consuming tool's impl
+    // doesn't actually read `ticket_path` (no KRB5CCNAME env, no -k/-no-pass),
+    // the injection is a no-op and the downstream auth fails with
+    // `CCache file is not found` / `Matching credential not found` while
+    // the dispatcher logs claim injection succeeded. Logging this loudly
+    // makes the gap visible so the next op that hits it doesn't take
+    // another hour of cross-referencing worker stdout against orchestrator
+    // dispatch traces.
+    if !tool_consumes_ticket_path(tool_name) {
+        warn!(
+            tool = %tool_name,
+            target_domain = %target_domain,
+            ticket_path = %ticket.ticket_path,
+            "credential_resolver: tool impl does not read ticket_path — \
+             injection will be silently dropped. Add the tool to \
+             tool_consumes_ticket_path() (and wire optional_str(\"ticket_path\") \
+             in the tool impl) so the ccache reaches the worker process."
+        );
+    }
     args.insert(
         "ticket_path".to_string(),
         Value::String(ticket.ticket_path.clone()),
@@ -1457,6 +1572,54 @@ mod tests {
         ];
         let found = find_hash(&hashes, "admin", "contoso.local", true).unwrap();
         assert_eq!(found.hash_value, "conhash");
+    }
+
+    #[test]
+    fn resolver_warns_when_ccache_intended_but_schema_lacks_slot() {
+        // Bug B: tools whose impl actually reads `ticket_path` are in the
+        // allow-list. Any cross-forest injection against a tool *not* in this
+        // set is a silent drop — the worker process inherits no KRB5CCNAME,
+        // the downstream auth fails with "CCache file is not found", and the
+        // dispatcher logs claim injection succeeded. The resolver warn covers
+        // the gap; this test pins the membership so a future tool with a
+        // mismatched schema/impl trips CI.
+        for known in [
+            "secretsdump",
+            "secretsdump_kerberos",
+            "psexec_kerberos",
+            "wmiexec_kerberos",
+            "smbexec_kerberos",
+            "ldap_search",
+            "ldap_search_descriptions",
+            "ldap_acl_enumeration",
+            "bloodyad_set_password",
+            "bloodyad_add_group_member",
+            "bloodyad_add_genericall",
+            "smbclient_kerberos_shares",
+        ] {
+            assert!(
+                tool_consumes_ticket_path(known),
+                "{known} impl reads ticket_path — must be allow-listed so the \
+                 resolver doesn't warn-on-injection"
+            );
+        }
+
+        // Negative side: tools that have no Kerberos path must trip the
+        // silent-drop warn — picking obviously-not-Kerberos shapes.
+        for unknown in [
+            "rpcclient_command",
+            "password_spray",
+            "username_as_password",
+            "save_users_to_file",
+            "dig_query",
+            "petitpotam_unauth",
+        ] {
+            assert!(
+                !tool_consumes_ticket_path(unknown),
+                "{unknown} impl does NOT read ticket_path — injection against it \
+                 must trip the silent-drop warn"
+            );
+        }
     }
 
     #[test]
@@ -1845,6 +2008,35 @@ mod tests {
         assert!(
             has_ntlm,
             "NTLM hash present — Kerberos injection should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_cross_forest_ticket_skipped_when_same_realm_plaintext_exists() {
+        // The guard skips cross-forest injection when a same-realm plaintext
+        // credential exists for the dispatched principal — otherwise
+        // ldap_search's `ticket_path > password` preference shadows a working
+        // simple bind with a doomed GSSAPI bind against the foreign DC.
+        let credentials = [cred("carol", "fabrikam.local", "fr3edom")];
+        let hashes: [Hash; 0] = [];
+        let domain_l = "fabrikam.local";
+        let user_l = "carol";
+        let has_ntlm = hashes.iter().any(|h: &Hash| {
+            h.domain.to_lowercase() == domain_l
+                && (user_l.is_empty() || h.username.to_lowercase() == user_l)
+                && !h.hash_value.is_empty()
+                && is_authenticating_hash_type(&h.hash_type)
+        });
+        let has_plaintext = credentials.iter().any(|c| {
+            c.domain.to_lowercase() == domain_l
+                && (user_l.is_empty() || c.username.to_lowercase() == user_l)
+                && !c.password.is_empty()
+        });
+        assert!(!has_ntlm, "no NTLM hash for fabrikam.local in this scenario");
+        assert!(
+            has_plaintext,
+            "same-realm plaintext for carol@fabrikam.local — cross-forest \
+             ccache injection must be skipped so ldap_search uses simple bind"
         );
     }
 
@@ -2252,5 +2444,204 @@ mod tests {
         assert!(is_authenticating_hash_type("aes128"));
         assert!(is_authenticating_hash_type("lm"));
         assert!(is_authenticating_hash_type(""));
+    }
+
+    /// Bug B end-to-end contract: when the resolver writes `ticket_path` into
+    /// the args map, the downstream tool builders must export it as
+    /// `KRB5CCNAME` in the spawned subprocess's environment. This pins the
+    /// resolver-side `tool_consumes_ticket_path` allowlist against the
+    /// tool-side env wiring so a future refactor that breaks one without the
+    /// other trips CI rather than burning an entire DA op on silent drops.
+    #[test]
+    fn credential_resolver_injection_reaches_worker_env() {
+        const CCACHE: &str =
+            "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache";
+
+        // Per-tool fixtures: each entry is (tool_name, args). Args mirror
+        // exactly what `resolve_credentials` would have constructed for a
+        // cross-forest dispatch — username/domain populated, ticket_path
+        // injected from the kerberos_tickets HASH.
+        let fixtures: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "bloodyad_set_password",
+                json!({
+                    "domain": "fabrikam.local",
+                    "dc_ip": "192.168.58.20",
+                    "target_user": "alice",
+                    "new_password": "Pwn3d!2026",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "bloodyad_add_group_member",
+                json!({
+                    "domain": "fabrikam.local",
+                    "dc_ip": "192.168.58.20",
+                    "group": "Domain Admins",
+                    "target_user": "carol",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "bloodyad_add_genericall",
+                json!({
+                    "domain": "fabrikam.local",
+                    "dc_ip": "192.168.58.20",
+                    "target_dn": "CN=Users,DC=fabrikam,DC=local",
+                    "principal": "carol",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "smbclient_kerberos_shares",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "ldap_search",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "filter": "(objectClass=user)",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "ldap_search_descriptions",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "ldap_acl_enumeration",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "enumerate_domain_trusts",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+        ];
+
+        for (tool, args) in &fixtures {
+            // Sanity guard: every tool exercised here must be on the
+            // resolver's allowlist, otherwise the silent-drop warn fires
+            // and the env-wiring contract is unverified.
+            assert!(
+                tool_consumes_ticket_path(tool),
+                "{tool} must be on tool_consumes_ticket_path allowlist"
+            );
+
+            let cmd = match *tool {
+                "bloodyad_set_password" => {
+                    ares_tools::acl::build_bloodyad_set_password(args).unwrap()
+                }
+                "bloodyad_add_group_member" => {
+                    ares_tools::acl::build_bloodyad_add_group_member(args).unwrap()
+                }
+                "bloodyad_add_genericall" => {
+                    ares_tools::acl::build_bloodyad_add_genericall(args).unwrap()
+                }
+                "smbclient_kerberos_shares" => {
+                    ares_tools::recon::build_smbclient_kerberos_shares(args).unwrap()
+                }
+                "ldap_search" => ares_tools::recon::build_ldap_search(args).unwrap(),
+                "ldap_search_descriptions" => {
+                    ares_tools::credential_access::build_ldap_search_descriptions(args).unwrap()
+                }
+                "ldap_acl_enumeration" => {
+                    ares_tools::recon::build_ldap_acl_enumeration(args).unwrap()
+                }
+                "enumerate_domain_trusts" => {
+                    ares_tools::recon::build_enumerate_domain_trusts(args).unwrap()
+                }
+                other => panic!("no build_* helper wired for {other}"),
+            };
+
+            let env_set = cmd
+                .env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == CCACHE);
+            assert!(
+                env_set,
+                "{tool}: injected ticket_path did not reach the worker subprocess as \
+                 KRB5CCNAME — Bug B silent-drop regression. env={:?}",
+                cmd.env_vars_for_test()
+            );
+        }
+    }
+
+    /// Cred resolver lookup-miss regression guard. The end-to-end
+    /// contract is: a credential written via `RedisStateReader::add_credential`
+    /// (same path `ares ops inject-credential` uses) must be visible to the
+    /// resolver's `(username, domain)` lookup. Reading via `get_credentials`
+    /// then matching with `find_credential(..., realm_strict=true)` mirrors
+    /// what `resolve_credentials` does for `ldap_search` (which sets
+    /// `requires_exact_realm`). If this regresses, the resolver will log
+    /// `cred_count=0` for principals whose cred is on the board, and the
+    /// dispatched tool will fail with a missing-credential error.
+    #[tokio::test]
+    async fn cred_resolver_finds_injected_cleartext_cred_by_domain_user() {
+        use ares_core::state::mock_redis::MockRedisConnection;
+        use ares_core::state::RedisStateReader;
+
+        let mut conn = MockRedisConnection::new();
+        let reader = RedisStateReader::new("op-test".to_string());
+
+        // Mirror `ops_inject_credential` exactly: build a Credential and call
+        // `add_credential`. The dedup key shape is irrelevant for retrieval
+        // (HGETALL returns all values), but pinning the same code path here
+        // catches a future divergence between writer and reader.
+        let injected = Credential {
+            id: "injected".to_string(),
+            username: "carol".to_string(),
+            password: "fr3edom".to_string(),
+            domain: "fabrikam.local".to_string(),
+            source: "manual-inject".to_string(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let added = reader.add_credential(&mut conn, &injected).await.unwrap();
+        assert!(added, "inject path must persist the cred");
+
+        // Now mirror what `resolve_credentials` does at lookup time.
+        let credentials = reader.get_credentials(&mut conn).await.unwrap();
+        assert_eq!(
+            credentials.len(),
+            1,
+            "get_credentials must surface the injected cred"
+        );
+
+        // ldap_search calls requires_exact_realm=true, so the resolver uses
+        // realm_strict=true. The lookup MUST find the injected cred under
+        // (fabrikam.local, carol).
+        let found = find_credential(&credentials, "carol", "fabrikam.local", true);
+        let cred = found.expect(
+            "resolver must find injected cleartext cred by (domain, username)",
+        );
+        assert_eq!(cred.password, "fr3edom");
+        assert_eq!(cred.domain, "fabrikam.local");
+
+        // UPN form must resolve to the same cred (the LLM frequently passes
+        // `username=carol@fabrikam.local` for cross-forest dispatches).
+        let found_upn =
+            find_credential(&credentials, "carol@fabrikam.local", "fabrikam.local", true);
+        assert!(
+            found_upn.is_some(),
+            "resolver must handle UPN-form username for injected cleartext cred"
+        );
     }
 }

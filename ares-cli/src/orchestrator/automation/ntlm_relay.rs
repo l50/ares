@@ -97,6 +97,12 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             };
 
             let priority = dispatcher.effective_priority("ntlm_relay");
+            // Serialize all relay-bearing dispatches against the
+            // listener's port-445 mutex — see `Dispatcher::relay_slot`
+            // doc. Held across the throttled_submit so a concurrent
+            // ESC8 or auto_coercion dispatch in another task waits its
+            // turn instead of racing the bind.
+            let _relay_guard = dispatcher.relay_slot.lock().await;
             match dispatcher
                 .throttled_submit("coercion", "coercion", payload, priority)
                 .await

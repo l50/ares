@@ -71,6 +71,13 @@ or another principal you control. Do NOT call `bloodyad_set_password` on a group
 If you added group membership, the new privilege is live on the next Kerberos
 auth — call `domain_admin_checker` to confirm DA reach (when relevant).
 
+**Password-reset fallback:** if `bloodyad_set_password` fails with
+`unicodePwd modify rejected`, `LDAP server is unwilling to perform`,
+`confidentiality required`, or any LDAP signing / channel-binding /
+LDAPS-required error, retry with `samr_change_password` against the same
+target. It performs the same ForceChangePassword primitive over SAMR/RPC
+instead of LDAP and is not subject to the DC's LDAP password-modify policy.
+
 ### Reporting
 
 Call `report_finding` with the new credential or membership change so the

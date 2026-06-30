@@ -172,6 +172,17 @@ pub struct StateInner {
     /// Used by the completion monitor to enforce a post-exploitation grace period.
     pub all_forests_dominated_at: Option<tokio::time::Instant>,
 
+    /// Per-DC coercion phase state — Bug F. Tracks which coercion techniques
+    /// have already been attempted, the attempt count, the last observed error
+    /// signal, and any active cooldown. The previous boolean dedup
+    /// (`DEDUP_COERCED_DCS`) accepted one attempt per DC and never cycled
+    /// techniques, so one `RPC_S_ACCESS_DENIED` on PetitPotam locked the DC
+    /// out of every other coercion forever. The cycling logic in
+    /// `auto_coercion` reads this map to pick the next un-tried technique
+    /// (unauth ladder → authenticated retry when a same-forest cred lands).
+    pub coercion_phase_state:
+        HashMap<String, crate::orchestrator::automation::coercion::CoercionPhaseState>,
+
     /// IPv4 addresses bound to the orchestrator's own network interfaces.
     /// Populated once at orchestrator startup via `SharedState::initialize_self_ips`
     /// from `local_ip_address::list_afinet_netifas`. `publish_host` skips any
@@ -228,6 +239,7 @@ impl StateInner {
             kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,
+            coercion_phase_state: HashMap::new(),
             self_ips: HashSet::new(),
         }
     }
@@ -268,9 +280,25 @@ impl StateInner {
     /// Quarantine a principal for `QUARANTINE_DURATION_SECS` after a lockout
     /// signal. See [`is_principal_quarantined`] for which signals feed in.
     pub fn quarantine_principal(&mut self, username: &str, domain: &str) {
+        self.quarantine_principal_for(username, domain, QUARANTINE_DURATION_SECS);
+    }
+
+    /// Quarantine a principal for `duration_secs`. Caller chooses the window:
+    /// the default 5-min `QUARANTINE_DURATION_SECS` is appropriate for ordinary
+    /// auth-attempt lockouts where the next 5-min window probably clears the
+    /// AD lockout policy; a SPN-bearing service account observed locked from
+    /// password_spray should use the AD default (~30 min) instead so the
+    /// spray loop doesn't keep re-hammering the same locked principal across
+    /// neighbouring domains. Picks the longer of the existing and new expiry
+    /// so a 30-min extension never accidentally shortens an in-flight cooldown.
+    pub fn quarantine_principal_for(&mut self, username: &str, domain: &str, duration_secs: i64) {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
-        let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
-        self.quarantined_principals.insert(key, expiry);
+        let new_expiry = Utc::now() + chrono::Duration::seconds(duration_secs);
+        let final_expiry = match self.quarantined_principals.get(&key) {
+            Some(existing) if *existing > new_expiry => *existing,
+            _ => new_expiry,
+        };
+        self.quarantined_principals.insert(key, final_expiry);
     }
 
     pub fn mark_credential_capture_in_flight(&mut self, domain: &str) {

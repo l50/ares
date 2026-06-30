@@ -46,8 +46,7 @@ pub(crate) async fn ops_runtime(
     println!("Runtime:   {}", format_duration(runtime_seconds));
     println!();
 
-    let creds = state.all_credentials.len();
-    let hashes = state.all_hashes.len();
+    let (creds, hashes) = super::loot::reportable_counts(&state);
     let vulns = state.discovered_vulnerabilities.len();
     let exploited = state.exploited_vulnerabilities.len();
 

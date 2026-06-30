@@ -187,10 +187,19 @@ fn is_inter_forest(source: &str, target: &str) -> bool {
 ///   ~30s cost of an unnecessary attempt is cheaper than silently dropping
 ///   a valid attack path on a misconfigured trust)
 fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str) -> bool {
-    if !is_inter_forest(source, target) {
+    let target_l = target.to_lowercase();
+    let inter_forest = is_inter_forest(source, target);
+    if !inter_forest {
+        debug!(
+            source = %source,
+            target = %target,
+            inter_forest = false,
+            decision = false,
+            reason = "same_forest_by_name",
+            "trust filter predicate"
+        );
         return false;
     }
-    let target_l = target.to_lowercase();
     // Look up only the target's metadata. `trusted_domains` is keyed by the
     // foreign-side domain name in each enumeration result, so the entry for
     // `target_l` describes the source→target relationship. Falling back to
@@ -198,19 +207,67 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
     // (e.g. child→contoso parent_child stored under "contoso.local"
     // when we query contoso→fabrikam), which would wrongly classify the
     // unknown cross-forest path as intra-forest and let the doomed forge fire.
+    //
+    // The diagnostic block below disambiguates three reasons the
+    // "Suppressing forge_inter_realm_and_dump" branch can fail to fire:
+    // (a) trust-enum hasn't yet populated `trusted_domains` for the target,
+    // (b) the entry is under a different key, or
+    // (c) `is_cross_forest()` returned false on the entry.
+    let known_keys: Vec<&str> = state
+        .trusted_domains
+        .keys()
+        .map(String::as_str)
+        .collect();
     if let Some(t) = state.trusted_domains.get(&target_l) {
-        if t.is_cross_forest() {
+        let cross = t.is_cross_forest();
+        let decision = cross && t.sid_filtering;
+        debug!(
+            source = %source,
+            target = %target,
+            inter_forest = true,
+            metadata_present = true,
+            trust_type = %t.trust_type,
+            trust_direction = %t.direction,
+            is_cross_forest = cross,
+            sid_filtering = t.sid_filtering,
+            decision = decision,
+            reason = if cross { "metadata_cross_forest" } else { "metadata_not_cross_forest" },
+            trusted_domains_keys = ?known_keys,
+            "trust filter predicate"
+        );
+        if cross {
             return t.sid_filtering;
         }
         // Trust enumeration disagrees with name-based heuristic — trust the
         // explicit metadata (e.g. unusual same-forest cross-DNS-suffix setup).
         return false;
     }
-    // No metadata — try the forge. False positives (SID filtering actually on)
-    // cost ~30s for a doomed DCSync attempt; false negatives (refusing a valid
-    // attack on a misconfigured trust where SID filtering is off) cost the
-    // entire foreign domain. Prefer the cheaper failure mode.
-    false
+    // No metadata — assume SID filtering is on and skip the speculative forge.
+    //
+    // Previously this returned `false` ("try the forge"), under the reasoning
+    // that the false-positive cost was only ~30s. In practice the speculative
+    // forge against a SID-filtered target produces:
+    //   - one `Cross-forest forge dispatched` task that always returns 0 hashes
+    //   - then the post-failure fallback at the bottom of the spawn dispatches
+    //     `create_inter_realm_ticket` and calls `wake_cross_forest_fallbacks` —
+    //     exactly the same work the suppression branch does.
+    // So the doomed forge is pure waste plus a noisy `rpc_s_access_denied`
+    // trace that doesn't move the operation forward. The handful of labs
+    // where SID filtering is genuinely off can still be exploited via the
+    // ACL / foreign-group / cross-forest enum fallbacks that the suppression
+    // branch wakes, or via the LLM-driven attack paths that aren't gated on
+    // this function.
+    debug!(
+        source = %source,
+        target = %target,
+        inter_forest = true,
+        metadata_present = false,
+        decision = true,
+        reason = "no_metadata_assume_filtered",
+        trusted_domains_keys = ?known_keys,
+        "trust filter predicate"
+    );
+    true
 }
 
 /// Clear cross-forest fallback dedup keys for `target_domain` so the next
@@ -538,6 +595,97 @@ pub(crate) fn find_child_to_parent_admin_cred(
         );
     }
     (None, "none")
+}
+
+/// Build trust-follow work items directly from `discovered_vulnerabilities`.
+///
+/// The hash-iteration path inside `auto_trust_follow` silently filters a
+/// candidate trust account at three points (empty source domain after
+/// fallback, no resolvable target FQDN, dedup already marked). Each filter
+/// returns `None` from inside a `filter_map`, so a single bad heuristic
+/// permanently drops a valid attack with no INFO trace. Reproduced as: a
+/// FABRIKAM$ trust key captured on a contoso DC dump produced a
+/// `forest_trust_escalation` vuln with `target=192.168.58.40,
+/// source_domain=contoso.local, target_domain=fabrikam.local` — yet the
+/// hash-iteration path emitted zero `forge_inter_realm_and_dump` dispatches
+/// across the rest of the operation.
+///
+/// The analyzer that builds the vuln (see `build_trust_escalation_vuln`) has
+/// already resolved `target_dc_ip` (stored as `v.target`) and stashed the
+/// trust account, source, and target in `details`. Rebuilding the work item
+/// from those fields is robust against any FQDN-resolution gap that hides the
+/// hash from the iteration path.
+///
+/// Callers merge with the hash-iteration result, deduping by `dedup_key`. Put
+/// vuln-driven items first in the merge so a duplicate key prefers the
+/// analyzer's resolved `target_dc_ip` over the hash path's possibly-None one.
+fn collect_trust_follow_work_from_vulns(state: &StateInner) -> Vec<TrustFollowWork> {
+    let mut out = Vec::new();
+    for v in state.discovered_vulnerabilities.values() {
+        if v.vuln_type != "forest_trust_escalation" {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&v.vuln_id) {
+            continue;
+        }
+        let Some(source_domain) = v.details.get("source_domain").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Some(target_domain) = v.details.get("target_domain").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Some(trust_account) = v.details.get("trust_account").and_then(|x| x.as_str()) else {
+            continue;
+        };
+
+        let source_lower = source_domain.to_lowercase();
+        let target_lower = target_domain.to_lowercase();
+        let trust_lower = trust_account.to_lowercase();
+
+        // Prefer current keys over `_history0`/`_prev` rows — mirrors the
+        // hash-iteration sort at the auto_trust_follow call site.
+        let Some(hash) = state
+            .hashes
+            .iter()
+            .filter(|h| {
+                h.username.eq_ignore_ascii_case(trust_account)
+                    && h.hash_type.eq_ignore_ascii_case("NTLM")
+                    && !h.hash_value.is_empty()
+                    && (h.domain.is_empty() || h.domain.eq_ignore_ascii_case(source_domain))
+            })
+            .min_by_key(|h| h.is_previous as u8)
+            .cloned()
+        else {
+            continue;
+        };
+
+        let dedup_key = format!("trust_follow:{source_lower}:{trust_lower}");
+        if state.is_processed(DEDUP_TRUST_FOLLOW, &dedup_key) {
+            continue;
+        }
+
+        // `v.target` is the analyzer's resolved DC IP at vuln-creation time.
+        // Empty target falls through to the live DC map.
+        let target_dc_ip = if !v.target.is_empty() {
+            Some(v.target.clone())
+        } else {
+            state.resolve_dc_ip(target_domain)
+        };
+
+        let source_domain_sid = state.domain_sids.get(&source_lower).cloned();
+        let target_domain_sid = state.domain_sids.get(&target_lower).cloned();
+
+        out.push(TrustFollowWork {
+            dedup_key,
+            hash,
+            source_domain: source_domain.to_string(),
+            target_domain: target_domain.to_string(),
+            target_dc_ip,
+            source_domain_sid,
+            target_domain_sid,
+        });
+    }
+    out
 }
 
 /// Monitors for trust account hashes and dispatches cross-domain attacks.
@@ -1601,6 +1749,40 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 .collect();
 
             items
+        };
+
+        // Vuln-driven fallback: rebuild work items directly from
+        // `discovered_vulnerabilities`. The hash-iteration above can silently
+        // drop a valid forest_trust_escalation when one of its FQDN heuristics
+        // fails — the analyzer that produced the vuln has the resolved
+        // target_dc_ip on hand, so this path closes the gap.
+        let work: Vec<TrustFollowWork> = {
+            let state = dispatcher.state.read().await;
+            let vuln_items = collect_trust_follow_work_from_vulns(&state);
+            drop(state);
+
+            let hash_keys: HashSet<String> = work.iter().map(|w| w.dedup_key.clone()).collect();
+            for vi in &vuln_items {
+                if !hash_keys.contains(&vi.dedup_key) {
+                    info!(
+                        source = %vi.source_domain,
+                        target = %vi.target_domain,
+                        trust_account = %vi.hash.username,
+                        target_dc_ip = ?vi.target_dc_ip,
+                        "auto_trust_follow: vuln-driven fallback added forest_trust_escalation work item missed by hash iteration"
+                    );
+                }
+            }
+
+            // Vuln-driven items first so a duplicate dedup_key wins with the
+            // analyzer's resolved target_dc_ip rather than the hash path's
+            // possibly-None one.
+            let mut seen = HashSet::new();
+            vuln_items
+                .into_iter()
+                .chain(work)
+                .filter(|w| seen.insert(w.dedup_key.clone()))
+                .collect()
         };
 
         for item in work {
@@ -3016,12 +3198,15 @@ mod tests {
     }
 
     #[test]
-    fn filtered_inter_forest_no_metadata_tries_forge() {
+    fn auto_trust_follow_skips_forge_when_sid_filter_known() {
+        // Bug A: when trust metadata is missing for an inter-forest target,
+        // suppress the speculative forge. The post-failure path runs the same
+        // `dispatch_create_inter_realm_ticket` + `wake_cross_forest_fallbacks`
+        // work, so an unguarded forge against a SID-filtered target is pure
+        // waste. Returning true here drives trust-follow into the suppression
+        // branch which short-circuits straight to the equivalent fallback.
         let s = StateInner::new("op-test".into());
-        // No TrustInfo for the target. Without explicit filtering metadata we
-        // try the forge — the cost of an unnecessary attempt (~30s) is cheaper
-        // than silently dropping a valid attack on a misconfigured trust.
-        assert!(!is_filtered_inter_forest_trust(
+        assert!(is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -3032,8 +3217,9 @@ mod tests {
     fn filtered_inter_forest_ignores_unrelated_source_metadata() {
         // A child-realm parent_child TrustInfo on the source must NOT answer
         // an unrelated cross-forest path: that would misclassify it as
-        // intra-forest. With no metadata for the actual target we try the
-        // forge rather than silently suppressing it.
+        // intra-forest. With no metadata for the actual target we now suppress
+        // (post Bug A fix) — the speculative forge would have produced the
+        // same fallback work as the suppression branch anyway.
         let parent_trust = ares_core::models::TrustInfo {
             domain: "contoso.local".into(),
             flat_name: "CONTOSO".into(),
@@ -3043,8 +3229,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("contoso.local", parent_trust);
-        // Target fabrikam.local has no metadata — try the forge.
-        assert!(!is_filtered_inter_forest_trust(
+        assert!(is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -3729,5 +3914,236 @@ mod tests {
         let cleared = sweep_stale_forge_in_flight(&mut s);
 
         assert_eq!(cleared, vec![key]);
+    }
+
+    // collect_trust_follow_work_from_vulns
+
+    fn make_trust_hash(domain: &str, account: &str, value: &str) -> ares_core::models::Hash {
+        ares_core::models::Hash {
+            id: format!("h-{account}"),
+            username: account.into(),
+            hash_value: value.into(),
+            hash_type: "NTLM".into(),
+            domain: domain.into(),
+            cracked_password: None,
+            source: String::new(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: true,
+            trust_pair_label: None,
+        }
+    }
+
+    fn forest_trust_vuln(
+        source: &str,
+        target: &str,
+        account: &str,
+        target_dc_ip: &str,
+    ) -> ares_core::models::VulnerabilityInfo {
+        build_trust_escalation_vuln(source, target, account, target_dc_ip)
+    }
+
+    #[test]
+    fn vuln_driven_emits_work_when_hash_matches() {
+        let mut s = StateInner::new("op".into());
+        s.hashes.push(make_trust_hash(
+            "contoso.local",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:1111111111111111",
+        ));
+        let v = forest_trust_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+
+        let work = collect_trust_follow_work_from_vulns(&s);
+        assert_eq!(work.len(), 1);
+        let w = &work[0];
+        assert_eq!(w.dedup_key, "trust_follow:contoso.local:fabrikam$");
+        assert_eq!(w.source_domain, "contoso.local");
+        assert_eq!(w.target_domain, "fabrikam.local");
+        assert_eq!(w.target_dc_ip.as_deref(), Some("192.168.58.40"));
+        assert_eq!(w.hash.username, "FABRIKAM$");
+    }
+
+    #[test]
+    fn vuln_driven_skips_when_no_matching_hash() {
+        // Vuln names FABRIKAM$ but state only has a different trust key — the
+        // dispatcher would have nothing to forge with, so skip the work item.
+        let mut s = StateInner::new("op".into());
+        s.hashes.push(make_trust_hash(
+            "contoso.local",
+            "OTHER$",
+            "aad3b435b51404eeaad3b435b51404ee:2222222222222222",
+        ));
+        let v = forest_trust_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+
+        assert!(collect_trust_follow_work_from_vulns(&s).is_empty());
+    }
+
+    #[test]
+    fn vuln_driven_skips_already_exploited() {
+        let mut s = StateInner::new("op".into());
+        s.hashes.push(make_trust_hash(
+            "contoso.local",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:3333333333333333",
+        ));
+        let v = forest_trust_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        let id = v.vuln_id.clone();
+        s.discovered_vulnerabilities.insert(id.clone(), v);
+        s.exploited_vulnerabilities.insert(id);
+
+        assert!(collect_trust_follow_work_from_vulns(&s).is_empty());
+    }
+
+    #[test]
+    fn vuln_driven_skips_already_processed_dedup() {
+        let mut s = StateInner::new("op".into());
+        s.hashes.push(make_trust_hash(
+            "contoso.local",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:4444444444444444",
+        ));
+        let v = forest_trust_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.mark_processed(
+            DEDUP_TRUST_FOLLOW,
+            "trust_follow:contoso.local:fabrikam$".into(),
+        );
+
+        assert!(collect_trust_follow_work_from_vulns(&s).is_empty());
+    }
+
+    #[test]
+    fn vuln_driven_skips_non_forest_trust_vuln_types() {
+        // child_to_parent is intra-forest; raise_child handles it via a
+        // different path. The vuln-driven helper must not pick those up.
+        let mut s = StateInner::new("op".into());
+        s.hashes.push(make_trust_hash(
+            "child.contoso.local",
+            "CHILD$",
+            "aad3b435b51404eeaad3b435b51404ee:5555555555555555",
+        ));
+        let v = build_trust_escalation_vuln(
+            "child.contoso.local",
+            "contoso.local",
+            "CHILD$",
+            "192.168.58.20",
+        );
+        // Sanity check: this is the intra-forest variant.
+        assert_eq!(v.vuln_type, "child_to_parent");
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+
+        assert!(collect_trust_follow_work_from_vulns(&s).is_empty());
+    }
+
+    #[test]
+    fn vuln_driven_falls_back_to_resolve_dc_ip_when_target_empty() {
+        let mut s = StateInner::new("op".into());
+        s.hashes.push(make_trust_hash(
+            "contoso.local",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:6666666666666666",
+        ));
+        s.domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.41".into());
+
+        // Hand-craft a vuln with `target = ""` to exercise the resolve_dc_ip
+        // fallback (`build_trust_escalation_vuln` always sets target, so we
+        // build directly).
+        let mut v = build_trust_escalation_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        v.target = String::new();
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+
+        let work = collect_trust_follow_work_from_vulns(&s);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_dc_ip.as_deref(), Some("192.168.58.41"));
+    }
+
+    #[test]
+    fn vuln_driven_matches_hash_when_domain_field_empty() {
+        // NTDS dumps occasionally land trust-key rows with empty `domain` —
+        // historically a common source of silent skips in the hash-iteration
+        // path. The vuln-driven path must still match those.
+        let mut s = StateInner::new("op".into());
+        let mut h = make_trust_hash(
+            "",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:7777777777777777",
+        );
+        h.domain = String::new();
+        s.hashes.push(h);
+        let v = forest_trust_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+
+        let work = collect_trust_follow_work_from_vulns(&s);
+        assert_eq!(work.len(), 1);
+    }
+
+    #[test]
+    fn vuln_driven_prefers_current_over_history_key() {
+        let mut s = StateInner::new("op".into());
+        let mut history = make_trust_hash(
+            "contoso.local",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:88888888",
+        );
+        history.id = "h-history".into();
+        history.is_previous = true;
+        let mut current = make_trust_hash(
+            "contoso.local",
+            "FABRIKAM$",
+            "aad3b435b51404eeaad3b435b51404ee:99999999",
+        );
+        current.id = "h-current".into();
+        current.is_previous = false;
+        s.hashes.push(history);
+        s.hashes.push(current);
+
+        let v = forest_trust_vuln(
+            "contoso.local",
+            "fabrikam.local",
+            "FABRIKAM$",
+            "192.168.58.40",
+        );
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+
+        let work = collect_trust_follow_work_from_vulns(&s);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].hash.id, "h-current");
     }
 }

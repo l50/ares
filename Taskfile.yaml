@@ -37,8 +37,8 @@ includes:
       TARGET: '{{.TARGET}}'
       DOMAIN: '{{.DOMAIN}}'
       EC2_NAME: '{{.EC2_NAME}}'
-      EC2_PROFILE: '{{.EC2_PROFILE}}'
-      EC2_REGION: '{{.EC2_REGION}}'
+      AWS_PROFILE: '{{.AWS_PROFILE}}'
+      AWS_REGION: '{{.AWS_REGION}}'
       BLUE_ENABLED: '{{.BLUE_ENABLED}}'
       BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL}}'
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
@@ -47,8 +47,8 @@ includes:
     optional: true
     vars:
       EC2_NAME: '{{.EC2_NAME}}'
-      EC2_PROFILE: '{{.EC2_PROFILE}}'
-      EC2_REGION: '{{.EC2_REGION}}'
+      AWS_PROFILE: '{{.AWS_PROFILE}}'
+      AWS_REGION: '{{.AWS_REGION}}'
       ARES_CONFIG: '{{.ARES_CONFIG}}'
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
       ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
@@ -105,8 +105,9 @@ vars:
   ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
   # EC2 deployment (alternative to K8s)
   EC2_NAME: '{{.EC2_NAME | default "ares-tools"}}'
-  EC2_PROFILE: '{{.EC2_PROFILE | default .AWS_PROFILE | default "lab"}}'
-  EC2_REGION: '{{.EC2_REGION | default .AWS_REGION | default .AWS_DEFAULT_REGION | default "us-west-1"}}'
+  # AWS profile/region: honor standard AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION env vars.
+  AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+  AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
   # Blue team (set BLUE_ENABLED=1 to run blue alongside red)
   BLUE_ENABLED: '{{.BLUE_ENABLED | default "0"}}'
   BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
@@ -364,8 +365,8 @@ tasks:
     internal: true
     silent: true
     vars:
-      PROFILE: '{{.PROFILE | default "lab"}}'
-      REGION: '{{.REGION | default "us-west-1"}}'
+      PROFILE: '{{.PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+      REGION: '{{.REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
     cmds:
       - |
         # Check if AWS CLI is installed

@@ -118,6 +118,18 @@ pub struct Dispatcher {
     pub llm_runner: Arc<LlmTaskRunner>,
     /// Per-credential concurrency limiter.
     pub credential_inflight: CredentialInflight,
+    /// Single-slot mutex shared by every dispatcher that submits a
+    /// coercion-or-relay-bearing task. ntlmrelayx binds the loopback
+    /// port-445 mutex on the listener host, so concurrent dispatches
+    /// from `auto_ntlm_relay`, `auto_coercion`, and the ESC8 chain in
+    /// `auto_adcs_exploitation` race the same OS lock and surface as
+    /// `RELAY_BIND_BUSY` aborts. Holding this mutex around the dispatch
+    /// serializes the dispatches at the
+    /// orchestrator layer; the per-dispatch `RELAY_BIND_BUSY` handling
+    /// in `adcs_exploitation.rs:1380-1394, 1429-1435` remains as a
+    /// fallback for the rare race the mutex didn't prevent (a still-
+    /// running ntlmrelayx from a prior dispatch).
+    pub relay_slot: Arc<Mutex<()>>,
 }
 
 impl Dispatcher {
@@ -155,6 +167,7 @@ impl Dispatcher {
             llm_runner,
             // Allow up to 3 concurrent tasks per credential
             credential_inflight: CredentialInflight::new(3),
+            relay_slot: Arc::new(Mutex::new(())),
         }
     }
 }

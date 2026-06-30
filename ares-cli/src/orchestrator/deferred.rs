@@ -24,35 +24,60 @@ use tracing::{debug, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
 use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::diversity;
 use crate::orchestrator::task_queue::TaskQueue;
 use crate::orchestrator::throttling::{ThrottleDecision, Throttler};
 
 /// Redis key prefix for deferred queues.
 pub const DEFERRED_QUEUE_PREFIX: &str = "ares:deferred";
 
-/// Atomic enqueue: per-type cap → global cap → ZADD → INCR counter.
+/// Atomic enqueue: signature dedup → per-type cap → global cap → ZADD →
+/// INCR counter → SADD signature.
 ///
-/// KEYS[1] = per-type ZSET   KEYS[2] = total counter
-/// ARGV[1] = score   ARGV[2] = member JSON   ARGV[3] = max_per_type   ARGV[4] = max_total
+/// KEYS[1] = per-type ZSET
+/// KEYS[2] = total counter
+/// KEYS[3] = per-type signature SET
+/// ARGV[1] = score
+/// ARGV[2] = member JSON
+/// ARGV[3] = max_per_type
+/// ARGV[4] = max_total
+/// ARGV[5] = signature (stable hash of task identity)
 ///
-/// Returns: `1` accepted, `0` per-type full, `-1` global full, `-2` member already present.
+/// Returns: `1` accepted, `0` per-type full, `-1` global full,
+/// `-2` member already present (timestamp-identical re-enqueue),
+/// `-3` duplicate signature (logical duplicate already deferred — Bug J).
+///
+/// The signature dedup is the load-bearing change for Bug J: multiple
+/// automation rules race to enqueue equivalent tasks every tick. Without
+/// it, each call produces a JSON member with a distinct timestamp, ZADD
+/// accepts every one, and the cred-gated queue saturates within minutes
+/// against a tuple the worker pool is already happy to drain.
 static ENQUEUE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     redis::Script::new(
         r"
+        if redis.call('SISMEMBER', KEYS[3], ARGV[5]) == 1 then return -3 end
         if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
         if tonumber(redis.call('GET', KEYS[2]) or '0') >= tonumber(ARGV[4]) then return -1 end
         local added = redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
         if added == 0 then return -2 end
         redis.call('INCR', KEYS[2])
+        redis.call('SADD', KEYS[3], ARGV[5])
         return 1
         ",
     )
 });
 
-/// Atomic ZREM + counter DECR.
+/// Atomic ZREM + counter DECR + signature SREM.
 ///
-/// KEYS[1] = per-type ZSET   KEYS[2] = total counter   ARGV[1] = member
-/// Returns the number of elements removed (0 or 1). Counter never goes negative.
+/// KEYS[1] = per-type ZSET
+/// KEYS[2] = total counter
+/// KEYS[3] = per-type signature SET
+/// ARGV[1] = member
+/// ARGV[2] = signature
+///
+/// Returns the number of elements removed (0 or 1). Counter never goes
+/// negative; signature SET shrinks in lockstep with the ZSET so a future
+/// enqueue of the same logical task is no longer treated as duplicate.
 static REMOVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     redis::Script::new(
         r"
@@ -60,6 +85,7 @@ static REMOVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
         if removed > 0 then
             local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
             if cur > 0 then redis.call('DECR', KEYS[2]) end
+            redis.call('SREM', KEYS[3], ARGV[2])
         end
         return removed
         ",
@@ -80,6 +106,53 @@ impl DeferredTask {
     /// ZSET score: priority bucket * 1e9 + enqueue millis.
     pub fn score(&self) -> f64 {
         (self.priority as f64) * 1_000_000_000.0 + self.enqueue_time * 1000.0
+    }
+
+    /// Stable signature used by the deferred queue's producer-side dedup
+    /// (Bug J). Hashes the task-identity tuple `(task_type, target_role,
+    /// technique, target_ip, credential_key)` — explicitly excluding the
+    /// timestamp so two automation rules dispatching equivalent work in
+    /// the same tick produce the same signature and only the first
+    /// reaches the ZSET.
+    ///
+    /// Fields outside the tuple (priority, vuln_id, etc.) are
+    /// intentionally NOT in the hash: a higher-priority duplicate isn't
+    /// useful — the existing copy will run and produce the same outcome.
+    pub fn signature(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let technique = self
+            .payload
+            .get("technique")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target_ip = self
+            .payload
+            .get("target_ip")
+            .or_else(|| self.payload.get("dc_ip"))
+            .or_else(|| self.payload.get("target"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let credential_key = self
+            .payload
+            .get("credential")
+            .and_then(|c| {
+                let user = c.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                let dom = c.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                if user.is_empty() && dom.is_empty() {
+                    None
+                } else {
+                    Some(format!("{}@{}", user.to_lowercase(), dom.to_lowercase()))
+                }
+            })
+            .unwrap_or_default();
+        let mut h = DefaultHasher::new();
+        self.task_type.hash(&mut h);
+        self.target_role.hash(&mut h);
+        technique.to_lowercase().hash(&mut h);
+        target_ip.hash(&mut h);
+        credential_key.hash(&mut h);
+        format!("{:x}", h.finish())
     }
 }
 
@@ -102,6 +175,22 @@ impl DeferredQueue {
         )
     }
 
+    /// Redis key for the per-task-type signature SET — paired with the
+    /// ZSET and maintained in lockstep via Lua. Used by the producer-side
+    /// dedup gate (Bug J): two automation rules racing to enqueue the
+    /// same `(task_type, role, technique, target_ip, cred)` tuple both
+    /// compute the same signature, and only the first one reaches the
+    /// ZSET. The SET shrinks when the corresponding ZSET member is
+    /// removed (pop_best / evict_stale) so a legitimate later dispatch
+    /// of the same tuple is no longer treated as duplicate once the
+    /// in-flight copy completes.
+    fn sig_key(&self, task_type: &str) -> String {
+        format!(
+            "{}:{}:{}:sigs",
+            DEFERRED_QUEUE_PREFIX, self.config.operation_id, task_type
+        )
+    }
+
     /// Redis key for the global cardinality counter. Mutations to the ZSETs
     /// are paired with INCR/DECR via Lua so this stays consistent.
     fn total_key(&self) -> String {
@@ -113,11 +202,18 @@ impl DeferredQueue {
 
     /// Enqueue a task for later dispatch.
     ///
-    /// Returns `true` if the task was accepted, `false` if either the per-type
-    /// or operation-wide cap is full.
+    /// Returns `true` if the task was accepted (or already deferred under
+    /// the same signature — idempotent), `false` if either cap is full.
+    ///
+    /// Producer-side dedup (Bug J): equivalent tasks racing across
+    /// automation rules collapse to a single ZSET entry via the
+    /// signature SET — see [`DeferredTask::signature`] for what's
+    /// considered equivalent.
     pub async fn enqueue(&self, task: &DeferredTask) -> Result<bool> {
         let key = self.zset_key(&task.task_type);
         let total_key = self.total_key();
+        let sig_key = self.sig_key(&task.task_type);
+        let signature = task.signature();
         let json = serde_json::to_string(task).context("Failed to serialize DeferredTask")?;
         let score = task.score();
         let mut conn = self.queue_conn();
@@ -125,10 +221,12 @@ impl DeferredQueue {
         let result: i64 = ENQUEUE_SCRIPT
             .key(&key)
             .key(&total_key)
+            .key(&sig_key)
             .arg(score)
             .arg(&json)
             .arg(self.config.max_deferred_per_type)
             .arg(self.config.max_deferred_total)
+            .arg(&signature)
             .invoke_async(&mut conn)
             .await
             .with_context(|| format!("Deferred enqueue script on {key}"))?;
@@ -140,6 +238,7 @@ impl DeferredQueue {
                     role = %task.target_role,
                     priority = task.priority,
                     score,
+                    signature = %signature,
                     "Task deferred"
                 );
                 Ok(true)
@@ -165,6 +264,18 @@ impl DeferredQueue {
                 // (idempotent re-enqueue from the drain loop's retry paths).
                 Ok(true)
             }
+            -3 => {
+                // Signature already present — a logically equivalent task is
+                // already deferred (or recently dequeued without SREM lag).
+                // Treat as accepted from the caller's perspective: the work
+                // is already in the pipeline. Bug J.
+                debug!(
+                    task_type = %task.task_type,
+                    signature = %signature,
+                    "Deferred enqueue collapsed by signature dedup (Bug J)"
+                );
+                Ok(true)
+            }
             other => {
                 warn!(result = other, "Unexpected enqueue script result");
                 Ok(false)
@@ -172,10 +283,13 @@ impl DeferredQueue {
         }
     }
 
-    /// Pop the highest-priority (lowest-score) task from any type ZSET.
+    /// Pop a task from any type ZSET.
     ///
-    /// Scans all known task-type keys for this operation and picks the
-    /// globally lowest score.
+    /// Default behaviour: pick the globally lowest score (highest priority)
+    /// across all per-type ZSETs. When `selection_temperature > 0`, softmax-
+    /// sample among the per-type lowest candidates by priority instead, so the
+    /// deferred drain order varies across runs (attack-path diversity). At
+    /// temperature 0 the selection is exact argmin, identical to before.
     pub async fn pop_best(&self) -> Result<Option<DeferredTask>> {
         let pattern = format!("{}:{}:*", DEFERRED_QUEUE_PREFIX, self.config.operation_id);
         let total_key = self.total_key();
@@ -188,14 +302,19 @@ impl DeferredQueue {
             return Ok(None);
         }
 
-        // Find the globally best candidate across all type ZSETs
-        let mut best: Option<(String, String, f64)> = None; // (key, member, score)
-
+        // Peek the lowest-score member of each per-type ZSET — these are the
+        // selection candidates.
+        let mut candidates: Vec<(String, String, DeferredTask)> = Vec::new(); // (key, member, task)
         for key in &keys {
             if key == &total_key {
                 continue;
             }
-            // Peek at the lowest-score member
+            // Skip the signature SETs — they share the queue prefix but
+            // are not ZSETs (Bug J). ZRANGEBYSCORE on a SET returns
+            // WRONGTYPE; better to skip cleanly than catch the error.
+            if key.ends_with(":sigs") {
+                continue;
+            }
             let members: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
                 .arg(key)
                 .arg("-inf")
@@ -208,34 +327,61 @@ impl DeferredQueue {
                 .await
                 .unwrap_or_default();
 
-            if let Some((member, score)) = members.into_iter().next() {
-                let dominated = best.as_ref().map(|(_, _, s)| score < *s).unwrap_or(true);
-                if dominated {
-                    best = Some((key.clone(), member, score));
+            if let Some((member, _score)) = members.into_iter().next() {
+                if let Ok(task) = serde_json::from_str::<DeferredTask>(&member) {
+                    candidates.push((key.clone(), member, task));
                 }
             }
         }
 
-        match best {
-            Some((key, member, _score)) => {
-                let total_key = self.total_key();
-                let removed: i64 = REMOVE_SCRIPT
-                    .key(&key)
-                    .key(&total_key)
-                    .arg(&member)
-                    .invoke_async(&mut conn)
-                    .await
-                    .unwrap_or(0);
-                if removed == 0 {
-                    // Someone else grabbed it (unlikely in single-orchestrator mode)
-                    return Ok(None);
-                }
-                let task: DeferredTask =
-                    serde_json::from_str(&member).context("Bad DeferredTask JSON")?;
-                Ok(Some(task))
-            }
-            None => Ok(None),
+        if candidates.is_empty() {
+            return Ok(None);
         }
+
+        let temperature = self.config.strategy.selection_temperature;
+        let idx = if temperature > 0.0 {
+            let priorities: Vec<f32> = candidates
+                .iter()
+                .map(|(_, _, t)| t.priority as f32)
+                .collect();
+            let mut rng = rand::thread_rng();
+            diversity::softmax_select_index(&priorities, temperature, &mut rng).unwrap_or(0)
+        } else {
+            // Exact argmin by score (previous behaviour; first minimum wins).
+            candidates
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    a.2.score()
+                        .partial_cmp(&b.2.score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
+
+        let (key, member, task) = candidates
+            .into_iter()
+            .nth(idx)
+            .expect("selection index within bounds");
+        // SREM the signature in lockstep with the ZREM so a future enqueue
+        // of equivalent work is no longer treated as duplicate (Bug J).
+        let sig_key = format!("{key}:sigs");
+        let signature = task.signature();
+        let removed: i64 = REMOVE_SCRIPT
+            .key(&key)
+            .key(&total_key)
+            .key(&sig_key)
+            .arg(&member)
+            .arg(&signature)
+            .invoke_async(&mut conn)
+            .await
+            .unwrap_or(0);
+        if removed == 0 {
+            // Someone else grabbed it (unlikely in single-orchestrator mode)
+            return Ok(None);
+        }
+        Ok(Some(task))
     }
 
     /// Evict tasks older than `max_age` from all deferred ZSETs.
@@ -253,6 +399,12 @@ impl DeferredQueue {
             if key == &total_key {
                 continue;
             }
+            // Skip signature SETs — they share the queue prefix but are
+            // not ZSETs (Bug J). ZRANGEBYSCORE on a SET returns WRONGTYPE.
+            if key.ends_with(":sigs") {
+                continue;
+            }
+            let sig_key = format!("{key}:sigs");
             let members: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
                 .arg(key)
                 .arg("-inf")
@@ -265,10 +417,13 @@ impl DeferredQueue {
             for (member, _score) in members {
                 if let Ok(task) = serde_json::from_str::<DeferredTask>(&member) {
                     if task.enqueue_time < cutoff {
+                        let signature = task.signature();
                         let removed: i64 = REMOVE_SCRIPT
                             .key(key)
                             .key(&total_key)
+                            .key(&sig_key)
                             .arg(&member)
+                            .arg(&signature)
                             .invoke_async(&mut conn)
                             .await
                             .unwrap_or(0);
@@ -310,6 +465,11 @@ impl DeferredQueue {
         let mut total: usize = 0;
         for key in &keys {
             if key == &total_key {
+                continue;
+            }
+            // Skip signature SETs — they're paired with the ZSETs but
+            // don't contribute to the deferred-task count (Bug J).
+            if key.ends_with(":sigs") {
                 continue;
             }
             total = total.saturating_add(conn.zcard::<_, usize>(key).await.unwrap_or(0));
@@ -640,6 +800,232 @@ mod tests {
         assert_eq!(t.task_type, "recon");
         assert_eq!(t.target_role, "recon");
         assert_eq!(t.source_agent, "orchestrator");
+    }
+
+    // ── Bug J: signature dedup ────────────────────────────────────────
+
+    fn make_signed_task(
+        task_type: &str,
+        role: &str,
+        technique: &str,
+        target_ip: &str,
+        cred_user: &str,
+        cred_domain: &str,
+        enqueue_time: f64,
+    ) -> DeferredTask {
+        DeferredTask {
+            priority: 5,
+            enqueue_time,
+            task_type: task_type.into(),
+            target_role: role.into(),
+            payload: serde_json::json!({
+                "technique": technique,
+                "target_ip": target_ip,
+                "credential": {
+                    "username": cred_user,
+                    "domain": cred_domain,
+                },
+            }),
+            source_agent: "orchestrator".into(),
+        }
+    }
+
+    #[test]
+    fn signature_excludes_timestamp() {
+        // The same logical task at two different ticks must produce
+        // identical signatures — that's how producer-side dedup
+        // collapses repeated dispatches across the tick interval.
+        let a = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        let b = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            2000.0,
+        );
+        assert_eq!(a.signature(), b.signature());
+    }
+
+    #[test]
+    fn signature_differs_on_target_ip() {
+        // Two different DCs should not dedup against each other even
+        // when everything else matches.
+        let a = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        let b = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.30",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        assert_ne!(a.signature(), b.signature());
+    }
+
+    #[test]
+    fn signature_differs_on_technique() {
+        let a = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        let b = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "kerberoast",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        assert_ne!(a.signature(), b.signature());
+    }
+
+    #[test]
+    fn signature_differs_on_credential() {
+        let a = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        let b = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "bob",
+            "fabrikam.local",
+            1000.0,
+        );
+        assert_ne!(a.signature(), b.signature());
+    }
+
+    #[test]
+    fn signature_is_case_insensitive_on_credential_realm() {
+        // Realm spelling should not split the signature — the worker
+        // pool treats them as equivalent.
+        let a = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "FABRIKAM.LOCAL",
+            1000.0,
+        );
+        let b = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        assert_eq!(a.signature(), b.signature());
+    }
+
+    #[test]
+    fn signature_is_stable_across_calls() {
+        let t = make_signed_task(
+            "credential_access",
+            "credential_access",
+            "secretsdump",
+            "192.168.58.20",
+            "carol",
+            "fabrikam.local",
+            1000.0,
+        );
+        let s1 = t.signature();
+        let s2 = t.signature();
+        let s3 = t.signature();
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s3);
+    }
+
+    #[test]
+    fn signature_handles_missing_payload_fields() {
+        // Payload with no technique / target / credential — still
+        // produces a stable signature derived from task_type/role only.
+        let bare = DeferredTask {
+            priority: 5,
+            enqueue_time: 1000.0,
+            task_type: "ad_recon".into(),
+            target_role: "recon".into(),
+            payload: serde_json::json!({}),
+            source_agent: "orchestrator".into(),
+        };
+        let bare2 = DeferredTask {
+            priority: 5,
+            enqueue_time: 9999.0,
+            task_type: "ad_recon".into(),
+            target_role: "recon".into(),
+            payload: serde_json::json!({}),
+            source_agent: "orchestrator".into(),
+        };
+        assert_eq!(bare.signature(), bare2.signature());
+        // ...and distinct from a task with the same skeleton but a
+        // populated technique.
+        let with_tech = DeferredTask {
+            payload: serde_json::json!({ "technique": "ldap_enum" }),
+            ..bare.clone()
+        };
+        assert_ne!(bare.signature(), with_tech.signature());
+    }
+
+    #[test]
+    fn signature_falls_back_to_dc_ip_when_target_ip_absent() {
+        // Some automation payloads use `dc_ip` instead of `target_ip`.
+        // The signature must still cover those so they dedup correctly.
+        let a = DeferredTask {
+            priority: 5,
+            enqueue_time: 1000.0,
+            task_type: "credential_access".into(),
+            target_role: "credential_access".into(),
+            payload: serde_json::json!({
+                "technique": "kerberoast",
+                "dc_ip": "192.168.58.20",
+                "credential": {"username": "alice", "domain": "fabrikam.local"},
+            }),
+            source_agent: "orchestrator".into(),
+        };
+        let b = DeferredTask {
+            payload: serde_json::json!({
+                "technique": "kerberoast",
+                "dc_ip": "192.168.58.20",
+                "credential": {"username": "alice", "domain": "fabrikam.local"},
+            }),
+            enqueue_time: 5000.0,
+            ..a.clone()
+        };
+        assert_eq!(a.signature(), b.signature());
     }
 
     #[test]

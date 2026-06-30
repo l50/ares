@@ -237,13 +237,23 @@ pub async fn laps_dump(args: &Value) -> Result<ToolOutput> {
 /// (`user@bind_domain`). Use when the credential belongs to a different
 /// domain than the one being queried. Defaults to `domain`.
 pub async fn ldap_search_descriptions(args: &Value) -> Result<ToolOutput> {
+    build_ldap_search_descriptions(args)?.execute().await
+}
+
+/// Build the `ldapsearch` invocation for [`ldap_search_descriptions`].
+///
+/// Exposed so the resolver-side Bug B contract test can confirm an
+/// injected `ticket_path` surfaces as `KRB5CCNAME` on the child process
+/// and that a supplied password reaches `-w`.
+#[doc(hidden)]
+pub fn build_ldap_search_descriptions(args: &Value) -> Result<CommandBuilder> {
     let target = required_str(args, "target")?;
     let domain = required_str(args, "domain")?;
     let username = optional_str(args, "username");
     let password = optional_str(args, "password");
     let bind_domain = optional_str(args, "bind_domain");
     let base_dn = optional_str(args, "base_dn");
-    let ticket_path = optional_str(args, "ticket_path");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let computed_base_dn = match base_dn {
         Some(dn) => dn.to_string(),
@@ -270,13 +280,12 @@ pub async fn ldap_search_descriptions(args: &Value) -> Result<ToolOutput> {
         cmd = cmd.arg("-x").flag("-D", &bind_dn).flag("-w", p);
     }
 
-    cmd.flag("-b", &computed_base_dn)
+    Ok(cmd
+        .flag("-b", &computed_base_dn)
         .arg("(&(objectClass=user)(description=*))")
         .arg("sAMAccountName")
         .arg("description")
-        .arg("userPrincipalName")
-        .execute()
-        .await
+        .arg("userPrincipalName"))
 }
 
 /// Spider SMB shares for interesting files via `netexec smb -M spider_plus`.
@@ -1284,6 +1293,51 @@ mod tests {
             "base_dn": "OU=Users,DC=contoso,DC=local"
         });
         assert!(super::ldap_search_descriptions(&args).await.is_ok());
+    }
+
+    // ── Bug B: ticket_path → KRB5CCNAME env wiring ──────────────────────
+
+    #[test]
+    fn ldap_search_descriptions_invocation_exports_krb5ccname_when_ticket_path_set() {
+        let args = json!({
+            "target": "dc02.fabrikam.local",
+            "domain": "fabrikam.local",
+            "ticket_path": "/tmp/ares-tickets/z.ccache",
+        });
+        let cmd = super::build_ldap_search_descriptions(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/z.ccache"),
+            "ticket_path must export KRB5CCNAME for ldap_search_descriptions"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-Y"));
+        assert!(args_vec.iter().any(|a| a == "GSSAPI"));
+        assert!(args_vec.iter().all(|a| a != "-w"));
+    }
+
+    #[test]
+    fn ldap_search_descriptions_password_branch_passes_w_flag() {
+        let args = json!({
+            "target": "192.168.58.1",
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ss",
+        });
+        let cmd = super::build_ldap_search_descriptions(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        let w_idx = args_vec
+            .iter()
+            .position(|a| a == "-w")
+            .expect("password must reach -w for ldap_search_descriptions");
+        assert_eq!(args_vec.get(w_idx + 1).map(String::as_str), Some("P@ss"));
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .all(|(k, _)| k != "KRB5CCNAME"),
+            "simple-bind branch must not export KRB5CCNAME"
+        );
     }
 
     #[tokio::test]

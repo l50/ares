@@ -24,16 +24,20 @@ vars:
   WARN: '\033[1;33m[WARN]\033[0m'
   # EC2 instance identification (Name tag filter)
   EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
-  EC2_PROFILE: '{{.EC2_PROFILE | default .AWS_PROFILE | default "lab"}}'
-  EC2_REGION: '{{.EC2_REGION | default .AWS_REGION | default .AWS_DEFAULT_REGION | default "us-west-1"}}'
+  # Honor standard AWS env vars (AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION).
+  # Override per-invocation with AWS_PROFILE=foo task ec2:foo or by passing
+  # AWS_PROFILE=foo AWS_REGION=us-east-1 explicitly on the task command line.
+  AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+  AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
   # S3 bucket for file staging (required; pass S3_BUCKET=your-bucket or set as env var)
   S3_BUCKET: '{{.S3_BUCKET | default ""}}'
   # Remote paths on EC2
   ARES_REMOTE_BIN: '/usr/local/bin'
   ARES_REMOTE_CONFIG: '/etc/ares/config.yaml'
   ARES_LOG_DIR: '/var/log/ares'
-  # Build tool: auto (cross on macOS due to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo, remote
-  # remote: builds natively on EC2 (fastest for iteration, no cross-compilation)
+  # Build tool: auto (cross on macOS due to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo
+  # `remote` (native EC2 build) is also accepted but currently undocumented —
+  # tokio OOMs the linker on the kali-ares instance size. Bump RAM/swap before using it.
   BUILD_TOOL: '{{.BUILD_TOOL | default "auto"}}'
   # Build profile: release (optimized) or dev-deploy (fast compile, less optimized)
   BUILD_PROFILE: '{{.BUILD_PROFILE | default "dev-deploy"}}'
@@ -55,8 +59,8 @@ tasks:
     cmds:
       - |
         INSTANCE_INFO=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].[InstanceId,PrivateIpAddress,Tags[?Key==\`Name\`].Value|[0]]" \
@@ -86,13 +90,18 @@ tasks:
       CARGO_BUILD_JOBS: '{{.CARGO_BUILD_JOBS | default "0"}}'
       S3_DEPLOY_PREFIX: 'ares-deploy'
     preconditions:
-      - sh: aws sts get-caller-identity --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}" >/dev/null 2>&1
-        msg: "Not logged into AWS (profile: {{.EC2_PROFILE}}). Run: aws sso login --profile {{.EC2_PROFILE}}"
+      - sh: aws sts get-caller-identity --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" >/dev/null 2>&1
+        msg: "Not logged into AWS (profile: {{.AWS_PROFILE}}). Run: aws sso login --profile {{.AWS_PROFILE}}"
       - sh: test -n "{{.S3_BUCKET}}"
         msg: "S3_BUCKET not set. Pass S3_BUCKET=your-bucket or export it as an env var."
     cmds:
       # Build binaries (local cross-compile or remote native build)
       - |
+        # cross/cargo-zigbuild/sccache live in ~/.cargo/bin; fresh non-login
+        # shells (and Task's own env) don't always inherit it, so `command -v`
+        # misses them and auto-detect falls back to plain cargo.
+        export PATH="$HOME/.cargo/bin:$PATH"
+
         BUILD_TOOL="{{.BUILD_TOOL}}"
 
         # Resolve 'auto': cross is required on macOS because aws-lc-sys
@@ -118,8 +127,8 @@ tasks:
 
           # Resolve instance
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --filters "Name=instance-state-name,Values=running" \
                       "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
             --query "Reservations[*].Instances[*].InstanceId" \
@@ -148,7 +157,7 @@ tasks:
           # Upload source to S3
           echo -e "{{.INFO}} Uploading source to S3..."
           aws s3 cp "$SRC_TAR" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/ares-src.tar.gz" \
-            --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}"
+            --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
           # Build on EC2 via SSM
           echo -e "{{.INFO}} Building on $INSTANCE_ID (this may take a few minutes on first run)..."
@@ -181,8 +190,8 @@ tasks:
           # Allow 30 min total for both the SSM command itself and the local
           # polling loop so we don't bail mid-build with a "InProgress" report.
           CMD_ID=$(aws ssm send-command \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters "file://$PARAMS_FILE" \
@@ -192,8 +201,8 @@ tasks:
           # Poll for completion (up to 30 minutes)
           for i in $(seq 1 900); do
             STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
+              --profile "{{.AWS_PROFILE}}" \
+              --region "{{.AWS_REGION}}" \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "Status" --output text 2>/dev/null) || true
@@ -205,8 +214,8 @@ tasks:
 
           # Show build output
           OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardOutputContent" --output text 2>/dev/null)
@@ -214,8 +223,8 @@ tasks:
 
           if [ "$STATUS" != "Success" ]; then
             DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
+              --profile "{{.AWS_PROFILE}}" \
+              --region "{{.AWS_REGION}}" \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "StatusDetails" --output text 2>/dev/null)
@@ -225,8 +234,8 @@ tasks:
               echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
             fi
             aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
+              --profile "{{.AWS_PROFILE}}" \
+              --region "{{.AWS_REGION}}" \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "StandardErrorContent" --output text
@@ -289,7 +298,7 @@ tasks:
             cargo build $PROFILE_FLAG --target {{.RUST_TARGET}} $JOBS_FLAG -p ares-cli
             ;;
           *)
-            echo -e "{{.ERROR}} Unknown BUILD_TOOL: $BUILD_TOOL (valid: auto, cross, zigbuild, cargo, remote)"
+            echo -e "{{.ERROR}} Unknown BUILD_TOOL: $BUILD_TOOL (valid: auto, cross, zigbuild, cargo)"
             exit 1
             ;;
         esac
@@ -336,7 +345,7 @@ tasks:
 
         echo -e "{{.INFO}} Uploading binary to s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/..."
         aws s3 cp "$BIN_PATH" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/ares" \
-          --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}"
+          --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
         echo -e "{{.SUCCESS}} Binary staged in S3 (sha=$BUILD_SHA)"
 
@@ -345,8 +354,8 @@ tasks:
         if [ "{{.BUILD_TOOL}}" = "remote" ]; then exit 0; fi
 
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -385,8 +394,8 @@ tasks:
           ]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -395,8 +404,8 @@ tasks:
         # Poll for completion
         for i in $(seq 1 120); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -407,8 +416,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -419,8 +428,8 @@ tasks:
           # in ConnectionLost). For Undeliverable, stdout/stderr are both empty, so
           # without this the operator sees only "status: Failed" and two blank lines.
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -431,8 +440,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text
@@ -460,8 +469,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -474,7 +483,7 @@ tasks:
 
         echo -e "{{.INFO}} Uploading config to S3..."
         aws s3 cp "{{.ARES_CONFIG}}" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml" \
-          --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}"
+          --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
         echo -e "{{.INFO}} Pulling config to $INSTANCE_ID..."
         PARAMS_FILE=$(mktemp)
@@ -484,8 +493,8 @@ tasks:
           > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -493,8 +502,8 @@ tasks:
 
         for i in $(seq 1 30); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -505,16 +514,16 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
 
         if [ "$STATUS" != "Success" ]; then
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -524,8 +533,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text
@@ -543,8 +552,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -563,8 +572,8 @@ tasks:
         jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/setup.sh > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -575,8 +584,8 @@ tasks:
 
         for i in $(seq 1 120); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -588,16 +597,16 @@ tasks:
 
         echo ""
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
 
         if [ "$STATUS" != "Success" ]; then
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -607,8 +616,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text
@@ -626,8 +635,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -657,8 +666,8 @@ tasks:
         jq -n --arg cmd "$START_CMD" '{"commands": [$cmd]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -666,8 +675,8 @@ tasks:
 
         for i in $(seq 1 30); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -678,8 +687,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -688,8 +697,8 @@ tasks:
           echo -e "{{.SUCCESS}} All services started"
         else
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -699,8 +708,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text
@@ -713,8 +722,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -737,8 +746,8 @@ tasks:
         jq -n --arg units "$WORKER_UNITS" '{"commands": ["systemctl stop " + $units + " 2>/dev/null || true; pkill -f \"ares orchestrator\" 2>/dev/null || true; echo Stopped all ares workers and orchestrator"]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -746,8 +755,8 @@ tasks:
 
         for i in $(seq 1 15); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -758,8 +767,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -776,7 +785,7 @@ tasks:
       - sh: '[ -n "{{.OPERATION_ID}}" ] || [ "{{.LATEST}}" = "true" ]'
         msg: "Provide OPERATION_ID=op-xxx or LATEST=true"
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops stop
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -797,8 +806,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -814,8 +823,8 @@ tasks:
         jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/status.sh > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -823,8 +832,8 @@ tasks:
 
         for i in $(seq 1 15); do
           RESULT=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -835,8 +844,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -850,8 +859,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -866,8 +875,8 @@ tasks:
         echo -e "{{.INFO}} Tailing $LOG_FILE on $INSTANCE_ID (Ctrl+C to stop)..."
 
         aws ssm start-session \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartInteractiveCommand" \
           --parameters "command=[\"tail -n {{.LINES}} -f $LOG_FILE\"]"
@@ -881,8 +890,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -903,8 +912,8 @@ tasks:
         echo ""
 
         aws ssm start-session \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartPortForwardingSession" \
           --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}'
@@ -922,7 +931,7 @@ tasks:
       JSON: '{{.JSON | default "false"}}'
       DIFF: '{{.DIFF | default "false"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops loot
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -936,7 +945,7 @@ tasks:
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
       LATEST: '{{.LATEST | default "true"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops runtime
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -952,8 +961,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -971,8 +980,8 @@ tasks:
           jq -n --arg cmd "$CMD_PAYLOAD" '{"commands": [$cmd]}' > "$PARAMS_FILE"
 
           CMD_ID=$(aws ssm send-command \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters "file://$PARAMS_FILE" \
@@ -984,8 +993,8 @@ tasks:
           STATUS=""
           for i in $(seq 1 "$TIMEOUT"); do
             STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
+              --profile "{{.AWS_PROFILE}}" \
+              --region "{{.AWS_REGION}}" \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "Status" --output text 2>/dev/null) || true
@@ -996,16 +1005,16 @@ tasks:
           done
 
           OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardOutputContent" --output text)
 
           if [ "$STATUS" != "Success" ]; then
             DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
+              --profile "{{.AWS_PROFILE}}" \
+              --region "{{.AWS_REGION}}" \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "StatusDetails" --output text 2>/dev/null)
@@ -1018,8 +1027,8 @@ tasks:
               echo "$OUTPUT" >&2
             fi
             aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
+              --profile "{{.AWS_PROFILE}}" \
+              --region "{{.AWS_REGION}}" \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "StandardErrorContent" --output text >&2
@@ -1109,7 +1118,7 @@ tasks:
     vars:
       LATEST: '{{.LATEST | default "false"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops list
       {{if eq .LATEST "true"}}--latest{{end}}
 
@@ -1152,7 +1161,7 @@ tasks:
             exit 1
           fi
 
-          STATUS_OUT=$(ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}} \
+          STATUS_OUT=$(ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}} \
             ops status $OP_ARG $LATEST_FLAG 2>&1 || true)
 
           STATUS=$(echo "$STATUS_OUT" | grep -E '^Status: ' | head -1 | awk '{print $2}')
@@ -1207,8 +1216,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -1245,8 +1254,8 @@ tasks:
 
         # Fetch API keys from Secrets Manager
         SECRETS=$(aws secretsmanager get-secret-value \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --secret-id "{{.SECRETS_ID}}" \
           --query SecretString --output text 2>/dev/null) || true
 
@@ -1341,8 +1350,8 @@ tasks:
         echo -e "{{.INFO}} Launching orchestrator on $INSTANCE_ID..."
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -1350,8 +1359,8 @@ tasks:
 
         for i in $(seq 1 30); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -1360,16 +1369,16 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
 
         if [ "$STATUS" != "Success" ]; then
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -1379,8 +1388,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text >&2
@@ -1409,8 +1418,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -1490,8 +1499,8 @@ tasks:
         echo -e "{{.INFO}} Installing pentest tools on $INSTANCE_ID (2-3 minutes)..."
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -1499,8 +1508,8 @@ tasks:
 
         for i in $(seq 1 180); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -1509,8 +1518,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -1519,8 +1528,8 @@ tasks:
           echo -e "{{.SUCCESS}} Tools installed on $INSTANCE_ID"
         else
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -1530,8 +1539,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text >&2
@@ -1552,8 +1561,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -1569,8 +1578,8 @@ tasks:
         jq -n --arg cmd "{{.CMD}}" '{"commands": [$cmd]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -1578,8 +1587,8 @@ tasks:
 
         for i in $(seq 1 60); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -1590,16 +1599,16 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
 
         if [ "$STATUS" != "Success" ]; then
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -1609,8 +1618,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text >&2

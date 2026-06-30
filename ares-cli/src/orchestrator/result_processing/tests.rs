@@ -2247,3 +2247,212 @@ fn high_trust_sources_are_not_recognised() {
         );
     }
 }
+
+// ── is_dcsync_chain_blocked_by_sid_filter (Bug C) ──────────────────────────
+
+#[test]
+fn auto_trust_follow_skips_dcsync_chain_for_sid_filtered_target() {
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+    state.trusted_domains.insert(
+        "fabrikam.local".into(),
+        ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: true,
+            security_identifier: None,
+        },
+    );
+    assert!(is_dcsync_chain_blocked_by_sid_filter(&state, "fabrikam.local"));
+    // Case-insensitive lookup.
+    assert!(is_dcsync_chain_blocked_by_sid_filter(&state, "FABRIKAM.LOCAL"));
+}
+
+#[test]
+fn dcsync_chain_not_blocked_when_sid_filter_off() {
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+    state.trusted_domains.insert(
+        "fabrikam.local".into(),
+        ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: false,
+            security_identifier: None,
+        },
+    );
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "fabrikam.local"
+    ));
+}
+
+#[test]
+fn dcsync_chain_not_blocked_for_intra_forest_trust() {
+    // child→parent intra-forest trusts may have sid_filtering=true logically
+    // but `is_cross_forest()` is false, so DCSync chain is fine.
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+    state.trusted_domains.insert(
+        "child.contoso.local".into(),
+        ares_core::models::TrustInfo {
+            domain: "child.contoso.local".into(),
+            flat_name: "CHILD".into(),
+            direction: "bidirectional".into(),
+            trust_type: "parent_child".into(),
+            sid_filtering: true,
+            security_identifier: None,
+        },
+    );
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "child.contoso.local"
+    ));
+}
+
+#[test]
+fn dcsync_chain_not_blocked_when_no_trust_metadata() {
+    // Unlike trust-follow (which is conservative re: missing metadata), the
+    // S4U chain has the LDAP-bind ticket regardless — so we only skip the
+    // DCSync when we have *positive evidence* of SID filtering.
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let state = StateInner::new("op-test".into());
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(&state, "fabrikam.local"));
+}
+
+// ── Bug E: AES kerberoast retry + SPN lockout propagation ──────────────────
+
+#[test]
+fn etype_nosupp_detector_matches_canonical_marker() {
+    use super::result_text_indicates_etype_nosupp;
+    let result = Some(serde_json::json!({
+        "tool_outputs": [
+            "Kerberos SessionError: KDC_ERR_ETYPE_NOSUPP(KDC has no support for encryption type)"
+        ]
+    }));
+    assert!(result_text_indicates_etype_nosupp(&result));
+}
+
+#[test]
+fn etype_nosupp_detector_negative() {
+    use super::result_text_indicates_etype_nosupp;
+    let result = Some(serde_json::json!({
+        "tool_outputs": ["TGS-REP captured: $krb5tgs$18$*svc_sql$..."]
+    }));
+    assert!(!result_text_indicates_etype_nosupp(&result));
+}
+
+#[test]
+fn kerberoast_retries_with_aes_after_etype_nosupp() {
+    use super::should_retry_kerberoast_with_aes;
+    let result = Some(serde_json::json!({
+        "tool_outputs": ["[-] KDC_ERR_ETYPE_NOSUPP for svc_sql@fabrikam.local"]
+    }));
+    assert!(should_retry_kerberoast_with_aes(Some("kerberoast"), &result));
+    assert!(should_retry_kerberoast_with_aes(
+        Some("targeted_kerberoast"),
+        &result
+    ));
+    // Non-kerberoast technique: no retry.
+    assert!(!should_retry_kerberoast_with_aes(
+        Some("password_spray"),
+        &result
+    ));
+    // No technique at all: no retry.
+    assert!(!should_retry_kerberoast_with_aes(None, &result));
+}
+
+#[test]
+fn build_aes_kerberoast_retry_payload_includes_etype_hint() {
+    use crate::orchestrator::automation::credential_access::build_aes_kerberoast_retry_payload;
+    let cred = ares_core::models::Credential {
+        id: "c1".into(),
+        username: "carol".into(),
+        password: "fr3edom".into(), // pragma: allowlist secret
+        domain: "fabrikam.local".into(),
+        source: "test".into(),
+        discovered_at: None,
+        is_admin: false,
+        parent_id: None,
+        attack_step: 0,
+    };
+    let payload = build_aes_kerberoast_retry_payload(
+        "fabrikam.local",
+        "192.168.58.20",
+        &cred,
+        Some("sql_svc"),
+    );
+    assert_eq!(payload["technique"], "kerberoast");
+    assert_eq!(payload["target_user"], "sql_svc");
+    let etypes = payload["etype_hint"].as_array().expect("etype_hint array");
+    assert!(etypes.iter().any(|v| v == "aes256-cts-hmac-sha1-96"));
+    assert!(etypes.iter().any(|v| v == "aes128-cts-hmac-sha1-96"));
+    assert_eq!(payload["retry_reason"], "kdc_err_etype_nosupp");
+}
+
+#[test]
+fn lockout_on_spn_account_propagates_to_spray_exclusion() {
+    use crate::orchestrator::automation::credential_access::{
+        is_kerberoastable_principal, SPN_LOCKOUT_QUARANTINE_SECS,
+    };
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+
+    // Register a SPN-bearing account via a kerberoastable_account vuln.
+    let mut details = std::collections::HashMap::new();
+    details.insert(
+        "account_name".into(),
+        serde_json::Value::String("sql_svc".into()),
+    );
+    details.insert(
+        "domain".into(),
+        serde_json::Value::String("fabrikam.local".into()),
+    );
+    state.discovered_vulnerabilities.insert(
+        "v-spn-1".into(),
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: "v-spn-1".into(),
+            vuln_type: "kerberoastable_account".into(),
+            target: "192.168.58.20".into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: "credential_access".into(),
+            priority: 2,
+        },
+    );
+    assert!(is_kerberoastable_principal(&state, "sql_svc", "fabrikam.local"));
+    // Plain non-SPN principal: not flagged.
+    assert!(!is_kerberoastable_principal(&state, "alice", "fabrikam.local"));
+
+    // Quarantine with the SPN window — verify the expiry is longer than the
+    // 5-min default (300s). 1800s expiry should still be present after a
+    // hypothetical 600s probe.
+    state.quarantine_principal_for("sql_svc", "fabrikam.local", SPN_LOCKOUT_QUARANTINE_SECS);
+    let excluded = state.quarantined_principals_in_domain("fabrikam.local");
+    assert!(
+        excluded.iter().any(|u| u == "sql_svc"),
+        "SPN-bearing principal must land in spray exclusion list, got: {:?}",
+        excluded
+    );
+
+    // Subsequent shorter quarantine must not shrink the 30-min window.
+    state.quarantine_principal("sql_svc", "fabrikam.local"); // 5-min
+    let now = chrono::Utc::now();
+    let key = "sql_svc@fabrikam.local".to_string();
+    let expiry = state.quarantined_principals.get(&key).copied().expect("entry");
+    let remaining = (expiry - now).num_seconds();
+    assert!(
+        remaining > 900,
+        "30-min quarantine should still have >15min remaining, got {}s",
+        remaining
+    );
+}
