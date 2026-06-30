@@ -105,8 +105,8 @@ vars:
   ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
   # EC2 deployment (alternative to K8s)
   EC2_NAME: '{{.EC2_NAME | default "ares-tools"}}'
-  EC2_PROFILE: '{{.EC2_PROFILE | default "lab"}}'
-  EC2_REGION: '{{.EC2_REGION | default "us-west-1"}}'
+  EC2_PROFILE: '{{.EC2_PROFILE | default .AWS_PROFILE | default "lab"}}'
+  EC2_REGION: '{{.EC2_REGION | default .AWS_REGION | default .AWS_DEFAULT_REGION | default "us-west-1"}}'
   # Blue team (set BLUE_ENABLED=1 to run blue alongside red)
   BLUE_ENABLED: '{{.BLUE_ENABLED | default "0"}}'
   BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'

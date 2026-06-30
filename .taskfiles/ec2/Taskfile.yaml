@@ -24,8 +24,8 @@ vars:
   WARN: '\033[1;33m[WARN]\033[0m'
   # EC2 instance identification (Name tag filter)
   EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
-  EC2_PROFILE: '{{.EC2_PROFILE | default "lab"}}'
-  EC2_REGION: '{{.EC2_REGION | default "us-west-1"}}'
+  EC2_PROFILE: '{{.EC2_PROFILE | default .AWS_PROFILE | default "lab"}}'
+  EC2_REGION: '{{.EC2_REGION | default .AWS_REGION | default .AWS_DEFAULT_REGION | default "us-west-1"}}'
   # S3 bucket for file staging (required; pass S3_BUCKET=your-bucket or set as env var)
   S3_BUCKET: '{{.S3_BUCKET | default ""}}'
   # Remote paths on EC2
