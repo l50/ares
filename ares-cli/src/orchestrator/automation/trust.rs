@@ -213,11 +213,7 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
     // (a) trust-enum hasn't yet populated `trusted_domains` for the target,
     // (b) the entry is under a different key, or
     // (c) `is_cross_forest()` returned false on the entry.
-    let known_keys: Vec<&str> = state
-        .trusted_domains
-        .keys()
-        .map(String::as_str)
-        .collect();
+    let known_keys: Vec<&str> = state.trusted_domains.keys().map(String::as_str).collect();
     if let Some(t) = state.trusted_domains.get(&target_l) {
         let cross = t.is_cross_forest();
         let decision = cross && t.sid_filtering;

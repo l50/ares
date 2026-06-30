@@ -1844,15 +1844,13 @@ mod tests {
             source_domain: "contoso.local".into(),
             target_domain: "fabrikam.local".into(),
             username: "Administrator".into(),
-            ticket_path:
-                "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache".into(),
+            ticket_path: "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"
+                .into(),
             forged_at: None,
         });
         assert_eq!(
             inter_realm_ccache_for_target(&s, "fabrikam.local").as_deref(),
-            Some(
-                "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"
-            )
+            Some("/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache")
         );
         // Case-insensitive lookup.
         assert!(inter_realm_ccache_for_target(&s, "FABRIKAM.LOCAL").is_some());
@@ -1896,8 +1894,8 @@ mod tests {
             source_domain: "contoso.local".into(),
             target_domain: "fabrikam.local".into(),
             username: "Administrator".into(),
-            ticket_path:
-                "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache".into(),
+            ticket_path: "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"
+                .into(),
             forged_at: None,
         });
         let work = select_unconstrained_work_items(&s, &HashMap::new(), Instant::now());
@@ -1933,7 +1931,8 @@ mod tests {
         let mut s = StateInner::new("op-test".into());
         let v = make_uc_vuln("v-uc-mach", "DC02$", "contoso.local");
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
-        s.hosts.push(make_host("dc02.contoso.local", "192.168.58.11"));
+        s.hosts
+            .push(make_host("dc02.contoso.local", "192.168.58.11"));
         s.domain_controllers
             .insert("contoso.local".into(), "192.168.58.10".into());
         s.credentials

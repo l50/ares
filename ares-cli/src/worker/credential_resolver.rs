@@ -309,17 +309,16 @@ pub async fn resolve_credentials(
             None
         };
         if let Some(ref realm) = target_realm {
-            if let Some(renamed) =
-                resolve_cross_forest_ticket(
-                    args_obj,
-                    &reader,
-                    conn,
-                    tool_name,
-                    realm,
-                    &credentials,
-                    &hashes,
-                )
-                    .await
+            if let Some(renamed) = resolve_cross_forest_ticket(
+                args_obj,
+                &reader,
+                conn,
+                tool_name,
+                realm,
+                &credentials,
+                &hashes,
+            )
+            .await
             {
                 redirected_tool = Some(renamed);
             }
@@ -2032,7 +2031,10 @@ mod tests {
                 && (user_l.is_empty() || c.username.to_lowercase() == user_l)
                 && !c.password.is_empty()
         });
-        assert!(!has_ntlm, "no NTLM hash for fabrikam.local in this scenario");
+        assert!(
+            !has_ntlm,
+            "no NTLM hash for fabrikam.local in this scenario"
+        );
         assert!(
             has_plaintext,
             "same-realm plaintext for carol@fabrikam.local — cross-forest \
@@ -2629,9 +2631,7 @@ mod tests {
         // realm_strict=true. The lookup MUST find the injected cred under
         // (fabrikam.local, carol).
         let found = find_credential(&credentials, "carol", "fabrikam.local", true);
-        let cred = found.expect(
-            "resolver must find injected cleartext cred by (domain, username)",
-        );
+        let cred = found.expect("resolver must find injected cleartext cred by (domain, username)");
         assert_eq!(cred.password, "fr3edom");
         assert_eq!(cred.domain, "fabrikam.local");
 

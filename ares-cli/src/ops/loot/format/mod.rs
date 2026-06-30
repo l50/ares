@@ -155,8 +155,10 @@ mod tests {
             mk_hash("krbtgt", "contoso.local", None), // noise username: dropped
             mk_hash("bob", "contoso.local", Some("hunter2")), // cracked: dropped
         ];
-        state.all_credentials =
-            vec![mk_cred("alice", "contoso.local"), mk_cred("DC01$", "contoso.local")];
+        state.all_credentials = vec![
+            mk_cred("alice", "contoso.local"),
+            mk_cred("DC01$", "contoso.local"),
+        ];
 
         let (cred_count, hash_count) = reportable_counts(&state);
         assert_eq!(cred_count, 1);

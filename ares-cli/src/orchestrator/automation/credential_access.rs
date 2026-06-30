@@ -1000,7 +1000,9 @@ pub async fn auto_credential_access(
                         .await;
                 }
                 Ok(None) => {}
-                Err(e) => warn!(err = %e, vuln_id = %item.vuln_id, "Failed to dispatch vuln-driven kerberoast"),
+                Err(e) => {
+                    warn!(err = %e, vuln_id = %item.vuln_id, "Failed to dispatch vuln-driven kerberoast")
+                }
             }
         }
 
@@ -1926,9 +1928,9 @@ mod tests {
     #[test]
     fn pick_kerberoast_credential_prefers_same_realm() {
         let mut s = StateInner::new("op-test".into());
-        s.credentials.push(make_cred("alice", "Pw!", "fabrikam.local"));
         s.credentials
-            .push(make_cred("bob", "Pw!", "contoso.local"));
+            .push(make_cred("alice", "Pw!", "fabrikam.local"));
+        s.credentials.push(make_cred("bob", "Pw!", "contoso.local"));
         let c = pick_kerberoast_credential(&s, "fabrikam.local").expect("cred");
         assert_eq!(c.username, "alice");
     }

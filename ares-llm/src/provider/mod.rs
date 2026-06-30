@@ -1,9 +1,10 @@
 //! Model-agnostic LLM provider trait and shared types.
 //!
 //! Providers implement `LlmProvider` to support different LLM backends
-//! (Anthropic, OpenAI, Ollama) through a unified interface.
+//! (Anthropic, Claude Code CLI, OpenAI, Ollama) through a unified interface.
 
 pub mod anthropic;
+pub mod claude_cli;
 pub mod ollama;
 pub mod openai;
 
@@ -260,6 +261,8 @@ pub trait LlmProvider: Send + Sync {
 ///
 /// Supported prefixes:
 /// - `anthropic/` → AnthropicProvider (reads `ANTHROPIC_API_KEY`)
+/// - `claude-cli/` → ClaudeCliProvider (shells out to local `claude -p`; draws
+///   from the operator's Claude Code subscription, no API key needed)
 /// - `openai/` → OpenAiProvider (reads `OPENAI_API_KEY`)
 /// - `ollama/` → OllamaProvider (reads `OLLAMA_BASE_URL`, default `http://localhost:11434`)
 ///
@@ -269,6 +272,9 @@ pub fn create_provider(model: &str) -> anyhow::Result<(Box<dyn LlmProvider>, Str
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
         let provider = anthropic::AnthropicProvider::new(api_key);
+        Ok((Box::new(provider), model_name.to_string()))
+    } else if let Some(model_name) = model.strip_prefix("claude-cli/") {
+        let provider = claude_cli::ClaudeCliProvider::new();
         Ok((Box::new(provider), model_name.to_string()))
     } else if let Some(model_name) = model.strip_prefix("openai/") {
         let api_key = std::env::var("OPENAI_API_KEY")
@@ -335,6 +341,17 @@ mod tests {
         assert_eq!(req.model, "claude-sonnet-4-20250514");
         assert_eq!(req.max_tokens, 4096);
         assert!(req.tools.is_empty());
+    }
+
+    #[test]
+    fn create_provider_routes_claude_cli_prefix() {
+        // claude-cli/ never reads env vars (subprocess does); routing should
+        // succeed regardless of ANTHROPIC_API_KEY, and strip the prefix from
+        // the returned model name so it lands on the CLI as e.g. "sonnet".
+        let (provider, model) =
+            create_provider("claude-cli/sonnet").expect("claude-cli route succeeds");
+        assert_eq!(provider.name(), "claude-cli");
+        assert_eq!(model, "sonnet");
     }
 
     #[test]

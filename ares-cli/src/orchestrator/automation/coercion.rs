@@ -170,10 +170,7 @@ pub struct CoercionWorkItem {
 /// only marked when the ladder is fully exhausted, so the caller can still
 /// treat dedup as the "permanent" signal that no more coercion attempts will
 /// reach this DC.
-pub(crate) fn select_coercion_work(
-    state: &StateInner,
-    listener_ip: &str,
-) -> Vec<CoercionWorkItem> {
+pub(crate) fn select_coercion_work(state: &StateInner, listener_ip: &str) -> Vec<CoercionWorkItem> {
     let mut out = Vec::new();
     let default_state = CoercionPhaseState::default();
     for (domain, dc_ip) in state.domain_controllers.iter() {
@@ -183,7 +180,10 @@ pub(crate) fn select_coercion_work(
         if state.is_processed(DEDUP_COERCED_DCS, dc_ip) {
             continue;
         }
-        let phase = state.coercion_phase_state.get(dc_ip).unwrap_or(&default_state);
+        let phase = state
+            .coercion_phase_state
+            .get(dc_ip)
+            .unwrap_or(&default_state);
         let has_auth = has_authenticated_coercion_credential(state, domain);
         let Some(tech) = next_coercion_technique(phase, has_auth) else {
             continue;
@@ -255,10 +255,7 @@ pub async fn auto_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
                     );
                     let dc_ip = item.dc_ip.clone();
                     let mut state = dispatcher.state.write().await;
-                    let phase = state
-                        .coercion_phase_state
-                        .entry(dc_ip.clone())
-                        .or_default();
+                    let phase = state.coercion_phase_state.entry(dc_ip.clone()).or_default();
                     if !phase.techniques_tried.contains(&item.technique) {
                         phase.techniques_tried.push(item.technique.clone());
                     }
@@ -270,10 +267,12 @@ pub async fn auto_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
                     // dedup" semantics that ntlm_relay / unconstrained rely on,
                     // while allowing the phase-state path to keep cycling
                     // techniques in between.
-                    let has_auth =
-                        has_authenticated_coercion_credential(&state, &item.domain);
-                    let phase_after =
-                        state.coercion_phase_state.get(&dc_ip).cloned().unwrap_or_default();
+                    let has_auth = has_authenticated_coercion_credential(&state, &item.domain);
+                    let phase_after = state
+                        .coercion_phase_state
+                        .get(&dc_ip)
+                        .cloned()
+                        .unwrap_or_default();
                     if next_coercion_technique(&phase_after, has_auth).is_none() {
                         state.mark_processed(DEDUP_COERCED_DCS, dc_ip.clone());
                         drop(state);

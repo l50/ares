@@ -124,6 +124,7 @@ The operative evidence is that *neither* branch of `is_filtered_inter_forest_tru
 This is *the* reason discovery (21 → 338 vulns over 1 hour) outran exploitation (stuck at 6) in this op: the dispatch pipeline is not bottlenecked on worker capacity, it's bottlenecked on the cred-gate queue not deduping at the producer side. The automation tier produces orders of magnitude more dispatches than the consumer can drain, with no flow control between them.
 
 **Proposed fix sketch.**
+
 1. Producer-side dedup: before enqueuing a `(user, domain, target_ip, technique)` task into the cred-gated queue, check whether an equivalent task is already in the deferred set or in `tasks:in_progress`. Drop the duplicate at the producer instead of accepting it into the queue and dropping the next legitimate task. This is cheaper than queue saturation and surfaces the redundancy at the source automation rule.
 2. Make the Lua enqueue script idempotent on `(task_signature_hash)` so even if two automation rules race, only one ends up in the queue.
 3. Audit the six automation rules listed above for the missandei case — most of them are firing on overlapping signals (vuln events, cred events, share events). Several are likely redundant in semantics: `auto_credential_expansion` and `auto_credential_access` both want to run secretsdump against the same DC with the same cred. Consolidate to one canonical dispatcher per `(technique, target)` tuple.

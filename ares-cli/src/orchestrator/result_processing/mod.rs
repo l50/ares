@@ -548,23 +548,19 @@ pub async fn process_completed_task(
             .map(|s| s.to_string());
         let cred = {
             let state = dispatcher.state.read().await;
-            task_username
-                .as_deref()
-                .and_then(|u| {
-                    state
-                        .credentials
-                        .iter()
-                        .find(|c| {
-                            c.username.eq_ignore_ascii_case(u)
-                                && (resolved_domain.is_empty()
-                                    || c.domain.eq_ignore_ascii_case(&resolved_domain))
-                        })
-                        .cloned()
-                })
+            task_username.as_deref().and_then(|u| {
+                state
+                    .credentials
+                    .iter()
+                    .find(|c| {
+                        c.username.eq_ignore_ascii_case(u)
+                            && (resolved_domain.is_empty()
+                                || c.domain.eq_ignore_ascii_case(&resolved_domain))
+                    })
+                    .cloned()
+            })
         };
-        if let (false, false, Some(cred)) =
-            (resolved_domain.is_empty(), dc_ip.is_empty(), cred)
-        {
+        if let (false, false, Some(cred)) = (resolved_domain.is_empty(), dc_ip.is_empty(), cred) {
             let payload =
                 crate::orchestrator::automation::credential_access::build_aes_kerberoast_retry_payload(
                     &resolved_domain,

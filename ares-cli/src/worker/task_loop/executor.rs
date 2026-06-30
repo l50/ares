@@ -75,11 +75,8 @@ pub async fn run_agent_task(
                 }
                 let raw = output.combined_raw();
                 let combined = output.combined();
-                let disc = ares_tools::parsers::parse_tool_output(
-                    &effective_name,
-                    &raw,
-                    &resolved_params,
-                );
+                let disc =
+                    ares_tools::parsers::parse_tool_output(&effective_name, &raw, &resolved_params);
                 all_discoveries.push(disc);
                 outputs.push(format!("=== {} ===\n{}", effective_name, combined));
             }
@@ -500,8 +497,7 @@ mod tests {
             "domain": "contoso.local",
         });
         // Synthesize the same scenario: no conn ≡ no resolver call ≡ pass-through.
-        let (name, resolved) =
-            super::resolve_for_dispatch(None, None, "nmap_scan", &params).await;
+        let (name, resolved) = super::resolve_for_dispatch(None, None, "nmap_scan", &params).await;
         assert_eq!(name, "nmap_scan");
         assert_eq!(resolved, params);
     }

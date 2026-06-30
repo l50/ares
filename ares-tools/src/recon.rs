@@ -1189,9 +1189,11 @@ mod tests {
         });
         let cmd = super::build_ldap_search(&args).unwrap();
         assert!(
-            cmd.env_vars_for_test().iter().any(|(k, v)| k == "KRB5CCNAME"
-                && v
-                    == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME"
+                    && v
+                        == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
             "ticket_path must export KRB5CCNAME so ldapsearch loads the cross-forest ccache"
         );
         let args_vec = cmd.args_for_test();
@@ -1387,9 +1389,11 @@ mod tests {
         });
         let cmd = super::build_smbclient_kerberos_shares(&args).unwrap();
         assert!(
-            cmd.env_vars_for_test().iter().any(|(k, v)| k == "KRB5CCNAME"
-                && v
-                    == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME"
+                    && v
+                        == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
             "ticket_path must export KRB5CCNAME so smbclient.py loads the cross-forest ccache"
         );
         let args_vec = cmd.args_for_test();

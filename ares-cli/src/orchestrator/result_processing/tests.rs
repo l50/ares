@@ -2266,9 +2266,15 @@ fn auto_trust_follow_skips_dcsync_chain_for_sid_filtered_target() {
             security_identifier: None,
         },
     );
-    assert!(is_dcsync_chain_blocked_by_sid_filter(&state, "fabrikam.local"));
+    assert!(is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "fabrikam.local"
+    ));
     // Case-insensitive lookup.
-    assert!(is_dcsync_chain_blocked_by_sid_filter(&state, "FABRIKAM.LOCAL"));
+    assert!(is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "FABRIKAM.LOCAL"
+    ));
 }
 
 #[test]
@@ -2325,7 +2331,10 @@ fn dcsync_chain_not_blocked_when_no_trust_metadata() {
     use super::is_dcsync_chain_blocked_by_sid_filter;
     use crate::orchestrator::state::StateInner;
     let state = StateInner::new("op-test".into());
-    assert!(!is_dcsync_chain_blocked_by_sid_filter(&state, "fabrikam.local"));
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "fabrikam.local"
+    ));
 }
 
 // ── Bug E: AES kerberoast retry + SPN lockout propagation ──────────────────
@@ -2356,7 +2365,10 @@ fn kerberoast_retries_with_aes_after_etype_nosupp() {
     let result = Some(serde_json::json!({
         "tool_outputs": ["[-] KDC_ERR_ETYPE_NOSUPP for svc_sql@fabrikam.local"]
     }));
-    assert!(should_retry_kerberoast_with_aes(Some("kerberoast"), &result));
+    assert!(should_retry_kerberoast_with_aes(
+        Some("kerberoast"),
+        &result
+    ));
     assert!(should_retry_kerberoast_with_aes(
         Some("targeted_kerberoast"),
         &result
@@ -2429,9 +2441,17 @@ fn lockout_on_spn_account_propagates_to_spray_exclusion() {
             priority: 2,
         },
     );
-    assert!(is_kerberoastable_principal(&state, "sql_svc", "fabrikam.local"));
+    assert!(is_kerberoastable_principal(
+        &state,
+        "sql_svc",
+        "fabrikam.local"
+    ));
     // Plain non-SPN principal: not flagged.
-    assert!(!is_kerberoastable_principal(&state, "alice", "fabrikam.local"));
+    assert!(!is_kerberoastable_principal(
+        &state,
+        "alice",
+        "fabrikam.local"
+    ));
 
     // Quarantine with the SPN window — verify the expiry is longer than the
     // 5-min default (300s). 1800s expiry should still be present after a
@@ -2448,7 +2468,11 @@ fn lockout_on_spn_account_propagates_to_spray_exclusion() {
     state.quarantine_principal("sql_svc", "fabrikam.local"); // 5-min
     let now = chrono::Utc::now();
     let key = "sql_svc@fabrikam.local".to_string();
-    let expiry = state.quarantined_principals.get(&key).copied().expect("entry");
+    let expiry = state
+        .quarantined_principals
+        .get(&key)
+        .copied()
+        .expect("entry");
     let remaining = (expiry - now).num_seconds();
     assert!(
         remaining > 900,
