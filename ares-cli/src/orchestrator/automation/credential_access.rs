@@ -818,6 +818,68 @@ pub async fn auto_credential_access(
                         }
                     }
                 });
+            } else {
+                // Cold-start: no userlist for this domain yet. The LLM submit
+                // above gets the cold-start instructions but the
+                // credential_access agent consistently picks `password_spray`
+                // over `kerberos_user_enum_noauth` — leaving the only
+                // zero-cred foothold path for a SID-filtered foreign forest
+                // unexercised (verified in op-20260629-220147: 0 essos
+                // accounts discovered until a DA cred was manually injected).
+                // Fire GetNPUsers against the seclists wordlist directly.
+                // Any AS-REP hash that comes back lands in state.hashes via
+                // push_realtime_discoveries; the user-backfill in publish_hash
+                // populates state.users, and the next tick re-arms this
+                // domain's dedup as `:users` so the warm-path branch above
+                // re-runs GetNPUsers against the discovered list.
+                let det_args = json!({
+                    "domain": domain,
+                    "dc_ip": dc_ip,
+                });
+                let det_call = ares_llm::ToolCall {
+                    id: format!("asrep_enum_{}", uuid::Uuid::new_v4().simple()),
+                    name: "kerberos_user_enum_noauth".to_string(),
+                    arguments: det_args,
+                };
+                let det_task_id = format!(
+                    "asrep_enum_{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                );
+                info!(
+                    task_id = %det_task_id,
+                    domain = %domain,
+                    dc_ip = %dc_ip,
+                    "Cold-start AS-REP user enum dispatched (direct tool, no LLM)"
+                );
+                let dispatcher_bg = dispatcher.clone();
+                let domain_bg = domain.clone();
+                tokio::spawn(async move {
+                    match dispatcher_bg
+                        .llm_runner
+                        .tool_dispatcher()
+                        .dispatch_tool("credential_access", &det_task_id, &det_call)
+                        .await
+                    {
+                        Ok(result) => {
+                            let hash_count = result
+                                .discoveries
+                                .as_ref()
+                                .and_then(|d| d.get("hashes"))
+                                .and_then(|h| h.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            info!(
+                                task_id = %det_task_id,
+                                domain = %domain_bg,
+                                hash_count,
+                                "Cold-start AS-REP user enum completed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(err = %e, domain = %domain_bg, "Cold-start AS-REP user enum failed");
+                        }
+                    }
+                });
             }
         }
 
