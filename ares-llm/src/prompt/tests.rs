@@ -598,7 +598,7 @@ fn exploit_trust_key_extraction() {
 }
 
 #[test]
-fn exploit_child_to_parent_has_raise_child() {
+fn exploit_child_to_parent_describes_automatic_forge() {
     let payload = serde_json::json!({
         "vuln_type": "child_to_parent",
         "target": "192.168.58.10",
@@ -610,8 +610,9 @@ fn exploit_child_to_parent_has_raise_child() {
     });
     let prompt = generate_task_prompt("exploit", "t-31", &payload, None).unwrap();
     assert!(prompt.contains("TRUST KEY EXTRACTION"));
-    assert!(prompt.contains("raise_child"));
+    assert!(prompt.contains("forge_inter_realm_and_dump"));
     assert!(prompt.contains("Enterprise Admins"));
+    assert!(!prompt.contains("raise_child"));
 }
 
 #[test]

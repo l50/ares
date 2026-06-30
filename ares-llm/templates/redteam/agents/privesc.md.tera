@@ -270,10 +270,10 @@ source/target domain SIDs, and the trusted forest FQDN already populated by
 Trigger the path by ensuring the prerequisite data lands in state:
 
 - **Child-to-Parent escalation** runs when a child-domain krbtgt hash and
-  child-DA credentials are present. The dispatched task either calls
-  `raise_child` (automated path) or, when the manual ExtraSID path is taken,
-  forges a golden ticket whose `extra_sids` is the parent forest's SID with
-  `-519` appended (the Enterprise Admins RID).
+  child-DA credentials are present. The orchestrator dispatches
+  `forge_inter_realm_and_dump` automatically with
+  `extra_sid=<parent_sid>-519` (Enterprise Admins) injected so DCSync on
+  the parent DC succeeds.
 - **Cross-Forest Trust Key Extraction** runs when DA in `{{ target_domain }}`
   exists and `enumerate_domain_trusts` reports a forest trust. The chain is
   `extract_trust_key` → `create_inter_realm_ticket` → `secretsdump_kerberos`.
@@ -380,7 +380,6 @@ For local privilege escalation via RBCD (requires ability to add computer):
 |------|----------|
 | get_sid | Get domain SID for ticket forging |
 | generate_golden_ticket | Forge TGT with krbtgt hash |
-| raise_child | Child-to-parent domain escalation |
 | extract_trust_key | Extract inter-realm trust key |
 | create_inter_realm_ticket | Forge inter-realm TGT |
 

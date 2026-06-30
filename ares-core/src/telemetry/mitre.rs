@@ -130,8 +130,8 @@ pub static TOOL_TO_TECHNIQUE: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
         ("add_computer", "T1136.002"),
         ("addspn", "T1098.001"),
         ("krbrelayup", "T1134.001"),
-        ("raise_child", "T1134.001"),
         ("create_inter_realm_ticket", "T1558.001"),
+        ("forge_inter_realm_and_dump", "T1134.005"),
         ("get_sid", "T1087.002"),
         ("dnstool", "T1484.001"),
         ("nopac", "T1068"),
@@ -243,8 +243,8 @@ pub static TOOL_TO_CATEGORY: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
         ("gmsa_read_password_bloodyad", "GMSATools"),
         // ── TrustAttackTools ────────────────────────────────────────────
         ("extract_trust_key", "TrustAttackTools"),
-        ("raise_child", "TrustAttackTools"),
         ("create_inter_realm_ticket", "TrustAttackTools"),
+        ("forge_inter_realm_and_dump", "TrustAttackTools"),
         // ── CertipyTools ────────────────────────────────────────────────
         ("certipy_auth", "CertipyTools"),
         ("certipy_find", "CertipyTools"),

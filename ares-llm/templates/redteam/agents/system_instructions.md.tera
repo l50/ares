@@ -157,7 +157,8 @@ IF BloodHound or delegation tools find opportunities:
 | RBCD | add_computer → rbcd_write → s4u_attack → secretsdump | Admin on target |
 
 **Trust Escalation:**
-- Child-domain krbtgt hash → raise_child → secretsdump parent DCs
+- Child-domain DA → extract `CHILD$` trust key → orchestrator forges
+  inter-realm TGT with `extra_sid=<parent_sid>-519` → DCSync parent DC
 
 **MSSQL Pivoting:**
 - mssql_enum_linked_servers → find linked servers
@@ -320,7 +321,7 @@ The operator strategy has configured the following technique priority ordering.
 | 10 | MSSQL impersonation | mssql_enable_xp_cmdshell + mssql_command with impersonate='sa' |
 | 11 | MSSQL trustworthy DB | mssql_impersonate (dbo) → mssql_enable_xp_cmdshell → mssql_command |
 | 12 | MSSQL linked servers | mssql_enum_linked_servers → mssql_exec_linked |
-| 13 | Trust escalation | raise_child → secretsdump parent DCs |
+| 13 | Trust escalation | extract `CHILD$` trust key → forge_inter_realm_and_dump (orchestrator-dispatched) |
 | 14 | noPac CVE | nopac → impersonate DC |
 | 15 | Golden ticket | generate_golden_ticket → secretsdump all DCs |
 | 16 | LAPS | laps_dump → local admin access |

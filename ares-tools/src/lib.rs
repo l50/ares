@@ -181,7 +181,6 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "addspn" => privesc::addspn(arguments).await,
         "rbcd_write" => privesc::rbcd_write(arguments).await,
         "krbrelayup" => privesc::krbrelayup(arguments).await,
-        "raise_child" => privesc::raise_child(arguments).await,
         "extract_trust_key" => privesc::extract_trust_key(arguments).await,
         "create_inter_realm_ticket" => privesc::create_inter_realm_ticket(arguments).await,
         "forge_inter_realm_and_dump" => privesc::forge_inter_realm_and_dump(arguments).await,

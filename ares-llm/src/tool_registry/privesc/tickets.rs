@@ -41,35 +41,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "raise_child".into(),
-            description: "Elevate privileges from a child domain to the parent domain using \
-                the ExtraSid or trust key technique. Automatically performs golden ticket \
-                creation with Enterprise Admin SID."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "child_domain": {
-                        "type": "string",
-                        "description": "Child domain FQDN (e.g. child.contoso.local)"
-                    },
-                    "username": {
-                        "type": "string",
-                        "description": "Username with admin rights in the child domain"
-                    },
-                    "password": {
-                        "type": "string",
-                        "description": "Password for authentication (use this OR hash)"
-                    },
-                    "hash": {
-                        "type": "string",
-                        "description": "NTLM hash for pass-the-hash authentication (e.g. aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0). Use this OR password."
-                    }
-                },
-                "required": ["child_domain", "username"]
-            }),
-        },
-        ToolDefinition {
             name: "extract_trust_key".into(),
             description: "Extract the inter-domain trust key from a domain controller using \
                 secretsdump. The trust key is used to forge inter-realm TGTs for cross-forest \

@@ -102,32 +102,6 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 discoveries["credentials"] = Value::Array(creds);
             }
         }
-        "raise_child" => {
-            // raiseChild.py performs the parent-domain NTDS dump in standard
-            // secretsdump format (lines like "contoso.local/user:RID:LM:NT:::"
-            // or "DOMAIN\\user:RID:..."). Derive parent FQDN from child_domain
-            // and pass as target_domain so bare-username lines and NetBIOS
-            // prefixes get attributed to the parent forest root.
-            let child_domain = params
-                .get("child_domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let parent_domain = child_domain
-                .split_once('.')
-                .map(|(_, rest)| rest)
-                .unwrap_or(child_domain);
-            let mut params_with_target = params.clone();
-            if let Some(obj) = params_with_target.as_object_mut() {
-                obj.insert("target_domain".into(), json!(parent_domain));
-            }
-            let (hashes, creds) = parse_secretsdump(output, &params_with_target);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
-        }
         "kerberoast" => {
             let hashes = parse_kerberoast(output, params);
             if !hashes.is_empty() {
@@ -888,28 +862,6 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
         let params = json!({"domain": "contoso.local"});
         let disc = parse_tool_output("secretsdump", output, &params);
         assert!(!disc["hashes"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn parse_tool_output_raise_child_attributes_to_parent() {
-        // raise_child dumps the parent NTDS in slash-separated FQDN format.
-        // Parser must derive parent_domain from child_domain and attribute hashes there.
-        let output = "\
-[*] Forest is contoso.local
-contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::
-contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:22222222222222222222222222222222:::";
-        let params = json!({
-            "child_domain": "child.contoso.local",
-            "username": "testuser",
-            "password": "REDACTED",
-        });
-        let disc = parse_tool_output("raise_child", output, &params);
-        let hashes = disc["hashes"].as_array().expect("hashes array");
-        assert_eq!(hashes.len(), 2);
-        assert_eq!(hashes[0]["username"], "krbtgt");
-        assert_eq!(hashes[0]["domain"], "contoso.local");
-        assert_eq!(hashes[1]["username"], "Administrator");
-        assert_eq!(hashes[1]["domain"], "contoso.local");
     }
 
     #[test]

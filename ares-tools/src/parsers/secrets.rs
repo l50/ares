@@ -124,8 +124,9 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                     let prefix = &raw_user[..idx];
                     let user = &raw_user[idx + 1..];
                     // Resolve NetBIOS prefix to FQDN using target_domain.
-                    // raiseChild emits FQDN/user (slash separator),
-                    // standard secretsdump emits DOMAIN\user (backslash + NetBIOS).
+                    // Impacket emits FQDN/user (slash) when invoked with a
+                    // domain target; standard secretsdump on Windows output
+                    // is DOMAIN\user (backslash + NetBIOS).
                     let resolved = resolve_netbios_to_fqdn(prefix, domain);
                     (resolved, user.to_string())
                 } else if is_local_sam_account(raw_user, rid, section) {
@@ -728,7 +729,8 @@ CONTOSO\\FABRIKAM$_history0:1107:aad3b435b51404eeaad3b435b51404ee:44444444444444
 
     #[test]
     fn parse_secretsdump_slash_separator() {
-        // raiseChild.py emits FQDN/user with a slash; parser must accept both.
+        // Impacket emits FQDN/user (slash) for domain-scoped dumps; parser
+        // must accept both slash and backslash NetBIOS forms.
         let output = "\
 contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::
 contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:22222222222222222222222222222222:::";
