@@ -2,7 +2,6 @@
 target/
 **/*.rs.bk
 *.pdb
-.cargo/config.toml
 
 # Ansible
 .ansible/
