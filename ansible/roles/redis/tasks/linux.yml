@@ -64,6 +64,16 @@
   when: redis_install_ares_worker_unit
   notify: Reload systemd
 
+- name: Enable and start Ares worker instances
+  ansible.builtin.systemd:
+    name: "ares@{{ item }}.service"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ redis_ares_worker_roles }}"
+  when: redis_install_ares_worker_unit
+  become: true
+
 - name: Verify Redis is responding
   ansible.builtin.command:
     cmd: redis-cli ping

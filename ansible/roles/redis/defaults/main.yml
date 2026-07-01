@@ -19,5 +19,17 @@ redis_ares_worker_memory_high: "2G"
 redis_ares_worker_memory_max: "3G"
 redis_ares_worker_tasks_max: 256
 
+# ares@<role>.service instances to enable. Each subscribes to ares.tools.exec.<role>;
+# a missing role means the orchestrator's tool calls for that role hang.
+# Must match the role keys in ares-cli/tools.yaml.
+redis_ares_worker_roles:
+  - recon
+  - credential_access
+  - cracker
+  - acl
+  - privesc
+  - lateral
+  - coercion
+
 # Verification
 redis_verify_install: false

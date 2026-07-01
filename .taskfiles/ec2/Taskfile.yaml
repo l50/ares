@@ -929,7 +929,6 @@ tasks:
         {{- end}}
         export RUST_LOG=info
         export ARES_CONFIG={{.ARES_REMOTE_CONFIG}}
-        export ARES_TOOL_DISPATCH=local
         export ARES_BLUE_ENABLED=1
         export ARES_DEPLOYMENT='{{.EC2_DEPLOYMENT}}'
         export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT='${OTEL_TRACES_ENDPOINT}'

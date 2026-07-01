@@ -27,6 +27,14 @@ Redis server for Ares worker message broker
 | `redis_ares_worker_memory_high` | str | <code>2G</code> | No description |
 | `redis_ares_worker_memory_max` | str | <code>3G</code> | No description |
 | `redis_ares_worker_tasks_max` | int | <code>256</code> | No description |
+| `redis_ares_worker_roles` | list | <code>&#91;&#93;</code> | No description |
+| `redis_ares_worker_roles.0` | str | <code>recon</code> | No description |
+| `redis_ares_worker_roles.1` | str | <code>credential_access</code> | No description |
+| `redis_ares_worker_roles.2` | str | <code>cracker</code> | No description |
+| `redis_ares_worker_roles.3` | str | <code>acl</code> | No description |
+| `redis_ares_worker_roles.4` | str | <code>privesc</code> | No description |
+| `redis_ares_worker_roles.5` | str | <code>lateral</code> | No description |
+| `redis_ares_worker_roles.6` | str | <code>coercion</code> | No description |
 | `redis_verify_install` | bool | <code>False</code> | No description |
 
 ## Tasks
@@ -42,6 +50,7 @@ Redis server for Ares worker message broker
 - **Enable and start Redis** (ansible.builtin.systemd)
 - **Create Ares directories** (ansible.builtin.file)
 - **Install Ares worker systemd template unit** (ansible.builtin.template) - Conditional
+- **Enable and start Ares worker instances** (ansible.builtin.systemd) - Conditional
 - **Verify Redis is responding** (ansible.builtin.command) - Conditional
 - **Display Redis verification** (ansible.builtin.debug) - Conditional
 
