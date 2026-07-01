@@ -1,15 +1,24 @@
 //! Global concurrency caps for memory-heavy tools.
 //!
-//! `netexec spider_plus` (used by `smbclient_spider` and `sysvol_script_search`)
-//! enumerates SMB share trees recursively and holds the file metadata in RAM
-//! across the walk. Each invocation costs ~100–150 MB resident; without a cap,
-//! 60+ concurrent dispatches blow the EC2 cgroup to 6–9 GB and OOM-kill the
-//! orchestrator.
+//! Two layered caps live here:
 //!
-//! This module provides a process-wide async semaphore for those tools.
-//! Both the worker `tool_executor` path and the orchestrator's
-//! `LocalToolDispatcher` route through `ares_tools::dispatch`, so a single
-//! cap here covers both.
+//! 1. `TOOL_PERMITS` — global ceiling on total concurrent subprocess spawns
+//!    from `CommandBuilder::execute`. Backstop against pentest-tool fork-storms
+//!    that OOM-killed the orchestrator when ~110 concurrent netexec/nxc/hashcat
+//!    processes accumulated in a 10 GiB cgroup. Applied to every tool.
+//!
+//! 2. `SPIDER_PLUS_PERMITS` — tighter cap on `netexec spider_plus` specifically
+//!    (`smbclient_spider`, `sysvol_script_search`). Each spider_plus invocation
+//!    holds ~100–150 MB across a recursive share walk; without a specific cap,
+//!    60+ concurrent dispatches blow the cgroup to 6–9 GB on their own even
+//!    when the global cap is generous.
+//!
+//! Both caps are process-wide. Both the worker `tool_executor` path and the
+//! orchestrator's `LocalToolDispatcher` route through `ares_tools::dispatch`,
+//! so a single cap here covers both. Acquisition order is outer-to-inner:
+//! `dispatch()` acquires the spider_plus permit (if applicable), then calls
+//! the tool wrapper, which calls `CommandBuilder::execute()`, which acquires
+//! the global tool permit — consistent order avoids deadlock.
 
 use std::sync::LazyLock;
 
@@ -55,6 +64,45 @@ pub async fn acquire_spider_plus_permit() -> SemaphorePermit<'static> {
         .expect("spider_plus semaphore unexpectedly closed")
 }
 
+/// Default global cap on concurrent subprocess spawns from
+/// `CommandBuilder::execute`. Backstop against the pentest-tool fork-storm
+/// that OOM-killed the orchestrator when ~110 concurrent
+/// netexec/nxc/hashcat processes accumulated in a 10 GiB cgroup (each
+/// netexec 90–345 MB, hashcat 500+ MB). At ~250 MB average, 20 concurrent
+/// tools peak around 5 GB — well below the observed 10 GiB ceiling.
+pub const DEFAULT_TOOL_CONCURRENCY: usize = 20;
+
+/// Override via `ARES_MAX_CONCURRENT_TOOLS=<n>`. Values <1 are ignored.
+const TOOL_CONCURRENCY_ENV: &str = "ARES_MAX_CONCURRENT_TOOLS";
+
+static TOOL_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
+    let cap = std::env::var(TOOL_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TOOL_CONCURRENCY);
+    Semaphore::new(cap)
+});
+
+/// Acquire a permit for a subprocess spawn. Held for the lifetime of the
+/// executing tool; drop releases it for the next queued call. Called from
+/// `CommandBuilder::execute` on the hot spawn path — every subprocess is
+/// gated by this cap.
+///
+/// Composes with the spider_plus cap: `dispatch()` acquires the spider_plus
+/// permit first (outer), then the tool wrapper calls `execute()` which
+/// acquires this permit (inner). Consistent acquisition order avoids
+/// deadlock even when both caps are contended.
+pub async fn acquire_tool_permit() -> SemaphorePermit<'static> {
+    if TOOL_PERMITS.available_permits() == 0 {
+        debug!("global tool concurrency cap reached, queueing spawn");
+    }
+    TOOL_PERMITS
+        .acquire()
+        .await
+        .expect("tool semaphore unexpectedly closed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +132,16 @@ mod tests {
         drop(permit);
         let after_drop = SPIDER_PLUS_PERMITS.available_permits();
         assert_eq!(after_drop, initial);
+    }
+
+    #[tokio::test]
+    async fn tool_permit_reduces_available_count() {
+        // Mirrors the spider_plus sanity check: holding a permit reduces
+        // available_permits by one, dropping restores it.
+        let initial = TOOL_PERMITS.available_permits();
+        let permit = acquire_tool_permit().await;
+        assert_eq!(TOOL_PERMITS.available_permits(), initial.saturating_sub(1));
+        drop(permit);
+        assert_eq!(TOOL_PERMITS.available_permits(), initial);
     }
 }

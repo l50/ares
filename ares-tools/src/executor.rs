@@ -118,6 +118,10 @@ impl CommandBuilder {
         let display_cmd = format!("{} {}", self.program, self.args.join(" "));
         tracing::debug!(cmd = %display_cmd, timeout = ?self.timeout, "executing tool command");
 
+        // Global cap on concurrent subprocess spawns. Held for the full
+        // spawn+wait lifetime; released when this function returns.
+        let _tool_permit = crate::concurrency::acquire_tool_permit().await;
+
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
 
@@ -134,6 +138,10 @@ impl CommandBuilder {
         }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // Send SIGKILL when the `Child` is dropped. Required for the
+        // timeout-abort path below to actually terminate the OS process
+        // (tokio's default is to leave the child running on drop).
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
@@ -147,10 +155,14 @@ impl CommandBuilder {
             }
         }
 
-        // Spawn the wait on a task so we can abort on timeout. Aborting the
-        // task drops the `Child`, which sends SIGKILL on Unix.
+        // Move the child into a task so we can cancel the wait on timeout.
+        // On timeout we must `handle.abort()` — merely dropping a `JoinHandle`
+        // detaches the task and the child continues to run. Aborting drops
+        // the task's owned `Child`, and the `kill_on_drop(true)` above then
+        // sends SIGKILL to the OS process.
         let timeout = self.timeout;
         let handle = tokio::spawn(async move { child.wait_with_output().await });
+        let abort = handle.abort_handle();
 
         let join_result = tokio::time::timeout(timeout, handle).await;
 
@@ -177,11 +189,14 @@ impl CommandBuilder {
             }
             Ok(Ok(Err(e))) => Err(anyhow::anyhow!("command execution failed: {e}")),
             Ok(Err(e)) => Err(anyhow::anyhow!("task join error: {e}")),
-            Err(_) => Err(anyhow::anyhow!(
-                "command timed out after {:?}: {}",
-                timeout,
-                display_cmd
-            )),
+            Err(_) => {
+                abort.abort();
+                Err(anyhow::anyhow!(
+                    "command timed out after {:?}: {}",
+                    timeout,
+                    display_cmd
+                ))
+            }
         }
     }
 }
@@ -383,5 +398,67 @@ mod tests {
             .env("KRB5CCNAME", "/tmp/ticket.ccache")
             .timeout_secs(60)
             .stdin("y\n");
+    }
+
+    // ── timeout kills the child process ─────────────────────────────────────
+    //
+    // Regression guard for the OOM cause where a hung tool's `Child` was
+    // detached (via dropping the `JoinHandle`) instead of aborted, leaking
+    // the OS process. Verifies end-to-end that timeout → abort → SIGKILL.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_child_process() {
+        use std::time::{Duration, Instant};
+
+        // sh writes its PID to a temp file, then `exec sleep 30` replaces
+        // the shell process with sleep — same PID, so the file tells us
+        // exactly which OS process to check for aliveness after timeout.
+        let pid_file = tempfile::NamedTempFile::new().unwrap();
+        let script = format!("echo $$ > {} && exec sleep 30", pid_file.path().display());
+
+        let start = Instant::now();
+        let result = CommandBuilder::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .timeout(Duration::from_millis(500))
+            .execute()
+            .await;
+        let elapsed = start.elapsed();
+
+        // Must time out, not wait 30s.
+        assert!(result.is_err(), "expected timeout error, got {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "execute() didn't return promptly on timeout: {elapsed:?}"
+        );
+
+        // Give the runtime a moment to drop the aborted task and let the
+        // OS deliver SIGKILL + reap. 200ms is generous; the abort chain is
+        // synchronous up to the kernel signal.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Read the PID sh wrote before exec'ing sleep.
+        let pid_str = std::fs::read_to_string(pid_file.path())
+            .expect("child never wrote its PID — script didn't run at all");
+        let pid: i32 = pid_str
+            .trim()
+            .parse()
+            .expect("PID file contained non-integer");
+
+        // `kill -0 <pid>` returns 0 if the process exists and we can signal
+        // it, non-zero (ESRCH) if it's gone. This is the actual assertion
+        // the whole fix hinges on.
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("failed to invoke `kill -0`")
+            .success();
+
+        assert!(
+            !alive,
+            "child pid {pid} is still alive after timeout — abort/kill path is broken"
+        );
     }
 }
