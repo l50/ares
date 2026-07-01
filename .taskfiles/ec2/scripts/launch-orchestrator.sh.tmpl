@@ -85,8 +85,6 @@ exec systemd-run \
   --setenv=OTEL_EXPORTER_OTLP_TRACES_ENDPOINT \
   --setenv=OTEL_EXPORTER_OTLP_PROTOCOL \
   --setenv=OTEL_RESOURCE_ATTRIBUTES \
-  --setenv=ARES_DATABASE_URL \
-  --setenv=ARES_SESSION_LOG_DIR \
   --property=StandardOutput=append:/var/log/ares/orchestrator.log \
   --property=StandardError=append:/var/log/ares/orchestrator.log \
   --property=OOMScoreAdjust=-500 \

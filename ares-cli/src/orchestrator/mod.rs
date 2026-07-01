@@ -151,9 +151,15 @@ async fn run_inner() -> Result<()> {
     // database URL are available. The projector tails ARES_OPSTATE and
     // upserts each event into PG, replacing the manual `ares ops offload`
     // path with an always-current archive.
+    // Filter empty string: systemd-run --setenv=NAME (no value) always sets
+    // NAME in the child env even when the parent has it unset, arriving as
+    // literal "". Treating "" as Some(url) would drive PersistentStore::connect
+    // into a doomed call every startup and log a misleading "PG connect failed".
     let _projector_handle: Option<tokio::task::JoinHandle<()>> = match (
         nats_broker.clone(),
-        std::env::var("ARES_DATABASE_URL").ok(),
+        std::env::var("ARES_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
     ) {
         (Some(broker), Some(database_url)) => {
             match ares_core::persistent_store::PersistentStore::connect(&database_url).await {
