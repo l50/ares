@@ -125,18 +125,11 @@ tasks:
         if [ "$BUILD_TOOL" = "remote" ]; then
           echo -e "{{.INFO}} Building natively on EC2..."
 
-          # Resolve instance
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --filters "Name=instance-state-name,Values=running" \
-                      "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-            --query "Reservations[*].Instances[*].InstanceId" \
-            --output text | head -1)
-          if [ -z "$INSTANCE_ID" ]; then
-            echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-            exit 1
-          fi
+          export AWS_PROFILE="{{.AWS_PROFILE}}"
+          export AWS_REGION="{{.AWS_REGION}}"
+          . .taskfiles/ec2/scripts/run-ssm.sh
+
+          INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
           # Create source tarball (exclude build artifacts and git metadata).
           # .cargo/ holds an OPTIONAL gitignored per-dev config.toml; include
@@ -161,13 +154,12 @@ tasks:
 
           # Build on EC2 via SSM
           echo -e "{{.INFO}} Building on $INSTANCE_ID (this may take a few minutes on first run)..."
-          PARAMS_FILE=$(mktemp)
-          trap "rm -f $SRC_TAR $PARAMS_FILE" EXIT
-          jq -n \
+
+          PAYLOAD=$(jq -rn \
             --arg bucket "{{.S3_BUCKET}}" \
             --arg prefix "{{.S3_DEPLOY_PREFIX}}" \
             --arg build_dir "{{.REMOTE_BUILD_DIR}}" \
-            '{"commands": [
+            '[
               "set -ex",
               "mkdir -p " + $build_dir,
               "aws s3 cp s3://" + $bucket + "/" + $prefix + "/ares-src.tar.gz /tmp/ares-src.tar.gz",
@@ -183,65 +175,14 @@ tasks:
               "echo Deploy SHA: $DEPLOY_SHA",
               "if [ \"$BUILD_SHA\" != \"$DEPLOY_SHA\" ]; then echo ERROR: deployed sha differs from build artifact build=$BUILD_SHA deploy=$DEPLOY_SHA; exit 1; fi",
               "echo Deployed: && ls -lh /usr/local/bin/ares"
-            ]}' > "$PARAMS_FILE"
+            ] | join("\n")')
 
           # Clean cargo builds on a t3.medium can run 15-25 min — pre-EC2-reboot
           # cache may be wiped, and incremental builds still need to relink.
           # Allow 30 min total for both the SSM command itself and the local
           # polling loop so we don't bail mid-build with a "InProgress" report.
-          CMD_ID=$(aws ssm send-command \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "file://$PARAMS_FILE" \
-            --timeout-seconds 1800 \
-            --query "Command.CommandId" --output text)
-
-          # Poll for completion (up to 30 minutes)
-          for i in $(seq 1 900); do
-            STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null) || true
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 2
-          done
-
-          # Show build output
-          OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text 2>/dev/null)
+          OUTPUT=$(run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 1800) || exit 1
           echo "$OUTPUT" | tail -20
-
-          if [ "$STATUS" != "Success" ]; then
-            DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StatusDetails" --output text 2>/dev/null)
-            echo -e "{{.ERROR}} Remote build failed (status: $STATUS, details: $DETAILS)"
-            if [ "$DETAILS" = "Undeliverable" ]; then
-              echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-              echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-            fi
-            aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardErrorContent" --output text
-            exit 1
-          fi
-
           echo -e "{{.SUCCESS}} Remote build + deploy complete"
           exit 0
         fi
@@ -353,18 +294,11 @@ tasks:
       - |
         if [ "{{.BUILD_TOOL}}" = "remote" ]; then exit 0; fi
 
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         echo -e "{{.INFO}} Pulling binaries from S3 to $INSTANCE_ID..."
 
@@ -373,13 +307,11 @@ tasks:
           EXPECTED_SHA=$(cat target/.deploy/ares.sha256)
         fi
 
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n \
+        PAYLOAD=$(jq -rn \
           --arg bucket "{{.S3_BUCKET}}" \
           --arg prefix "{{.S3_DEPLOY_PREFIX}}" \
           --arg expected_sha "$EXPECTED_SHA" \
-          '{"commands": [
+          '[
             "set -ex",
             "aws s3 cp s3://" + $bucket + "/" + $prefix + "/ares /tmp/ares.staged",
             "STAGED_RAW=$(sha256sum /tmp/ares.staged); STAGED_SHA=${STAGED_RAW%% *}",
@@ -391,62 +323,9 @@ tasks:
             "if [ \"$STAGED_SHA\" != \"$DEPLOY_SHA\" ]; then echo ERROR: deployed sha differs from staged staged=$STAGED_SHA deploy=$DEPLOY_SHA; exit 1; fi",
             "rm -f /tmp/ares.staged",
             "echo Deployed: && ls -lh /usr/local/bin/ares"
-          ]}' > "$PARAMS_FILE"
+          ] | join("\n")')
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        # Poll for completion
-        for i in $(seq 1 120); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 2
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          # StatusDetails distinguishes script failure (script returned non-zero) from
-          # delivery failure (Undeliverable = SSM agent on instance is offline / instance
-          # in ConnectionLost). For Undeliverable, stdout/stderr are both empty, so
-          # without this the operator sees only "status: Failed" and two blank lines.
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Deploy failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID."
-            echo -e "{{.ERROR}} Check 'aws ssm describe-instance-information' — PingStatus is likely ConnectionLost."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 240 || exit 1
 
         echo -e "{{.SUCCESS}} Deploy complete"
 
@@ -468,78 +347,20 @@ tasks:
         msg: "S3_BUCKET not set. Pass S3_BUCKET=your-bucket or export it as an env var."
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         echo -e "{{.INFO}} Uploading config to S3..."
         aws s3 cp "{{.ARES_CONFIG}}" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml" \
           --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
         echo -e "{{.INFO}} Pulling config to $INSTANCE_ID..."
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg bucket "{{.S3_BUCKET}}" --arg prefix "{{.S3_DEPLOY_PREFIX}}" \
-          '{"commands": ["mkdir -p /etc/ares && aws s3 cp s3://" + $bucket + "/" + $prefix + "/config.yaml /etc/ares/config.yaml && echo Config deployed: && cat /etc/ares/config.yaml | head -5"]}' \
-          > "$PARAMS_FILE"
+        PAYLOAD="mkdir -p /etc/ares && aws s3 cp s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml /etc/ares/config.yaml && echo Config deployed: && cat /etc/ares/config.yaml | head -5"
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Config deploy failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 30 || exit 1
 
         echo -e "{{.SUCCESS}} Config deployed to $INSTANCE_ID:{{.ARES_REMOTE_CONFIG}}"
 
@@ -551,78 +372,18 @@ tasks:
     silent: true
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         echo -e "{{.INFO}} Setting up ares on $INSTANCE_ID..."
+        echo -e "{{.INFO}} Waiting for setup to complete..."
 
-        # JSON-encode the setup script for SSM
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/setup.sh > "$PARAMS_FILE"
-
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --timeout-seconds 120 \
-          --query "Command.CommandId" --output text)
-
-        echo -e "{{.INFO}} Waiting for setup to complete (command: $CMD_ID)..."
-
-        for i in $(seq 1 120); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
+        PAYLOAD=$(cat .taskfiles/ec2/scripts/setup.sh)
         echo ""
-        aws ssm get-command-invocation \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Setup failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 120 || exit 1
 
         echo -e "{{.SUCCESS}} EC2 setup complete"
 
@@ -634,18 +395,11 @@ tasks:
     silent: true
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         # Build systemctl start command for all roles
         WORKER_UNITS=""
@@ -655,66 +409,15 @@ tasks:
 
         echo -e "{{.INFO}} Starting ares services on $INSTANCE_ID..."
 
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
         START_CMD="systemctl start redis-server 2>/dev/null || systemctl start redis; sleep 1; redis-cli ping; "
         START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'; "
         START_CMD+="systemctl start $WORKER_UNITS; sleep 2; echo Worker status:; "
         START_CMD+='for role in recon credential_access cracker acl privesc lateral coercion; do '
         START_CMD+='st=$(systemctl is-active ares@${role} 2>/dev/null || echo dead); '
         START_CMD+='printf "  %-20s %s\n" $role $st; done'
-        jq -n --arg cmd "$START_CMD" '{"commands": [$cmd]}' > "$PARAMS_FILE"
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" = "Success" ]; then
-          echo -e "{{.SUCCESS}} All services started"
-        else
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Start failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$START_CMD" 30 || exit 1
+        echo -e "{{.SUCCESS}} All services started"
 
   stop:
     desc: "Stop all worker roles on EC2 (keeps Redis running) (usage: task ec2:stop [EC2_NAME=ares-tools])"
@@ -960,83 +663,11 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
-
-        run_ssm_cmd() {
-          CMD_PAYLOAD="$1"
-          TIMEOUT="${2:-120}"
-          PARAMS_FILE=$(mktemp)
-          jq -n --arg cmd "$CMD_PAYLOAD" '{"commands": [$cmd]}' > "$PARAMS_FILE"
-
-          CMD_ID=$(aws ssm send-command \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "file://$PARAMS_FILE" \
-            --timeout-seconds "$TIMEOUT" \
-            --query "Command.CommandId" --output text)
-
-          rm -f "$PARAMS_FILE"
-
-          STATUS=""
-          for i in $(seq 1 "$TIMEOUT"); do
-            STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null) || true
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 1
-          done
-
-          OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text)
-
-          if [ "$STATUS" != "Success" ]; then
-            DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StatusDetails" --output text 2>/dev/null)
-            echo -e "{{.ERROR}} SSM command failed (status: $STATUS, details: $DETAILS)" >&2
-            if [ "$DETAILS" = "Undeliverable" ]; then
-              echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)." >&2
-              echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
-            fi
-            if [ -n "$OUTPUT" ]; then
-              echo "$OUTPUT" >&2
-            fi
-            aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardErrorContent" --output text >&2
-            return 1
-          fi
-
-          printf '%s' "$OUTPUT"
-        }
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         REPORT_ARGS=""
         {{if ne .OPERATION_ID ""}}REPORT_ARGS="$REPORT_ARGS {{.OPERATION_ID}}"{{end}}
@@ -1056,7 +687,7 @@ tasks:
 
         echo -e "{{.INFO}} Generating report on EC2..."
 
-        OUTPUT=$(run_ssm_cmd "$REPORT_CMD" 120)
+        OUTPUT=$(run_ssm_cmd "$INSTANCE_ID" "$REPORT_CMD" 120)
         BEFORE_MARKER=$(echo "$OUTPUT" | sed '/===REPORT_META===/,$d')
         META=$(echo "$OUTPUT" | sed -n '/===REPORT_META===/,$p' | tail -n +2)
 
@@ -1085,7 +716,7 @@ tasks:
         CHUNK=0
         while [ $CHUNK -lt $CHUNKS ]; do
           CHUNK_CMD="dd if=\"$REMOTE_PATH\" bs=$CHUNK_SIZE skip=$CHUNK count=1 status=none | base64 | tr -d '\n'"
-          CHUNK_B64=$(run_ssm_cmd "$CHUNK_CMD" 30)
+          CHUNK_B64=$(run_ssm_cmd "$INSTANCE_ID" "$CHUNK_CMD" 30)
           if ! printf '%s' "$CHUNK_B64" | base64 -d >> "$TMP_OUT"; then
             echo -e "{{.ERROR}} Failed to decode report chunk $((CHUNK + 1))/$CHUNKS" >&2
             exit 1
@@ -1215,18 +846,11 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         if [ -n "{{.OPERATION_ID}}" ]; then
           OP_ID="{{.OPERATION_ID}}"
@@ -1343,58 +967,11 @@ tasks:
         fi"
 
         B64=$(echo "$LAUNCH_SCRIPT" | base64)
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg b64 "$B64" '{"commands": ["echo " + $b64 + " | base64 -d | /bin/bash"]}' > "$PARAMS_FILE"
+        LAUNCH_PAYLOAD="echo $B64 | base64 -d | /bin/bash"
 
         echo -e "{{.INFO}} Launching orchestrator on $INSTANCE_ID..."
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Launch failed (status: $STATUS, details: $DETAILS)" >&2
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)." >&2
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text >&2
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$LAUNCH_PAYLOAD" 30 || exit 1
 
         echo -e "{{.SUCCESS}} Operation $OP_ID launched"
         echo -e "{{.INFO}} Monitor: task ec2:runtime EC2_NAME={{.EC2_NAME}}"
@@ -1560,68 +1137,10 @@ tasks:
         msg: "CMD required. Usage: task ec2:exec CMD='redis-cli info keyspace'"
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg cmd "{{.CMD}}" '{"commands": [$cmd]}' > "$PARAMS_FILE"
-
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 60); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.AWS_PROFILE}}" \
-          --region "{{.AWS_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} exec failed (status: $STATUS, details: $DETAILS)" >&2
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)." >&2
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text >&2
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "{{.CMD}}" 60 || exit 1
