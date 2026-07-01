@@ -198,8 +198,14 @@ impl TaskQueue {
     pub async fn connect(redis_url: &str, nats_url: &str) -> Result<Self> {
         let client = redis::Client::open(redis_url)
             .with_context(|| format!("Invalid Redis URL: {redis_url}"))?;
+        // Bounded response_timeout: without this the orchestrator's shared
+        // ConnectionManager blocks forever on a dropped/stalled TCP frame,
+        // wedging every future queued behind it. Local dispatch has no worker
+        // pool to fall back on, so one stalled call kills the whole op.
+        let cm_config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(std::time::Duration::from_secs(30)));
         let conn = client
-            .get_connection_manager()
+            .get_connection_manager_with_config(cm_config)
             .await
             .with_context(|| format!("Failed to connect to Redis at {redis_url}"))?;
         info!(url = %redis_url, "Connected to Redis (state)");

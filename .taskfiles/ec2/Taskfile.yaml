@@ -2,17 +2,19 @@
 # EC2 deployment tasks — run ares directly on EC2 via AWS SSM
 # Alternative to K8s for faster testing iterations.
 #
-# Architecture: single EC2 with Redis + orchestrator + all worker roles.
-# Workers run as systemd template units (ares@{role}).
-# Orchestrator runs per-operation (not a service).
+# Architecture: single EC2 with Redis + NATS + orchestrator.
+# Orchestrator runs per-operation and dispatches tool calls in-process
+# (ARES_TOOL_DISPATCH=local); there is no separate worker fleet on EC2.
+# The ares@{role} systemd template still exists for ad-hoc distributed-mode
+# testing but is not enabled by default.
 #
 # Usage:
 #   task ec2:setup EC2_NAME=ares-tools       # One-time: install Redis, create systemd units
 #   task ec2:deploy EC2_NAME=ares-tools      # Build + push Rust binaries via S3 + SSM
-#   task ec2:start EC2_NAME=ares-tools       # Start Redis + workers
+#   task ec2:start EC2_NAME=ares-tools       # Start Redis + NATS (infra only)
 #   task ec2:status EC2_NAME=ares-tools      # Show process status
 #   task ec2:redis:forward EC2_NAME=ares-tools  # Port-forward Redis for local CLI
-#   task ec2:logs EC2_NAME=ares-tools ROLE=lateral  # Tail worker logs
+#   task ec2:logs EC2_NAME=ares-tools ROLE=orchestrator  # Tail orchestrator logs
 version: "3"
 
 set: [errexit, pipefail]
@@ -42,10 +44,6 @@ vars:
   # Build profile: release (optimized) or dev-deploy (fast compile, less optimized)
   BUILD_PROFILE: '{{.BUILD_PROFILE | default "dev-deploy"}}'
   REMOTE_BUILD_DIR: '/tmp/ares-build'
-  # Worker roles
-  WORKER_ROLES: 'recon credential_access cracker acl privesc lateral coercion'
-  # Worker mode: tool_exec (Rust LLM orchestrator) or task (Python-style)
-  WORKER_MODE: '{{.WORKER_MODE | default "tool_exec"}}'
   # Loki deployment label for blue team queries
   EC2_DEPLOYMENT: '{{.EC2_DEPLOYMENT | default "alpha-operator-range"}}'
 
@@ -391,7 +389,7 @@ tasks:
   # Process Management
   # ============================================================================
   start:
-    desc: "Start Redis + all worker roles on EC2 (usage: task ec2:start [EC2_NAME=ares-tools])"
+    desc: "Start Redis + NATS on EC2 (infra only; orchestrator launched per-op via red:ec2:multi)"
     silent: true
     cmds:
       - |
@@ -401,26 +399,16 @@ tasks:
 
         INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
-        # Build systemctl start command for all roles
-        WORKER_UNITS=""
-        for role in {{.WORKER_ROLES}}; do
-          WORKER_UNITS="$WORKER_UNITS ares@${role}.service"
-        done
-
-        echo -e "{{.INFO}} Starting ares services on $INSTANCE_ID..."
+        echo -e "{{.INFO}} Starting infra services on $INSTANCE_ID..."
 
         START_CMD="systemctl start redis-server 2>/dev/null || systemctl start redis; sleep 1; redis-cli ping; "
-        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'; "
-        START_CMD+="systemctl start $WORKER_UNITS; sleep 2; echo Worker status:; "
-        START_CMD+='for role in recon credential_access cracker acl privesc lateral coercion; do '
-        START_CMD+='st=$(systemctl is-active ares@${role} 2>/dev/null || echo dead); '
-        START_CMD+='printf "  %-20s %s\n" $role $st; done'
+        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'"
 
         run_ssm_cmd "$INSTANCE_ID" "$START_CMD" 30 || exit 1
-        echo -e "{{.SUCCESS}} All services started"
+        echo -e "{{.SUCCESS}} Infra services started"
 
   stop:
-    desc: "Stop all worker roles on EC2 (keeps Redis running) (usage: task ec2:stop [EC2_NAME=ares-tools])"
+    desc: "Stop the running ares orchestrator on EC2 (keeps Redis/NATS running)"
     silent: true
     cmds:
       - |
@@ -437,16 +425,11 @@ tasks:
           exit 1
         fi
 
-        WORKER_UNITS=""
-        for role in {{.WORKER_ROLES}}; do
-          WORKER_UNITS="$WORKER_UNITS ares@${role}.service"
-        done
-
-        echo -e "{{.INFO}} Stopping ares services on $INSTANCE_ID..."
+        echo -e "{{.INFO}} Stopping ares orchestrator on $INSTANCE_ID..."
 
         PARAMS_FILE=$(mktemp)
         trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg units "$WORKER_UNITS" '{"commands": ["systemctl stop " + $units + " 2>/dev/null || true; pkill -f \"ares orchestrator\" 2>/dev/null || true; echo Stopped all ares workers and orchestrator"]}' > "$PARAMS_FILE"
+        jq -n '{"commands": ["systemctl stop ares-orchestrator.service 2>/dev/null || true; pkill -f \"ares orchestrator\" 2>/dev/null || true; echo Stopped orchestrator"]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
           --profile "{{.AWS_PROFILE}}" \
@@ -494,7 +477,7 @@ tasks:
       {{if eq .LATEST "true"}}--latest{{end}}
 
   restart:
-    desc: "Restart all worker roles on EC2 (usage: task ec2:restart [EC2_NAME=ares-tools])"
+    desc: "Restart the ares orchestrator + infra services on EC2"
     silent: true
     cmds:
       - task: stop
@@ -928,8 +911,6 @@ tasks:
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_SESSION_LOG_DIR=/var/log/ares/session' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; mkdir -p /var/log/ares/session && chmod 0755 /var/log/ares/session"
         ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 /etc/ares/env; echo Wrote /etc/ares/env"
-        # Restart workers so they pick up the new env file
-        ENV_FILE_CMD="$ENV_FILE_CMD; for role in recon credential_access cracker acl privesc lateral coercion; do systemctl restart ares@\${role} 2>/dev/null || true; done; echo Workers restarted"
 
         LAUNCH_SCRIPT="#!/bin/bash
         set -e
@@ -1049,17 +1030,6 @@ tasks:
         else
           echo "rockyou.txt already present"
         fi
-
-        echo "=== Fixing worker PATH ==="
-        if ! grep -q "^Environment=PATH=" /etc/systemd/system/ares@.service 2>/dev/null; then
-          sed -i '/\[Service\]/a Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin' /etc/systemd/system/ares@.service
-          systemctl daemon-reload
-        fi
-
-        echo "=== Restarting workers ==="
-        for role in recon credential_access cracker acl privesc lateral coercion; do
-          systemctl restart ares@$role 2>/dev/null || true
-        done
 
         echo "=== Verifying ==="
         for cmd in nmap netexec impacket-secretsdump impacket-GetNPUsers smbclient rpcclient ldapsearch lsassy evil-winrm; do
