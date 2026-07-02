@@ -13,6 +13,7 @@ mod credential_access;
 mod lateral;
 mod orchestrator_tools;
 mod privesc;
+pub mod provenance;
 mod recon;
 mod reporting;
 
