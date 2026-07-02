@@ -234,6 +234,7 @@
     src: "{{ coercion_tools_petitpotam_install_dir }}/petitpotam.py"
     dest: "/usr/local/bin/petitpotam"
     state: link
+    force: true
   become: true
   when:
     - ansible_facts['os_family'] == 'Debian'
