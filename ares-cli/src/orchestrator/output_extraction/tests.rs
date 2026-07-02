@@ -639,11 +639,10 @@ fn valid_credential_rejects_hash_body_password() {
 }
 
 // ---------------------------------------------------------------------------
-// Tool-provenance forgery guards (FUCKING-LIES.md §2).
-//
-// The following tests lock down the three injection channels documented in the
-// gap analysis: attacker-controlled AD attributes, attacker-controlled file
-// content, and LLM-directed `xp_cmdshell 'echo ...'` output.
+// Tool-provenance forgery guards. The following tests lock down the three
+// injection channels the trust-boundary analysis surfaced: attacker-controlled
+// AD attributes, attacker-controlled file content, and LLM-directed
+// `xp_cmdshell 'echo ...'` output.
 // ---------------------------------------------------------------------------
 
 #[test]

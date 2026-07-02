@@ -48,8 +48,7 @@ static RE_NETEXEC_SUCCESS: LazyLock<Regex> = LazyLock::new(|| {
 /// `[+] u:p` sitting inside an AD `description`, a `type C:\...` dump,
 /// or an `xp_cmdshell 'echo ...'` result. The former only ever comes out
 /// of a tool that actually authenticated; the latter can be forged by
-/// anyone who controls an AD field or a readable file (see FUCKING-LIES.md
-/// §2).
+/// anyone who controls an AD field or a readable file.
 static RE_NETEXEC_AUTH_ANCHORED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?m)^\s*(?:SMB|LDAP|LDAPS|WINRM|MSSQL|RDP|WMI|SSH|FTP|NFS|VNC)\s+\S+\s+\d+\s+\S+\s+\[\+\]\s+([A-Za-z0-9_.\-]+)\\([A-Za-z0-9_.\-$]+):([^\s(]+)",
@@ -162,7 +161,6 @@ pub fn extract_plaintext_passwords(
     // reflects attacker-controllable data (AD `description`/`info`, file cats,
     // xp_cmdshell echoes). A `[+] DOMAIN\user:Pass (Pwn3d!)` sitting inside
     // an AD description would otherwise be ingested as a Domain Admin cred.
-    // See FUCKING-LIES.md §2 for the injection surfaces.
     let skip_netexec_auth = ctx.is_hash_auth() || !ctx.is_authenticating_tool();
 
     if !skip_netexec_auth {
