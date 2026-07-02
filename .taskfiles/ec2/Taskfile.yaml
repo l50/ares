@@ -330,6 +330,19 @@ tasks:
 
         run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 240 || exit 1
 
+        # Restart every ares@<role> worker unit so the freshly-installed
+        # binary is actually the code servicing NATS. Without this the
+        # deploy silently ships a new /usr/local/bin/ares while systemd
+        # keeps the pre-deploy process alive and executing the old binary
+        # against the same NATS subscription — the classic 14h-stale-worker
+        # wedge (see PR discussion). Uses a glob so newly-added roles come
+        # along for free; each unit's Restart=on-failure handles the
+        # transient window.
+        RESTART_CMD='set -e; UNITS=$(systemctl list-units --type=service --state=active --no-legend "ares@*.service" 2>/dev/null | awk "{print \$1}" | sort -u); '
+        RESTART_CMD+='if [ -z "$UNITS" ]; then echo "no ares@ worker units active — skipping restart"; else echo "restarting: $UNITS"; systemctl restart $UNITS; sleep 2; systemctl is-active $UNITS | sort -u; fi'
+        echo -e "{{.INFO}} Restarting ares@ worker units so they load the new binary..."
+        run_ssm_cmd "$INSTANCE_ID" "$RESTART_CMD" 60 || exit 1
+
         echo -e "{{.SUCCESS}} Deploy complete"
 
       # Also deploy config
