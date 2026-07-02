@@ -1420,6 +1420,7 @@ async fn extract_from_raw_text(
         for item in arr {
             if let Some(s) = item.as_str() {
                 tool_outputs.push(output_extraction::ToolOutputCtx {
+                    name: None,
                     arguments: None,
                     output: s,
                 });
@@ -1428,6 +1429,7 @@ async fn extract_from_raw_text(
                     continue;
                 };
                 tool_outputs.push(output_extraction::ToolOutputCtx {
+                    name: obj.get("name").and_then(|v| v.as_str()),
                     arguments: obj.get("arguments"),
                     output: s,
                 });

@@ -74,10 +74,8 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
 fn run_list() -> Result<()> {
     let bucket = std::env::var("BENCHMARK_S3_BUCKET")
         .unwrap_or_else(|_| "ares-benchmark-us-west-1".to_string());
-    let profile = std::env::var("BENCHMARK_AWS_PROFILE")
-        .unwrap_or_else(|_| "lab".to_string());
-    let region = std::env::var("BENCHMARK_AWS_REGION")
-        .unwrap_or_else(|_| "us-west-1".to_string());
+    let profile = std::env::var("BENCHMARK_AWS_PROFILE").unwrap_or_else(|_| "lab".to_string());
+    let region = std::env::var("BENCHMARK_AWS_REGION").unwrap_or_else(|_| "us-west-1".to_string());
 
     let snapshots = replay_infra::list_snapshots(&profile, &region, &bucket)?;
 
@@ -86,8 +84,10 @@ fn run_list() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<25} {:<20} {:<12} {:<6} {:<5} {:<6}",
-        "SNAPSHOT", "TARGET", "DATE", "TECHS", "DA", "CREDS");
+    println!(
+        "{:<25} {:<20} {:<12} {:<6} {:<5} {:<6}",
+        "SNAPSHOT", "TARGET", "DATE", "TECHS", "DA", "CREDS"
+    );
     println!("{}", "-".repeat(78));
 
     for (op_id, m) in &snapshots {

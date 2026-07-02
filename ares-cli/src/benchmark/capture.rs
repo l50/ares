@@ -103,13 +103,10 @@ pub(crate) async fn run_capture(
     // ── Sync Loki chunks from S3 ─────────────────────────────────────────
     eprint!("[2/5] Syncing Loki chunks from S3...");
     let _ = std::io::stderr().flush();
-    let (chunk_count, index_count) =
-        sync_loki_s3(&loki_dir, export_start, export_end).await?;
+    let (chunk_count, index_count) = sync_loki_s3(&loki_dir, export_start, export_end).await?;
     eprintln!(" done ({chunk_count} chunks, {index_count} index files)");
 
-    info!(
-        "synced {chunk_count} chunks + {index_count} index files from S3"
-    );
+    info!("synced {chunk_count} chunks + {index_count} index files from S3");
 
     // ── Export fired Grafana alerts ──────────────────────────────────────
     eprint!("[3/5] Exporting Grafana alerts...");
@@ -177,11 +174,14 @@ pub(crate) async fn run_capture(
 
         let status = std::process::Command::new("aws")
             .args([
-                "s3", "sync",
+                "s3",
+                "sync",
                 snapshot_dir.to_str().unwrap_or("."),
                 &s3_dest,
-                "--profile", &profile,
-                "--region", &region,
+                "--profile",
+                &profile,
+                "--region",
+                &region,
                 "--quiet",
             ])
             .status()
@@ -236,8 +236,14 @@ async fn sync_loki_s3(
     let end_ms = end.timestamp_millis();
 
     // ── Identify relevant index tables (24h periods, days since epoch) ──
-    let start_table = start.date_naive().signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
-    let end_table = end.date_naive().signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+    let start_table = start
+        .date_naive()
+        .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+        .num_days();
+    let end_table = end
+        .date_naive()
+        .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+        .num_days();
 
     // ── Sync index files for relevant days ──────────────────────────────
     let mut index_count: u64 = 0;
@@ -249,11 +255,14 @@ async fn sync_loki_s3(
         info!("syncing index table {table} from s3://{LOKI_S3_BUCKET}/{prefix}");
         let status = std::process::Command::new("aws")
             .args([
-                "s3", "sync",
+                "s3",
+                "sync",
                 &format!("s3://{LOKI_S3_BUCKET}/{prefix}"),
                 local_index.to_str().unwrap(),
-                "--profile", LOKI_S3_PROFILE,
-                "--region", LOKI_S3_REGION,
+                "--profile",
+                LOKI_S3_PROFILE,
+                "--region",
+                LOKI_S3_REGION,
                 "--quiet",
             ])
             .status()
@@ -281,16 +290,20 @@ async fn sync_loki_s3(
 
     let output = std::process::Command::new("aws")
         .args([
-            "s3api", "list-objects-v2",
-            "--bucket", LOKI_S3_BUCKET,
-            "--prefix", "fake/",
-            "--profile", LOKI_S3_PROFILE,
-            "--region", LOKI_S3_REGION,
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            LOKI_S3_BUCKET,
+            "--prefix",
+            "fake/",
+            "--profile",
+            LOKI_S3_PROFILE,
+            "--region",
+            LOKI_S3_REGION,
             "--query",
-            &format!(
-                "Contents[?LastModified>='{list_start}' && LastModified<'{list_end}'].Key"
-            ),
-            "--output", "json",
+            &format!("Contents[?LastModified>='{list_start}' && LastModified<'{list_end}'].Key"),
+            "--output",
+            "json",
         ])
         .output()
         .context("aws s3api list-objects-v2")?;
@@ -300,8 +313,7 @@ async fn sync_loki_s3(
         bail!("s3api list-objects-v2 failed: {stderr}");
     }
 
-    let keys: Vec<String> =
-        serde_json::from_slice(&output.stdout).context("parse s3api output")?;
+    let keys: Vec<String> = serde_json::from_slice(&output.stdout).context("parse s3api output")?;
 
     info!("found {} chunk objects in date range", keys.len());
 
@@ -317,13 +329,11 @@ async fn sync_loki_s3(
         if ts_parts.len() < 2 {
             continue;
         }
-        let chunk_start = match i64::from_str_radix(ts_parts[0], 16) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(chunk_start) = i64::from_str_radix(ts_parts[0], 16) else {
+            continue;
         };
-        let chunk_end = match i64::from_str_radix(ts_parts[1], 16) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(chunk_end) = i64::from_str_radix(ts_parts[1], 16) else {
+            continue;
         };
         // Overlap: chunk_end >= window_start AND chunk_start <= window_end
         if chunk_end >= start_ms && chunk_start <= end_ms {
@@ -369,7 +379,10 @@ echo "$COUNT"
         keys_file = keys_file.display(),
     );
 
-    info!("downloading {} chunks (20 parallel)...", matching_keys.len());
+    info!(
+        "downloading {} chunks (20 parallel)...",
+        matching_keys.len()
+    );
     let dl_output = std::process::Command::new("bash")
         .arg("-c")
         .arg(&script)
@@ -477,9 +490,8 @@ async fn export_grafana_alerts(
     let from_ms = start.timestamp_millis();
     let to_ms = end.timestamp_millis();
 
-    let url = format!(
-        "{grafana_url}/api/annotations?from={from_ms}&to={to_ms}&type=alert&limit=5000"
-    );
+    let url =
+        format!("{grafana_url}/api/annotations?from={from_ms}&to={to_ms}&type=alert&limit=5000");
 
     let client = reqwest::Client::new();
     let mut req = client.get(&url);

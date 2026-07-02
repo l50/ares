@@ -103,22 +103,34 @@ impl ReplayInfra {
              ]"
         );
 
-        info!("launching EC2 instance: {instance_name} ({}, {})",
-            config.instance_type, config.aws_region);
+        info!(
+            "launching EC2 instance: {instance_name} ({}, {})",
+            config.instance_type, config.aws_region
+        );
 
         let iam_profile_arg = format!("Name={}", config.instance_profile);
         let mut cmd = Command::new("aws");
         cmd.args([
-            "ec2", "run-instances",
-            "--image-id", &ami_id,
-            "--instance-type", &config.instance_type,
-            "--subnet-id", &config.subnet_id,
-            "--security-group-ids", &config.security_group_id,
-            "--iam-instance-profile", &iam_profile_arg,
-            "--tag-specifications", &tag_spec,
-            "--count", "1",
-            "--query", "Instances[0].InstanceId",
-            "--output", "text",
+            "ec2",
+            "run-instances",
+            "--image-id",
+            &ami_id,
+            "--instance-type",
+            &config.instance_type,
+            "--subnet-id",
+            &config.subnet_id,
+            "--security-group-ids",
+            &config.security_group_id,
+            "--iam-instance-profile",
+            &iam_profile_arg,
+            "--tag-specifications",
+            &tag_spec,
+            "--count",
+            "1",
+            "--query",
+            "Instances[0].InstanceId",
+            "--output",
+            "text",
         ]);
         append_aws_opts(&mut cmd, &config.aws_profile, &config.aws_region);
         let output = cmd.output().context("aws ec2 run-instances")?;
@@ -145,11 +157,16 @@ impl ReplayInfra {
         info!("waiting for instance to pass status checks...");
         let mut wait_cmd = Command::new("aws");
         wait_cmd.args([
-            "ec2", "wait", "instance-status-ok",
-            "--instance-ids", &instance_id,
+            "ec2",
+            "wait",
+            "instance-status-ok",
+            "--instance-ids",
+            &instance_id,
         ]);
         append_aws_opts(&mut wait_cmd, &config.aws_profile, &config.aws_region);
-        let wait_result = wait_cmd.status().context("aws ec2 wait instance-status-ok")?;
+        let wait_result = wait_cmd
+            .status()
+            .context("aws ec2 wait instance-status-ok")?;
 
         if !wait_result.success() {
             let _ = infra.teardown();
@@ -159,13 +176,19 @@ impl ReplayInfra {
         // ── Get private IP ──────────────────────────────────────────────
         let mut ip_cmd = Command::new("aws");
         ip_cmd.args([
-            "ec2", "describe-instances",
-            "--instance-ids", &instance_id,
-            "--query", "Reservations[0].Instances[0].PrivateIpAddress",
-            "--output", "text",
+            "ec2",
+            "describe-instances",
+            "--instance-ids",
+            &instance_id,
+            "--query",
+            "Reservations[0].Instances[0].PrivateIpAddress",
+            "--output",
+            "text",
         ]);
         append_aws_opts(&mut ip_cmd, &config.aws_profile, &config.aws_region);
-        let ip_output = ip_cmd.output().context("describe-instances for private IP")?;
+        let ip_output = ip_cmd
+            .output()
+            .context("describe-instances for private IP")?;
 
         if !ip_output.status.success() {
             let _ = infra.teardown();
@@ -173,7 +196,9 @@ impl ReplayInfra {
             bail!("describe-instances failed: {stderr}");
         }
 
-        infra.private_ip = String::from_utf8_lossy(&ip_output.stdout).trim().to_string();
+        infra.private_ip = String::from_utf8_lossy(&ip_output.stdout)
+            .trim()
+            .to_string();
         if infra.private_ip.is_empty() || infra.private_ip == "None" {
             let _ = infra.teardown();
             bail!("instance {instance_id} has no private IP");
@@ -192,13 +217,20 @@ impl ReplayInfra {
         let params_arg = format!("commands=[\"{decode_cmd}\"]");
         let mut ssm_cmd = Command::new("aws");
         ssm_cmd.args([
-            "ssm", "send-command",
-            "--instance-ids", &instance_id,
-            "--document-name", "AWS-RunShellScript",
-            "--parameters", &params_arg,
-            "--timeout-seconds", "900",
-            "--query", "Command.CommandId",
-            "--output", "text",
+            "ssm",
+            "send-command",
+            "--instance-ids",
+            &instance_id,
+            "--document-name",
+            "AWS-RunShellScript",
+            "--parameters",
+            &params_arg,
+            "--timeout-seconds",
+            "900",
+            "--query",
+            "Command.CommandId",
+            "--output",
+            "text",
         ]);
         append_aws_opts(&mut ssm_cmd, &config.aws_profile, &config.aws_region);
         let ssm_output = ssm_cmd.output().context("ssm send-command")?;
@@ -209,7 +241,9 @@ impl ReplayInfra {
             bail!("ssm send-command failed: {stderr}");
         }
 
-        let command_id = String::from_utf8_lossy(&ssm_output.stdout).trim().to_string();
+        let command_id = String::from_utf8_lossy(&ssm_output.stdout)
+            .trim()
+            .to_string();
         info!("SSM command: {command_id}");
 
         // ── Wait for SSM command to complete ────────────────────────────
@@ -224,7 +258,10 @@ impl ReplayInfra {
         info!("verifying Loki readiness on {}:3100...", infra.private_ip);
         verify_loki_ready(&infra.private_ip)?;
 
-        info!("replay infrastructure ready: {} ({})", instance_id, infra.private_ip);
+        info!(
+            "replay infrastructure ready: {} ({})",
+            instance_id, infra.private_ip
+        );
         Ok(infra)
     }
 
@@ -243,8 +280,10 @@ impl ReplayInfra {
 
         let mut cmd = Command::new("aws");
         cmd.args([
-            "ec2", "terminate-instances",
-            "--instance-ids", &self.instance_id,
+            "ec2",
+            "terminate-instances",
+            "--instance-ids",
+            &self.instance_id,
         ]);
         append_aws_opts(&mut cmd, &self.aws_profile, &self.aws_region);
         let status = cmd.status().context("ec2 terminate-instances")?;
@@ -262,8 +301,10 @@ impl ReplayInfra {
 impl Drop for ReplayInfra {
     fn drop(&mut self) {
         if !self.instance_id.is_empty() {
-            warn!("replay instance {} not explicitly torn down — terminating in Drop",
-                self.instance_id);
+            warn!(
+                "replay instance {} not explicitly torn down — terminating in Drop",
+                self.instance_id
+            );
             if let Err(e) = self.teardown() {
                 warn!("replay infrastructure cleanup failed: {e}");
             }
@@ -286,10 +327,14 @@ fn append_aws_opts<'a>(cmd: &'a mut Command, profile: &str, region: &str) -> &'a
 fn resolve_ami(profile: &str, region: &str) -> Result<String> {
     let mut cmd = Command::new("aws");
     cmd.args([
-        "ssm", "get-parameter",
-        "--name", "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
-        "--query", "Parameter.Value",
-        "--output", "text",
+        "ssm",
+        "get-parameter",
+        "--name",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        "--query",
+        "Parameter.Value",
+        "--output",
+        "text",
     ]);
     append_aws_opts(&mut cmd, profile, region);
     let output = cmd.output().context("resolve AL2023 AMI via SSM")?;
@@ -313,17 +358,19 @@ fn detect_subnet() -> Result<String> {
     // Try IMDSv2 token
     let token_output = Command::new("curl")
         .args([
-            "-sf", "--max-time", "2",
-            "-X", "PUT",
-            "-H", "X-aws-ec2-metadata-token-ttl-seconds: 60",
+            "-sf",
+            "--max-time",
+            "2",
+            "-X",
+            "PUT",
+            "-H",
+            "X-aws-ec2-metadata-token-ttl-seconds: 60",
             "http://169.254.169.254/latest/api/token",
         ])
         .output();
 
     let token = match token_output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => bail!(
             "BENCHMARK_SUBNET_ID not set and IMDS not available. \
              Set BENCHMARK_SUBNET_ID explicitly."
@@ -332,8 +379,11 @@ fn detect_subnet() -> Result<String> {
 
     let subnet_output = Command::new("curl")
         .args([
-            "-sf", "--max-time", "2",
-            "-H", &format!("X-aws-ec2-metadata-token: {token}"),
+            "-sf",
+            "--max-time",
+            "2",
+            "-H",
+            &format!("X-aws-ec2-metadata-token: {token}"),
             "http://169.254.169.254/latest/meta-data/network/interfaces/macs/",
         ])
         .output()
@@ -356,8 +406,11 @@ fn detect_subnet() -> Result<String> {
 
     let sid_output = Command::new("curl")
         .args([
-            "-sf", "--max-time", "2",
-            "-H", &format!("X-aws-ec2-metadata-token: {token}"),
+            "-sf",
+            "--max-time",
+            "2",
+            "-H",
+            &format!("X-aws-ec2-metadata-token: {token}"),
             &format!(
                 "http://169.254.169.254/latest/meta-data/network/interfaces/macs/{mac}/subnet-id"
             ),
@@ -369,7 +422,9 @@ fn detect_subnet() -> Result<String> {
         bail!("failed to get subnet-id from IMDS");
     }
 
-    let subnet_id = String::from_utf8_lossy(&sid_output.stdout).trim().to_string();
+    let subnet_id = String::from_utf8_lossy(&sid_output.stdout)
+        .trim()
+        .to_string();
     if subnet_id.is_empty() || !subnet_id.starts_with("subnet-") {
         bail!("invalid subnet-id from IMDS: {subnet_id}");
     }
@@ -492,11 +547,16 @@ fn wait_for_ssm_command(
 
         let mut cmd = Command::new("aws");
         cmd.args([
-            "ssm", "get-command-invocation",
-            "--command-id", command_id,
-            "--instance-id", instance_id,
-            "--query", "Status",
-            "--output", "text",
+            "ssm",
+            "get-command-invocation",
+            "--command-id",
+            command_id,
+            "--instance-id",
+            instance_id,
+            "--query",
+            "Status",
+            "--output",
+            "text",
         ]);
         append_aws_opts(&mut cmd, profile, region);
         let output = cmd.output().context("ssm get-command-invocation")?;
@@ -520,11 +580,16 @@ fn wait_for_ssm_command(
                 // Get the error output
                 let mut err_cmd = Command::new("aws");
                 err_cmd.args([
-                    "ssm", "get-command-invocation",
-                    "--command-id", command_id,
-                    "--instance-id", instance_id,
-                    "--query", "StandardErrorContent",
-                    "--output", "text",
+                    "ssm",
+                    "get-command-invocation",
+                    "--command-id",
+                    command_id,
+                    "--instance-id",
+                    instance_id,
+                    "--query",
+                    "StandardErrorContent",
+                    "--output",
+                    "text",
                 ]);
                 append_aws_opts(&mut err_cmd, profile, region);
                 let err_output = err_cmd.output();
@@ -558,7 +623,9 @@ fn verify_loki_ready(private_ip: &str) -> Result<()> {
     // Check /ready endpoint
     let ready_output = Command::new("curl")
         .args([
-            "-sf", "--max-time", "5",
+            "-sf",
+            "--max-time",
+            "5",
             &format!("http://{private_ip}:3100/ready"),
         ])
         .output()
@@ -571,7 +638,9 @@ fn verify_loki_ready(private_ip: &str) -> Result<()> {
     // Verify data is queryable
     let labels_output = Command::new("curl")
         .args([
-            "-sf", "--max-time", "10",
+            "-sf",
+            "--max-time",
+            "10",
             &format!("http://{private_ip}:3100/loki/api/v1/labels"),
         ])
         .output()
@@ -581,12 +650,14 @@ fn verify_loki_ready(private_ip: &str) -> Result<()> {
         warn!("Loki /labels query failed — data may not be loaded yet");
     } else {
         let body = String::from_utf8_lossy(&labels_output.stdout);
-        info!("Loki labels response: {}", body.chars().take(200).collect::<String>());
+        info!(
+            "Loki labels response: {}",
+            body.chars().take(200).collect::<String>()
+        );
     }
 
     Ok(())
 }
-
 
 /// List available snapshots from the benchmark S3 bucket.
 ///
@@ -599,12 +670,18 @@ pub(crate) fn list_snapshots(
     // List snapshot directories
     let mut cmd = Command::new("aws");
     cmd.args([
-        "s3api", "list-objects-v2",
-        "--bucket", bucket,
-        "--prefix", "snapshots/",
-        "--delimiter", "/",
-        "--query", "CommonPrefixes[].Prefix",
-        "--output", "json",
+        "s3api",
+        "list-objects-v2",
+        "--bucket",
+        bucket,
+        "--prefix",
+        "snapshots/",
+        "--delimiter",
+        "/",
+        "--query",
+        "CommonPrefixes[].Prefix",
+        "--output",
+        "json",
     ]);
     append_aws_opts(&mut cmd, profile, region);
     let output = cmd.output().context("list S3 snapshot prefixes")?;
@@ -655,7 +732,7 @@ pub(crate) fn list_snapshots(
     }
 
     // Sort by captured_at descending
-    snapshots.sort_by(|a, b| b.1.captured_at.cmp(&a.1.captured_at));
+    snapshots.sort_by_key(|b| std::cmp::Reverse(b.1.captured_at));
 
     Ok(snapshots)
 }
@@ -672,7 +749,12 @@ pub(crate) fn download_snapshot_metadata(
     std::fs::create_dir_all(local_dir)
         .with_context(|| format!("create local dir: {}", local_dir.display()))?;
 
-    let files = ["manifest.json", "red-state.json", "ground-truth.json", "fired-alerts.json"];
+    let files = [
+        "manifest.json",
+        "red-state.json",
+        "ground-truth.json",
+        "fired-alerts.json",
+    ];
     for file in &files {
         let s3_path = format!("s3://{bucket}/snapshots/{op_id}/{file}");
         let local_path = local_dir.join(file);

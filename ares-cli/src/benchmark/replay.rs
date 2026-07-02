@@ -107,18 +107,19 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
 
     // ── Resolve snapshot location ───────────────────────────────────────
     let replay_config = ReplayConfig::from_env()?;
-    let (snapshot_path, _is_temp) = resolve_snapshot(
-        &p.snapshot,
-        p.snapshot_dir.as_deref(),
-        &replay_config,
-    )?;
+    let (snapshot_path, _is_temp) =
+        resolve_snapshot(&p.snapshot, p.snapshot_dir.as_deref(), &replay_config)?;
 
     let manifest = load_manifest(snapshot_path.to_str().unwrap())?;
 
     info!(
         "benchmark run {run_id} [mode={}, trigger={}] for operation {}",
         p.replay_mode,
-        if is_timeline { "alert-replay" } else { &p.trigger_mode },
+        if is_timeline {
+            "alert-replay"
+        } else {
+            &p.trigger_mode
+        },
         manifest.operation_id,
     );
 
@@ -130,7 +131,16 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     info!("Loki URL: {loki_url}");
 
     // From here on, ensure teardown happens on error
-    let result = run_replay_inner(&p, &manifest, &loki_url, &snapshot_path, &run_id, is_timeline, run_started_at).await;
+    let result = run_replay_inner(
+        &p,
+        &manifest,
+        &loki_url,
+        &snapshot_path,
+        &run_id,
+        is_timeline,
+        run_started_at,
+    )
+    .await;
 
     // ── Teardown ────────────────────────────────────────────────────────
     info!("tearing down replay infrastructure...");
@@ -406,10 +416,7 @@ fn load_manifest(snapshot_dir: &str) -> Result<SnapshotManifest> {
     let manifest: SnapshotManifest = serde_json::from_str(&raw).context("parse manifest.json")?;
     info!(
         "loaded manifest: op={}, loki_source={}, chunks={}, alerts={}",
-        manifest.operation_id,
-        manifest.loki_source,
-        manifest.loki_chunks,
-        manifest.alerts_captured,
+        manifest.operation_id, manifest.loki_source, manifest.loki_chunks, manifest.alerts_captured,
     );
     Ok(manifest)
 }
@@ -437,10 +444,12 @@ async fn import_all_streams(
             continue;
         }
 
-        let file = fs::File::open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let reader = BufReader::new(file);
-        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
 
         info!("importing stream {name} from {}", path.display());
         let entries = loki_bulk::import_stream(config, reader, 0).await?;

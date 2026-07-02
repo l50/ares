@@ -54,16 +54,74 @@ impl TextExtractions {
 }
 
 /// Tool-call context paired with stdout, used by `extract_from_output_text`
-/// to gate noisy regexes on the invoking tool's arguments.
+/// to gate noisy regexes on the invoking tool's name and arguments.
 ///
-/// `arguments` is best-effort: when None (e.g. legacy bare-string tool_outputs
-/// payloads), extractors fall back to untyped behavior.
+/// `name` and `arguments` are best-effort: when None (e.g. legacy bare-string
+/// tool_outputs payloads), extractors fall back to untyped behavior — treating
+/// the output as anonymous stdout with no auth-context guarantee. Prefer the
+/// structured form so provenance gating is available.
 pub struct ToolOutputCtx<'a> {
+    pub name: Option<&'a str>,
     pub arguments: Option<&'a serde_json::Value>,
     pub output: &'a str,
 }
 
 impl<'a> ToolOutputCtx<'a> {
+    /// Normalized invoking tool name (lowercased, path/extension stripped).
+    /// None when no `name` was carried through (legacy bare-string outputs).
+    pub(crate) fn tool_name_normalized(&self) -> Option<String> {
+        let raw = self.name?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let last = raw.rsplit(['/', '\\']).next()?;
+        let base = last.trim_end_matches(".exe").trim_end_matches(".py");
+        Some(base.to_ascii_lowercase())
+    }
+
+    /// Returns true when this tool's stdout is a *plausible source of a genuine
+    /// authentication event* — i.e., the tool actually tries credentials against
+    /// a service and prints a `[+] DOMAIN\user:secret` success line only when
+    /// the credential worked. This excludes read-only enumerators (rpcclient /
+    /// ldapsearch / ldapdomaindump / cat / grep / xp_cmdshell relays) whose
+    /// stdout reflects attacker-controllable AD attributes or file contents.
+    ///
+    /// A `None` tool name (legacy bare-string outputs, tests) is treated as
+    /// authenticated to preserve behavior for existing structured extractors —
+    /// stricter gating (e.g. anchored regex prefix) still applies at the
+    /// regex layer.
+    pub(crate) fn is_authenticating_tool(&self) -> bool {
+        let Some(name) = self.tool_name_normalized() else {
+            return true;
+        };
+        // Enumeration/read-only channels that print AD attribute values or
+        // arbitrary file/table contents verbatim. Any `[+] u:p` in these
+        // buffers came from data the attacker can plant.
+        const READONLY_ENUMERATORS: &[&str] = &[
+            "rpcclient",
+            "ldapsearch",
+            "ldapdomaindump",
+            "bloodhound-python",
+            "bloodhound",
+            "certipy",
+            "adidnsdump",
+            "cat",
+            "grep",
+            "tail",
+            "head",
+            "less",
+            "more",
+            "type",
+            "get-content",
+            "read_file",
+            "read",
+            "mssqlclient",
+            "mssqlclient.py",
+            "xp_cmdshell",
+        ];
+        !READONLY_ENUMERATORS.iter().any(|t| &name == t)
+    }
+
     /// Returns true when the invoking arguments indicate the tool was authenticated
     /// with a hash rather than a plaintext password. Tools like nxc/netexec echo the
     /// supplied secret back on success lines (`[+] DOMAIN\user:secret (Pwn3d!)`),
@@ -392,6 +450,7 @@ mod unit_tests {
     #[test]
     fn extract_from_output_text_empty() {
         let ctx = ToolOutputCtx {
+            name: None,
             arguments: None,
             output: "",
         };
@@ -403,6 +462,7 @@ mod unit_tests {
     fn is_hash_auth_detects_common_keys() {
         let args = serde_json::json!({"hashes": "aad3:abcd"});
         let ctx = ToolOutputCtx {
+            name: None,
             arguments: Some(&args),
             output: "",
         };
@@ -410,6 +470,7 @@ mod unit_tests {
 
         let args = serde_json::json!({"nthash": "abcd"});
         let ctx = ToolOutputCtx {
+            name: None,
             arguments: Some(&args),
             output: "",
         };
@@ -417,6 +478,7 @@ mod unit_tests {
 
         let args = serde_json::json!({"hashes": ""});
         let ctx = ToolOutputCtx {
+            name: None,
             arguments: Some(&args),
             output: "",
         };
@@ -424,12 +486,14 @@ mod unit_tests {
 
         let args = serde_json::json!({"password": "P@ss"});
         let ctx = ToolOutputCtx {
+            name: None,
             arguments: Some(&args),
             output: "",
         };
         assert!(!ctx.is_hash_auth());
 
         let ctx = ToolOutputCtx {
+            name: None,
             arguments: None,
             output: "",
         };
