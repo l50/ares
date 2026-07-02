@@ -228,6 +228,29 @@ pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
         }
     }
 
+    // Write a companion krb5.conf shim alongside the ccache. Without
+    // `[domain_realm]` mappings for `.<target_domain>`, MIT libkrb5 falls
+    // back to `default_realm` (`EC2.INTERNAL` on the ares AMI) when
+    // resolving `ldap/<target-dc>` and misses the cached service ticket
+    // with `Matching credential not found` — every cross-forest GSSAPI
+    // call fails despite a valid ccache. Every wrapper that sets
+    // `KRB5CCNAME=<ccache>` also sets `KRB5_CONFIG=<ccache>.krb5.conf:
+    // /etc/krb5.conf`, so the shim only affects GSSAPI calls that carry
+    // this ccache.
+    if ccache_path.exists() {
+        let shim_path = krb5_shim_path_for(&ccache_path);
+        let shim = build_krb5_shim(&[
+            (source_domain.to_string(), source_domain.to_uppercase()),
+            (target_domain.to_string(), target_domain.to_uppercase()),
+        ]);
+        if let Err(e) = std::fs::write(&shim_path, shim) {
+            output.stdout.push_str(&format!(
+                "\n[!] failed to write krb5.conf shim at {}: {e}\n",
+                shim_path.display()
+            ));
+        }
+    }
+
     // Append the ticket path to stdout so the orchestrator can parse it.
     if ccache_path.exists() {
         output
@@ -236,6 +259,46 @@ pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     }
 
     Ok(output)
+}
+
+/// Path where the krb5.conf shim companion to `ccache_path` lives.
+///
+/// Convention: append `.krb5.conf` to the ccache path. Every consumer that
+/// exports `KRB5CCNAME=<ccache>` also exports
+/// `KRB5_CONFIG=<ccache>.krb5.conf:/etc/krb5.conf`. Colon fallback so a
+/// missing shim doesn't nuke the system krb5.conf.
+pub fn krb5_shim_path_for(ccache_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = ccache_path.as_os_str().to_owned();
+    s.push(".krb5.conf");
+    std::path::PathBuf::from(s)
+}
+
+/// Build the krb5.conf content mapping each (domain, realm) pair through
+/// `[domain_realm]`. `default_realm` is the first entry — the first entry
+/// SHOULD be the source realm (the ccache's default principal's realm)
+/// so MIT resolves unspecified realms to it. `dns_lookup_realm = false`
+/// prevents MIT from trying DNS `_kerberos.<domain>` lookups that would
+/// leak to the internet from the attacker host.
+fn build_krb5_shim(entries: &[(String, String)]) -> String {
+    let default_realm = entries
+        .first()
+        .map(|(_, r)| r.as_str())
+        .unwrap_or("EMPTY.REALM");
+    let mut out = String::new();
+    out.push_str("# ares-managed krb5.conf shim — regenerated per ticket forge.\n");
+    out.push_str("[libdefaults]\n");
+    out.push_str(&format!("    default_realm = {default_realm}\n"));
+    out.push_str("    dns_lookup_realm = false\n");
+    out.push_str("    dns_lookup_kdc = false\n");
+    out.push_str("    rdns = false\n");
+    out.push_str("    forwardable = true\n\n");
+    out.push_str("[domain_realm]\n");
+    for (domain, realm) in entries {
+        let d_lc = domain.to_lowercase();
+        out.push_str(&format!("    .{d_lc} = {realm}\n"));
+        out.push_str(&format!("    {d_lc} = {realm}\n"));
+    }
+    out
 }
 
 /// Forge an inter-realm Kerberos ticket, request a TGS for the target DC,
@@ -477,6 +540,52 @@ pub async fn dnstool(args: &Value) -> Result<ToolOutput> {
 mod tests {
     use crate::args::{optional_str, required_str};
     use serde_json::json;
+
+    // --- krb5 shim helpers ---
+
+    #[test]
+    fn krb5_shim_path_appends_krb5_conf_suffix() {
+        let cc = std::path::PathBuf::from(
+            "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache",
+        );
+        let shim = super::krb5_shim_path_for(&cc);
+        assert_eq!(
+            shim.to_string_lossy(),
+            "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache.krb5.conf"
+        );
+    }
+
+    #[test]
+    fn krb5_shim_maps_every_domain_to_its_realm() {
+        // Cross-forest case: source + target both listed under [domain_realm]
+        // so MIT libkrb5 can resolve ldap/<target-dc> → TARGET.REALM and hit
+        // the cached service ticket. default_realm is the first entry.
+        let out = super::build_krb5_shim(&[
+            ("contoso.local".into(), "CONTOSO.LOCAL".into()),
+            ("fabrikam.local".into(), "FABRIKAM.LOCAL".into()),
+        ]);
+        assert!(
+            out.contains("default_realm = CONTOSO.LOCAL"),
+            "default_realm should be the first entry, got: {out}"
+        );
+        assert!(
+            out.contains("dns_lookup_realm = false"),
+            "must disable DNS realm lookup to prevent attacker-host DNS leaks"
+        );
+        for (want_domain, want_realm) in [
+            ("contoso.local", "CONTOSO.LOCAL"),
+            ("fabrikam.local", "FABRIKAM.LOCAL"),
+        ] {
+            assert!(
+                out.contains(&format!(".{want_domain} = {want_realm}")),
+                "missing wildcard domain_realm entry `.{want_domain} = {want_realm}` in: {out}"
+            );
+            assert!(
+                out.contains(&format!("{want_domain} = {want_realm}")),
+                "missing exact domain_realm entry `{want_domain} = {want_realm}` in: {out}"
+            );
+        }
+    }
 
     // --- extract_trust_key ---
 

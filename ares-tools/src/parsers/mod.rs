@@ -158,10 +158,34 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 discoveries["vulnerabilities"] = Value::Array(vulns);
             }
         }
-        "certipy_find" => {
+        "certipy_find" | "certipy_find_anon" => {
             let vulns = parse_certipy_find(output, params);
             if !vulns.is_empty() {
                 discoveries["vulnerabilities"] = Value::Array(vulns);
+            }
+        }
+        "esc8_relay_probe" => {
+            // Any output line starting with `ESC8_CANDIDATE:` — emitted by
+            // `esc8_relay_probe` when the CA's `/certsrv/certfnsh.asp`
+            // endpoint advertises NTLM — is promoted to a `vuln_type=esc8`
+            // vulnerability so `auto_coercion` can queue the PetitPotam +
+            // ntlmrelayx chain.
+            if output.contains("ESC8_CANDIDATE") {
+                let target_ip = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                let vuln = json!({
+                    "vuln_id": format!("esc8_relay:{target_ip}"),
+                    "vuln_type": "esc8",
+                    "target": target_ip,
+                    "discovered_by": "esc8_relay_probe",
+                    "details": {
+                        "endpoint": "/certsrv/certfnsh.asp",
+                        "auth_method": "NTLM",
+                        "relay_ready": true,
+                    },
+                    "recommended_agent": "coercion",
+                    "priority": 5,
+                });
+                discoveries["vulnerabilities"] = Value::Array(vec![vuln]);
             }
         }
         "certipy_esc1_full_chain" => {

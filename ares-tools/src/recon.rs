@@ -316,7 +316,16 @@ pub fn build_ldap_search(args: &Value) -> Result<CommandBuilder> {
         // bind when both are available because forged inter-realm tickets
         // only authenticate via GSSAPI. Caller must ensure `target` is an
         // FQDN so ldapsearch can derive the ldap/<host>@<REALM> SPN.
-        cmd = cmd.env("KRB5CCNAME", ccache).arg("-Y").arg("GSSAPI");
+        //
+        // KRB5_CONFIG points at the per-ccache shim written by
+        // create_inter_realm_ticket so MIT libkrb5 can resolve the target
+        // domain to its realm; without it MIT falls back to the system
+        // default_realm and misses the cached service ticket.
+        cmd = cmd
+            .env("KRB5CCNAME", ccache)
+            .env("KRB5_CONFIG", format!("{ccache}.krb5.conf:/etc/krb5.conf"))
+            .arg("-Y")
+            .arg("GSSAPI");
     } else if let (Some(u), Some(p)) = (username, password) {
         let auth_domain = bind_domain.unwrap_or(domain);
         let bind_dn = format!("{u}@{auth_domain}");
@@ -470,6 +479,7 @@ pub fn build_enumerate_domain_trusts(args: &Value) -> Result<CommandBuilder> {
     if let Some(ccache) = ticket_path {
         return Ok(CommandBuilder::new("ldapsearch")
             .env("KRB5CCNAME", ccache)
+            .env("KRB5_CONFIG", format!("{ccache}.krb5.conf:/etc/krb5.conf"))
             .flag("-H", &uri)
             .arg("-Y")
             .arg("GSSAPI")
@@ -692,7 +702,9 @@ pub fn build_smbclient_kerberos_shares(args: &Value) -> Result<CommandBuilder> {
         .timeout_secs(180);
 
     if let Some(tpath) = ticket_path {
-        cmd = cmd.env("KRB5CCNAME", tpath);
+        cmd = cmd
+            .env("KRB5CCNAME", tpath)
+            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
     }
 
     if let Some(ip) = target_ip {
@@ -740,6 +752,10 @@ pub fn build_ldap_acl_enumeration(args: &Value) -> Result<CommandBuilder> {
     if let Some(ccache) = ticket_path {
         return Ok(CommandBuilder::new("ldapsearch")
             .env("KRB5CCNAME", ccache)
+            .env(
+                "KRB5_CONFIG",
+                format!("{ccache}.krb5.conf:/etc/krb5.conf"),
+            )
             .flag("-H", &uri)
             .arg("-Y")
             .arg("GSSAPI")
@@ -1188,13 +1204,23 @@ mod tests {
             "filter": "(objectClass=user)",
         });
         let cmd = super::build_ldap_search(&args).unwrap();
+        let envs = cmd.env_vars_for_test();
         assert!(
-            cmd.env_vars_for_test()
-                .iter()
-                .any(|(k, v)| k == "KRB5CCNAME"
-                    && v
-                        == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
+            envs.iter().any(|(k, v)| k == "KRB5CCNAME"
+                && v == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"),
             "ticket_path must export KRB5CCNAME so ldapsearch loads the cross-forest ccache"
+        );
+        // KRB5_CONFIG points at the per-ccache shim so MIT libkrb5 can
+        // resolve `<target-fqdn> → TARGET.REALM` and hit the cached service
+        // ticket. Without this MIT falls back to the system default_realm
+        // (EC2.INTERNAL on the ares AMI) and the GSSAPI bind fails with
+        // "Matching credential not found" despite a valid ccache.
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "KRB5_CONFIG"
+                    && v
+                        == "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache.krb5.conf:/etc/krb5.conf"),
+            "ticket_path must export KRB5_CONFIG pointing at the per-ccache shim, got envs: {envs:?}"
         );
         let args_vec = cmd.args_for_test();
         assert!(args_vec.iter().any(|a| a == "-Y"));

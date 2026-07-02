@@ -41,8 +41,10 @@ pub async fn find_delegation(args: &Value) -> Result<ToolOutput> {
 pub async fn s4u_attack(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = optional_str(args, "password");
-    let hash = optional_str(args, "hash");
+    // Treat empty-string password/hash as "not provided" — impacket-getST
+    // would otherwise prompt interactively and the task would time out.
+    let password = optional_str(args, "password").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
     let target_spn = required_str(args, "target_spn")?;
     let impersonate = required_str(args, "impersonate")?;
     let dc_ip = optional_str(args, "dc_ip");
@@ -61,7 +63,7 @@ pub async fn s4u_attack(args: &Value) -> Result<ToolOutput> {
     } else if let Some(p) = password {
         cmd = cmd.arg(format!("{domain}/{username}:{p}"));
     } else {
-        anyhow::bail!("s4u_attack requires either password or hash");
+        anyhow::bail!("s4u_attack requires either a non-empty password or hash — got neither");
     }
 
     cmd = cmd.timeout_secs(120);
@@ -335,6 +337,25 @@ mod tests {
         let args = json!({
             "domain": "contoso.local",
             "username": "svc_web$",
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator"
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::s4u_attack(&args));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("password or hash"));
+    }
+
+    #[test]
+    fn s4u_attack_empty_password_and_hash_errors() {
+        // Regression: an empty password/hash string must be rejected as if
+        // absent — impacket-getST would otherwise prompt interactively and
+        // the task would time out.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "password": "",
+            "hash": "",
             "target_spn": "cifs/dc01.contoso.local",
             "impersonate": "Administrator"
         });

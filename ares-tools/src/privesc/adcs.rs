@@ -878,6 +878,110 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
     })
 }
 
+/// Unauthenticated probe for ESC8 (ADCS HTTP web enrollment) exposure.
+///
+/// Sends an HTTP HEAD to `/certsrv/certfnsh.asp` and reports whether the
+/// endpoint advertises NTLM authentication in the `WWW-Authenticate` header.
+/// A confirmed hit means the host is a viable NTLM-relay target (PetitPotam →
+/// ntlmrelayx `-t http://<host>/certsrv/certfnsh.asp` → cert issuance) with
+/// zero pre-auth. The orchestrator publishes a `discoveries[]` entry with
+/// `vuln_type=esc8` on success so `auto_coercion` can queue the actual chain.
+///
+/// Required args: `target` (CA host IP or hostname)
+/// Optional args: `port` (default 80), `scheme` (`http` or `https`; default
+///                `http` — enrollment web is usually plain HTTP)
+pub async fn esc8_relay_probe(args: &Value) -> Result<ToolOutput> {
+    let target = required_str(args, "target")?;
+    let scheme = optional_str(args, "scheme").unwrap_or("http");
+    let port = args
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+    let url = format!("{scheme}://{target}:{port}/certsrv/certfnsh.asp");
+    esc8_probe_url(&url).await
+}
+
+/// Perform the HTTP HEAD probe against `url` and format the result as a
+/// `ToolOutput`. Split from `esc8_relay_probe` so tests can drive the
+/// formatter without exercising the arg-parsing layer.
+async fn esc8_probe_url(url: &str) -> Result<ToolOutput> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build reqwest client")?;
+
+    let resp = match client.head(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(ToolOutput {
+                stdout: format!("esc8_relay_probe: {url} unreachable ({e})\n"),
+                stderr: String::new(),
+                exit_code: Some(1),
+                success: false,
+            });
+        }
+    };
+
+    let status = resp.status();
+    let www_auth = resp
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ntlm_offered = www_auth.split(',').any(|s| {
+        s.trim().eq_ignore_ascii_case("NTLM") || s.trim().to_lowercase().starts_with("ntlm ")
+    });
+
+    let verdict = if ntlm_offered {
+        "ESC8_CANDIDATE: NTLM offered on /certsrv — relay target confirmed"
+    } else if status.as_u16() == 401 {
+        "endpoint present but no NTLM scheme advertised"
+    } else if status.is_success() || status.as_u16() == 405 {
+        "endpoint reachable, no auth required (unexpected — likely not an ADCS web enrollment)"
+    } else {
+        "endpoint returned unexpected status"
+    };
+
+    Ok(ToolOutput {
+        stdout: format!(
+            "esc8_relay_probe url={url} status={status} www_authenticate={www_auth:?} verdict={verdict}\n"
+        ),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: ntlm_offered,
+    })
+}
+
+/// Unauthenticated Certipy enumeration.
+///
+/// Runs `certipy find -u '' -p '' -target-ip <dc_ip> -stdout` — some ADCS
+/// deployments permit anonymous LDAP queries and will surface template / CA
+/// names without any credential. Any hit is passed through the same
+/// `parse_certipy_find` pipeline as the authenticated tool, so ESC-labeled
+/// templates surface as vulns automatically.
+///
+/// Required args: `domain`, `dc_ip`
+pub async fn certipy_find_anon(args: &Value) -> Result<ToolOutput> {
+    let domain = required_str(args, "domain")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+
+    CommandBuilder::new("certipy")
+        .arg("find")
+        .flag("-u", format!("@{domain}"))
+        .flag("-p", "")
+        .flag("-target-ip", dc_ip)
+        .flag("-dc-ip", dc_ip)
+        .arg("-text")
+        .arg("-stdout")
+        .arg("-vulnerable")
+        .timeout_secs(120)
+        .execute()
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::args::{optional_bool, optional_str, required_str};

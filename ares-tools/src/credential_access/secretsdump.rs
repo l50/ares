@@ -46,7 +46,9 @@ pub async fn secretsdump(args: &Value) -> Result<ToolOutput> {
     if use_kerberos {
         cmd = cmd.arg("-k").arg("-no-pass");
         if let Some(tp) = ticket_path {
-            cmd = cmd.env("KRB5CCNAME", tp);
+            cmd = cmd
+                .env("KRB5CCNAME", tp)
+                .env("KRB5_CONFIG", format!("{tp}.krb5.conf:/etc/krb5.conf"));
         }
     } else {
         cmd = cmd.args(extra_args);

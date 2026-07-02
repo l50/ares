@@ -271,7 +271,11 @@ pub fn build_ldap_search_descriptions(args: &Value) -> Result<CommandBuilder> {
         .timeout_secs(120);
 
     if let Some(ccache) = ticket_path {
-        cmd = cmd.env("KRB5CCNAME", ccache).arg("-Y").arg("GSSAPI");
+        cmd = cmd
+            .env("KRB5CCNAME", ccache)
+            .env("KRB5_CONFIG", format!("{ccache}.krb5.conf:/etc/krb5.conf"))
+            .arg("-Y")
+            .arg("GSSAPI");
     } else {
         let u = username.ok_or_else(|| anyhow::anyhow!("missing required arg: username"))?;
         let p = password.ok_or_else(|| anyhow::anyhow!("missing required arg: password"))?;
