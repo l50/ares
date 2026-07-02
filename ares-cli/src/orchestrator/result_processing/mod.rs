@@ -393,6 +393,29 @@ pub async fn process_completed_task(
                         "Vuln abandoned — exceeded max exploit failures"
                     );
                 }
+
+                // Shadow-cred pre-flight (post-flight learning): when a
+                // shadow-cred exploit returns INSUFF_ACCESS_RIGHTS on
+                // msDS-KeyCredentialLink, the source doesn't hold
+                // WriteProperty on that attribute — retrying won't grant
+                // it. Skip straight to abandoned instead of burning
+                // MAX_EXPLOIT_FAILURES worth of dispatches.
+                let vuln_type_snapshot = task_params_snapshot
+                    .get("vuln_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if is_shadow_cred_vuln_type(vuln_type_snapshot)
+                    && result_indicates_keycredlink_access_denied(&result.result, err_msg)
+                    && !dispatcher.state.is_exploit_abandoned(&vuln_id).await
+                {
+                    warn!(
+                        vuln_id = %vuln_id,
+                        task_id = %task_id,
+                        vuln_type = %vuln_type_snapshot,
+                        "Shadow-cred INSUFF_ACCESS_RIGHTS on msDS-KeyCredentialLink — abandoning vuln (source lacks WriteProperty on that attribute)"
+                    );
+                    dispatcher.state.mark_exploit_abandoned(&vuln_id).await;
+                }
             }
         }
     }
@@ -993,6 +1016,72 @@ fn is_ticket_grant_vuln(vuln_id: &str) -> bool {
         || v.starts_with("unconstrained_delegation_")
         || v.starts_with("rbcd_")
         || v.starts_with("s4u_")
+}
+
+/// True when `vuln_type` (as recorded in `task.params.vuln_type`) belongs
+/// to a shadow-credentials dispatch — the shape of the vuln types kept in
+/// sync with `automation::shadow_credentials::is_shadow_cred_candidate`.
+/// Used by the result-processing pre-flight gate: a shadow-cred task that
+/// comes back with INSUFF_ACCESS_RIGHTS on `msDS-KeyCredentialLink` gets
+/// one-shot abandoned instead of retrying to the generic MAX.
+fn is_shadow_cred_vuln_type(vuln_type: &str) -> bool {
+    matches!(
+        vuln_type.to_lowercase().as_str(),
+        "genericall"
+            | "genericwrite"
+            | "writedacl"
+            | "writeowner"
+            | "shadow_credentials"
+            | "writeproperty"
+            | "acl_genericall"
+            | "acl_genericwrite"
+            | "acl_writedacl"
+            | "acl_writeowner"
+            | "acl_writeproperty"
+    )
+}
+
+/// True when the tool output or error string carries a
+/// `INSUFF_ACCESS_RIGHTS`-shaped failure specifically for the
+/// `msDS-KeyCredentialLink` attribute (LDAP code 0x2098 / 50). This is the
+/// deterministic signal that the source principal doesn't hold WriteProperty
+/// on that attribute — no amount of retry will grant it, so the shadow-cred
+/// pre-flight bumps the vuln straight to abandoned.
+///
+/// Recognises the impacket/ldap3/certipy/pywhisker/bloodyad wordings:
+///   - `INSUFF_ACCESS_RIGHTS` combined with `msDS-KeyCredentialLink` /
+///     `KeyCredentialLink` in the same output blob
+///   - LDAP result `0x2098` combined with the same attribute reference
+///   - certipy's canonical "user has no permission to add a certificate"
+fn result_indicates_keycredlink_access_denied(result: &Option<Value>, err_msg: &str) -> bool {
+    let mut haystacks: Vec<String> = Vec::new();
+    haystacks.push(err_msg.to_lowercase());
+    if let Some(payload) = result.as_ref() {
+        for part in collect_result_text_parts(payload) {
+            haystacks.push(part.to_lowercase());
+        }
+    }
+    for h in &haystacks {
+        let mentions_keycred =
+            h.contains("keycredentiallink") || h.contains("msds-keycredentiallink");
+        if !mentions_keycred {
+            continue;
+        }
+        let mentions_denied = h.contains("insuff_access_rights")
+            || h.contains("insufficient access rights")
+            || h.contains("insufficientaccessrights")
+            || h.contains("0x2098")
+            || h.contains("has no permission to add a certificate");
+        if mentions_denied {
+            return true;
+        }
+    }
+    // certipy sometimes emits the "no permission to add a certificate"
+    // wording without naming the attribute — accept the certipy-specific
+    // phrase on its own as a shadow-cred deny signal.
+    haystacks
+        .iter()
+        .any(|h| h.contains("no permission to add a certificate"))
 }
 
 /// True when the result's raw tool output indicates a Kerberos ticket was

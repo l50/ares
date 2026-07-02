@@ -221,7 +221,7 @@ impl SharedState {
                 && hash.hash_type.to_lowercase().contains("ntlm");
             let hash_domain = hash.domain.clone();
             let mut state = self.inner.write().await;
-            state.hashes.push(hash);
+            state.push_hash_capped(hash);
 
             // Track per-domain domination when krbtgt NTLM hash arrives
             if is_krbtgt {

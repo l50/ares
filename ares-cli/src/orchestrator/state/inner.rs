@@ -16,6 +16,15 @@ const QUARANTINE_DURATION_SECS: i64 = 300;
 
 const CAPTURE_IN_FLIGHT_TTL_SECS: i64 = 180;
 
+/// Maximum number of entries kept in `state.hashes`. ESC8 relay + coerce
+/// floods can dump thousands of machine-account NTLMv2 rows into state
+/// (WAYSFUCKED op-20260612 saw 11,977) which crowds out signal at every
+/// read site. When ingestion hits this cap, `push_hash_capped` evicts the
+/// oldest low-value entry to make room. High-value entries (krbtgt,
+/// cracked, trust keys, AES256-bearing) are never evicted, so the cap is
+/// soft — an all-high-value overflow logs a warn and still pushes.
+const MAX_HASHES: usize = 500;
+
 /// How long an LLM-marked "assist-abandoned" task pattern stays
 /// dispatch-blocked before the orchestrator allows a single re-try.
 ///
@@ -315,6 +324,41 @@ impl StateInner {
             return false;
         };
         Utc::now().signed_duration_since(*ts).num_seconds() < CAPTURE_IN_FLIGHT_TTL_SECS
+    }
+
+    /// Push a hash onto `state.hashes`, evicting the oldest low-value entry
+    /// when the vector is at or above `MAX_HASHES`. "Low-value" here means:
+    /// not `krbtgt`, not cracked, no trust-key flag, no AES256 key. If every
+    /// entry is high-value the push still lands (warn logged); the cap is
+    /// deliberately soft so we never drop a hash the attack chain actually
+    /// needs.
+    pub fn push_hash_capped(&mut self, hash: Hash) {
+        if self.hashes.len() >= MAX_HASHES {
+            let evict = self.hashes.iter().position(|h| {
+                h.username.to_lowercase() != "krbtgt"
+                    && h.cracked_password.is_none()
+                    && !h.is_trust_key
+                    && h.aes_key.is_none()
+            });
+            if let Some(idx) = evict {
+                let dropped = self.hashes.remove(idx);
+                tracing::debug!(
+                    username = %dropped.username,
+                    domain = %dropped.domain,
+                    hash_type = %dropped.hash_type,
+                    len_after = self.hashes.len(),
+                    cap = MAX_HASHES,
+                    "state.hashes evicted low-value entry at cap"
+                );
+            } else {
+                tracing::warn!(
+                    len = self.hashes.len(),
+                    cap = MAX_HASHES,
+                    "state.hashes at cap but every entry is high-value — allowing overflow"
+                );
+            }
+        }
+        self.hashes.push(hash);
     }
 
     /// Return a deduplicated list of currently-quarantined usernames in
@@ -1222,5 +1266,117 @@ mod tests {
 
         // Should not be quarantined (expired)
         assert!(!state.is_principal_quarantined("jdoe", "child.contoso.local"));
+    }
+
+    // --- push_hash_capped ---------------------------------------------------
+
+    fn make_test_hash(username: &str, hash_value: &str) -> Hash {
+        Hash {
+            id: format!("h-{username}-{hash_value}"),
+            username: username.to_string(),
+            hash_value: hash_value.to_string(),
+            hash_type: "NTLM".to_string(),
+            domain: "contoso.local".to_string(),
+            cracked_password: None,
+            source: "test".to_string(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        }
+    }
+
+    #[test]
+    fn push_hash_capped_under_cap_just_appends() {
+        let mut state = StateInner::new("op-1".into());
+        for i in 0..10 {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert_eq!(state.hashes.len(), 10);
+    }
+
+    #[test]
+    fn push_hash_capped_evicts_oldest_low_value_at_cap() {
+        let mut state = StateInner::new("op-1".into());
+        // Fill to cap with uncracked, non-krbtgt, non-trust-key, no-AES entries.
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert_eq!(state.hashes.len(), MAX_HASHES);
+        let first_before = state.hashes[0].username.clone();
+        // Push one more — oldest low-value entry (index 0) should be evicted.
+        state.push_hash_capped(make_test_hash("newcomer", "deadbeef"));
+        assert_eq!(state.hashes.len(), MAX_HASHES);
+        assert_ne!(state.hashes[0].username, first_before);
+        assert_eq!(state.hashes.last().unwrap().username, "newcomer");
+    }
+
+    #[test]
+    fn push_hash_capped_never_evicts_krbtgt() {
+        let mut state = StateInner::new("op-1".into());
+        // krbtgt at index 0, then fill with low-value entries.
+        let mut krb = make_test_hash("krbtgt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        krb.hash_type = "NTLM".into();
+        state.push_hash_capped(krb);
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        // krbtgt must still be present.
+        assert!(state
+            .hashes
+            .iter()
+            .any(|h| h.username.eq_ignore_ascii_case("krbtgt")));
+        assert_eq!(state.hashes.len(), MAX_HASHES);
+    }
+
+    #[test]
+    fn push_hash_capped_never_evicts_cracked() {
+        let mut state = StateInner::new("op-1".into());
+        let mut cracked = make_test_hash("victim", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        cracked.cracked_password = Some("P@ssw0rd!".into());
+        state.push_hash_capped(cracked);
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert!(state
+            .hashes
+            .iter()
+            .any(|h| h.username == "victim" && h.cracked_password.is_some()));
+    }
+
+    #[test]
+    fn push_hash_capped_never_evicts_trust_key_or_aes() {
+        let mut state = StateInner::new("op-1".into());
+        let mut trust = make_test_hash("CONTOSO$", "cccccccccccccccccccccccccccccccc");
+        trust.is_trust_key = true;
+        state.push_hash_capped(trust);
+        let mut aes = make_test_hash("svc_aes", "dddddddddddddddddddddddddddddddd");
+        aes.aes_key = Some("a".repeat(64));
+        state.push_hash_capped(aes);
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert!(state.hashes.iter().any(|h| h.is_trust_key));
+        assert!(state.hashes.iter().any(|h| h.aes_key.is_some()));
+    }
+
+    #[test]
+    fn push_hash_capped_all_high_value_overflows() {
+        let mut state = StateInner::new("op-1".into());
+        // Fill entirely with cracked entries (all high-value).
+        for i in 0..MAX_HASHES {
+            let mut h = make_test_hash(&format!("user{i}"), &format!("{i:032x}"));
+            h.cracked_password = Some("pw".into());
+            state.push_hash_capped(h);
+        }
+        // Add one more — cap is soft, all entries are protected, so we overflow.
+        let mut extra = make_test_hash("extra", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        extra.cracked_password = Some("pw".into());
+        state.push_hash_capped(extra);
+        assert_eq!(state.hashes.len(), MAX_HASHES + 1);
     }
 }

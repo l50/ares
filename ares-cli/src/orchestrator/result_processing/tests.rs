@@ -2480,3 +2480,122 @@ fn lockout_on_spn_account_propagates_to_spray_exclusion() {
         remaining
     );
 }
+
+// ── shadow-cred pre-flight helpers ─────────────────────────────────────
+
+use super::{is_shadow_cred_vuln_type, result_indicates_keycredlink_access_denied};
+
+#[test]
+fn shadow_cred_vuln_type_matches_dispatch_shapes() {
+    for t in [
+        "genericall",
+        "GenericAll",
+        "genericwrite",
+        "writedacl",
+        "writeowner",
+        "writeproperty",
+        "shadow_credentials",
+        "acl_genericall",
+        "acl_writeproperty",
+    ] {
+        assert!(is_shadow_cred_vuln_type(t), "should match: {t}");
+    }
+}
+
+#[test]
+fn shadow_cred_vuln_type_rejects_non_acl_shapes() {
+    for t in [
+        "rbcd",
+        "esc1",
+        "constrained_delegation",
+        "unconstrained_delegation",
+        "forcechangepassword",
+        "allextendedrights", // deliberately excluded — not a valid shadow-cred primitive
+        "acl_allextendedrights",
+        "",
+    ] {
+        assert!(!is_shadow_cred_vuln_type(t), "should NOT match: {t}");
+    }
+}
+
+#[test]
+fn keycredlink_denied_detects_impacket_insuff_access_rights() {
+    let payload = json!({
+        "tool_outputs": [
+            "[+] Connecting to LDAP",
+            "[!] Result: ldap.INSUFFICIENTACCESSRIGHTS: 00002098: LdapErr: DSID-0C09075A, comment: 000020BD: SecErr on msDS-KeyCredentialLink write"
+        ]
+    });
+    assert!(result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        "operation failed"
+    ));
+}
+
+#[test]
+fn keycredlink_denied_detects_bare_insuff_access_rights_with_attribute() {
+    let payload = json!({
+        "tool_outputs": [
+            "[-] pywhisker error: INSUFF_ACCESS_RIGHTS when writing msDS-KeyCredentialLink for target CB-ATTK1$"
+        ]
+    });
+    assert!(result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_detects_certipy_no_permission_phrase() {
+    // certipy_shadow surfaces a plain-English refusal without naming the
+    // attribute — treat that phrase alone as a shadow-cred deny.
+    let payload = json!({
+        "tool_outputs": [
+            "[!] certipy: The user has no permission to add a certificate to this account"
+        ]
+    });
+    assert!(result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_ignores_unrelated_access_denied() {
+    // INSUFF_ACCESS_RIGHTS on a different attribute (servicePrincipalName)
+    // must NOT flip the shadow-cred flag — that's a DACL edge for a
+    // different primitive.
+    let payload = json!({
+        "tool_outputs": [
+            "[-] INSUFF_ACCESS_RIGHTS writing servicePrincipalName"
+        ]
+    });
+    assert!(!result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_ignores_success_output() {
+    let payload = json!({
+        "tool_outputs": [
+            "[+] Successfully added msDS-KeyCredentialLink to target CB-ATTK1$"
+        ]
+    });
+    assert!(!result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_accepts_worker_error_string() {
+    // `result.error` at this call site is worker-authored (tool_executor /
+    // result_handler), not LLM-authored — so a worker-reported deny in the
+    // error field IS a real signal and the pre-flight should honor it.
+    assert!(result_indicates_keycredlink_access_denied(
+        &None,
+        "INSUFF_ACCESS_RIGHTS on msDS-KeyCredentialLink for target CB-ATTK1$"
+    ));
+}

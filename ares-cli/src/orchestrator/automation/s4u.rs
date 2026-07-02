@@ -241,7 +241,22 @@ pub(crate) fn select_s4u_work_items(
                         .get("AllowedToDelegate")
                         .and_then(|v| v.as_str())
                 })
-                .map(|s| s.to_string());
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty());
+
+            // impacket-getST -impersonate requires a target SPN; without one
+            // s4u_attack bails at `required_str(args, "target_spn")`. Skip
+            // now so the dispatch counter isn't burned on a guaranteed
+            // failure. The SPN may be re-populated later (e.g. via a fresh
+            // BloodHound edge) — we simply skip this tick, we don't block.
+            if target_spn.is_none() {
+                debug!(
+                    vuln_id = %vuln.vuln_id,
+                    vuln_type = %vuln.vuln_type,
+                    "S4U skipped: target_spn missing from delegation vuln"
+                );
+                return None;
+            }
 
             let credential = account_name.as_ref().and_then(|acct| {
                 state
@@ -788,7 +803,12 @@ mod tests {
     #[test]
     fn select_allows_after_cooldown_expires() {
         let mut s = StateInner::new("op-test".into());
-        let v = make_delegation_vuln("v-rbcd-svc_web", "rbcd", Some("svc_web"), None);
+        let v = make_delegation_vuln(
+            "v-rbcd-svc_web",
+            "rbcd",
+            Some("svc_web"),
+            Some("CIFS/dc01.contoso.local"),
+        );
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
         s.credentials
             .push(make_cred("svc_web", "Pw!", "contoso.local"));
@@ -801,6 +821,44 @@ mod tests {
         let work = select_s4u_work_items(&s, &tracker, now);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].vuln.vuln_id, "v-rbcd-svc_web");
+    }
+
+    #[test]
+    fn select_skips_delegation_vuln_without_target_spn() {
+        let mut s = StateInner::new("op-test".into());
+        // constrained_delegation with matching cred but no delegation_target/AllowedToDelegate.
+        let v = make_delegation_vuln(
+            "v-cd-no-spn",
+            "constrained_delegation",
+            Some("svc_sql"),
+            None,
+        );
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.credentials
+            .push(make_cred("svc_sql", "Pw!", "contoso.local"));
+        assert!(select_s4u_work_items(&s, &HashMap::new(), Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn select_skips_delegation_vuln_with_blank_target_spn() {
+        let mut s = StateInner::new("op-test".into());
+        let mut details = std::collections::HashMap::new();
+        details.insert("account_name".into(), json!("svc_sql"));
+        details.insert("delegation_target".into(), json!("   "));
+        let v = ares_core::models::VulnerabilityInfo {
+            vuln_id: "v-cd-blank-spn".into(),
+            vuln_type: "constrained_delegation".into(),
+            target: "192.168.58.50".into(),
+            discovered_by: "test".into(),
+            discovered_at: Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 1,
+        };
+        s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
+        s.credentials
+            .push(make_cred("svc_sql", "Pw!", "contoso.local"));
+        assert!(select_s4u_work_items(&s, &HashMap::new(), Instant::now()).is_empty());
     }
 
     #[test]
@@ -847,7 +905,12 @@ mod tests {
     #[test]
     fn select_picks_credential_case_insensitively() {
         let mut s = StateInner::new("op-test".into());
-        let v = make_delegation_vuln("v-rbcd-SvcSql", "rbcd", Some("SvcSql"), None);
+        let v = make_delegation_vuln(
+            "v-rbcd-SvcSql",
+            "rbcd",
+            Some("SvcSql"),
+            Some("CIFS/dc01.contoso.local"),
+        );
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
         s.credentials
             .push(make_cred("svcsql", "Pw!", "contoso.local"));
@@ -859,7 +922,12 @@ mod tests {
     #[test]
     fn select_falls_back_to_ntlm_hash_when_no_password_cred() {
         let mut s = StateInner::new("op-test".into());
-        let v = make_delegation_vuln("v-rbcd-svc", "rbcd", Some("svc"), None);
+        let v = make_delegation_vuln(
+            "v-rbcd-svc",
+            "rbcd",
+            Some("svc"),
+            Some("CIFS/dc01.contoso.local"),
+        );
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
         s.hashes.push(make_hash("svc", "deadbeef", "contoso.local"));
         let work = select_s4u_work_items(&s, &HashMap::new(), Instant::now());
@@ -872,7 +940,12 @@ mod tests {
     #[test]
     fn select_skips_non_ntlm_hashes() {
         let mut s = StateInner::new("op-test".into());
-        let v = make_delegation_vuln("v-rbcd-svc", "rbcd", Some("svc"), None);
+        let v = make_delegation_vuln(
+            "v-rbcd-svc",
+            "rbcd",
+            Some("svc"),
+            Some("CIFS/dc01.contoso.local"),
+        );
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
         let mut h = make_hash("svc", "deadbeef", "contoso.local");
         h.hash_type = "AES256".into();
@@ -883,7 +956,12 @@ mod tests {
     #[test]
     fn select_populates_dc_ip_from_domain_controllers() {
         let mut s = StateInner::new("op-test".into());
-        let v = make_delegation_vuln("v-rbcd-svc", "rbcd", Some("svc"), None);
+        let v = make_delegation_vuln(
+            "v-rbcd-svc",
+            "rbcd",
+            Some("svc"),
+            Some("CIFS/dc01.contoso.local"),
+        );
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
         s.credentials.push(make_cred("svc", "Pw!", "contoso.local"));
         s.domain_controllers
@@ -909,8 +987,18 @@ mod tests {
     #[test]
     fn select_accepts_constrained_delegation_and_rbcd_only() {
         let mut s = StateInner::new("op-test".into());
-        let cd = make_delegation_vuln("v-cd", "Constrained_Delegation", Some("svc1"), None);
-        let rbcd = make_delegation_vuln("v-rb", "RBCD", Some("svc2"), None);
+        let cd = make_delegation_vuln(
+            "v-cd",
+            "Constrained_Delegation",
+            Some("svc1"),
+            Some("CIFS/dc01.contoso.local"),
+        );
+        let rbcd = make_delegation_vuln(
+            "v-rb",
+            "RBCD",
+            Some("svc2"),
+            Some("CIFS/dc02.contoso.local"),
+        );
         s.discovered_vulnerabilities.insert(cd.vuln_id.clone(), cd);
         s.discovered_vulnerabilities
             .insert(rbcd.vuln_id.clone(), rbcd);

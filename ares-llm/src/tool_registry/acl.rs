@@ -223,7 +223,7 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pywhisker".into(),
-            description: "Manage msDS-KeyCredentialLink attribute for Shadow Credentials attack. Adds, removes, or lists Key Credential entries on a target object. When adding, generates a PFX certificate that can be used with PKINIT to obtain a TGT for the target principal.".into(),
+            description: "Manage msDS-KeyCredentialLink attribute for Shadow Credentials attack. Adds, removes, or lists Key Credential entries on a target object. When adding, generates a PFX certificate that can be used with PKINIT to obtain a TGT for the target principal. Auth precedence: ticket_path > hash > password.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -241,7 +241,15 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for authentication (used only when no ticket_path or hash is supplied)"
+                    },
+                    "hash": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash (LM:NT or bare NT). Takes precedence over password."
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Highest auth precedence; sets KRB5CCNAME and invokes pywhisker with -k --no-pass."
                     },
                     "dc_ip": {
                         "type": "string",
@@ -254,12 +262,12 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                         "default": "add"
                     }
                 },
-                "required": ["target_samaccountname", "domain", "username", "password", "dc_ip"]
+                "required": ["target_samaccountname", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
             name: "targeted_kerberoast".into(),
-            description: "Set a Service Principal Name (SPN) on a target account and then Kerberoast it. Exploits GenericAll or GenericWrite permissions to add an SPN to an account that lacks one, then requests a TGS ticket whose hash can be cracked offline to recover the account's password.".into(),
+            description: "Set a Service Principal Name (SPN) on a target account and then Kerberoast it. Exploits GenericAll or GenericWrite permissions to add an SPN to an account that lacks one, then requests a TGS ticket whose hash can be cracked offline to recover the account's password. Auth precedence: ticket_path > hash > password.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -277,14 +285,22 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for authentication (used only when no ticket_path or hash is supplied)"
+                    },
+                    "hash": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash (LM:NT or bare NT). Takes precedence over password."
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Highest auth precedence; sets KRB5CCNAME and invokes the tool with -k -no-pass."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_user", "domain", "username", "password", "dc_ip"]
+                "required": ["target_user", "domain", "username", "dc_ip"]
             }),
         },
         // NOTE: sharpgpoabuse removed — SharpGPOAbuse.exe not in ACL container.

@@ -233,18 +233,23 @@ fn extract_target_user(
 /// NT hash via certipy auth).
 ///
 /// Includes the obvious primitives (GenericAll, GenericWrite, WriteDacl,
-/// WriteOwner) plus two that the lab's BloodHound exposed but the
-/// original matcher missed:
-/// - `allextendedrights`: subsumes every extended right on the target,
-///   including the property-write needed for msDS-KeyCredentialLink —
-///   equivalent to GenericAll for shadow-creds purposes.
-/// - `writeproperty`: a property write that covers msDS-KeyCredentialLink
-///   (BloodHound's targetedwrite analogue).
+/// WriteOwner) plus `writeproperty` (BloodHound's targetedwrite analogue
+/// for a specific attribute write, which — when it covers all properties
+/// or msDS-KeyCredentialLink specifically — is a valid shadow-cred primitive).
 ///
-/// `forcechangepassword` is deliberately excluded: the User-Force-Change-
-/// Password extended right grants password reset only, not the property
-/// write required for msDS-KeyCredentialLink. Those vulns are routed to
-/// `auto_dacl_abuse` → `bloodyad_set_password` instead.
+/// `AllExtendedRights` is deliberately excluded. The extended-rights ACE
+/// covers *control access rights* (User-Force-Change-Password, DS-Replication-
+/// Get-Changes, etc.) but does NOT grant `WriteProperty` on any attribute —
+/// including `msDS-KeyCredentialLink`. Historically the matcher accepted it,
+/// which caused every `AllExtendedRights` edge from BloodHound to burn a
+/// shadow-cred dispatch that came back `INSUFF_ACCESS_RIGHTS 00002098` on
+/// `msDS-KeyCredentialLink`. See WAYSFUCKED op-20260624 for the trail.
+/// Those vulns are routed to `auto_dacl_abuse` instead.
+///
+/// `forcechangepassword` is likewise excluded: the User-Force-Change-Password
+/// extended right grants password reset only, not the property write required
+/// for msDS-KeyCredentialLink. Those vulns are routed to `auto_dacl_abuse` →
+/// `bloodyad_set_password`.
 ///
 /// All forms accept both the bare and `acl_`-prefixed shapes emitted by
 /// ldap_acl_enumeration's parser.
@@ -256,13 +261,11 @@ pub(crate) fn is_shadow_cred_candidate(vuln_type: &str) -> bool {
             | "writedacl"
             | "writeowner"
             | "shadow_credentials"
-            | "allextendedrights"
             | "writeproperty"
             | "acl_genericall"
             | "acl_genericwrite"
             | "acl_writedacl"
             | "acl_writeowner"
-            | "acl_allextendedrights"
             | "acl_writeproperty"
     )
 }
@@ -288,15 +291,13 @@ mod tests {
     }
 
     #[test]
-    fn is_shadow_cred_candidate_accepts_allextendedrights_and_writeproperty() {
-        // BloodHound surfaces these on user-targeted ACLs (e.g. a low-priv
-        // account with AllExtendedRights on Administrator) — accepting them
-        // lets certipy_shadow fire on the direct DA path.
-        assert!(is_shadow_cred_candidate("allextendedrights"));
-        assert!(is_shadow_cred_candidate("AllExtendedRights"));
+    fn is_shadow_cred_candidate_accepts_writeproperty() {
+        // WriteProperty (unrestricted) covers all properties including
+        // msDS-KeyCredentialLink, so it remains a valid shadow-cred
+        // primitive. When BloodHound reports a *property-scoped* WriteProperty
+        // that doesn't touch KeyCredentialLink, the pre-flight result-inspection
+        // path in result_processing bumps it to abandoned after one failure.
         assert!(is_shadow_cred_candidate("writeproperty"));
-        // ACL-prefixed forms emitted by ldap_acl_enumeration parser.
-        assert!(is_shadow_cred_candidate("acl_allextendedrights"));
         assert!(is_shadow_cred_candidate("acl_writeproperty"));
         assert!(is_shadow_cred_candidate("acl_writeowner"));
     }
@@ -315,6 +316,13 @@ mod tests {
         assert!(!is_shadow_cred_candidate("forcechangepassword"));
         assert!(!is_shadow_cred_candidate("ForceChangePassword"));
         assert!(!is_shadow_cred_candidate("acl_forcechangepassword"));
+        // AllExtendedRights grants extended (control-access) rights, NOT
+        // property writes on msDS-KeyCredentialLink. See WAYSFUCKED
+        // op-20260624 for the trail of INSUFF_ACCESS_RIGHTS failures this
+        // used to produce. Routed to auto_dacl_abuse instead.
+        assert!(!is_shadow_cred_candidate("allextendedrights"));
+        assert!(!is_shadow_cred_candidate("AllExtendedRights"));
+        assert!(!is_shadow_cred_candidate("acl_allextendedrights"));
     }
 
     #[test]

