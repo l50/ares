@@ -45,9 +45,8 @@ Install and configure network poisoning and relay attack tools for Ares agents
 | `coercion_tools_responder_service_enabled` | bool | <code>True</code> | No description |
 | `coercion_tools_responder_service_state` | str | <code>started</code> | No description |
 | `coercion_tools_responder_interface` | str | <code>eth0</code> | No description |
-| `coercion_tools_responder_service_args` | str | <code>-I {{ coercion_tools_responder_interface }} -A --lm --disable-ess</code> | No description |
+| `coercion_tools_responder_service_args` | str | <code><multiline value: folded_strip></code> | No description |
 | `coercion_tools_responder_bin` | str | <code><multiline value: folded_strip></code> | No description |
-| `coercion_tools_responder_conf_path` | str | <code><multiline value: folded_strip></code> | No description |
 | `coercion_tools_install_mitm6` | bool | <code>True</code> | No description |
 | `coercion_tools_mitm6_package` | str | <code>mitm6</code> | No description |
 | `coercion_tools_install_coercer` | bool | <code>True</code> | No description |
@@ -163,7 +162,6 @@ Install and configure network poisoning and relay attack tools for Ares agents
 ### responder_configure.yml
 
 
-- **Set Responder static challenge for NetNTLMv1 rainbow-table cracking** (ansible.builtin.lineinfile)
 - **Install Responder systemd unit** (ansible.builtin.template)
 - **Flush handlers so systemd sees the new unit before manage-service** (ansible.builtin.meta)
 - **Manage Responder service** (ansible.builtin.systemd)
