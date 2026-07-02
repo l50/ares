@@ -438,7 +438,7 @@ task remote:status
 
 Full reset on an EC2 instance: stop workers and any running op, deploy
 fresh binaries, wipe Redis, restart workers, then launch a new operation.
-EC2 equivalent of the K8s `task -y red:multi:sync:align && task -y red:multi`
+EC2 equivalent of the K8s `task -y k8s:reset && task -y k8s:deploy && task -y red:multi`
 shortcut.
 
 `ec2:deploy` requires `S3_BUCKET` (binary staging bucket) — export it or

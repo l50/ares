@@ -53,6 +53,11 @@ includes:
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
       ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
       LOKI_URL: '{{.LOKI_URL}}'
+  k8s:
+    taskfile: .taskfiles/k8s/Taskfile.yaml
+    optional: true
+    vars:
+      K8S_NAMESPACE: '{{.K8S_NAMESPACE}}'
   blue:
     taskfile: .taskfiles/blue/Taskfile.yaml
     optional: true

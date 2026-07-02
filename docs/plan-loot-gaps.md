@@ -340,7 +340,7 @@ active.
 **K8s (red:multi):**
 
 ```bash
-task -y red:multi:sync:align && task -y red:multi TARGET=dreadgoad
+task -y k8s:reset && task -y k8s:deploy && task -y red:multi TARGET=dreadgoad
 task red:multi:list LATEST=true
 task red:multi:loot LATEST=true
 task red:multi:report LATEST=true
