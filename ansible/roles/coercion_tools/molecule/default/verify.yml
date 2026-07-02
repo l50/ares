@@ -322,15 +322,19 @@
     # impacket is the 0.10.0 transitive dep that pip pulls in for the
     # coercer package, and impacket/version.py crashes on `import
     # pkg_resources` because setuptools isn't installed for the system
-    # Python. Asserting --help exits 0 catches that regression class for
-    # every coercion-side coerce entrypoint, not just the impacket ones.
-    - name: Read first line of /usr/local/bin/petitpotam to confirm bash wrapper
+    # Python. Kali ships python3-pkg-resources so a plain symlink to the
+    # raw .py works there; non-Kali needs a venv-aware bash wrapper.
+    # Asserting --help exits 0 catches the regression class for every
+    # coercion entrypoint on both distros regardless of launcher strategy.
+    - name: Read first line of /usr/local/bin/petitpotam to confirm bash wrapper (non-Kali)
       ansible.builtin.command: head -n 1 /usr/local/bin/petitpotam
       register: coercion_tools_petitpotam_shebang
       changed_when: false
-      when: coercion_tools_install_petitpotam | default(true)
+      when:
+        - coercion_tools_install_petitpotam | default(true)
+        - ansible_facts['distribution'] != 'Kali'
 
-    - name: Assert /usr/local/bin/petitpotam is a bash wrapper (not a symlink to the raw .py)
+    - name: Assert /usr/local/bin/petitpotam is a bash wrapper (non-Kali)
       ansible.builtin.assert:
         that:
           - "'#!/bin/bash' in coercion_tools_petitpotam_shebang.stdout"
@@ -341,7 +345,34 @@
           the system Python, which on Debian trixie crashes with
           ModuleNotFoundError: pkg_resources at import time.
         success_msg: "/usr/local/bin/petitpotam is a venv-aware bash wrapper"
-      when: coercion_tools_install_petitpotam | default(true)
+      when:
+        - coercion_tools_install_petitpotam | default(true)
+        - ansible_facts['distribution'] != 'Kali'
+
+    - name: Stat /usr/local/bin/petitpotam launcher (Kali)
+      ansible.builtin.stat:
+        path: /usr/local/bin/petitpotam
+        follow: false
+      register: coercion_tools_petitpotam_kali_launcher
+      when:
+        - coercion_tools_install_petitpotam | default(true)
+        - ansible_facts['distribution'] == 'Kali'
+
+    - name: Assert /usr/local/bin/petitpotam is a symlink to petitpotam.py (Kali)
+      ansible.builtin.assert:
+        that:
+          - coercion_tools_petitpotam_kali_launcher.stat.islnk | default(false)
+          - coercion_tools_petitpotam_kali_launcher.stat.lnk_target
+            == coercion_tools_petitpotam_install_dir ~ '/petitpotam.py'
+        fail_msg: >-
+          /usr/local/bin/petitpotam is not a symlink pointing at
+          '{{ coercion_tools_petitpotam_install_dir }}/petitpotam.py'
+          (islnk={{ coercion_tools_petitpotam_kali_launcher.stat.islnk | default(false) }},
+          target='{{ coercion_tools_petitpotam_kali_launcher.stat.lnk_target | default('') }}').
+        success_msg: "/usr/local/bin/petitpotam is a symlink to petitpotam.py"
+      when:
+        - coercion_tools_install_petitpotam | default(true)
+        - ansible_facts['distribution'] == 'Kali'
 
     - name: Run --help on coercion entrypoints to catch import-time crashes
       ansible.builtin.command: "{{ item }} --help"
