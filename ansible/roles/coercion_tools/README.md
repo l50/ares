@@ -40,6 +40,14 @@ Install and configure network poisoning and relay attack tools for Ares agents
 | `coercion_tools_responder_repo` | str | <code>https://github.com/lgandx/Responder.git</code> | No description |
 | `coercion_tools_responder_install_dir` | str | <code>/opt/Responder</code> | No description |
 | `coercion_tools_responder_version` | str | <code>v3.1.4.0</code> | No description |
+| `coercion_tools_responder_challenge` | str | <code>1122334455667788</code> | No description |
+| `coercion_tools_responder_configure_service` | bool | <code>True</code> | No description |
+| `coercion_tools_responder_service_enabled` | bool | <code>True</code> | No description |
+| `coercion_tools_responder_service_state` | str | <code>started</code> | No description |
+| `coercion_tools_responder_interface` | str | <code>eth0</code> | No description |
+| `coercion_tools_responder_service_args` | str | <code>-I {{ coercion_tools_responder_interface }} -A --lm --disable-ess</code> | No description |
+| `coercion_tools_responder_bin` | str | <code><multiline value: folded_strip></code> | No description |
+| `coercion_tools_responder_conf_path` | str | <code><multiline value: folded_strip></code> | No description |
 | `coercion_tools_install_mitm6` | bool | <code>True</code> | No description |
 | `coercion_tools_mitm6_package` | str | <code>mitm6</code> | No description |
 | `coercion_tools_install_coercer` | bool | <code>True</code> | No description |
@@ -111,9 +119,6 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Remove conflicting python3-responder package on Kali** (ansible.builtin.apt) - Conditional
 - **Install Kali-specific poisoning tools (includes responder from apt)** (ansible.builtin.apt) - Conditional
 - **Install Ubuntu-compatible dependencies** (ansible.builtin.apt) - Conditional
-- **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
-- **Check if Coercer is already installed** (ansible.builtin.command) - Conditional
-- **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Install Impacket from source for ntlmrelayx** (ansible.builtin.include_tasks) - Conditional
 - **Check for ntlmrelayx.py wrapper** (ansible.builtin.stat) - Conditional
 - **Create ntlmrelayx wrapper script** (ansible.builtin.copy) - Conditional
@@ -122,13 +127,15 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Install Responder dependencies (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Make Responder.py executable** (ansible.builtin.file) - Conditional
 - **Create symlink for Responder** (ansible.builtin.file) - Conditional
+- **Configure Responder challenge and service** (ansible.builtin.include_tasks) - Conditional
 - **Install mitm6 via pipx** (ansible.builtin.include_tasks) - Conditional
 - **Install mitm6 via apt (Kali)** (ansible.builtin.apt) - Conditional
+- **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
+- **Check if Coercer is already installed** (ansible.builtin.command) - Conditional
+- **Install Coercer via pip (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Clone PetitPotam from GitHub (ly4k's improved version)** (ansible.builtin.git) - Conditional
 - **Make petitpotam.py executable** (ansible.builtin.file) - Conditional
-- **Stat existing PetitPotam launcher** (ansible.builtin.stat) - Conditional
-- **Remove legacy PetitPotam symlink so the wrapper can replace it** (ansible.builtin.file) - Conditional
-- **Install venv-aware bash wrapper for PetitPotam** (ansible.builtin.copy) - Conditional
+- **Create symlink for PetitPotam** (ansible.builtin.file) - Conditional
 - **Clone krbrelayx from GitHub** (ansible.builtin.git) - Conditional
 - **Configure git to ignore filemode changes in krbrelayx repo** (ansible.builtin.command) - Conditional
 - **Create virtual environment for krbrelayx** (ansible.builtin.command) - Conditional
@@ -149,6 +156,14 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Check if mitm6 is already installed via pipx** (ansible.builtin.command)
 - **Install mitm6 via pipx** (ansible.builtin.command) - Conditional
 - **Create symlink for mitm6 in /usr/local/bin** (ansible.builtin.file)
+
+### responder_configure.yml
+
+
+- **Set Responder static challenge for NetNTLMv1 rainbow-table cracking** (ansible.builtin.lineinfile)
+- **Install Responder systemd unit** (ansible.builtin.template)
+- **Flush handlers so systemd sees the new unit before manage-service** (ansible.builtin.meta)
+- **Manage Responder service** (ansible.builtin.systemd)
 
 ## Example Playbook
 

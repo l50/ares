@@ -27,6 +27,36 @@ coercion_tools_responder_install_dir: "/opt/Responder"
 # Pin to latest stable release for reproducibility
 coercion_tools_responder_version: "v3.1.4.0"
 
+# Static challenge → captured NetNTLMv1 hashes are crackable via crack.sh
+# rainbow tables (seconds) or local hashcat (-m 27000). Set to "Random"
+# to opt out.
+coercion_tools_responder_challenge: "1122334455667788"
+
+# Install (and by default run) a systemd unit that keeps Responder up as
+# a coerced-auth listener. Analyze mode (-A) skips LLMNR/NBTNS/MDNS
+# poisoning but still runs SMB/HTTP/FTP/LDAP rogue servers, so coerced
+# auth from PetitPotam/PrinterBug/DFSCoerce is captured without
+# blue-team-noisy poison responses. --lm --disable-ess forces the
+# NetNTLMv1 downgrade path.
+coercion_tools_responder_configure_service: true
+coercion_tools_responder_service_enabled: true
+coercion_tools_responder_service_state: started
+coercion_tools_responder_interface: "eth0"
+coercion_tools_responder_service_args: "-I {{ coercion_tools_responder_interface }} -A --lm --disable-ess"
+
+# Distro-specific paths. Kali's apt package installs to /usr/sbin/ and
+# ships Responder.conf under /usr/share/responder/. The source install
+# clones into coercion_tools_responder_install_dir and symlinks the
+# binary into /usr/local/bin/ (see linux.yml).
+coercion_tools_responder_bin: >-
+  {{ '/usr/sbin/responder'
+     if (ansible_facts['distribution'] | default('')) == 'Kali'
+     else '/usr/local/bin/responder' }}
+coercion_tools_responder_conf_path: >-
+  {{ '/usr/share/responder/Responder.conf'
+     if (ansible_facts['distribution'] | default('')) == 'Kali'
+     else coercion_tools_responder_install_dir ~ '/Responder.conf' }}
+
 # mitm6 configuration (DHCPv6 poisoning)
 coercion_tools_install_mitm6: true
 coercion_tools_mitm6_package: "mitm6"

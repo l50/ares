@@ -57,46 +57,6 @@
     - ansible_facts['os_family'] == 'Debian'
     - ansible_facts['distribution'] != 'Kali'
 
-# Coercer must be installed BEFORE the impacket source wrappers below. The pip
-# install pulls in its own copy of impacket as a dependency, which drops the
-# upstream example scripts (ntlmrelayx.py, secretsdump.py, ...) into
-# /usr/local/bin wired to the system Python. Those have to be overwritten by
-# the venv-aware bash wrappers from impacket_source.yml, so Coercer has to run
-# first — otherwise it clobbers the wrappers, leaving the tools pointed at a
-# broken system interpreter and making the converge non-idempotent.
-- name: Install Coercer via apt (Kali)
-  ansible.builtin.apt:
-    name: "{{ coercion_tools_coercer_package }}"
-    state: present
-  become: true
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - ansible_facts['distribution'] == 'Kali'
-    - coercion_tools_install_coercer
-
-- name: Check if Coercer is already installed
-  ansible.builtin.command: pip3 show coercer
-  register: coercion_tools_coercer_check
-  changed_when: false
-  failed_when: false
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - ansible_facts['distribution'] != 'Kali'
-    - coercion_tools_install_coercer
-
-- name: Install Coercer via pip (non-Kali)
-  ansible.builtin.pip:
-    name: "{{ coercion_tools_coercer_package }}"
-    executable: pip3
-    # Use --ignore-installed to handle system packages that can't be uninstalled
-    extra_args: "{{ ('--break-system-packages ' if (base_pip_break_required | default(false)) else '') ~ '--ignore-installed' }}"
-  become: true
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - ansible_facts['distribution'] != 'Kali'
-    - coercion_tools_install_coercer
-    - coercion_tools_coercer_check.rc != 0
-
 - name: Install Impacket from source for ntlmrelayx
   ansible.builtin.include_tasks: impacket_source.yml
   when:
@@ -189,6 +149,13 @@
     - ansible_facts['distribution'] != 'Kali'
     - coercion_tools_install_responder
 
+- name: Configure Responder challenge and service
+  ansible.builtin.include_tasks: responder_configure.yml
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - coercion_tools_install_responder
+    - coercion_tools_responder_configure_service
+
 - name: Install mitm6 via pipx
   ansible.builtin.include_tasks: mitm6_pipx.yml
   when:
@@ -205,6 +172,39 @@
     - ansible_facts['os_family'] == 'Debian'
     - ansible_facts['distribution'] == 'Kali'
     - coercion_tools_install_mitm6
+
+- name: Install Coercer via apt (Kali)
+  ansible.builtin.apt:
+    name: "{{ coercion_tools_coercer_package }}"
+    state: present
+  become: true
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - ansible_facts['distribution'] == 'Kali'
+    - coercion_tools_install_coercer
+
+- name: Check if Coercer is already installed
+  ansible.builtin.command: pip3 show coercer
+  register: coercion_tools_coercer_check
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - ansible_facts['distribution'] != 'Kali'
+    - coercion_tools_install_coercer
+
+- name: Install Coercer via pip (non-Kali)
+  ansible.builtin.pip:
+    name: "{{ coercion_tools_coercer_package }}"
+    executable: pip3
+    # Use --ignore-installed to handle system packages that can't be uninstalled
+    extra_args: "{{ ('--break-system-packages ' if (base_pip_break_required | default(false)) else '') ~ '--ignore-installed' }}"
+  become: true
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - ansible_facts['distribution'] != 'Kali'
+    - coercion_tools_install_coercer
+    - coercion_tools_coercer_check.rc != 0
 
 - name: Clone PetitPotam from GitHub (ly4k's improved version)
   ansible.builtin.git:
@@ -228,54 +228,16 @@
     - coercion_tools_install_petitpotam
     - coercion_tools_petitpotam_clone is not skipped
 
-# petitpotam.py ships with `#!/usr/bin/python3` and does
-# `from impacket import system_errors, version`. On Debian trixie / Python
-# 3.13 the only system-wide impacket is whatever `pip install coercer`
-# dragged in (impacket 0.10.0 → /usr/local/lib/python3.13/dist-packages),
-# and impacket/version.py does `import pkg_resources`, which is not
-# available because setuptools isn't installed in the system interpreter.
-# That makes every petitpotam invocation crash before parsing argv.
-#
-# Same fix as ntlmrelayx / krbrelayx: drop a bash wrapper that dispatches
-# through the impacket source venv (/opt/impacket/venv), which has
-# impacket 0.13.0 + setuptools properly installed.
-- name: Stat existing PetitPotam launcher
-  ansible.builtin.stat:
-    path: /usr/local/bin/petitpotam
-    follow: false
-  register: coercion_tools_petitpotam_launcher
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - coercion_tools_install_petitpotam
-
-# Only clear out a legacy symlink (the previous implementation symlinked
-# petitpotam.py here). Once the bash wrapper is in place it is a regular file,
-# so the copy below handles it idempotently — removing unconditionally would
-# delete and recreate the wrapper on every run and break idempotence.
-- name: Remove legacy PetitPotam symlink so the wrapper can replace it
+- name: Create symlink for PetitPotam
   ansible.builtin.file:
-    path: /usr/local/bin/petitpotam
-    state: absent
+    src: "{{ coercion_tools_petitpotam_install_dir }}/petitpotam.py"
+    dest: "/usr/local/bin/petitpotam"
+    state: link
   become: true
   when:
     - ansible_facts['os_family'] == 'Debian'
     - coercion_tools_install_petitpotam
-    - coercion_tools_petitpotam_launcher.stat.islnk | default(false)
-
-- name: Install venv-aware bash wrapper for PetitPotam
-  ansible.builtin.copy:
-    dest: /usr/local/bin/petitpotam
-    mode: '0755'
-    content: |
-      #!/bin/bash
-      exec "{{ coercion_tools_impacket_venv | default('/opt/impacket/venv') }}/bin/python" \
-           "{{ coercion_tools_petitpotam_install_dir }}/petitpotam.py" "$@"
-  become: true
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - coercion_tools_install_petitpotam
-    - coercion_tools_install_ntlmrelayx
-    - coercion_tools_impacket_from_source
+    - coercion_tools_petitpotam_clone is not skipped
 
 # krbrelayx - Kerberos relay attacks (alternative to ntlmrelayx for Kerberos)
 - name: Clone krbrelayx from GitHub
