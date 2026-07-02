@@ -17,11 +17,14 @@
 //!
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn, Instrument};
 
 use ares_core::nats::{self, NatsBroker};
@@ -65,10 +68,82 @@ struct ToolExecResponse {
 
 // ─── Tool executor loop ─────────────────────────────────────────────────────
 
+/// Default per-worker concurrent-tool cap. Each worker processes up to N
+/// tool requests in parallel via `tokio::spawn`; the serial `.await` on
+/// each dispatch was throttling effective fleet throughput to the number
+/// of worker roles (7) regardless of how many permits `TOOL_PERMITS`
+/// advertised. Kept conservative (3) so the fleet-wide peak stays under
+/// the observed 10 GiB cgroup ceiling: at ~250 MB per netexec × 3 per
+/// worker × 7 roles = ~5 GB peak, matching the original single-worker
+/// TOOL_PERMITS=20 memory profile. Override via `ARES_WORKER_CONCURRENCY`.
+const DEFAULT_WORKER_CONCURRENCY: usize = 3;
+
+/// Environment variable override for [`DEFAULT_WORKER_CONCURRENCY`].
+/// Values <1 are ignored (falls back to default).
+const WORKER_CONCURRENCY_ENV: &str = "ARES_WORKER_CONCURRENCY";
+
+fn worker_concurrency_from_env() -> usize {
+    std::env::var(WORKER_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_WORKER_CONCURRENCY)
+}
+
+/// Guard for the per-worker in-flight counter. Increments the counter on
+/// construction (flipping `status_tx` to "busy" on the 0→1 transition) and
+/// decrements on drop (flipping to "idle" on the 1→0 transition). Held for
+/// the lifetime of a spawned `execute_and_respond` task so panics and early
+/// returns can never leak the count.
+struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+    status_tx: tokio::sync::watch::Sender<WorkerStatus>,
+}
+
+impl InflightGuard {
+    fn enter(
+        counter: Arc<AtomicUsize>,
+        status_tx: tokio::sync::watch::Sender<WorkerStatus>,
+        tool_name: &str,
+        call_id: &str,
+    ) -> Self {
+        let prev = counter.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 {
+            let _ = status_tx.send(WorkerStatus {
+                status: "busy".to_string(),
+                current_task: Some(busy_current_task(tool_name, call_id)),
+            });
+        }
+        Self { counter, status_tx }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let after = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
+        if after == 0 {
+            let _ = self.status_tx.send(WorkerStatus {
+                status: "idle".to_string(),
+                current_task: None,
+            });
+        }
+    }
+}
+
 /// Run the tool execution loop until shutdown is signalled.
 ///
 /// Subscribes to `ares.tools.exec.{role}` as a queue group so each request
 /// goes to exactly one worker. Replies on the request's reply inbox.
+///
+/// Concurrency: each received request is dispatched into `tokio::spawn`
+/// gated by a per-worker semaphore capped at [`DEFAULT_WORKER_CONCURRENCY`]
+/// (default 3). The loop backpressures on `acquire_owned().await` when the
+/// cap is reached — a full cap holds the next `sub.next()` fetch in
+/// suspension, so NATS's queue-group rebalances to a worker with slack.
+/// Ordering is not preserved across concurrent dispatches; the LLM's tool
+/// calls are independent, so this is safe. Preserves the serial-loop's
+/// memory guardrail via the process-wide `TOOL_PERMITS` semaphore inside
+/// `CommandBuilder::execute()` plus the tighter per-worker cap here.
 pub async fn run_tool_exec_loop(
     config: &WorkerConfig,
     conn: redis::aio::ConnectionManager,
@@ -102,7 +177,10 @@ pub async fn run_tool_exec_loop(
         "Starting tool executor loop (NATS queue subscribe)"
     );
 
-    let mut unavailable_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let unavailable_tools: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let worker_permits = Arc::new(Semaphore::new(worker_concurrency_from_env()));
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let worker_role = config.worker_role.clone();
 
     loop {
         let next = tokio::select! {
@@ -126,14 +204,24 @@ pub async fn run_tool_exec_loop(
             }
         };
 
-        let _ = status_tx.send(WorkerStatus {
-            status: "busy".to_string(),
-            current_task: Some(busy_current_task(&request.tool_name, &request.call_id)),
-        });
+        // Acquire the per-worker permit BEFORE spawning so the loop
+        // backpressures on the cap. `acquire_owned` returns a permit whose
+        // Drop releases the semaphore slot — moving it into the spawned
+        // task ties the slot's lifetime to the task's, no matter how it
+        // exits (Ok, error, panic).
+        let permit = match worker_permits.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                // Only reachable if the semaphore is explicitly closed,
+                // which we never do — treat as fatal.
+                error!(err = %e, "worker semaphore closed unexpectedly, exiting loop");
+                return Err(anyhow::anyhow!("worker semaphore closed: {e}"));
+            }
+        };
 
         let ti = extract_target_info(&request.arguments);
         let tt = infer_target_type_from_info(&ti);
-        let mut span_builder = AgentSpanBuilder::new("tool_exec", &config.worker_role, Team::Red)
+        let mut span_builder = AgentSpanBuilder::new("tool_exec", &worker_role, Team::Red)
             .tool(&request.tool_name)
             .kind(SpanKind::Consumer);
         if let Some(ref ip) = ti.target_ip {
@@ -163,21 +251,33 @@ pub async fn run_tool_exec_loop(
         // the borrow during state reads — keeping a per-request copy avoids
         // interleaving with the next iteration's `sub.next()` await.
         let conn_for_resolver = conn.clone();
+        let unavailable_for_task = unavailable_tools.clone();
+        let guard = InflightGuard::enter(
+            inflight.clone(),
+            status_tx.clone(),
+            &request.tool_name,
+            &request.call_id,
+        );
 
-        execute_and_respond(
-            client_for_reply,
-            reply_to,
-            &request,
-            &mut unavailable_tools,
-            conn_for_resolver,
-        )
-        .instrument(exec_span)
-        .await;
-
-        let _ = status_tx.send(WorkerStatus {
-            status: "idle".to_string(),
-            current_task: None,
-        });
+        tokio::spawn(
+            async move {
+                // Bind `permit` locally so its Drop releases the worker
+                // semaphore slot exactly when this task ends — including
+                // on panic, task cancellation, or early return from any
+                // branch of `execute_and_respond`.
+                let _permit = permit;
+                let _guard = guard;
+                execute_and_respond(
+                    client_for_reply,
+                    reply_to,
+                    &request,
+                    &unavailable_for_task,
+                    conn_for_resolver,
+                )
+                .await;
+            }
+            .instrument(exec_span),
+        );
     }
 }
 
@@ -289,10 +389,19 @@ async fn execute_and_respond(
     client: async_nats::Client,
     reply_to: Option<async_nats::Subject>,
     request: &ToolExecRequest,
-    unavailable_tools: &mut std::collections::HashSet<String>,
+    unavailable_tools: &Arc<Mutex<HashSet<String>>>,
     mut conn: redis::aio::ConnectionManager,
 ) {
-    if unavailable_tools.contains(&request.tool_name) {
+    // Cheap contains-check under a briefly-held std::sync::Mutex — no await
+    // point holds this lock, so it can't deadlock with concurrent spawned
+    // tasks that also read/write the same shared HashSet.
+    let is_unavailable = {
+        let g = unavailable_tools
+            .lock()
+            .expect("unavailable_tools mutex poisoned");
+        g.contains(&request.tool_name)
+    };
+    if is_unavailable {
         debug!(
             tool = %request.tool_name,
             call_id = %request.call_id,
@@ -389,7 +498,10 @@ async fn execute_and_respond(
                     tool = %effective_tool_name,
                     "Tool binary not found — marking as unavailable for this session"
                 );
-                unavailable_tools.insert(effective_tool_name.to_string());
+                unavailable_tools
+                    .lock()
+                    .expect("unavailable_tools mutex poisoned")
+                    .insert(effective_tool_name.to_string());
             }
             warn!(
                 tool = %effective_tool_name,
@@ -436,6 +548,212 @@ async fn send_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Per-worker concurrency (Serial-loop wedge fix) ────────────────────
+
+    /// Env-var tests serialise on this mutex — process-wide `set_var` is
+    /// not test-isolated, and cargo runs unit tests in parallel by default.
+    /// Without the guard, the "default" test can observe the "override"
+    /// test's leaked value and fail with a bogus assertion.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drop guard that snapshots [`WORKER_CONCURRENCY_ENV`] on entry and
+    /// restores it on scope exit. Combined with `ENV_LOCK`, this keeps
+    /// each env-touching test hermetic against its sibling tests.
+    struct EnvGuard {
+        prior: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvGuard {
+        fn acquire() -> Self {
+            // If a sibling test panicked while holding the lock, PoisonError
+            // still lets us proceed — we just want serialisation, not the
+            // sibling's data.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                prior: std::env::var(WORKER_CONCURRENCY_ENV).ok(),
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(WORKER_CONCURRENCY_ENV, v),
+                None => std::env::remove_var(WORKER_CONCURRENCY_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn worker_concurrency_default_when_env_unset() {
+        let _g = EnvGuard::acquire();
+        std::env::remove_var(WORKER_CONCURRENCY_ENV);
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+    }
+
+    #[test]
+    fn worker_concurrency_ignores_zero_and_negative() {
+        // Zero and negative overrides must not silently disable the worker —
+        // fall back to the default so a fat-fingered env var can't wedge
+        // the fleet.
+        let _g = EnvGuard::acquire();
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "0");
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "-1");
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "not-a-number");
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+    }
+
+    #[test]
+    fn worker_concurrency_env_override_takes_effect() {
+        let _g = EnvGuard::acquire();
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "7");
+        assert_eq!(worker_concurrency_from_env(), 7);
+    }
+
+    #[tokio::test]
+    async fn inflight_guard_flips_busy_on_0_to_1_transition() {
+        // Contract: entering the FIRST inflight guard flips the watch
+        // channel to "busy". Subsequent guards (concurrent dispatches) do
+        // NOT re-broadcast — the guard checks the pre-add counter.
+        let (tx, rx) = tokio::sync::watch::channel(WorkerStatus {
+            status: "idle".to_string(),
+            current_task: None,
+        });
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let g1 = InflightGuard::enter(counter.clone(), tx.clone(), "nmap_scan", "call-1");
+        assert_eq!(rx.borrow().status, "busy");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let g2 = InflightGuard::enter(counter.clone(), tx, "secretsdump", "call-2");
+        // Still busy; counter reflects the second in-flight dispatch.
+        assert_eq!(rx.borrow().status, "busy");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        drop(g2);
+        // Dropping the second guard while the first is still held must NOT
+        // flip to idle — the 1→0 transition is the only trigger.
+        assert_eq!(rx.borrow().status, "busy");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        drop(g1);
+        // Now the counter hits zero; flip back to idle.
+        assert_eq!(rx.borrow().status, "idle");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inflight_guard_flips_idle_on_panic_via_drop() {
+        // Contract: a spawned task that panics mid-execution still releases
+        // its inflight slot because `InflightGuard: Drop` runs during
+        // unwinding. Prevents a permanent "busy" report on a wedged worker.
+        let (tx, rx) = tokio::sync::watch::channel(WorkerStatus {
+            status: "idle".to_string(),
+            current_task: None,
+        });
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let counter_for_task = counter.clone();
+        let tx_for_task = tx.clone();
+        let handle = tokio::spawn(async move {
+            let _guard =
+                InflightGuard::enter(counter_for_task, tx_for_task, "kaboom", "panic-call");
+            panic!("simulated tool executor panic");
+        });
+
+        // Await the task — panics propagate as a JoinError.
+        let result = handle.await;
+        assert!(result.is_err(), "expected the spawned task to panic");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "InflightGuard::Drop must fire during unwind to release the slot"
+        );
+        assert_eq!(rx.borrow().status, "idle");
+    }
+
+    #[tokio::test]
+    async fn worker_permits_backpressure_at_cap() {
+        // Contract: `acquire_owned().await` on a saturated semaphore
+        // suspends until a permit is dropped. Verified by
+        // 1. holding all N permits, then confirming `available_permits()`
+        //    reaches zero,
+        // 2. wrapping a fresh `acquire_owned` in `tokio::time::timeout` —
+        //    it times out while the cap is held,
+        // 3. dropping a held permit and confirming a subsequent
+        //    `acquire_owned` completes promptly.
+        // This is the same backpressure the worker loop relies on to keep
+        // fleet-wide concurrent tool count within memory budget.
+        use std::time::Duration;
+
+        let permits = Arc::new(Semaphore::new(2));
+
+        let p1 = permits.clone().acquire_owned().await.unwrap();
+        let p2 = permits.clone().acquire_owned().await.unwrap();
+        assert_eq!(permits.available_permits(), 0);
+
+        // A fresh acquire under a tight timeout must fail with Elapsed
+        // while the cap is saturated. Elapsed is the timeout arm's Err.
+        let stuck =
+            tokio::time::timeout(Duration::from_millis(25), permits.clone().acquire_owned()).await;
+        assert!(
+            stuck.is_err(),
+            "acquire_owned should not have resolved while the cap was full"
+        );
+
+        drop(p1);
+        // Slot freed — the next acquire completes well within the same
+        // timeout budget.
+        let p3 = tokio::time::timeout(Duration::from_millis(200), permits.clone().acquire_owned())
+            .await
+            .expect("acquire_owned failed to complete after a permit was dropped")
+            .expect("semaphore closed unexpectedly");
+
+        drop(p2);
+        drop(p3);
+        assert_eq!(permits.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn unavailable_tools_read_write_across_tasks_no_deadlock() {
+        // Contract: `unavailable_tools` is shared across concurrently
+        // spawned dispatch tasks. The std::sync::Mutex is held only for
+        // the duration of a HashSet contains/insert — never across an
+        // await — so many concurrent tasks can safely serialize on it
+        // without deadlocking each other or the outer loop's
+        // `sub.next().await`.
+        let set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // First writer marks "hashcat" as unavailable.
+        let writer_set = set.clone();
+        let writer = tokio::spawn(async move {
+            writer_set
+                .lock()
+                .expect("mutex poisoned")
+                .insert("hashcat".to_string());
+        });
+
+        // Concurrent readers race the writer; either observation is valid,
+        // but neither may deadlock.
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let r_set = set.clone();
+            readers.push(tokio::spawn(async move {
+                r_set.lock().expect("mutex poisoned").contains("hashcat")
+            }));
+        }
+
+        writer.await.unwrap();
+        for r in readers {
+            let _observed = r.await.unwrap();
+        }
+
+        // After all tasks settle, the writer's mutation is visible.
+        assert!(set.lock().unwrap().contains("hashcat"));
+    }
 
     #[test]
     fn tool_exec_request_deserialize() {
