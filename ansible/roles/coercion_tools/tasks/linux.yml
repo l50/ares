@@ -180,13 +180,6 @@
     - ansible_facts['distribution'] != 'Kali'
     - coercion_tools_install_responder
 
-- name: Configure Responder challenge and service
-  ansible.builtin.include_tasks: responder_configure.yml
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - coercion_tools_install_responder
-    - coercion_tools_responder_configure_service
-
 - name: Install mitm6 via pipx
   ansible.builtin.include_tasks: mitm6_pipx.yml
   when:

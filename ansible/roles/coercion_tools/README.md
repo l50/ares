@@ -40,13 +40,6 @@ Install and configure network poisoning and relay attack tools for Ares agents
 | `coercion_tools_responder_repo` | str | <code>https://github.com/lgandx/Responder.git</code> | No description |
 | `coercion_tools_responder_install_dir` | str | <code>/opt/Responder</code> | No description |
 | `coercion_tools_responder_version` | str | <code>v3.1.4.0</code> | No description |
-| `coercion_tools_responder_challenge` | str | <code>1122334455667788</code> | No description |
-| `coercion_tools_responder_configure_service` | bool | <code>True</code> | No description |
-| `coercion_tools_responder_service_enabled` | bool | <code>True</code> | No description |
-| `coercion_tools_responder_service_state` | str | <code>started</code> | No description |
-| `coercion_tools_responder_interface` | str | <code>eth0</code> | No description |
-| `coercion_tools_responder_service_args` | str | <code><multiline value: folded_strip></code> | No description |
-| `coercion_tools_responder_bin` | str | <code><multiline value: folded_strip></code> | No description |
 | `coercion_tools_install_mitm6` | bool | <code>True</code> | No description |
 | `coercion_tools_mitm6_package` | str | <code>mitm6</code> | No description |
 | `coercion_tools_install_coercer` | bool | <code>True</code> | No description |
@@ -128,7 +121,6 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Install Responder dependencies (non-Kali)** (ansible.builtin.pip) - Conditional
 - **Make Responder.py executable** (ansible.builtin.file) - Conditional
 - **Create symlink for Responder** (ansible.builtin.file) - Conditional
-- **Configure Responder challenge and service** (ansible.builtin.include_tasks) - Conditional
 - **Install mitm6 via pipx** (ansible.builtin.include_tasks) - Conditional
 - **Install mitm6 via apt (Kali)** (ansible.builtin.apt) - Conditional
 - **Install Coercer via apt (Kali)** (ansible.builtin.apt) - Conditional
@@ -158,13 +150,6 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - **Check if mitm6 is already installed via pipx** (ansible.builtin.command)
 - **Install mitm6 via pipx** (ansible.builtin.command) - Conditional
 - **Create symlink for mitm6 in /usr/local/bin** (ansible.builtin.file)
-
-### responder_configure.yml
-
-
-- **Install Responder systemd unit** (ansible.builtin.template)
-- **Flush handlers so systemd sees the new unit before manage-service** (ansible.builtin.meta)
-- **Manage Responder service** (ansible.builtin.systemd)
 
 ## Example Playbook
 
