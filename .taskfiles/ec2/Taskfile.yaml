@@ -585,6 +585,95 @@ tasks:
           --document-name "AWS-StartInteractiveCommand" \
           --parameters "command=[\"tail -n {{.LINES}} -f $LOG_FILE\"]"
 
+  logs:fetch:
+    desc: "Fetch ares logs from EC2 to a local file for programmatic reading (usage: task ec2:logs:fetch [ROLE=orchestrator|recon|all] [LINES=2000] [OP_ID=op-YYYYMMDD-HHMMSS] [SINCE=2026-07-02T15:00])"
+    silent: true
+    vars:
+      ROLE: '{{.ROLE | default "orchestrator"}}'
+      LINES: '{{.LINES | default "2000"}}'
+      OP_ID: '{{.OP_ID | default ""}}'
+      SINCE: '{{.SINCE | default ""}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./logs"}}'
+    cmds:
+      - |
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+
+        mkdir -p "{{.OUTPUT_DIR}}"
+        TS=$(date +%Y%m%d-%H%M%S)
+        TAG="{{.OP_ID}}"
+        if [ -z "$TAG" ]; then TAG="latest"; fi
+
+        # Filters run remotely (grep+awk cheap on the box; keeps SSM payload small).
+        # When OP_ID or SINCE is set, over-fetch by 20x so the final `tail -n LINES`
+        # still lands on real content instead of an empty slice.
+        REMOTE_LINES={{.LINES}}
+        if [ -n "{{.OP_ID}}" ] || [ -n "{{.SINCE}}" ]; then
+          REMOTE_LINES=$(({{.LINES}} * 20))
+        fi
+
+        # Build the shared filter pipe applied to each log file.
+        FILTER=""
+        if [ -n "{{.OP_ID}}" ]; then
+          FILTER="$FILTER | grep -F '{{.OP_ID}}'"
+        fi
+        if [ -n "{{.SINCE}}" ]; then
+          # tracing_subscriber fmt timestamps are ISO-8601 in field 1 — lex-comparable.
+          # Timestamped lines gate on SINCE; multi-line continuation lines (tool
+          # output, stack traces) have no leading timestamp and pass through so
+          # they stay attached to the log entry they belong to.
+          FILTER="$FILTER | awk -v s='{{.SINCE}}' '\$1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ { if (\$1 >= s) print; next } { print }'"
+        fi
+        FILTER="$FILTER | tail -n {{.LINES}}"
+
+        OUT_FILE="{{.OUTPUT_DIR}}/ec2-{{.ROLE}}-$TAG-$TS.log"
+
+        # Strip ANSI escape codes locally. systemd `StandardOutput=append:` usually
+        # captures without a TTY (no color) but this is cheap belt-and-suspenders.
+        strip_ansi() { LC_ALL=C sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+
+        # Pick role scope. `all` fans out one SSM call per role — remote
+        # concatenation blows past SSM's StandardOutputContent cap (~24KB) and
+        # silently truncates trailing files. Single-role hits its file directly.
+        if [ "{{.ROLE}}" = "all" ]; then
+          : > "$OUT_FILE"
+          for role in orchestrator recon credential_access lateral_movement coercion acl cracker privesc; do
+            LOG_PATH="{{.ARES_LOG_DIR}}/$role.log"
+            REMOTE_CMD="tail -n $REMOTE_LINES $LOG_PATH 2>/dev/null $FILTER"
+            echo "===FILE:$LOG_PATH===" >> "$OUT_FILE"
+            run_ssm_cmd "$INSTANCE_ID" "$REMOTE_CMD" 60 \
+              | strip_ansi \
+              >> "$OUT_FILE" || true
+            # run_ssm_cmd emits with no trailing newline; keep the next FILE
+            # marker on its own line.
+            printf '\n' >> "$OUT_FILE"
+          done
+        else
+          LOG_PATH="{{.ARES_LOG_DIR}}/{{.ROLE}}.log"
+          REMOTE_CMD="tail -n $REMOTE_LINES $LOG_PATH $FILTER"
+          if ! run_ssm_cmd "$INSTANCE_ID" "$REMOTE_CMD" 60 \
+            | strip_ansi \
+            > "$OUT_FILE"; then
+            echo -e "{{.ERROR}} Failed to fetch logs from $INSTANCE_ID"
+            rm -f "$OUT_FILE"
+            exit 1
+          fi
+        fi
+
+        LINE_COUNT=$(wc -l < "$OUT_FILE" | tr -d ' ')
+        BYTE_COUNT=$(wc -c < "$OUT_FILE" | tr -d ' ')
+        echo -e "{{.INFO}} Fetched $LINE_COUNT lines ($BYTE_COUNT bytes) from {{.ROLE}} log on $INSTANCE_ID"
+        if [ -n "{{.OP_ID}}" ]; then
+          echo -e "{{.INFO}} Filtered by OP_ID={{.OP_ID}}"
+        fi
+        if [ -n "{{.SINCE}}" ]; then
+          echo -e "{{.INFO}} Filtered by SINCE={{.SINCE}}"
+        fi
+        echo "$OUT_FILE"
+
   # ============================================================================
   # Redis Port Forward
   # ============================================================================

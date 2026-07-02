@@ -28,9 +28,11 @@ target/
 .secrets.baseline
 
 # Claude Code
-.claude/
+.claude/*
 !.claude/agents/
-!.claude/agents/ares-operator.md
+!.claude/agents/*.md
+!.claude/skills/
+!.claude/skills/**
 
 # Python caches (from dev tools)
 __pycache__/
