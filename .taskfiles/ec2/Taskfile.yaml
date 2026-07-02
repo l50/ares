@@ -215,10 +215,15 @@ tasks:
           JOBS_FLAG="-j $JOBS"
         fi
 
-        # Use sccache if available for dependency caching
-        if command -v sccache >/dev/null 2>&1; then
+        # Use sccache if available for dependency caching.
+        # For the `cross` path, sccache runs INSIDE the container (installed
+        # via Cross.toml pre-build); RUSTC_WRAPPER + SCCACHE_DIR are passed
+        # through, and SCCACHE_DIR is bind-mounted so the cache persists.
+        if command -v sccache >/dev/null 2>&1 || [ "$BUILD_TOOL" = "cross" ]; then
           export RUSTC_WRAPPER=sccache
-          echo -e "{{.INFO}} Using sccache for compilation caching"
+          export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
+          mkdir -p "$SCCACHE_DIR"
+          echo -e "{{.INFO}} Using sccache (cache: $SCCACHE_DIR)"
         fi
 
         case "$BUILD_TOOL" in
