@@ -429,31 +429,14 @@ impl StateInner {
     /// `(domain, dc_ip)` pairs.
     pub fn all_domains_with_dcs(&self) -> Vec<(String, String)> {
         let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-
-        // Gather all known domain names (lowercased for dedup)
-        let mut all_domains: Vec<String> = Vec::new();
-        for d in self.domain_controllers.keys() {
-            all_domains.push(d.to_lowercase());
-        }
-        for d in &self.domains {
-            all_domains.push(d.to_lowercase());
-        }
-        for d in self.trusted_domains.keys() {
-            all_domains.push(d.to_lowercase());
-        }
-
-        for domain in all_domains {
-            if seen.contains(&domain) {
-                continue;
-            }
-            seen.insert(domain.clone());
-            if let Some(ip) = self.resolve_dc_ip(&domain) {
-                result.push((domain, ip));
-            }
-        }
-
-        result
+        self.domain_controllers
+            .keys()
+            .chain(&self.domains)
+            .chain(self.trusted_domains.keys())
+            .map(|d| d.to_lowercase())
+            .filter(|d| seen.insert(d.clone()))
+            .filter_map(|d| self.resolve_dc_ip(&d).map(|ip| (d, ip)))
+            .collect()
     }
 
     /// Find a cleartext credential from a trusted domain that can authenticate

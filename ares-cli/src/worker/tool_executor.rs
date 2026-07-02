@@ -462,7 +462,7 @@ async fn execute_and_respond(
     let response = match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
         Ok(output) => {
             let raw = output.combined_raw();
-            let combined = output.combined();
+            let mut combined = output.combined();
             let success = output.success;
             let exit_code = output.exit_code;
 
@@ -471,6 +471,20 @@ async fn execute_and_respond(
                 &raw,
                 &resolved_arguments,
             ));
+
+            // A zero-yield unauthenticated harvest (spray/roast) exits 0 and
+            // masks its empty result as "success". Append an explicit advisory
+            // so the LLM enumerates real users instead of re-spraying the same
+            // canned wordlist. No-op for tools that aren't unauth harvests or
+            // that actually produced loot.
+            if success {
+                if let Some(note) = ares_tools::parsers::empty_harvest_advisory(
+                    &effective_tool_name,
+                    discoveries.as_ref(),
+                ) {
+                    combined.push_str(&note);
+                }
+            }
 
             if let Some(ref disc) = discoveries {
                 for (disc_type, _count) in count_discovery_entries(disc) {

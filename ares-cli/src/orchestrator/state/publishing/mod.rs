@@ -36,6 +36,47 @@ pub(super) async fn emit_op_state(
 pub(super) static PASSWORD_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^password\s*:\s*").unwrap());
 
+/// Whether the realm string on a captured credential / hash / user came from
+/// an authoritative AD source — i.e. a successful authenticated round-trip,
+/// a host-pinned NTDS/LSA dump, or an LDAP/Kerberos enumeration result.
+///
+/// Used to gate auto-promotion of the realm into `state.domains`. Realms
+/// from these sources cannot have been an LLM typo: a wrong realm would
+/// have rejected the auth, been absent from NTDS, or never come back from
+/// the DC's LDAP response in the first place. Lower-trust sources (text
+/// scrapes of tool prose, registry autologon, SYSVOL scripts, description
+/// fields) are explicitly excluded — those can carry typos that would
+/// otherwise pollute the canonical domain registry.
+pub(super) fn realm_source_is_authoritative(source: &str) -> bool {
+    matches!(
+        source,
+        // Host-pinned dumps — realm pinned by NTDS / LSA storage.
+        "secretsdump"
+            | "lsassy"
+            | "lsa_secrets"
+            | "dpapi"
+            | "kerberos_extracted"
+            | "initial"
+            // Realm validated by an actual auth round-trip, or extracted
+            // from a Kerberos response that carried the crealm.
+            | "netexec_auth"
+            | "password_spray"
+            | "kerberoast"
+            | "asrep_roast"
+            // Cracked from a hash whose realm was already pinned.
+            | "cracked:hashcat"
+            | "cracked:john"
+            | "cracked"
+            // Authoritative user-enumeration sources (LDAP / Kerberos).
+            | "ldap_extraction"
+            | "kerberos_enum"
+            | "netexec_user_enum"
+            | "secretsdump_implicit"
+            // Cert-based credential extraction (host-pinned chain).
+            | "certipy_esc1_full_chain"
+    )
+}
+
 /// Trust ranking for a credential source.
 ///
 /// Used by `publish_credential` to decide whether a new (user, password)

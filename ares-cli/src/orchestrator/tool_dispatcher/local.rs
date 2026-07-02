@@ -111,7 +111,7 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
         match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
             Ok(output) => {
                 let raw = output.combined_raw();
-                let combined = output.combined();
+                let mut combined = output.combined();
                 let error = if output.success {
                     None
                 } else {
@@ -143,6 +143,17 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                         &resolved_arguments,
                     )
                     .await;
+                }
+
+                // Mirror the worker path: flag a zero-yield unauthenticated
+                // harvest so the LLM changes strategy instead of re-spraying.
+                if output.success {
+                    if let Some(note) = ares_tools::parsers::empty_harvest_advisory(
+                        &effective_tool_name,
+                        discoveries.as_ref(),
+                    ) {
+                        combined.push_str(&note);
+                    }
                 }
 
                 Ok(ToolExecResult {

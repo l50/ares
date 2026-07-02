@@ -41,6 +41,20 @@ pub const LOCK_PREFIX: &str = "ares:lock";
 /// Task status keys expire after 24 hours.
 const TASK_STATUS_TTL_SECS: u64 = 60 * 60 * 24;
 
+/// Durable name for the orchestrator's single result-demux consumer on the
+/// `ARES_TASKS` stream. Stable so a restarted orchestrator re-attaches to the
+/// existing consumer via `get_or_create_consumer` instead of racing to create
+/// a fresh one — a WorkQueue stream rejects a second consumer whose filter
+/// subject overlaps (JetStream error 10100), which previously surfaced as
+/// "filtered consumer not unique on workqueue stream" on every restart.
+const RESULT_DEMUX_CONSUMER: &str = "orchestrator-result-demux";
+
+/// Idle window after which JetStream reaps the durable result-demux consumer.
+/// Long enough to bridge an orchestrator restart, short enough that an
+/// abandoned consumer (op finished, pod gone) does not linger and pin
+/// undelivered result messages on the WorkQueue stream.
+const RESULT_DEMUX_INACTIVE_THRESHOLD: Duration = Duration::from_secs(600);
+
 /// Task submitted to a role queue. Mirrors `ares.core.task_queue.TaskMessage`.
 ///
 /// Construction is exercised by tests; production red-team dispatch goes through
@@ -128,12 +142,19 @@ impl ResultDemux {
 
         let filter = format!("{}.>", nats::TASK_RESULT_SUBJECT_PREFIX);
         let cfg = PullConfig {
+            durable_name: Some(RESULT_DEMUX_CONSUMER.to_string()),
             filter_subject: filter.clone(),
             ack_policy: AckPolicy::Explicit,
+            inactive_threshold: RESULT_DEMUX_INACTIVE_THRESHOLD,
             ..Default::default()
         };
+        // Idempotent: get_or_create re-attaches to the existing durable
+        // consumer on restart rather than tripping the WorkQueue
+        // single-consumer-per-filter rule (error 10100). Exactly one demux
+        // runs per process (see `connect` vs `connect_state_only`), so there
+        // is no second reader to split the result cache.
         let consumer: Consumer<PullConfig> = stream
-            .create_consumer(cfg)
+            .get_or_create_consumer(RESULT_DEMUX_CONSUMER, cfg)
             .await
             .context("create result-demux consumer")?;
 
@@ -192,10 +213,34 @@ impl ResultDemux {
 }
 
 impl TaskQueue {
-    /// Connect to Redis + NATS and return a TaskQueue.
+    /// Connect to Redis + NATS and return a TaskQueue that polls task results.
     ///
-    /// Ensures the standard JetStream streams exist before returning.
+    /// Ensures the standard JetStream streams exist and starts the single
+    /// [`ResultDemux`] that drains `ares.tasks.results.*`. Use this for the
+    /// orchestrator's main dispatch loop — the only subsystem that reads
+    /// results via [`check_result`](Self::check_result).
     pub async fn connect(redis_url: &str, nats_url: &str) -> Result<Self> {
+        Self::connect_inner(redis_url, nats_url, true).await
+    }
+
+    /// Connect to Redis + NATS without starting a result demux.
+    ///
+    /// For subsystems that only need Redis state (locks, task-status) and NATS
+    /// publish — the lock keeper and the recovery manager. Starting a demux
+    /// here is not just wasteful: a second demux on the WorkQueue results
+    /// stream trips JetStream's single-consumer-per-filter rule (error 10100),
+    /// which failed the whole `connect` and silently disabled recovery / the
+    /// lock keeper's dedicated connection. It would also split the result
+    /// cache away from the dispatch loop, hiding completed results.
+    pub async fn connect_state_only(redis_url: &str, nats_url: &str) -> Result<Self> {
+        Self::connect_inner(redis_url, nats_url, false).await
+    }
+
+    async fn connect_inner(
+        redis_url: &str,
+        nats_url: &str,
+        start_result_demux: bool,
+    ) -> Result<Self> {
         let client = redis::Client::open(redis_url)
             .with_context(|| format!("Invalid Redis URL: {redis_url}"))?;
         // Bounded response_timeout: without this the orchestrator's shared
@@ -213,12 +258,16 @@ impl TaskQueue {
         let nats = NatsBroker::connect(nats_url).await?;
         nats.ensure_streams().await?;
 
-        let result_demux = ResultDemux::start(&nats).await?;
+        let result_demux = if start_result_demux {
+            Some(ResultDemux::start(&nats).await?)
+        } else {
+            None
+        };
 
         Ok(Self {
             conn,
             nats: Some(nats),
-            result_demux: Some(result_demux),
+            result_demux,
         })
     }
 }

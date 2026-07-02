@@ -316,10 +316,7 @@ impl DatasetEvaluationResult {
     }
 
     pub fn pass_rate(&self) -> f64 {
-        if self.results.is_empty() {
-            return 0.0;
-        }
-        self.results.iter().filter(|r| r.passed()).count() as f64 / self.results.len() as f64
+        rate(&self.results, |r| r.passed())
     }
 
     pub fn avg_overall_score(&self) -> f64 {
@@ -335,21 +332,11 @@ impl DatasetEvaluationResult {
     }
 
     pub fn alert_fire_rate(&self) -> f64 {
-        if self.results.is_empty() {
-            return 0.0;
-        }
-        self.results.iter().filter(|r| r.alert_fired).count() as f64 / self.results.len() as f64
+        rate(&self.results, |r| r.alert_fired)
     }
 
     pub fn investigation_completion_rate(&self) -> f64 {
-        if self.results.is_empty() {
-            return 0.0;
-        }
-        self.results
-            .iter()
-            .filter(|r| r.investigation_completed)
-            .count() as f64
-            / self.results.len() as f64
+        rate(&self.results, |r| r.investigation_completed)
     }
 
     pub fn total_cost_usd(&self) -> f64 {
@@ -452,6 +439,13 @@ fn avg(results: &[EvaluationResult], f: impl Fn(&EvaluationResult) -> f64) -> f6
         return 0.0;
     }
     results.iter().map(f).sum::<f64>() / results.len() as f64
+}
+
+fn rate(results: &[EvaluationResult], pred: impl Fn(&EvaluationResult) -> bool) -> f64 {
+    if results.is_empty() {
+        return 0.0;
+    }
+    results.iter().filter(|r| pred(r)).count() as f64 / results.len() as f64
 }
 
 #[cfg(test)]

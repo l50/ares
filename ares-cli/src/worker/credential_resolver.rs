@@ -746,6 +746,15 @@ fn split_user_realm(raw: &str) -> (String, Option<String>) {
     }
 }
 
+/// Keep whichever of `slot`/`cand` has the higher `attack_step`, preferring
+/// `cand` on ties so the most recently seen record wins — the selection rule
+/// shared by every credential/hash preference bucket.
+fn keep_latest<'a, T>(slot: &mut Option<&'a T>, cand: &'a T, step: impl Fn(&T) -> i32) {
+    if slot.is_none_or(|prev| step(cand) >= step(prev)) {
+        *slot = Some(cand);
+    }
+}
+
 fn find_credential<'a>(
     credentials: &'a [Credential],
     username: &str,
@@ -772,17 +781,9 @@ fn find_credential<'a>(
         }
         let domain_match = domain_empty || cred.domain.to_lowercase() == domain_l;
         if domain_match {
-            match exact {
-                None => exact = Some(cred),
-                Some(prev) if cred.attack_step >= prev.attack_step => exact = Some(cred),
-                _ => {}
-            }
+            keep_latest(&mut exact, cred, |c| c.attack_step);
         }
-        match any_user {
-            None => any_user = Some(cred),
-            Some(prev) if cred.attack_step >= prev.attack_step => any_user = Some(cred),
-            _ => {}
-        }
+        keep_latest(&mut any_user, cred, |c| c.attack_step);
     }
     // Realm-strict callers (LDAP/RPC direct bind) MUST get an exact-realm
     // match or nothing. A foreign-realm cred just produces 52e/775 at bind
@@ -974,30 +975,14 @@ fn find_hash<'a>(
         let domain_match = domain_empty || h.domain.is_empty() || h_domain_l == domain_l;
         let has_aes = h.aes_key.as_deref().is_some_and(|s| !s.is_empty());
         if domain_match {
-            match exact {
-                None => exact = Some(h),
-                Some(prev) if h.attack_step >= prev.attack_step => exact = Some(h),
-                _ => {}
-            }
+            keep_latest(&mut exact, h, |x| x.attack_step);
             if has_aes {
-                match exact_aes {
-                    None => exact_aes = Some(h),
-                    Some(prev) if h.attack_step >= prev.attack_step => exact_aes = Some(h),
-                    _ => {}
-                }
+                keep_latest(&mut exact_aes, h, |x| x.attack_step);
             }
         }
-        match any_user {
-            None => any_user = Some(h),
-            Some(prev) if h.attack_step >= prev.attack_step => any_user = Some(h),
-            _ => {}
-        }
+        keep_latest(&mut any_user, h, |x| x.attack_step);
         if has_aes {
-            match any_user_aes {
-                None => any_user_aes = Some(h),
-                Some(prev) if h.attack_step >= prev.attack_step => any_user_aes = Some(h),
-                _ => {}
-            }
+            keep_latest(&mut any_user_aes, h, |x| x.attack_step);
         }
     }
     let exact_pick = exact_aes.or(exact);

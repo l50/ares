@@ -25,6 +25,16 @@ fn render_chain_output(steps: &[(&str, &ToolOutput)]) -> (String, String) {
     (stdout, stderr)
 }
 
+/// Milliseconds since the Unix epoch, or 0 if the system clock predates it.
+/// Used to make certipy output filenames unique so certipy's interactive
+/// "Overwrite? (y/n)" prompt never fires and kills a non-interactive run.
+fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 /// Enumerate ADCS certificate templates and CAs using Certipy.
 ///
 /// Required args: `username`, `domain`, `dc_ip`
@@ -96,13 +106,7 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
     // prompt which kills non-interactive runs. Use template + epoch millis.
     let out = match optional_str(args, "out") {
         Some(o) => o.to_string(),
-        None => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            format!("cert_{template}_{ts}")
-        }
+        None => format!("cert_{template}_{}", epoch_millis()),
     };
 
     let user_at_domain = format!("{username}@{domain}");
@@ -171,13 +175,7 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
     // Generate unique output name to avoid interactive overwrite prompt
     let out = match optional_str(args, "out") {
         Some(o) => o.to_string(),
-        None => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            format!("shadow_{target}_{ts}")
-        }
+        None => format!("shadow_{target}_{}", epoch_millis()),
     };
 
     // certipy shadow auto internally calls certipy auth which writes .ccache
@@ -272,12 +270,8 @@ pub async fn certipy_forge(args: &Value) -> Result<ToolOutput> {
     let out = match optional_str(args, "out") {
         Some(o) => o.to_string(),
         None => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
             let safe_upn = upn.replace(['/', '\\', ' '], "_");
-            format!("forged_{safe_upn}_{ts}.pfx")
+            format!("forged_{safe_upn}_{}.pfx", epoch_millis())
         }
     };
 
@@ -314,10 +308,7 @@ pub async fn certipy_retrieve(args: &Value) -> Result<ToolOutput> {
 
     let user_at_domain = format!("{username}@{domain}");
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = epoch_millis();
     let out = format!("cert_retrieve_{request_id}_{ts}");
 
     CommandBuilder::new("certipy")
@@ -375,10 +366,7 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let step1 = step1_cmd.timeout_secs(120).execute().await?;
     outputs.push(("Add Officer", step1));
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = epoch_millis();
     let out_name = format!("cert_esc7_{ts}");
 
     let mut req_cmd = CommandBuilder::new("certipy")
@@ -610,10 +598,7 @@ pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
         .get("template")
         .and_then(|v| v.as_str())
         .unwrap_or("esc4");
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = epoch_millis();
     let out_name = format!("cert_{template}_{ts}");
     let pfx_path = format!("{out_name}.pfx");
 
@@ -691,10 +676,7 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
     let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC3 chain")?;
     let cwd = tempdir.path().to_path_buf();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = epoch_millis();
     let agent_out = format!("agent_{ts}");
     let agent_pfx = format!("{agent_out}.pfx");
     let target_out = format!("target_{ts}");
@@ -826,10 +808,7 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
     let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC1 chain")?;
     let cwd = tempdir.path().to_path_buf();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = epoch_millis();
     let out_name = format!("esc1_{ts}");
     let pfx_name = format!("{out_name}.pfx");
 

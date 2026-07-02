@@ -1008,8 +1008,9 @@ async fn run_blue_only() -> Result<()> {
     let (provider, model_name) =
         ares_llm::create_provider(&model_spec).context("Failed to create LLM provider")?;
 
-    // Blue uses a simple Redis-based tool dispatcher (no operation-scoped auth throttle)
-    let queue = self::task_queue::TaskQueue::connect(&redis_url, &nats_url)
+    // Blue uses a simple Redis-based tool dispatcher (no operation-scoped auth
+    // throttle) and never polls task results, so it needs no result demux.
+    let queue = self::task_queue::TaskQueue::connect_state_only(&redis_url, &nats_url)
         .await
         .context("Failed to connect to Redis/NATS")?;
     let auth_throttle = tool_dispatcher::AuthThrottle::new(3, std::time::Duration::from_secs(30));

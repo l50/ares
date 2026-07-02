@@ -75,9 +75,7 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         "listener_ip": item.listener,
                         "coercion_source": item.coercion_source,
                     });
-                    if let Some(cred) = credential_json.as_ref() {
-                        p["credential"] = cred.clone();
-                    }
+                    insert_credential(&mut p, credential_json.as_ref());
                     p
                 }
                 RelayType::Esc8 { ca_name, domain } => {
@@ -89,9 +87,7 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         "domain": domain,
                         "coercion_source": item.coercion_source,
                     });
-                    if let Some(cred) = credential_json.as_ref() {
-                        p["credential"] = cred.clone();
-                    }
+                    insert_credential(&mut p, credential_json.as_ref());
                     p
                 }
             };
@@ -133,6 +129,14 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                 }
             }
         }
+    }
+}
+
+/// Attach the optional relay `credential` to a payload. Extracted so the three
+/// relay-type arms don't each repeat the same insertion.
+fn insert_credential(payload: &mut serde_json::Value, credential: Option<&serde_json::Value>) {
+    if let Some(cred) = credential {
+        payload["credential"] = cred.clone();
     }
 }
 

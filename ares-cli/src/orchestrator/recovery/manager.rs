@@ -47,7 +47,7 @@ impl OperationRecoveryManager {
         let mut last_err: Option<anyhow::Error> = None;
 
         for attempt in 1..=MAX_CONNECTION_RETRIES {
-            let queue = match TaskQueue::connect(&self.redis_url, &self.nats_url).await {
+            let queue = match TaskQueue::connect_state_only(&self.redis_url, &self.nats_url).await {
                 Ok(q) => q,
                 Err(e) => {
                     if attempt < MAX_CONNECTION_RETRIES {

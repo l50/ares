@@ -89,9 +89,10 @@ impl SharedState {
             let parts: Vec<&str> = hostname_clean.split('.').collect();
             if parts.len() >= 3 {
                 let domain = parts[1..].join(".").to_lowercase();
+                let is_dc = host.is_dc || host.detect_dc();
                 // A DC FQDN is the DC self-reporting its own domain — strong
                 // enough to bypass the candidate hold.
-                let evidence = if host.is_dc || host.detect_dc() {
+                let evidence = if is_dc {
                     DomainEvidence::DcSelfReport
                 } else {
                     DomainEvidence::HostnameInference
@@ -99,6 +100,21 @@ impl SharedState {
                 let _ = self
                     .publish_candidate_domain(queue, &domain, evidence, Some(host.ip.clone()))
                     .await;
+
+                // Zone-apex alias guard: for DCs, the reported hostname may
+                // *itself* be the domain (e.g. SMB returns
+                // `child.contoso.local` for an IP whose true FQDN is
+                // `dc02.child.contoso.local` — the short host was
+                // dropped). Without this, the parts[1..] extraction yields
+                // only the parent domain and the child is never discovered.
+                // Push the whole hostname as a probe-only candidate; DNS SRV
+                // will confirm real domains and reject host FQDNs.
+                let hostname_lower = hostname_clean.to_lowercase();
+                if is_dc && hostname_lower != domain {
+                    let _ = self
+                        .record_hostname_candidate(queue, &hostname_lower, Some(host.ip.clone()))
+                        .await;
+                }
 
                 // Auto-populate netbios_to_fqdn map so CLI can resolve short names.
                 // e.g. "dc02.child.contoso.local" → DC02 → dc02.child.contoso.local
@@ -264,10 +280,7 @@ impl SharedState {
         }
 
         // New host — add to Redis and state
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
         reader.add_host(&mut conn, &host).await?;
@@ -574,6 +587,58 @@ mod tests {
 
         let s = state.inner.read().await;
         assert!(s.domains.contains(&"contoso.local".to_string()));
+    }
+
+    #[tokio::test]
+    async fn publish_host_dc_zone_apex_alias_holds_whole_hostname() {
+        // Regression: SMB hostname queries against a child-domain DC can
+        // return the bare domain (e.g. `child.contoso.local` for an IP
+        // whose true FQDN is `dc02.child.contoso.local`). The
+        // parts[1..] extractor would only promote the parent; the child
+        // gets lost. The whole hostname must be held as a candidate so the
+        // DNS SRV probe can confirm and promote it.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("192.168.58.11", "child.contoso.local", true);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domains.contains(&"contoso.local".to_string()),
+            "parent domain should auto-promote (DcSelfReport), got {:?}",
+            s.domains
+        );
+        assert!(
+            s.candidate_domains.contains_key("child.contoso.local"),
+            "whole DC hostname should be held as candidate, got {:?}",
+            s.candidate_domains.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !s.domains.contains(&"child.contoso.local".to_string()),
+            "child must wait for DNS SRV probe before promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_host_dc_normal_fqdn_does_not_pollute_with_host_string() {
+        // For a normal DC FQDN like `dc01.contoso.local`, the parent_known
+        // corroboration shortcut would falsely promote the whole hostname
+        // as a "domain" — the new probe-only path must bypass that. The
+        // candidate gets recorded; the DNS SRV probe rejects it later.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("192.168.58.10", "dc01.contoso.local", true);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(s.domains.contains(&"contoso.local".to_string()));
+        assert!(
+            !s.domains.contains(&"dc01.contoso.local".to_string()),
+            "DC host FQDN must NOT be promoted as a domain, got {:?}",
+            s.domains
+        );
     }
 
     #[tokio::test]

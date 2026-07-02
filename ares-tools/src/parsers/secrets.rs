@@ -352,6 +352,67 @@ pub fn parse_kerberoast(output: &str, params: &Value) -> Vec<Value> {
     hashes
 }
 
+/// Extract MSSQL host records from kerberoast (`GetUserSPNs`) output.
+///
+/// An `MSSQLSvc/<fqdn>` SPN is definitive proof the named host runs SQL
+/// Server on 1433 — independent of whether a port scan ever reached it.
+/// Hosts discovered only via kerberoasting or share-spidering otherwise
+/// never get `1433` into `host.services`, so `auto_mssql_detection` never
+/// emits `mssql_access` and the entire MSSQL automation tree stays dark.
+///
+/// We scan the raw output for `MSSQLSvc/` tokens — this covers both the
+/// `ServicePrincipalName` column of the `GetUserSPNs` table AND the SPN
+/// embedded inside each `$krb5tgs$...$MSSQLSvc/<host>*$...` hash, so a roast
+/// that captured a ticket always yields the host even when the table header
+/// is absent. Each emitted host carries an empty `ip` and the SPN's FQDN as
+/// `hostname`; `publish_host` merges it by hostname into the existing
+/// IP-bearing record (or seeds a hostname-only record the later scan fills
+/// in), folding `1433` into its service list.
+pub fn extract_mssql_hosts_from_kerberoast(output: &str) -> Vec<Value> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut hosts = Vec::new();
+
+    for token in output.split(|c: char| c.is_whitespace() || c == '*' || c == '$') {
+        // Case-insensitive prefix match — impacket prints `MSSQLSvc` but the
+        // embedded-hash form preserves whatever case the SPN used.
+        let Some(spn_host) = token
+            .get(..8)
+            .filter(|p| p.eq_ignore_ascii_case("MSSQLSvc"))
+            .and_then(|_| token.get(8..))
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        // Strip the port-or-instance suffix. The table form uses `:1433` /
+        // `:INSTANCE`; the SPN embedded in the krb5tgs hash blob uses impacket's
+        // `~` separator (`MSSQLSvc/host~1433`). A real FQDN contains neither.
+        let fqdn = spn_host
+            .split([':', '~'])
+            .next()
+            .unwrap_or(spn_host)
+            .to_lowercase();
+        // Require a dotted FQDN so a malformed/short token can't seed a
+        // junk hostname that would never match a real host record.
+        if !fqdn.contains('.') || fqdn.is_empty() {
+            continue;
+        }
+        if !seen.insert(fqdn.clone()) {
+            continue;
+        }
+        hosts.push(json!({
+            "ip": "",
+            "hostname": fqdn,
+            "os": "",
+            "roles": ["mssql"],
+            "services": ["1433/tcp (ms-sql-s)"],
+            "is_dc": false,
+            "owned": false,
+        }));
+    }
+
+    hosts
+}
+
 pub fn parse_asrep_roast(output: &str, params: &Value) -> Vec<Value> {
     let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -804,6 +865,74 @@ $krb5tgs$23$*svc_http$CONTOSO.LOCAL$contoso.local/svc_http*$789xyz
     fn parse_kerberoast_no_hashes() {
         let hashes = parse_kerberoast("[*] No SPN accounts found", &json!({}));
         assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn mssql_hosts_from_getuserspns_table() {
+        // The ServicePrincipalName column of the GetUserSPNs table carries the
+        // MSSQLSvc SPN with a `:1433` port suffix — strip it and emit the host.
+        let output = "\
+ServicePrincipalName                    Name     MemberOf  PasswordLastSet
+--------------------------------------  -------  --------  ------------------
+MSSQLSvc/sql01.contoso.local:1433       svc_sql            2024-01-02 03:04:05
+HTTP/web01.contoso.local                svc_web            2024-01-02 03:04:05";
+        let hosts = extract_mssql_hosts_from_kerberoast(output);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0]["hostname"], "sql01.contoso.local");
+        assert_eq!(hosts[0]["ip"], "");
+        let services: Vec<&str> = hosts[0]["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(services.iter().any(|s| s.contains("1433")));
+        assert!(hosts[0]["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|x| x == "mssql"));
+    }
+
+    #[test]
+    fn mssql_hosts_from_embedded_hash_spn() {
+        // The SPN is also embedded in the krb5tgs hash blob — a roast that
+        // captured a ticket yields the host even without the table header.
+        let output =
+            "$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$MSSQLSvc/sql01.contoso.local~1433*$aabb$ccdd";
+        let hosts = extract_mssql_hosts_from_kerberoast(output);
+        assert_eq!(hosts.len(), 1);
+        // `~1433` is impacket's port separator in the embedded-hash SPN form;
+        // it must be stripped so the FQDN matches the real host record.
+        assert_eq!(hosts[0]["hostname"], "sql01.contoso.local");
+    }
+
+    #[test]
+    fn mssql_hosts_dedup_and_case_insensitive() {
+        let output = "\
+MSSQLSvc/sql01.fabrikam.local:1433 svc_sql
+mssqlsvc/SQL01.FABRIKAM.LOCAL svc_sql2";
+        let hosts = extract_mssql_hosts_from_kerberoast(output);
+        assert_eq!(hosts.len(), 1, "same host in different case must dedupe");
+        assert_eq!(hosts[0]["hostname"], "sql01.fabrikam.local");
+    }
+
+    #[test]
+    fn mssql_hosts_skips_non_mssql_and_short_names() {
+        let output = "\
+HTTP/web01.contoso.local svc_web
+CIFS/dc01.contoso.local svc_cifs
+MSSQLSvc/localhost svc_sql";
+        // No MSSQLSvc SPN with a dotted FQDN → nothing emitted.
+        let hosts = extract_mssql_hosts_from_kerberoast(output);
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn mssql_hosts_empty_output() {
+        assert!(extract_mssql_hosts_from_kerberoast("").is_empty());
+        assert!(extract_mssql_hosts_from_kerberoast("[*] No SPN accounts found").is_empty());
     }
 
     #[test]

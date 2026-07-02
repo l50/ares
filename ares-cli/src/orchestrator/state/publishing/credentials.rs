@@ -88,10 +88,7 @@ impl SharedState {
             }
         }
 
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
         let added = reader.add_credential(&mut conn, &cred).await?;
@@ -171,10 +168,7 @@ impl SharedState {
             }
         }
 
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let operation_id_for_redis = operation_id.clone();
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();

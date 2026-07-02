@@ -28,11 +28,81 @@ pub use delegation::{extract_delegation_account, parse_delegation};
 pub use mssql::{parse_mssql_impersonation, parse_mssql_linked_servers};
 pub use nmap::{flush_nmap_host, parse_nmap_output};
 pub use ntsd::parse_acl_enumeration;
-pub use secrets::{parse_asrep_roast, parse_kerberoast, parse_secretsdump};
+pub use secrets::{
+    extract_mssql_hosts_from_kerberoast, parse_asrep_roast, parse_kerberoast, parse_secretsdump,
+};
 pub use smb::{parse_netexec_smb, parse_smb_signing};
 pub use spider::parse_spider_credentials;
 pub use trust::parse_domain_trusts;
 pub use users_shares::{parse_netexec_shares, parse_netexec_users};
+
+/// Assign `items` to `discoveries[key]` only when non-empty, so absent
+/// discovery categories stay off the output object instead of appearing as
+/// empty arrays.
+fn set_if_nonempty(discoveries: &mut Value, key: &str, items: Vec<Value>) {
+    if !items.is_empty() {
+        discoveries[key] = Value::Array(items);
+    }
+}
+
+/// Credential-harvesting tools that run WITHOUT a pre-existing authenticated
+/// principal and fall back to a generic, guessed userlist when the caller
+/// doesn't seed one. They exit 0 whether or not they find anything, and a
+/// zero-yield run is a wall of `[-]` failure lines that reads as "the tool
+/// ran fine" — so the LLM re-dispatches the same spray against the same canned
+/// wordlist instead of enumerating real accounts. See [`empty_harvest_advisory`].
+fn is_unauth_harvest_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "password_spray" | "username_as_password" | "asrep_roast" | "kerberos_user_enum_noauth"
+    )
+}
+
+/// True when a harvest tool's parsed `discoveries` carry at least one
+/// credential, hash, or newly-enumerated user — i.e. the run produced
+/// something the operation can act on.
+fn harvest_yielded_loot(discoveries: Option<&Value>) -> bool {
+    let Some(disc) = discoveries else {
+        return false;
+    };
+    ["credentials", "hashes", "discovered_users"]
+        .iter()
+        .any(|k| {
+            disc.get(*k)
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+        })
+}
+
+/// Advisory appended to an unauthenticated credential-harvest tool's output
+/// when the run obtained zero credentials, hashes, and users.
+///
+/// `password_spray`, `username_as_password`, `asrep_roast`, and
+/// `kerberos_user_enum_noauth` return exit-0 "success" regardless of yield, so
+/// an empty result is indistinguishable from a productive one in the raw
+/// output. Without this note the LLM reads the "success" and keeps dispatching
+/// the same technique against the same guessed wordlist — the 20-minute
+/// unauthenticated cul-de-sac this guards against. Returns `None` when the
+/// tool isn't an unauth harvest tool or when it did yield loot; callers append
+/// the returned text to the LLM-facing output on the success path.
+pub fn empty_harvest_advisory(tool_name: &str, discoveries: Option<&Value>) -> Option<String> {
+    if !is_unauth_harvest_tool(tool_name) || harvest_yielded_loot(discoveries) {
+        return None;
+    }
+    Some(format!(
+        "\n\n[ares] {tool_name} completed but obtained 0 credentials, 0 hashes, and 0 new \
+         valid users. A zero-yield unauthenticated harvest almost always means the userlist \
+         did not match real domain accounts — the built-in fallback wordlist rarely lines up \
+         with a target's actual users. Do NOT re-run this technique with the same generic \
+         wordlist. Next steps:\n\
+         1. Enumerate real accounts first — enumerate_users (SMB RID-brute / LDAP anonymous \
+         bind), ldap_search, or a null-session RPC query against the DC.\n\
+         2. Re-run AS-REP roasting / spraying with the discovered accounts (pass them via \
+         users_file or known_users).\n\
+         If you have ALREADY enumerated real users and still got nothing, these accounts \
+         resist this vector — pivot to a different technique instead of repeating the spray."
+    ))
+}
 
 /// Parse raw tool output and return structured discoveries.
 ///
@@ -44,23 +114,12 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
 
     match tool_name {
         "nmap_scan" => {
-            let hosts = parse_nmap_output(output, params);
-            if !hosts.is_empty() {
-                discoveries["hosts"] = Value::Array(hosts);
-            }
+            set_if_nonempty(&mut discoveries, "hosts", parse_nmap_output(output, params))
         }
         "smb_signing_check" => {
-            let hosts = parse_smb_signing(output, params);
-            if !hosts.is_empty() {
-                discoveries["hosts"] = Value::Array(hosts);
-            }
+            set_if_nonempty(&mut discoveries, "hosts", parse_smb_signing(output, params))
         }
-        "smb_sweep" => {
-            let hosts = parse_netexec_smb(output);
-            if !hosts.is_empty() {
-                discoveries["hosts"] = Value::Array(hosts);
-            }
-        }
+        "smb_sweep" => set_if_nonempty(&mut discoveries, "hosts", parse_netexec_smb(output)),
         "enumerate_users" => {
             let mut raw_users = parse_netexec_users(output);
 
@@ -81,10 +140,7 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
             }
         }
         "enumerate_shares" => {
-            let shares = parse_netexec_shares(output);
-            if !shares.is_empty() {
-                discoveries["shares"] = Value::Array(shares);
-            }
+            set_if_nonempty(&mut discoveries, "shares", parse_netexec_shares(output))
         }
         "run_bloodhound" => {
             // BloodHound collection doesn't produce immediate discoveries
@@ -95,24 +151,24 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
             // hashes get attributed to the dumped (target/parent) realm,
             // not the forging (source/child) realm.
             let (hashes, creds) = parse_secretsdump(output, params);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
+            set_if_nonempty(&mut discoveries, "hashes", hashes);
+            set_if_nonempty(&mut discoveries, "credentials", creds);
         }
         "kerberoast" => {
-            let hashes = parse_kerberoast(output, params);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
+            set_if_nonempty(&mut discoveries, "hashes", parse_kerberoast(output, params));
+            // An `MSSQLSvc/<fqdn>` SPN in the roast output proves the host runs
+            // SQL Server on 1433 even when no port scan ever reached it —
+            // enrich `host.services` so `auto_mssql_detection` can arm the
+            // MSSQL automation tree off the kerberoast alone.
+            let mssql_hosts = extract_mssql_hosts_from_kerberoast(output);
+            set_if_nonempty(&mut discoveries, "hosts", mssql_hosts);
         }
         "asrep_roast" | "kerberos_user_enum_noauth" => {
-            let hashes = parse_asrep_roast(output, params);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
+            set_if_nonempty(
+                &mut discoveries,
+                "hashes",
+                parse_asrep_roast(output, params),
+            );
             // Extract valid usernames from GetNPUsers output lines like:
             //   [-] User Administrator doesn't have UF_DONT_REQUIRE_PREAUTH set
             //   [-] invalid principal syntax
@@ -148,22 +204,18 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                     }
                 }
             }
-            if !valid_users.is_empty() {
-                discoveries["discovered_users"] = Value::Array(valid_users);
-            }
+            set_if_nonempty(&mut discoveries, "discovered_users", valid_users);
         }
-        "find_delegation" => {
-            let vulns = parse_delegation(output, params);
-            if !vulns.is_empty() {
-                discoveries["vulnerabilities"] = Value::Array(vulns);
-            }
-        }
-        "certipy_find" | "certipy_find_anon" => {
-            let vulns = parse_certipy_find(output, params);
-            if !vulns.is_empty() {
-                discoveries["vulnerabilities"] = Value::Array(vulns);
-            }
-        }
+        "find_delegation" => set_if_nonempty(
+            &mut discoveries,
+            "vulnerabilities",
+            parse_delegation(output, params),
+        ),
+        "certipy_find" | "certipy_find_anon" => set_if_nonempty(
+            &mut discoveries,
+            "vulnerabilities",
+            parse_certipy_find(output, params),
+        ),
         "esc8_relay_probe" => {
             // Any output line starting with `ESC8_CANDIDATE:` — emitted by
             // `esc8_relay_probe` when the CA's `/certsrv/certfnsh.asp`
@@ -190,35 +242,27 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
         }
         "certipy_esc1_full_chain" | "certipy_auth" => {
             // Both emit "Got hash for 'user@realm': <lm>:<nt>" on success.
-            let hashes = parse_certipy_esc1_chain(output, params);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
+            set_if_nonempty(
+                &mut discoveries,
+                "hashes",
+                parse_certipy_esc1_chain(output, params),
+            );
         }
         "lsassy" => {
             let (hashes, creds) = parse_lsassy(output, params);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
+            set_if_nonempty(&mut discoveries, "hashes", hashes);
+            set_if_nonempty(&mut discoveries, "credentials", creds);
         }
         "ntds_dit_extract" => {
             let (hashes, creds) = parse_ntds_dit(output, params);
-            if !hashes.is_empty() {
-                discoveries["hashes"] = Value::Array(hashes);
-            }
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
+            set_if_nonempty(&mut discoveries, "hashes", hashes);
+            set_if_nonempty(&mut discoveries, "credentials", creds);
         }
-        "password_spray" | "smb_login_check" => {
-            let creds = parse_spray_success(output, params);
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
-        }
+        "password_spray" | "smb_login_check" => set_if_nonempty(
+            &mut discoveries,
+            "credentials",
+            parse_spray_success(output, params),
+        ),
         "username_as_password" => {
             let creds = parse_spray_success(output, params);
             // Only keep creds where password == username.
@@ -230,62 +274,46 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                     !pass.is_empty() && pass.eq_ignore_ascii_case(user)
                 })
                 .collect();
-            if !filtered.is_empty() {
-                discoveries["credentials"] = Value::Array(filtered);
-            }
+            set_if_nonempty(&mut discoveries, "credentials", filtered);
         }
-        "ldap_search_descriptions" => {
-            let creds = parse_ldap_descriptions(output, params);
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
-        }
-        "adidnsdump" => {
-            let hosts = parse_adidnsdump(output);
-            if !hosts.is_empty() {
-                discoveries["hosts"] = Value::Array(hosts);
-            }
-        }
-        "mssql_enum_impersonation" => {
-            let vulns = parse_mssql_impersonation(output, params);
-            if !vulns.is_empty() {
-                discoveries["vulnerabilities"] = Value::Array(vulns);
-            }
-        }
-        "mssql_enum_linked_servers" => {
-            let vulns = parse_mssql_linked_servers(output, params);
-            if !vulns.is_empty() {
-                discoveries["vulnerabilities"] = Value::Array(vulns);
-            }
-        }
+        "ldap_search_descriptions" => set_if_nonempty(
+            &mut discoveries,
+            "credentials",
+            parse_ldap_descriptions(output, params),
+        ),
+        "adidnsdump" => set_if_nonempty(&mut discoveries, "hosts", parse_adidnsdump(output)),
+        "mssql_enum_impersonation" => set_if_nonempty(
+            &mut discoveries,
+            "vulnerabilities",
+            parse_mssql_impersonation(output, params),
+        ),
+        "mssql_enum_linked_servers" => set_if_nonempty(
+            &mut discoveries,
+            "vulnerabilities",
+            parse_mssql_linked_servers(output, params),
+        ),
         "enumerate_domain_trusts" => {
-            let trusts = parse_domain_trusts(output);
-            if !trusts.is_empty() {
-                let trust_values: Vec<Value> = trusts
-                    .iter()
-                    .filter_map(|t| serde_json::to_value(t).ok())
-                    .collect();
-                discoveries["trusted_domains"] = Value::Array(trust_values);
-            }
+            let trust_values: Vec<Value> = parse_domain_trusts(output)
+                .iter()
+                .filter_map(|t| serde_json::to_value(t).ok())
+                .collect();
+            set_if_nonempty(&mut discoveries, "trusted_domains", trust_values);
         }
-        "crack_with_hashcat" | "crack_with_john" => {
-            let creds = parse_cracker_output(output, params);
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
-        }
-        "sysvol_script_search" | "smbclient_spider" => {
-            let creds = parse_spider_credentials(output, params);
-            if !creds.is_empty() {
-                discoveries["credentials"] = Value::Array(creds);
-            }
-        }
-        "ldap_acl_enumeration" => {
-            let vulns = parse_acl_enumeration(output, params);
-            if !vulns.is_empty() {
-                discoveries["vulnerabilities"] = Value::Array(vulns);
-            }
-        }
+        "crack_with_hashcat" | "crack_with_john" => set_if_nonempty(
+            &mut discoveries,
+            "credentials",
+            parse_cracker_output(output, params),
+        ),
+        "sysvol_script_search" | "smbclient_spider" => set_if_nonempty(
+            &mut discoveries,
+            "credentials",
+            parse_spider_credentials(output, params),
+        ),
+        "ldap_acl_enumeration" => set_if_nonempty(
+            &mut discoveries,
+            "vulnerabilities",
+            parse_acl_enumeration(output, params),
+        ),
         "password_policy" => {
             // Password policy is informational metadata, not an exploitable vuln —
             // surfacing it as `vulnerabilities[]` makes the orchestrator route it to
@@ -551,29 +579,17 @@ pub fn merge_discoveries(all: &[Value]) -> Value {
     }
 
     let mut merged = json!({});
-    if !host_map.is_empty() {
-        let hosts: Vec<Value> = host_map.into_values().collect();
-        merged["hosts"] = Value::Array(hosts);
-    }
-    if !credentials.is_empty() {
-        merged["credentials"] = Value::Array(credentials);
-    }
-    if !hashes.is_empty() {
-        merged["hashes"] = Value::Array(hashes);
-    }
-    if !vulnerabilities.is_empty() {
-        merged["vulnerabilities"] = Value::Array(vulnerabilities);
-    }
-    if !discovered_users.is_empty() {
-        merged["discovered_users"] = Value::Array(discovered_users);
-    }
-    if !shares.is_empty() {
-        merged["shares"] = Value::Array(shares);
-    }
-    if !trusted_domains_map.is_empty() {
-        let trusted_domains: Vec<Value> = trusted_domains_map.into_values().collect();
-        merged["trusted_domains"] = Value::Array(trusted_domains);
-    }
+    set_if_nonempty(&mut merged, "hosts", host_map.into_values().collect());
+    set_if_nonempty(&mut merged, "credentials", credentials);
+    set_if_nonempty(&mut merged, "hashes", hashes);
+    set_if_nonempty(&mut merged, "vulnerabilities", vulnerabilities);
+    set_if_nonempty(&mut merged, "discovered_users", discovered_users);
+    set_if_nonempty(&mut merged, "shares", shares);
+    set_if_nonempty(
+        &mut merged,
+        "trusted_domains",
+        trusted_domains_map.into_values().collect(),
+    );
     merged
 }
 
@@ -626,6 +642,62 @@ pub fn looks_like_ip_pub(s: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── empty_harvest_advisory ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_harvest_advisory_fires_on_zero_yield_spray() {
+        // password_spray that parsed no credentials → advisory.
+        let note = empty_harvest_advisory("password_spray", None);
+        assert!(note.is_some());
+        let note = note.unwrap();
+        assert!(note.contains("password_spray"));
+        assert!(note.contains("Enumerate real accounts first"));
+    }
+
+    #[test]
+    fn empty_harvest_advisory_fires_when_only_unrelated_discoveries() {
+        // asrep_roast that surfaced hosts (via MSSQL SPN enrichment) but no
+        // hashes / users still counts as a zero-yield harvest.
+        let disc = json!({ "hosts": [{ "ip": "192.168.58.10" }] });
+        assert!(empty_harvest_advisory("asrep_roast", Some(&disc)).is_some());
+    }
+
+    #[test]
+    fn empty_harvest_advisory_silent_when_credentials_found() {
+        let disc = json!({ "credentials": [{ "username": "alice" }] });
+        assert!(empty_harvest_advisory("password_spray", Some(&disc)).is_none());
+    }
+
+    #[test]
+    fn empty_harvest_advisory_silent_when_hashes_found() {
+        let disc = json!({ "hashes": [{ "username": "svc_sql" }] });
+        assert!(empty_harvest_advisory("asrep_roast", Some(&disc)).is_none());
+    }
+
+    #[test]
+    fn empty_harvest_advisory_silent_when_users_enumerated() {
+        // kerberos_user_enum_noauth's whole job is enumerating users — a run
+        // that found some is productive, no advisory.
+        let disc = json!({ "discovered_users": [{ "username": "bob" }] });
+        assert!(empty_harvest_advisory("kerberos_user_enum_noauth", Some(&disc)).is_none());
+    }
+
+    #[test]
+    fn empty_harvest_advisory_silent_for_non_harvest_tools() {
+        // Authenticated / non-harvest tools never get the advisory even on
+        // empty output — secretsdump with no output is a real failure the
+        // orchestrator handles elsewhere.
+        assert!(empty_harvest_advisory("secretsdump", None).is_none());
+        assert!(empty_harvest_advisory("nmap_scan", None).is_none());
+        assert!(empty_harvest_advisory("kerberoast", None).is_none());
+    }
+
+    #[test]
+    fn empty_harvest_advisory_treats_empty_arrays_as_zero_yield() {
+        let disc = json!({ "credentials": [], "hashes": [], "discovered_users": [] });
+        assert!(empty_harvest_advisory("username_as_password", Some(&disc)).is_some());
+    }
 
     #[test]
     fn parse_nmap_with_services() {

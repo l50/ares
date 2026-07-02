@@ -252,11 +252,31 @@ pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
         {
             Ok(r) => r,
             Err(e) => {
-                // Connection or timeout error — retryable
-                let msg = format!("Loki request failed: {e}");
-                warn!(attempt, error = %e, "Loki request error (retryable)");
-                last_err = Some(msg);
-                continue;
+                // A builder error means the request could not even be
+                // constructed — a malformed base URL or an invalid header
+                // value (e.g. a GRAFANA_URL / auth token with a stray newline).
+                // It is deterministic, so retrying re-fails identically; fail
+                // fast and point the operator at the config instead of burning
+                // MAX_RETRIES rounds of backoff.
+                if e.is_builder() {
+                    warn!(error = %e, "Loki request construction failed (non-retryable)");
+                    return Ok(make_error(&format!(
+                        "Loki request could not be constructed \
+                         (check GRAFANA_URL / LOKI_URL and auth token for invalid \
+                         characters such as a trailing newline): {e}"
+                    )));
+                }
+                // Only genuine transport failures are worth retrying.
+                if e.is_connect() || e.is_timeout() {
+                    let msg = format!("Loki request failed: {e}");
+                    warn!(attempt, error = %e, "Loki request error (retryable)");
+                    last_err = Some(msg);
+                    continue;
+                }
+                // Anything else (redirect loops, decode, etc.) is not
+                // transient — surface it without wasting retry attempts.
+                warn!(error = %e, "Loki request error (non-retryable)");
+                return Ok(make_error(&format!("Loki request failed: {e}")));
             }
         };
 

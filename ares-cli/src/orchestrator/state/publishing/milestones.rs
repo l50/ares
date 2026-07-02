@@ -31,10 +31,7 @@ impl SharedState {
                 return Ok(());
             }
         }
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id);
         let mut conn = queue.connection();
         reader
@@ -93,10 +90,7 @@ impl SharedState {
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
         path: Option<String>,
     ) -> Result<()> {
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id);
         let mut conn = queue.connection();
         reader

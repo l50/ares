@@ -190,32 +190,41 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
             let client = nats.client().clone();
 
             let timeout = self.tool_timeout;
-            let response_msg = match tokio::time::timeout(
-                timeout,
-                client.request(subject.clone(), Bytes::from(payload)),
-            )
-            .await
-            {
-                Ok(Ok(msg)) => msg,
-                Ok(Err(e)) => {
-                    warn!(
-                        tool = %call.name,
-                        call_id = %call_id,
-                        err = %e,
-                        "NATS request failed"
-                    );
-                    return Ok(dispatch_error_result(&call.name, e));
-                }
-                Err(_) => {
-                    warn!(
-                        tool = %call.name,
-                        call_id = %call_id,
-                        timeout_secs = timeout.as_secs(),
-                        "Tool execution timed out"
-                    );
-                    return Ok(dispatch_timeout_result(&call.name, timeout));
-                }
-            };
+            // `client.request()` inherits async_nats' client-level request
+            // timeout, which defaults to 10s. Long-running tools (password_spray,
+            // secretsdump, kerberoast, hashcat, ...) routinely exceed that and
+            // would spuriously fail with "request timed out: deadline has
+            // elapsed" well before the intended `self.tool_timeout`. Send the
+            // request with `.timeout(None)` so the NATS layer imposes no
+            // deadline and the outer `tokio::time::timeout` is authoritative.
+            // A genuinely-absent worker still returns `NoResponders` immediately.
+            let request = async_nats::Request::new()
+                .payload(Bytes::from(payload))
+                .timeout(None);
+            let response_msg =
+                match tokio::time::timeout(timeout, client.send_request(subject.clone(), request))
+                    .await
+                {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(e)) => {
+                        warn!(
+                            tool = %call.name,
+                            call_id = %call_id,
+                            err = %e,
+                            "NATS request failed"
+                        );
+                        return Ok(dispatch_error_result(&call.name, e));
+                    }
+                    Err(_) => {
+                        warn!(
+                            tool = %call.name,
+                            call_id = %call_id,
+                            timeout_secs = timeout.as_secs(),
+                            "Tool execution timed out"
+                        );
+                        return Ok(dispatch_timeout_result(&call.name, timeout));
+                    }
+                };
 
             let response: ToolExecResponse = serde_json::from_slice(&response_msg.payload)
                 .context("Failed to deserialize tool exec response")?;
