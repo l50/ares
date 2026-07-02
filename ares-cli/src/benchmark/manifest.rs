@@ -38,11 +38,14 @@ pub struct SnapshotManifest {
     /// End of the Loki export window (includes post-attack buffer).
     pub capture_window_end: DateTime<Utc>,
 
-    /// Exported Loki streams and their entry counts.
-    pub streams: Vec<StreamEntry>,
+    /// How Loki data was captured ("s3-chunks" or "api-export").
+    pub loki_source: String,
 
-    /// Total log entries across all streams.
-    pub total_log_entries: u64,
+    /// Number of Loki chunks synced from S3.
+    pub loki_chunks: u64,
+
+    /// Number of Loki index files synced from S3.
+    pub loki_index_files: u64,
 
     /// Number of Grafana alert annotations captured.
     pub alerts_captured: usize,
@@ -61,22 +64,6 @@ pub struct SnapshotManifest {
 
     /// When this snapshot was captured.
     pub captured_at: DateTime<Utc>,
-}
-
-/// Metadata about a single exported Loki stream.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct StreamEntry {
-    /// Loki job label value (e.g., "windows-security").
-    pub job: String,
-
-    /// LogQL selector used for export (e.g., `{job="windows-security"}`).
-    pub selector: String,
-
-    /// Relative path to the JSONL file within the snapshot directory.
-    pub file: String,
-
-    /// Number of log entries in this stream.
-    pub entries: u64,
 }
 
 /// A Grafana alert that fired during the operation window.
@@ -109,6 +96,9 @@ pub struct BenchmarkResult {
     /// Investigation ID for this replay run.
     pub run_id: String,
 
+    /// Replay mode: "static" or "timeline".
+    pub replay_mode: String,
+
     /// How the blue team was triggered ("alert-replay" or "operation").
     pub trigger_mode: String,
 
@@ -126,6 +116,14 @@ pub struct BenchmarkResult {
 
     /// When the benchmark run completed.
     pub completed_at: DateTime<Utc>,
+
+    /// Seconds of quiet period before first alert (timeline mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet_period_secs: Option<f64>,
+
+    /// Time compression factor (timeline mode). 1.0 = real-time, 10.0 = 10x.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_compression: Option<f64>,
 
     /// Seconds spent importing data into Loki.
     pub import_duration_secs: f64,

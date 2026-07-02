@@ -122,6 +122,7 @@ dependencies = [
  "ares-tools",
  "async-nats",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "clap",

@@ -1,11 +1,12 @@
-//! Benchmark replay: load snapshots into Loki and run blue team investigations.
+//! Benchmark replay: provision EC2 Loki, run blue team investigations, score.
 //!
 //! - `load`: import a snapshot's JSONL streams into a target Loki instance
-//! - `run`: full pipeline (ephemeral Loki → import → investigate → score)
+//! - `run`: full pipeline (EC2 Loki → investigate → score → teardown)
 
 use std::fs;
+#[allow(unused_imports)]
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -24,25 +25,30 @@ use ares_tools::blue::loki_bulk::{self, BulkLokiConfig};
 use crate::ops::submit::{collect_env_vars, resolve_model, BLUE_ENV_VAR_NAMES};
 use crate::redis_conn::connect_redis;
 
-use super::k8s_loki::EphemeralLoki;
 use super::manifest::{BenchmarkResult, FiredAlert, SnapshotManifest};
+use super::replay_infra::{ReplayConfig, ReplayInfra};
 
 /// Parameters for the `benchmark run` command.
 pub(crate) struct ReplayParams {
     pub redis_url: Option<String>,
-    pub snapshot_dir: String,
-    pub loki_mode: String,
-    pub loki_url: Option<String>,
+    pub snapshot: String,
+    pub snapshot_dir: Option<String>,
+    pub replay_mode: String,
     pub trigger_mode: String,
     pub output_dir: String,
     pub model: Option<String>,
     pub max_steps: u32,
-    pub namespace: String,
+    pub quiet_period: Option<f64>,
+    pub time_compression: f64,
 }
 
 // ─── Load command ────────────────────────────────────────────────────────
 
 /// Import a snapshot's Loki data into a target Loki instance.
+///
+/// For `s3-chunks` snapshots, copies the chunk/index data into Loki's
+/// filesystem storage directory. For legacy `api-export` snapshots,
+/// pushes JSONL streams via the Loki push API.
 pub(crate) async fn run_load(
     snapshot_dir: &str,
     loki_url: &str,
@@ -50,6 +56,19 @@ pub(crate) async fn run_load(
 ) -> Result<()> {
     let manifest = load_manifest(snapshot_dir)?;
 
+    if manifest.loki_source == "s3-chunks" {
+        println!("Snapshot uses S3-chunks Loki data.");
+        println!("  Chunks:  {}", manifest.loki_chunks);
+        println!("  Index:   {}", manifest.loki_index_files);
+        println!();
+        println!("To use this data, configure Loki with filesystem storage");
+        println!("pointing at: {}/loki/", snapshot_dir);
+        println!("  chunks: {}/loki/fake/", snapshot_dir);
+        println!("  index:  {}/loki/index/", snapshot_dir);
+        return Ok(());
+    }
+
+    // Legacy api-export path (JSONL import via push API)
     let config = BulkLokiConfig {
         base_url: loki_url.trim_end_matches('/').to_string(),
         auth_token: loki_token.map(String::from),
@@ -60,7 +79,6 @@ pub(crate) async fn run_load(
     let duration = import_start.elapsed();
 
     println!("Import complete");
-    println!("  Streams:  {}", manifest.streams.len());
     println!("  Entries:  {total}");
     println!("  Duration: {:.1}s", duration.as_secs_f64());
 
@@ -69,73 +87,124 @@ pub(crate) async fn run_load(
 
 // ─── Run command ─────────────────────────────────────────────────────────
 
-/// Full replay: ephemeral Loki → import → investigate → score.
+/// Full replay: provision EC2 → configure Loki → investigate → score → teardown.
+///
+/// Supports two replay modes:
+/// - `static`: all data pre-loaded, agent knows full attack window (operation trigger)
+/// - `timeline`: quiet period before first alert, alert-replay trigger (no end window),
+///   simulating an unfolding attack
 pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
-    let manifest = load_manifest(&p.snapshot_dir)?;
     let run_started_at = Utc::now();
     let run_id = format!("inv-{}", run_started_at.format("%Y%m%d-%H%M%S"));
+    let is_timeline = p.replay_mode == "timeline";
 
-    info!(
-        "benchmark run {run_id} for operation {}",
-        manifest.operation_id
-    );
-
-    // ── Provision Loki ───────────────────────────────────────────────────
-    let mut ephemeral_loki: Option<EphemeralLoki> = None;
-    let loki_url: String;
-
-    match p.loki_mode.as_str() {
-        "ephemeral" => {
-            info!("creating ephemeral Loki in namespace {}", p.namespace);
-            let mut loki = EphemeralLoki::create(&p.namespace, &manifest.operation_id)?;
-            let url = loki.start_port_forward()?;
-            loki_url = url;
-            ephemeral_loki = Some(loki);
-        }
-        "external" => {
-            loki_url = p
-                .loki_url
-                .clone()
-                .context("--loki-url is required when --loki-mode=external")?;
-        }
-        other => bail!("unknown loki-mode: {other} (expected: ephemeral, external)"),
+    if !matches!(p.replay_mode.as_str(), "static" | "timeline") {
+        bail!(
+            "unknown replay-mode: {} (expected: static, timeline)",
+            p.replay_mode
+        );
     }
 
+    // ── Resolve snapshot location ───────────────────────────────────────
+    let replay_config = ReplayConfig::from_env()?;
+    let (snapshot_path, _is_temp) = resolve_snapshot(
+        &p.snapshot,
+        p.snapshot_dir.as_deref(),
+        &replay_config,
+    )?;
+
+    let manifest = load_manifest(snapshot_path.to_str().unwrap())?;
+
+    info!(
+        "benchmark run {run_id} [mode={}, trigger={}] for operation {}",
+        p.replay_mode,
+        if is_timeline { "alert-replay" } else { &p.trigger_mode },
+        manifest.operation_id,
+    );
+
+    // ── Provision replay EC2 with Loki ──────────────────────────────────
+    info!("provisioning replay EC2 for {}...", manifest.operation_id);
+    let mut replay_infra = ReplayInfra::provision(&manifest.operation_id, &replay_config)
+        .context("provision replay infrastructure")?;
+    let loki_url = replay_infra.loki_url();
     info!("Loki URL: {loki_url}");
 
-    // ── Import snapshot data ─────────────────────────────────────────────
-    let import_config = BulkLokiConfig {
-        base_url: loki_url.trim_end_matches('/').to_string(),
-        auth_token: None,
-    };
+    // From here on, ensure teardown happens on error
+    let result = run_replay_inner(&p, &manifest, &loki_url, &snapshot_path, &run_id, is_timeline, run_started_at).await;
 
+    // ── Teardown ────────────────────────────────────────────────────────
+    info!("tearing down replay infrastructure...");
+    if let Err(e) = replay_infra.teardown() {
+        eprintln!("WARNING: failed to tear down replay EC2: {e}");
+    }
+
+    result
+}
+
+/// Inner replay logic, separated so teardown always runs.
+async fn run_replay_inner(
+    p: &ReplayParams,
+    manifest: &SnapshotManifest,
+    loki_url: &str,
+    snapshot_path: &Path,
+    run_id: &str,
+    is_timeline: bool,
+    run_started_at: chrono::DateTime<Utc>,
+) -> Result<()> {
     let import_start = std::time::Instant::now();
-    let total_imported = import_all_streams(&p.snapshot_dir, &manifest, &import_config).await?;
     let import_duration = import_start.elapsed().as_secs_f64();
+    info!("Loki data loaded on replay EC2 (via SSM), import phase: {import_duration:.1}s");
 
-    info!("imported {total_imported} entries in {import_duration:.1}s");
-
-    // ── Override LOKI_URL so the blue team queries the ephemeral instance ─
+    // ── Override LOKI_URL so the blue team queries the replay instance ───
     // SAFETY: this is the documented mechanism for pointing the blue agent
     // at a specific Loki. The env var is read by loki_config() in loki.rs.
     unsafe {
-        std::env::set_var("LOKI_URL", &loki_url);
+        std::env::set_var("LOKI_URL", loki_url);
     }
 
+    // ── Timeline mode: quiet period ──────────────────────────────────────
+    let quiet_period_secs = if is_timeline {
+        let secs = p.quiet_period.unwrap_or_else(|| {
+            // Pseudo-random quiet period between 60-300s using nanosecond jitter.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as f64;
+            60.0 + (nanos % 240_000_000.0) / 1_000_000.0
+        });
+        if secs > 0.0 {
+            info!("timeline mode: quiet period {secs:.0}s before first alert");
+            tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+        }
+        Some(secs)
+    } else {
+        None
+    };
+
     // ── Build investigation trigger ──────────────────────────────────────
-    let alert_json = match p.trigger_mode.as_str() {
-        "alert-replay" => build_alert_replay_trigger(&p.snapshot_dir, &manifest)?,
-        "operation" => build_operation_trigger(&p.snapshot_dir, &manifest)?,
+    // Timeline mode always uses alert-replay (no attack_window_end).
+    let snapshot_dir_str = snapshot_path.to_str().unwrap();
+    let effective_trigger_mode = if is_timeline {
+        "alert-replay"
+    } else {
+        &p.trigger_mode
+    };
+
+    let alert_json = match effective_trigger_mode {
+        "alert-replay" => build_alert_replay_trigger(snapshot_dir_str, manifest)?,
+        "operation" => build_operation_trigger(snapshot_dir_str, manifest)?,
         other => bail!("unknown trigger-mode: {other} (expected: alert-replay, operation)"),
     };
 
-    info!("trigger built (mode={})", p.trigger_mode);
+    info!("trigger built (mode={effective_trigger_mode})");
 
     // ── Submit investigation via NATS ────────────────────────────────────
     let effective_model = resolve_model(&p.model);
-    let env_vars = collect_env_vars(BLUE_ENV_VAR_NAMES);
+    let mut env_vars = collect_env_vars(BLUE_ENV_VAR_NAMES);
+    // Ensure LOKI_URL points to the replay EC2
+    env_vars.insert("LOKI_URL".to_string(), loki_url.to_string());
 
-    let mut conn = connect_redis(p.redis_url).await?;
+    let mut conn = connect_redis(p.redis_url.clone()).await?;
 
     let request = serde_json::json!({
         "investigation_id": run_id,
@@ -149,7 +218,7 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         "submitted_at": Utc::now().to_rfc3339(),
     });
 
-    // Store env vars (includes LOKI_URL override)
+    // Store env vars (includes LOKI_URL override for per-investigation routing)
     if !env_vars.is_empty() {
         let env_key = format!("ares:blue:inv:{run_id}:env_vars");
         let env_json = serde_json::to_string(&env_vars)?;
@@ -212,11 +281,11 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let investigation_duration = investigation_start.elapsed().as_secs_f64();
 
     // ── Score against ground truth ───────────────────────────────────────
-    let red_state_path = Path::new(&p.snapshot_dir).join("red-state.json");
+    let red_state_path = snapshot_path.join("red-state.json");
     let (red_state, techniques) = load_red_state_from_file(&red_state_path)?;
     let ground_truth = create_ground_truth_from_red_state(&red_state, &techniques);
 
-    let blue_reader = BlueStateReader::new(run_id.clone());
+    let blue_reader = BlueStateReader::new(run_id.to_string());
     let blue_state = blue_reader
         .load_state(&mut conn)
         .await?
@@ -236,7 +305,7 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let gap_analysis = analyze_detection_gaps(&eval_result);
 
     // ── Write result ─────────────────────────────────────────────────────
-    let trigger_alert = match p.trigger_mode.as_str() {
+    let trigger_alert = match effective_trigger_mode {
         "alert-replay" => alert_json
             .get("labels")
             .and_then(|l| l.get("alertname"))
@@ -248,13 +317,20 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let result = BenchmarkResult {
         snapshot_id: manifest.operation_id.clone(),
         operation_id: manifest.operation_id.clone(),
-        run_id: run_id.clone(),
-        trigger_mode: p.trigger_mode.clone(),
+        run_id: run_id.to_string(),
+        replay_mode: p.replay_mode.clone(),
+        trigger_mode: effective_trigger_mode.to_string(),
         trigger_alert,
-        loki_mode: p.loki_mode.clone(),
+        loki_mode: "ec2".to_string(),
         model: model_name.to_string(),
         started_at: run_started_at,
         completed_at: Utc::now(),
+        quiet_period_secs,
+        time_compression: if is_timeline {
+            Some(p.time_compression)
+        } else {
+            None
+        },
         import_duration_secs: import_duration,
         investigation_duration_secs: investigation_duration,
         evaluation: eval_result.to_value(),
@@ -267,15 +343,14 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     fs::write(&result_path, serde_json::to_string_pretty(&result)?)
         .with_context(|| format!("write result: {}", result_path.display()))?;
 
-    // ── Cleanup ──────────────────────────────────────────────────────────
-    if let Some(mut loki) = ephemeral_loki {
-        loki.destroy()?;
-    }
-
     // ── Summary ─────────────────────────────────────────────────────────
     println!("Benchmark complete: {}", result_path.display());
     println!("  Run ID:         {run_id}");
+    println!("  Mode:           {}", p.replay_mode);
     println!("  Operation:      {}", manifest.operation_id);
+    if let Some(qp) = quiet_period_secs {
+        println!("  Quiet period:   {qp:.0}s");
+    }
     println!("  Grade:          {}", eval_result.grade());
     println!(
         "  Overall score:  {:.1}%",
@@ -289,7 +364,6 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         "  IOC detection:  {:.1}%",
         eval_result.ioc_detection_rate * 100.0
     );
-    println!("  Import:         {import_duration:.1}s");
     println!("  Investigation:  {investigation_duration:.1}s");
     println!("  Pass:           {}", eval_result.passed());
 
@@ -298,6 +372,32 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
+/// Resolve snapshot location: use local dir override if provided, otherwise
+/// download metadata from S3.
+fn resolve_snapshot(
+    snapshot_id: &str,
+    snapshot_dir_override: Option<&str>,
+    config: &ReplayConfig,
+) -> Result<(PathBuf, bool)> {
+    if let Some(dir) = snapshot_dir_override {
+        info!("using local snapshot directory: {dir}");
+        return Ok((PathBuf::from(dir), false));
+    }
+
+    // Download metadata from S3 to a temp directory
+    let tmp_dir = PathBuf::from(format!("/tmp/ares-benchmark-{snapshot_id}"));
+    info!("downloading snapshot metadata from S3 for {snapshot_id}...");
+    super::replay_infra::download_snapshot_metadata(
+        snapshot_id,
+        &config.aws_profile,
+        &config.aws_region,
+        &config.s3_bucket,
+        &tmp_dir,
+    )?;
+
+    Ok((tmp_dir, true))
+}
+
 /// Load and validate the snapshot manifest.
 fn load_manifest(snapshot_dir: &str) -> Result<SnapshotManifest> {
     let manifest_path = Path::new(snapshot_dir).join("manifest.json");
@@ -305,36 +405,46 @@ fn load_manifest(snapshot_dir: &str) -> Result<SnapshotManifest> {
         .with_context(|| format!("read {}", manifest_path.display()))?;
     let manifest: SnapshotManifest = serde_json::from_str(&raw).context("parse manifest.json")?;
     info!(
-        "loaded manifest: op={}, streams={}, entries={}",
+        "loaded manifest: op={}, loki_source={}, chunks={}, alerts={}",
         manifest.operation_id,
-        manifest.streams.len(),
-        manifest.total_log_entries,
+        manifest.loki_source,
+        manifest.loki_chunks,
+        manifest.alerts_captured,
     );
     Ok(manifest)
 }
 
-/// Import all JSONL streams from a snapshot into Loki.
+/// Import all JSONL streams from a legacy snapshot into Loki.
+///
+/// Scans the `loki/` subdirectory for `.jsonl` files and pushes each
+/// into Loki via the push API.
 async fn import_all_streams(
     snapshot_dir: &str,
-    manifest: &SnapshotManifest,
+    _manifest: &SnapshotManifest,
     config: &BulkLokiConfig,
 ) -> Result<u64> {
+    let loki_dir = Path::new(snapshot_dir).join("loki");
     let mut total: u64 = 0;
 
-    for stream in &manifest.streams {
-        let file_path = Path::new(snapshot_dir).join(&stream.file);
-        if !file_path.exists() {
-            info!("skipping missing stream file: {}", file_path.display());
+    if !loki_dir.exists() {
+        info!("no loki/ directory in snapshot — nothing to import");
+        return Ok(0);
+    }
+
+    for entry in fs::read_dir(&loki_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
 
-        let file =
-            fs::File::open(&file_path).with_context(|| format!("open {}", file_path.display()))?;
+        let file = fs::File::open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
         let reader = BufReader::new(file);
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
 
-        info!("importing stream {} from {}", stream.job, stream.file);
+        info!("importing stream {name} from {}", path.display());
         let entries = loki_bulk::import_stream(config, reader, 0).await?;
-        info!("  {}: {entries} entries imported", stream.job);
+        info!("  {name}: {entries} entries imported");
         total += entries;
     }
 
