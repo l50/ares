@@ -1,5 +1,6 @@
 //! auto_adcs_enumeration -- detect ADCS servers via CertEnroll share.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -364,12 +365,16 @@ pub async fn auto_adcs_enumeration(
                 .collect();
             let ce_count = certenroll_shares.len();
             let ce_hosts: Vec<_> = certenroll_shares.iter().map(|s| s.host.as_str()).collect();
-            let cred_domains: Vec<_> = state
-                .credentials
-                .iter()
-                .map(|c| c.domain.as_str())
-                .collect();
-            let hash_domains: Vec<_> = state.hashes.iter().map(|h| h.domain.as_str()).collect();
+            let cred_domains: BTreeMap<&str, usize> =
+                state.credentials.iter().fold(BTreeMap::new(), |mut m, c| {
+                    *m.entry(c.domain.as_str()).or_insert(0) += 1;
+                    m
+                });
+            let hash_domains: BTreeMap<&str, usize> =
+                state.hashes.iter().fold(BTreeMap::new(), |mut m, h| {
+                    *m.entry(h.domain.as_str()).or_insert(0) += 1;
+                    m
+                });
             let domains: Vec<_> = state.domains.iter().map(|d| d.as_str()).collect();
             let w = collect_adcs_work(&state);
             info!(
