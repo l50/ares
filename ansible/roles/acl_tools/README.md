@@ -35,7 +35,8 @@ Install and configure Active Directory ACL exploitation tools for Ares agents
 | `acl_tools_bloodyad_apt_package` | str | <code>bloodyad</code> | No description |
 | `acl_tools_install_pywhisker` | bool | <code>True</code> | No description |
 | `acl_tools_pywhisker_package` | str | <code>pywhisker</code> | No description |
-| `acl_tools_pyopenssl_package` | str | <code>pyOpenSSL<24</code> | No description |
+| `acl_tools_pywhisker_install_dir` | str | <code>/opt/pywhisker</code> | No description |
+| `acl_tools_pyopenssl_package` | str | <code>pyOpenSSL<25</code> | No description |
 | `acl_tools_install_dacledit` | bool | <code>True</code> | No description |
 | `acl_tools_impacket_from_source` | bool | <code>True</code> | No description |
 | `acl_tools_impacket_repo` | str | <code>https://github.com/fortra/impacket.git</code> | No description |
@@ -94,9 +95,8 @@ Install and configure Active Directory ACL exploitation tools for Ares agents
 - **Ensure bloodyAD symlink for Kali apt install** (ansible.builtin.file) - Conditional
 - **Check if bloodyAD is already installed** (ansible.builtin.command) - Conditional
 - **Install bloodyAD via pip** (ansible.builtin.pip) - Conditional
-- **Check if pywhisker is already installed** (ansible.builtin.command) - Conditional
-- **Install pywhisker via pip** (ansible.builtin.pip) - Conditional
-- **Pin pyOpenSSL below 24 for pywhisker PKCS12 support** (ansible.builtin.pip) - Conditional
+- **Install pywhisker in an isolated virtualenv** (ansible.builtin.pip) - Conditional
+- **Create wrapper script for pywhisker** (ansible.builtin.copy) - Conditional
 - **Clone targetedKerberoast from GitHub** (ansible.builtin.git) - Conditional
 - **Create virtual environment for targetedKerberoast** (ansible.builtin.command) - Conditional
 - **Install targetedKerberoast dependencies in venv** (ansible.builtin.pip) - Conditional

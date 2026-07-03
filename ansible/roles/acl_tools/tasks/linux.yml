@@ -131,38 +131,32 @@
     - acl_tools_install_bloodyad
     - acl_tools_bloodyad_check.rc != 0
 
-- name: Check if pywhisker is already installed
-  ansible.builtin.command: pip3 show pywhisker
-  register: acl_tools_pywhisker_check
-  changed_when: false
-  failed_when: false
-  when:
-    - ansible_facts['os_family'] == 'Debian'
-    - acl_tools_install_pywhisker
-
-- name: Install pywhisker via pip
+# pywhisker's PFX export uses OpenSSL.crypto.PKCS12, which later pyOpenSSL
+# releases removed; the 24.x line still ships it, hence pyOpenSSL<25. Keep this
+# confined to pywhisker's own venv: the system pyOpenSSL must stay >=24 for
+# impacket-ldap tooling (nxc, secretsdump), because a system-wide pyOpenSSL<24
+# references cryptography's _lib.GEN_EMAIL (removed in cryptography>=42) and
+# crashes every `import OpenSSL`. The pip module builds the venv itself via
+# `python3 -m venv`, so no separate creation task is needed.
+- name: Install pywhisker in an isolated virtualenv
   ansible.builtin.pip:
-    name: "{{ acl_tools_pywhisker_package }}"
-    executable: pip3
-    # --no-deps prevents pywhisker from downgrading impacket to 0.12.0 (its stale pin)
-    # impacket 0.13.0 is managed separately via impacket_source.yml
-    extra_args: "{{ ('--break-system-packages ' if (base_pip_break_required | default(false)) else '') ~ '--no-deps --ignore-installed' }}"
+    name:
+      - "{{ acl_tools_pywhisker_package }}"
+      - "{{ acl_tools_pyopenssl_package }}"
+    virtualenv: "{{ acl_tools_pywhisker_install_dir }}/venv"
+    virtualenv_command: python3 -m venv
   become: true
   when:
     - ansible_facts['os_family'] == 'Debian'
     - acl_tools_install_pywhisker
-    - acl_tools_pywhisker_check.rc != 0
 
-# pywhisker installs with --no-deps (above), so its pyOpenSSL dependency is not
-# pulled and the image's default pyOpenSSL (>=24, which dropped crypto.PKCS12)
-# leaks in — crashing pywhisker's PFX export. The pip module's native version
-# handling makes this idempotent: it downgrades when the installed version
-# doesn't satisfy pyOpenSSL<24, no-op otherwise.
-- name: Pin pyOpenSSL below 24 for pywhisker PKCS12 support
-  ansible.builtin.pip:
-    name: "{{ acl_tools_pyopenssl_package }}"
-    executable: pip3
-    extra_args: "{{ '--break-system-packages' if (base_pip_break_required | default(false)) else '' }}"
+- name: Create wrapper script for pywhisker
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      exec {{ acl_tools_pywhisker_install_dir }}/venv/bin/pywhisker "$@"
+    dest: /usr/local/bin/pywhisker
+    mode: '0755'
   become: true
   when:
     - ansible_facts['os_family'] == 'Debian'

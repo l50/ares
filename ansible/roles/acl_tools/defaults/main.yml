@@ -18,12 +18,16 @@ acl_tools_bloodyad_apt_package: "bloodyad"
 # Pywhisker configuration (shadow credentials manipulation)
 acl_tools_install_pywhisker: true
 acl_tools_pywhisker_package: "pywhisker"
-# pywhisker's PFX export calls OpenSSL.crypto.PKCS12, which pyOpenSSL removed in
-# 24.0.0 — a stock image ships a newer pyOpenSSL, so the shadow-cred write lands
-# but the PFX dump crashes with "module 'OpenSSL.crypto' has no attribute
-# 'PKCS12'". Pin below 24 so pywhisker's PKCS12 path exists. (certipy shadow uses
-# the cryptography PFX API and is unaffected — it's the preferred path.)
-acl_tools_pyopenssl_package: "pyOpenSSL<24"
+acl_tools_pywhisker_install_dir: "/opt/pywhisker"
+# pywhisker's PFX export calls OpenSSL.crypto.PKCS12, which later pyOpenSSL
+# releases removed — the shadow-cred write lands but the PFX dump crashes with
+# "module 'OpenSSL.crypto' has no attribute 'PKCS12'". The 24.x line still ships
+# PKCS12, so pin below 25. This pin is applied ONLY inside pywhisker's own venv,
+# never to the system interpreter: a system-wide pyOpenSSL<24 references
+# cryptography's _lib.GEN_EMAIL (dropped in cryptography>=42) and crashes every
+# `import OpenSSL`, breaking impacket-ldap/nxc. (certipy shadow uses the
+# cryptography PFX API and is unaffected — it's the preferred path.)
+acl_tools_pyopenssl_package: "pyOpenSSL<25"
 
 # dacledit configuration (Impacket ACL editing)
 acl_tools_install_dacledit: true
