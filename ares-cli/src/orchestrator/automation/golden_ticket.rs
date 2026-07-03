@@ -85,7 +85,13 @@ pub(crate) fn gather_golden_ticket_inputs(
         .cloned()?;
 
     let domain_sid = state.domain_sids.get(&domain_lc).cloned();
-    let dc_ip = state.domain_controllers.get(&domain_lc).cloned();
+    // Use `resolve_dc_ip` rather than a raw `domain_controllers` lookup: a
+    // child DC whose hostname is the bare domain apex (`child.contoso.local`)
+    // is only mapped correctly if `register_dc` ran after the child domain
+    // became known — and `register_dc` doesn't re-fire once the host is already
+    // a known DC. `resolve_dc_ip`'s zone-apex hosts scan resolves it regardless
+    // of registration ordering, matching what `auto_trust_follow` already does.
+    let dc_ip = state.resolve_dc_ip(&domain_lc);
 
     let admin_cred = state
         .credentials
@@ -685,6 +691,45 @@ mod tests {
         let inputs = gather_golden_ticket_inputs(&s, "contoso.local").unwrap();
         assert_eq!(inputs.domain_sid.as_deref(), Some("S-1-5-21-1-2-3"));
         assert_eq!(inputs.dc_ip.as_deref(), Some("192.168.58.10"));
+    }
+
+    #[test]
+    fn gather_inputs_resolves_zone_apex_child_dc_when_map_misfiled() {
+        // Regression: a child DC whose hostname is the bare domain apex
+        // (`north.contoso.local`) can be registered under the PARENT in the
+        // `domain_controllers` map when it's discovered before the child domain
+        // is known, and `register_dc` won't re-fire to correct it. A raw map
+        // lookup for the child domain then misses and the forge defers forever
+        // on "Cannot resolve domain SID". Going through `resolve_dc_ip` recovers
+        // the child DC IP from the hosts table via its zone-apex scan.
+        let mut s = StateInner::new("op-test".into());
+        s.has_domain_admin = true;
+        s.domains.push("contoso.local".into());
+        s.domains.push("north.contoso.local".into());
+        s.hashes.push(krbtgt_hash(
+            "north.contoso.local",
+            "31d6cfe0d16ae931b73c59d7e0c089c0",
+        ));
+        // Map misfiled: child DC's IP registered under the parent domain, with
+        // no entry at all for the child.
+        s.domain_controllers
+            .insert("contoso.local".into(), "192.168.58.240".into());
+        s.hosts.push(ares_core::models::Host {
+            ip: "192.168.58.240".into(),
+            hostname: "north.contoso.local".into(),
+            os: String::new(),
+            roles: vec!["domain_controller".into()],
+            services: vec![],
+            is_dc: true,
+            owned: false,
+        });
+
+        let inputs = gather_golden_ticket_inputs(&s, "north.contoso.local").unwrap();
+        assert_eq!(
+            inputs.dc_ip.as_deref(),
+            Some("192.168.58.240"),
+            "child DC IP must resolve via zone-apex hosts scan despite the misfiled map"
+        );
     }
 
     #[test]

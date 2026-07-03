@@ -323,11 +323,24 @@ impl SharedState {
         // passes, also require ≥3 dot-separated parts so 2-label names like
         // `DC01.local` don't yield `local` as the AD domain.
         let derived = if looks_like_real_domain(&host.hostname) {
-            let parts: Vec<&str> = host.hostname.split('.').collect();
-            if parts.len() >= 3 {
-                parts[1..].join(".").to_lowercase()
+            let hostname_lower = host.hostname.trim_end_matches('.').to_lowercase();
+            let whole_is_known_domain = {
+                let state = self.inner.read().await;
+                state
+                    .domains
+                    .iter()
+                    .chain(state.trusted_domains.keys())
+                    .any(|d| d.eq_ignore_ascii_case(&hostname_lower))
+            };
+            if whole_is_known_domain {
+                hostname_lower
             } else {
-                String::new()
+                let parts: Vec<&str> = hostname_lower.split('.').collect();
+                if parts.len() >= 3 {
+                    parts[1..].join(".")
+                } else {
+                    String::new()
+                }
             }
         } else {
             String::new()
@@ -885,6 +898,80 @@ mod tests {
         assert_eq!(
             s.domain_controllers.get("eu.contoso.local"),
             Some(&"192.168.58.1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_zone_apex_child_maps_to_child_not_parent() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("north.contoso.local".to_string());
+        }
+
+        let host = make_host("192.168.58.240", "north.contoso.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("north.contoso.local"),
+            Some(&"192.168.58.240".to_string()),
+            "child DC must register under the child domain"
+        );
+        assert!(
+            !s.domain_controllers.contains_key("contoso.local"),
+            "child DC must NOT be registered under the parent domain, got {:?}",
+            s.domain_controllers
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_zone_apex_two_label_parent() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("north.contoso.local".to_string());
+        }
+
+        let host = make_host("192.168.58.243", "contoso.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("contoso.local"),
+            Some(&"192.168.58.243".to_string()),
+            "parent DC with bare-apex hostname must register under its domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_zone_apex_corrects_stale_parent_mapping() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("north.contoso.local".to_string());
+            s.domain_controllers
+                .insert("contoso.local".to_string(), "192.168.58.240".to_string());
+        }
+
+        let host = make_host("192.168.58.240", "north.contoso.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("north.contoso.local"),
+            Some(&"192.168.58.240".to_string())
+        );
+        assert!(
+            !s.domain_controllers.contains_key("contoso.local"),
+            "stale parent -> child-IP mapping must be corrected, got {:?}",
+            s.domain_controllers
         );
     }
 

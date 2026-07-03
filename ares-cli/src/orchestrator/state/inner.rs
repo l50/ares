@@ -160,6 +160,17 @@ pub struct StateInner {
     // still tolerating transient auth races.
     pub mssql_link_pivot_attempts: HashMap<String, u32>,
 
+    // Per-(dc, domain, principal) consecutive-`Transient` counter for
+    // `auto_krbtgt_extraction`, keyed by `krbtgt_principal_attempt_key`. A
+    // `Transient` outcome intentionally leaves state clean so genuine network
+    // blips retry, but a principal that keeps returning non-logon-failure
+    // output that never advances (e.g. a full-dump retry that still can't
+    // parse krbtgt) would otherwise be re-picked every tick forever. After
+    // `KRBTGT_MAX_TRANSIENT` consecutive Transients we mark the principal dedup
+    // so the loop rotates to the next candidate. In-memory only — restart just
+    // resets the budget, which is the safe direction (re-try, don't over-skip).
+    pub krbtgt_transient_counts: HashMap<String, u32>,
+
     // Per-hash crack attempt counter, keyed by `crack_dedup_key`. Lets a
     // failed crack (wrong wordlist, password not in list, hashcat transient)
     // be retried up to `MAX_CRACK_ATTEMPTS` before the dispatcher marks
@@ -244,6 +255,7 @@ impl StateInner {
             forge_aes_defers: HashMap::new(),
             forge_in_flight: HashMap::new(),
             mssql_link_pivot_attempts: HashMap::new(),
+            krbtgt_transient_counts: HashMap::new(),
             crack_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
@@ -394,7 +406,6 @@ impl StateInner {
     /// environments.
     pub fn resolve_dc_ip(&self, domain: &str) -> Option<String> {
         let domain_lower = domain.to_lowercase();
-        // Tier 1: explicit DC map (case-insensitive)
         if let Some(ip) = self.domain_controllers.get(&domain_lower).or_else(|| {
             self.domain_controllers
                 .iter()
@@ -403,20 +414,33 @@ impl StateInner {
         }) {
             return Some(ip.clone());
         }
-        // Tier 2: scan hosts for a DC matching this domain by FQDN suffix
         for host in &self.hosts {
-            if !(host.is_dc || host.detect_dc()) {
+            if !(host.is_dc || host.detect_dc()) || host.hostname.is_empty() {
                 continue;
             }
-            if host.hostname.is_empty() {
+            if host
+                .hostname
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(&domain_lower)
+            {
+                return Some(host.ip.clone());
+            }
+        }
+        for host in &self.hosts {
+            if !(host.is_dc || host.detect_dc()) || host.hostname.is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = host.hostname.split('.').collect();
-            if parts.len() >= 3 {
-                let host_domain = parts[1..].join(".").to_lowercase();
-                if host_domain == domain_lower {
-                    return Some(host.ip.clone());
-                }
+            let hostname_lower = host.hostname.trim_end_matches('.').to_lowercase();
+            if self
+                .domains
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&hostname_lower))
+            {
+                continue;
+            }
+            let parts: Vec<&str> = hostname_lower.split('.').collect();
+            if parts.len() >= 3 && parts[1..].join(".") == domain_lower {
+                return Some(host.ip.clone());
             }
         }
         None
@@ -1361,5 +1385,55 @@ mod tests {
         extra.cracked_password = Some("pw".into());
         state.push_hash_capped(extra);
         assert_eq!(state.hashes.len(), MAX_HASHES + 1);
+    }
+
+    fn make_dc_host(ip: &str, hostname: &str) -> Host {
+        Host {
+            ip: ip.to_string(),
+            hostname: hostname.to_string(),
+            os: String::new(),
+            roles: vec!["domain_controller".to_string()],
+            services: vec![],
+            is_dc: true,
+            owned: false,
+        }
+    }
+
+    #[test]
+    fn resolve_dc_ip_zone_apex_does_not_transpose_parent_and_child() {
+        let mut state = StateInner::new("op-1".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("north.contoso.local".into());
+        state
+            .hosts
+            .push(make_dc_host("192.168.58.240", "north.contoso.local"));
+        state
+            .hosts
+            .push(make_dc_host("192.168.58.243", "contoso.local"));
+
+        assert_eq!(
+            state.resolve_dc_ip("contoso.local"),
+            Some("192.168.58.243".to_string()),
+            "parent domain must resolve to the parent DC, not the child"
+        );
+        assert_eq!(
+            state.resolve_dc_ip("north.contoso.local"),
+            Some("192.168.58.240".to_string()),
+            "child domain must resolve to the child DC"
+        );
+    }
+
+    #[test]
+    fn resolve_dc_ip_normal_fqdn_still_strips_machine_label() {
+        let mut state = StateInner::new("op-1".into());
+        state.domains.push("contoso.local".into());
+        state
+            .hosts
+            .push(make_dc_host("192.168.58.10", "dc01.contoso.local"));
+
+        assert_eq!(
+            state.resolve_dc_ip("contoso.local"),
+            Some("192.168.58.10".to_string())
+        );
     }
 }

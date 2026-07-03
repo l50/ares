@@ -57,6 +57,28 @@ pub(crate) fn resolve_flat_to_fqdn(flat: &str, state: &StateInner) -> Option<Str
         .map(|d| d.to_lowercase())
 }
 
+/// Resolve a domain FQDN (e.g. `child.contoso.local`) to its NetBIOS/flat
+/// name (e.g. `CHILD`), when Ares has authoritatively captured it.
+///
+/// The only trusted source is `state.trusted_domains`, whose `TrustInfo`
+/// entries carry a `flat_name` observed via LDAP `trustedDomain` enumeration.
+/// We deliberately do NOT guess the flat name from the FQDN's first label:
+/// callers use this to qualify `-just-dc-user` in a multi-domain forest, and a
+/// wrong guess turns a working bare-`krbtgt` dump into a hard "name not found"
+/// failure. `None` means "flat name unknown" — the caller should fall back to
+/// the bare account name (and, for `-just-dc-user`, a full-dump retry).
+pub(crate) fn resolve_fqdn_to_flat(fqdn: &str, state: &StateInner) -> Option<String> {
+    let target = fqdn.to_lowercase();
+    if target.is_empty() {
+        return None;
+    }
+    state
+        .trusted_domains
+        .values()
+        .find(|t| t.domain.to_lowercase() == target && !t.flat_name.is_empty())
+        .map(|t| t.flat_name.to_uppercase())
+}
+
 /// Validate that a string looks like a domain FQDN.
 ///
 /// Rejects empty strings, IP-like patterns, strings with whitespace, and strings
@@ -170,6 +192,58 @@ mod tests {
             resolve_flat_to_fqdn("CONTOSO", &state).as_deref(),
             Some("contoso.local")
         );
+    }
+
+    // -- resolve_fqdn_to_flat ----------------------------------------------
+
+    #[test]
+    fn resolve_fqdn_to_flat_uses_trusted_domain_metadata() {
+        let mut state = StateInner::new("op-test".into());
+        state.trusted_domains.insert(
+            "child.contoso.local".into(),
+            make_trust("child.contoso.local", "CHILD"),
+        );
+        assert_eq!(
+            resolve_fqdn_to_flat("child.contoso.local", &state).as_deref(),
+            Some("CHILD")
+        );
+    }
+
+    #[test]
+    fn resolve_fqdn_to_flat_is_case_insensitive_and_uppercases() {
+        let mut state = StateInner::new("op-test".into());
+        state.trusted_domains.insert(
+            "fabrikam.local".into(),
+            make_trust("fabrikam.local", "fabrikam"),
+        );
+        assert_eq!(
+            resolve_fqdn_to_flat("FABRIKAM.LOCAL", &state).as_deref(),
+            Some("FABRIKAM")
+        );
+    }
+
+    #[test]
+    fn resolve_fqdn_to_flat_unknown_returns_none() {
+        // No trust metadata → we must NOT guess "CHILD" from the first label.
+        let mut state = StateInner::new("op-test".into());
+        state.domains.push("child.contoso.local".into());
+        assert_eq!(resolve_fqdn_to_flat("child.contoso.local", &state), None);
+    }
+
+    #[test]
+    fn resolve_fqdn_to_flat_skips_empty_flat_name() {
+        let mut state = StateInner::new("op-test".into());
+        state.trusted_domains.insert(
+            "child.contoso.local".into(),
+            make_trust("child.contoso.local", ""),
+        );
+        assert_eq!(resolve_fqdn_to_flat("child.contoso.local", &state), None);
+    }
+
+    #[test]
+    fn resolve_fqdn_to_flat_empty_input_returns_none() {
+        let state = StateInner::new("op-test".into());
+        assert_eq!(resolve_fqdn_to_flat("", &state), None);
     }
 
     // -- is_valid_domain_fqdn ----------------------------------------------

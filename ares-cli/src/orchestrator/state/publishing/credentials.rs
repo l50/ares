@@ -151,6 +151,32 @@ impl SharedState {
         // Mirrors the same normalization in `sanitize_credential`.
         hash.domain = hash.domain.to_lowercase();
 
+        // Canonicalize flat NetBIOS → FQDN when known. `secretsdump.py`'s NTDS
+        // output emits `CHILD\administrator:500:...`; the extractor stamps
+        // `domain="child"` verbatim. Other emitters (LDAP dumps, orchestrator
+        // summaries) tag the same secret with the FQDN. Without this step both
+        // land as separate Redis fields (`ntlm:child:administrator:<h>` and
+        // `ntlm:child.contoso.local:administrator:<h>`), splitting the same
+        // identity and defeating dedup. `canonicalize_domain_label` returns
+        // `None` when the flat name is unknown to state — keep the original
+        // label rather than mint a phantom FQDN.
+        if !hash.domain.is_empty() {
+            let state_read = self.inner.read().await;
+            if let Some(canonical) =
+                super::super::canonicalize_domain_label(&hash.domain, &state_read)
+            {
+                if canonical != hash.domain {
+                    tracing::debug!(
+                        username = %hash.username,
+                        original = %hash.domain,
+                        canonical = %canonical,
+                        "Canonicalizing hash domain flat→FQDN before dedup"
+                    );
+                    hash.domain = canonical;
+                }
+            }
+        }
+
         // Reject malformed NTLM hashes before they enter state. Accept both a
         // bare NT half and standard secretsdump LM:NT pairs; tools can consume
         // either, but relay artifacts with partial/extra bytes only cause
@@ -812,6 +838,53 @@ mod tests {
         let s = state.inner.read().await;
         assert_eq!(s.hashes.len(), 1);
         assert_eq!(s.hashes[0].domain, "contoso.local");
+    }
+
+    #[tokio::test]
+    async fn publish_hash_canonicalizes_flat_netbios_to_fqdn() {
+        // The secretsdump NTDS extractor tags hashes with the flat NetBIOS name
+        // it sees in `CHILD\administrator:500:...:<h>:::`, while LDAP dumps and
+        // orchestrator-side emitters tag the same identity with the FQDN. Both
+        // must collapse into a single dedup slot; leaving flat- and FQDN-keyed
+        // rows side-by-side splits candidate selection (which keys on FQDN).
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("child.contoso.local".to_string());
+        }
+
+        let flat = make_hash("admin", "CHILD", "NTLM", NTLM_HASH_A);
+        let fqdn = make_hash("admin", "child.contoso.local", "NTLM", NTLM_HASH_A);
+        assert!(state.publish_hash(&q, flat).await.unwrap());
+        assert!(!state.publish_hash(&q, fqdn).await.unwrap());
+
+        let s = state.inner.read().await;
+        assert_eq!(s.hashes.len(), 1);
+        assert_eq!(s.hashes[0].domain, "child.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn publish_hash_preserves_unknown_flat_domain() {
+        // When the flat name doesn't resolve to any known FQDN (no
+        // netbios_to_fqdn entry, no first-label match against state.domains,
+        // no trust metadata), keep the label rather than mint a phantom FQDN.
+        // The hash still stores as `ntlm:unknown:...` — better a truthful
+        // "unattributed" tag than a fabricated domain that pollutes candidate
+        // selection.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+        }
+
+        let hash = make_hash("admin", "STRANGER", "NTLM", NTLM_HASH_A);
+        assert!(state.publish_hash(&q, hash).await.unwrap());
+
+        let s = state.inner.read().await;
+        assert_eq!(s.hashes.len(), 1);
+        assert_eq!(s.hashes[0].domain, "stranger");
     }
 
     #[tokio::test]
