@@ -2,12 +2,15 @@
 # EC2 deployment tasks — run ares directly on EC2 via AWS SSM
 # Alternative to K8s for faster testing iterations.
 #
-# Architecture: single EC2 with Redis + orchestrator + all worker roles.
-# Workers run as systemd template units (ares@{role}).
-# Orchestrator runs per-operation (not a service).
+# Architecture: single EC2 with Redis + NATS + orchestrator + per-role worker fleet.
+# Workers run as systemd template units (ares@{role}); the orchestrator routes
+# tool calls over NATS to them so heavy tools run in the worker's own cgroup.
+# All provisioning (Redis, NATS, the ares@ fleet, system-ares.slice, swap + OOM
+# tuning) is baked into the attack-box AMI by the Ansible collection in ansible/
+# (playbooks/ares/goad_attack_box.yml); ec2:setup only verifies readiness.
 #
 # Usage:
-#   task ec2:setup EC2_NAME=ares-tools       # One-time: install Redis, create systemd units
+#   task ec2:setup EC2_NAME=ares-tools       # Readiness check: ensure baked fleet is up, smoke-test Redis+NATS
 #   task ec2:deploy EC2_NAME=ares-tools      # Build + push Rust binaries via S3 + SSM
 #   task ec2:start EC2_NAME=ares-tools       # Start Redis + workers
 #   task ec2:status EC2_NAME=ares-tools      # Show process status
@@ -538,7 +541,7 @@ tasks:
   # One-Time Setup
   # ============================================================================
   setup:
-    desc: "One-time EC2 setup: install Redis, create log dirs, install systemd units (usage: task ec2:setup [EC2_NAME=ares-tools])"
+    desc: "EC2 readiness check: guard impacket drift, ensure the baked fleet is up, smoke-test Redis+NATS (provisioning is baked into the AMI; usage: task ec2:setup [EC2_NAME=ares-tools])"
     silent: true
     cmds:
       - |

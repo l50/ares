@@ -140,6 +140,9 @@
       vars:
         base_install_uv: true
         base_verify_install: true
+        # Swap cushion + OOM sysctls for the worker fleet (formerly ec2 setup.sh)
+        base_configure_swap: true
+        base_oom_tuning: true
 
     # Network reconnaissance tools (nmap, netexec, impacket, bloodhound, certipy, etc.)
     - role: dreadnode.nimbus_range.recon_tools
