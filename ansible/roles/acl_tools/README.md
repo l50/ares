@@ -91,6 +91,7 @@ Install and configure Active Directory ACL exploitation tools for Ares agents
 - **Install samba-common-bin when rpcclient is still missing** (ansible.builtin.apt) - Conditional
 - **Install Impacket from source for dacledit** (ansible.builtin.include_tasks) - Conditional
 - **Install bloodyAD via apt (Kali)** (ansible.builtin.apt) - Conditional
+- **Ensure bloodyAD symlink for Kali apt install** (ansible.builtin.file) - Conditional
 - **Check if bloodyAD is already installed** (ansible.builtin.command) - Conditional
 - **Install bloodyAD via pip** (ansible.builtin.pip) - Conditional
 - **Check if pywhisker is already installed** (ansible.builtin.command) - Conditional

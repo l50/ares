@@ -92,6 +92,21 @@
     - ansible_facts['distribution'] == 'Kali'
     - acl_tools_install_bloodyad
 
+# Kali's apt package ships the binary as lowercase `bloodyad`; upstream (pip)
+# ships it as `bloodyAD`. Normalize with a symlink so callers, verify tests,
+# and docs can rely on the mixed-case name regardless of install source.
+- name: Ensure bloodyAD symlink for Kali apt install
+  ansible.builtin.file:
+    src: /usr/bin/bloodyad
+    dest: /usr/local/bin/bloodyAD
+    state: link
+    force: true
+  become: true
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - ansible_facts['distribution'] == 'Kali'
+    - acl_tools_install_bloodyad
+
 - name: Check if bloodyAD is already installed
   ansible.builtin.command: pip3 show bloodyAD
   register: acl_tools_bloodyad_check
