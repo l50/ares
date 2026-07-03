@@ -91,6 +91,18 @@ pub(crate) enum OpsCommands {
         role: Option<String>,
     },
 
+    /// Bucket discovered vs exploited vulnerabilities by type (conversion diagnostic)
+    InspectVulns {
+        /// Operation ID
+        operation_id: Option<String>,
+        /// Use the latest operation (prefer running)
+        #[arg(long)]
+        latest: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List operations and queue state from Redis
     Queue,
 
@@ -223,6 +235,37 @@ pub(crate) enum OpsCommands {
         /// Whether SID filtering is active
         #[arg(long)]
         sid_filtering: bool,
+    },
+
+    /// Force an inter-realm ticket forge, bypassing the SID-filter check and
+    /// trust_follow dedup (operator escape hatch for a stalled cross-forest pivot)
+    ForceInterRealmForge {
+        /// Operation ID
+        operation_id: String,
+        /// Source forest whose <TARGET>$ trust key forges the ticket (e.g. contoso.local)
+        #[arg(long)]
+        source: String,
+        /// Foreign forest to forge into (e.g. fabrikam.local)
+        #[arg(long)]
+        target: String,
+        /// NT hash of the inter-realm trust account (source\\TARGET$)
+        #[arg(long)]
+        trust_key: String,
+        /// AES256 key of the trust account (required when the DC has RC4 disabled)
+        #[arg(long)]
+        aes_key: Option<String>,
+        /// Source-forest domain SID embedded in the forged TGT
+        #[arg(long)]
+        source_sid: Option<String>,
+        /// Target-forest domain SID (informational / state priming)
+        #[arg(long)]
+        target_sid: Option<String>,
+        /// Target DC IP (primed into state so the forge can chain service tickets)
+        #[arg(long)]
+        target_dc_ip: Option<String>,
+        /// Target DC FQDN (e.g. dc01.fabrikam.local)
+        #[arg(long)]
+        target_dc_fqdn: Option<String>,
     },
 
     /// Stop a running operation (signals graceful shutdown)

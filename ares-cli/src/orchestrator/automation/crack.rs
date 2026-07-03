@@ -28,6 +28,39 @@ fn crack_priority(hash_type: &str) -> u8 {
     }
 }
 
+/// Whether a hash can never be recovered by wordlist cracking and so must be
+/// kept out of the single hashcat slot. All three cases share the property
+/// that the secret is machine-generated (not a human password) and that
+/// *possessing the hash is already the win*, so a crack attempt only burns
+/// `MAX_CRACK_ATTEMPTS` runs apiece and starves genuinely crackable user
+/// hashes:
+///
+/// * **Computer accounts** (`username` ends in `$`): AD assigns 120-char random
+///   passwords — hopeless for any wordlist — and the NTLM hash is already
+///   pass-the-hash-usable straight from secretsdump. A kerberoast/AS-REP ticket
+///   for such an account is encrypted with that same un-crackable key.
+/// * **Inter-realm trust keys** (`is_trust_key`): consumed directly to forge
+///   inter-realm TGTs, never cracked.
+/// * **krbtgt** (and RODC `krbtgt_NNNNN`): the domain key account. Its password
+///   is machine-generated and uncrackable; capturing the NT hash *is* the
+///   objective. `auto_golden_ticket` forges straight from `state.hashes` using
+///   `krbtgt.hash_value` (see `golden_ticket.rs`) and never needs a plaintext.
+///
+/// This predicate only shapes the crack *work list* — it never removes a hash
+/// from `state.hashes`, so downstream forging (golden ticket, trust-key
+/// inter-realm forge) still sees every one of these hashes.
+fn is_uncrackable(hash: &ares_core::models::Hash) -> bool {
+    let username = hash.username.trim_end();
+    hash.is_trust_key || username.ends_with('$') || is_krbtgt(username)
+}
+
+/// Whether `username` names a krbtgt account: the domain krbtgt or an RODC
+/// per-DC krbtgt (`krbtgt_NNNNN`). Case-insensitive.
+fn is_krbtgt(username: &str) -> bool {
+    let lower = username.trim().to_ascii_lowercase();
+    lower == "krbtgt" || lower.starts_with("krbtgt_")
+}
+
 /// Max times a single hash gets dispatched to hashcat before the dispatcher
 /// permanently marks it `DEDUP_CRACK_REQUESTS` and gives up. Bounded retry
 /// covers the common failure modes (missing wordlist on the worker pod, a
@@ -89,6 +122,7 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                 .hashes
                 .iter()
                 .filter(|h| h.cracked_password.is_none())
+                .filter(|h| !is_uncrackable(h))
                 .filter_map(|h| {
                     let dedup = crack_dedup_key(h);
                     if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
@@ -160,7 +194,8 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
 #[cfg(test)]
 mod tests {
     use super::{
-        crack_priority, select_next_crack, MAX_CRACK_ATTEMPTS, NTLM_TURN_AFTER_ROASTABLE_STREAK,
+        crack_priority, is_krbtgt, is_uncrackable, select_next_crack, MAX_CRACK_ATTEMPTS,
+        NTLM_TURN_AFTER_ROASTABLE_STREAK,
     };
     use crate::orchestrator::state::{StateInner, DEDUP_CRACK_REQUESTS};
     use ares_core::models::Hash;
@@ -186,6 +221,76 @@ mod tests {
                 trust_pair_label: None,
             },
         )
+    }
+
+    fn mk_hash(username: &str, hash_type: &str, is_trust_key: bool) -> Hash {
+        Hash {
+            id: format!("h-{username}"),
+            username: username.into(),
+            hash_type: hash_type.into(),
+            hash_value: "x".into(),
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            cracked_password: None,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key,
+            trust_pair_label: None,
+        }
+    }
+
+    #[test]
+    fn machine_account_ntlm_is_uncrackable() {
+        // Computer-account NTLM from secretsdump: 120-char random password,
+        // hopeless for any wordlist, already PtH-usable — never dispatch it.
+        assert!(is_uncrackable(&mk_hash("dc01$", "ntlm", false)));
+        assert!(is_uncrackable(&mk_hash("ws01$", "ntlm", false)));
+    }
+
+    #[test]
+    fn machine_account_roastable_is_uncrackable() {
+        // A kerberoast/AS-REP ticket for a machine account is encrypted with
+        // that same un-crackable key, so it is skipped regardless of type.
+        assert!(is_uncrackable(&mk_hash("sql01$", "kerberoast", false)));
+    }
+
+    #[test]
+    fn trust_key_is_uncrackable() {
+        // Inter-realm trust keys are used directly for forging, never cracked.
+        assert!(is_uncrackable(&mk_hash("contoso", "ntlm", true)));
+    }
+
+    #[test]
+    fn user_hashes_remain_crackable() {
+        assert!(!is_uncrackable(&mk_hash("alice", "ntlm", false)));
+        assert!(!is_uncrackable(&mk_hash("svc_sql", "kerberoast", false)));
+    }
+
+    #[test]
+    fn krbtgt_is_uncrackable() {
+        // krbtgt's password is machine-generated and never crackable; cracking
+        // it only burns the hashcat slot. Excluding it from the crack work list
+        // does not remove it from state.hashes, so auto_golden_ticket still
+        // forges from krbtgt.hash_value (see golden_ticket.rs).
+        assert!(is_uncrackable(&mk_hash("krbtgt", "ntlm", false)));
+        assert!(is_uncrackable(&mk_hash("KRBTGT", "ntlm", false)));
+        // AS-REP/kerberoast material for krbtgt is just as uncrackable.
+        assert!(is_uncrackable(&mk_hash("krbtgt", "asrep", false)));
+        // RODC per-DC krbtgt accounts follow the krbtgt_NNNNN convention.
+        assert!(is_uncrackable(&mk_hash("krbtgt_31415", "ntlm", false)));
+    }
+
+    #[test]
+    fn is_krbtgt_matches_domain_and_rodc_variants() {
+        assert!(is_krbtgt("krbtgt"));
+        assert!(is_krbtgt("KrbTgt"));
+        assert!(is_krbtgt("krbtgt_20001"));
+        assert!(!is_krbtgt("alice"));
+        assert!(!is_krbtgt("krbtgtx"));
     }
 
     #[test]

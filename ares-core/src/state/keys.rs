@@ -172,6 +172,11 @@ pub const BLUE_STATUS_PREFIX: &str = "ares:blue:inv";
 /// Field = `{source}:{target}:{username}`, value = `KerberosTicket` JSON.
 pub const KEY_KERBEROS_TICKETS: &str = "kerberos_tickets";
 
+/// Redis LIST key suffix for operator escape-hatch inter-realm forge requests.
+/// Each element is a `ForceInterRealmForgeRequest` JSON blob RPUSHed by
+/// `ares ops force-inter-realm-forge`; the orchestrator trust loop drains it.
+pub const KEY_FORCE_FORGE_REQUESTS: &str = "force_forge_requests";
+
 #[cfg(test)]
 mod tests {
     use super::*;

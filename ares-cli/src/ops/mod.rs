@@ -5,6 +5,7 @@ mod delete;
 #[cfg(feature = "blue")]
 mod evaluate;
 mod inject;
+mod inspect;
 mod kill;
 mod list;
 mod loot;
@@ -48,6 +49,11 @@ pub(crate) async fn run_ops(cmd: OpsCommands, redis_url: Option<String>) -> Resu
             status,
             role,
         } => tasks::ops_tasks(redis_url, operation_id, latest, status, role).await,
+        OpsCommands::InspectVulns {
+            operation_id,
+            latest,
+            json,
+        } => inspect::ops_inspect_vulns(redis_url, operation_id, latest, json).await,
         OpsCommands::Queue => queue::ops_queue(redis_url).await,
         OpsCommands::ClaimNext { timeout } => queue::ops_claim_next(redis_url, timeout).await,
         OpsCommands::InjectCredential {
@@ -152,6 +158,31 @@ pub(crate) async fn run_ops(cmd: OpsCommands, redis_url: Option<String>) -> Resu
                 flat_name,
                 sid_filtering,
             )
+            .await
+        }
+        OpsCommands::ForceInterRealmForge {
+            operation_id,
+            source,
+            target,
+            trust_key,
+            aes_key,
+            source_sid,
+            target_sid,
+            target_dc_ip,
+            target_dc_fqdn,
+        } => {
+            inject::ops_force_inter_realm_forge(inject::OpsForceInterRealmForgeParams {
+                redis_url,
+                operation_id,
+                source,
+                target,
+                trust_key,
+                aes_key,
+                source_sid,
+                target_sid,
+                target_dc_ip,
+                target_dc_fqdn,
+            })
             .await
         }
         OpsCommands::BackfillDomains { operation_id } => {

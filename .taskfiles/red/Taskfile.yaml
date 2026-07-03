@@ -193,6 +193,23 @@ tasks:
         {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
 
+  multi:inspect-vulns:
+    desc: "Bucket discovered vs exploited vulns by type — vuln→exploit conversion diagnostic (usage: task red:multi:inspect-vulns [OPERATION_ID=op-xxx] [LATEST=true] [JSON=true])"
+    silent: true
+    vars:
+      OPERATION_ID: '{{.OPERATION_ID | default ""}}'
+      LATEST: '{{.LATEST | default ""}}'
+      JSON: '{{.JSON | default "false"}}'
+    preconditions:
+      - sh: test -n "{{.OPERATION_ID}}" || test "{{.LATEST}}" = "true"
+        msg: "Either OPERATION_ID or LATEST=true is required"
+    cmds:
+      - >-
+        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} ops inspect-vulns
+        {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
+        {{if eq .LATEST "true"}}--latest{{end}}
+        {{if eq .JSON "true"}}--json{{end}}
+
   multi:tasks:list:
     desc: "List tasks for an operation (usage: task red:multi:tasks:list [OPERATION_ID=op-xxx] [LATEST=true] [ROLE=lateral] [STATUS=pending|in_progress|running|completed|failed|all])"
     silent: true
@@ -577,6 +594,41 @@ tasks:
         --direction "{{.DIRECTION}}"
         {{if ne .FLAT_NAME ""}}--flat-name "{{.FLAT_NAME}}"{{end}}
         {{if eq .SID_FILTERING "true"}}--sid-filtering{{end}}
+
+  multi:force-inter-realm-forge:
+    desc: "Operator escape hatch: force an inter-realm ticket forge, bypassing the SID-filter check and trust_follow dedup (usage: task red:multi:force-inter-realm-forge OPERATION_ID=op-xxx SOURCE=north.sevenkingdoms.local TARGET=essos.local TRUST_KEY=<nthash> [AES_KEY=<aes>] [SOURCE_SID=<sid>] [TARGET_SID=<sid>] [TARGET_DC_IP=10.4.6.159] [TARGET_DC_FQDN=meereen.essos.local])"
+    silent: true
+    vars:
+      OPERATION_ID: '{{.OPERATION_ID | default ""}}'
+      SOURCE: '{{.SOURCE | default ""}}'
+      TARGET: '{{.TARGET | default ""}}'
+      TRUST_KEY: '{{.TRUST_KEY | default ""}}'
+      AES_KEY: '{{.AES_KEY | default ""}}'
+      SOURCE_SID: '{{.SOURCE_SID | default ""}}'
+      TARGET_SID: '{{.TARGET_SID | default ""}}'
+      TARGET_DC_IP: '{{.TARGET_DC_IP | default ""}}'
+      TARGET_DC_FQDN: '{{.TARGET_DC_FQDN | default ""}}'
+    preconditions:
+      - sh: test -n "{{.OPERATION_ID}}"
+        msg: "OPERATION_ID variable is required"
+      - sh: test -n "{{.SOURCE}}"
+        msg: "SOURCE variable is required (source forest, e.g. north.sevenkingdoms.local)"
+      - sh: test -n "{{.TARGET}}"
+        msg: "TARGET variable is required (target forest, e.g. essos.local)"
+      - sh: test -n "{{.TRUST_KEY}}"
+        msg: "TRUST_KEY variable is required (NT hash of source\\TARGET$ trust account)"
+    cmds:
+      - >-
+        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} ops force-inter-realm-forge
+        "{{.OPERATION_ID}}"
+        --source "{{.SOURCE}}"
+        --target "{{.TARGET}}"
+        --trust-key "{{.TRUST_KEY}}"
+        {{if ne .AES_KEY ""}}--aes-key "{{.AES_KEY}}"{{end}}
+        {{if ne .SOURCE_SID ""}}--source-sid "{{.SOURCE_SID}}"{{end}}
+        {{if ne .TARGET_SID ""}}--target-sid "{{.TARGET_SID}}"{{end}}
+        {{if ne .TARGET_DC_IP ""}}--target-dc-ip "{{.TARGET_DC_IP}}"{{end}}
+        {{if ne .TARGET_DC_FQDN ""}}--target-dc-fqdn "{{.TARGET_DC_FQDN}}"{{end}}
 
   multi:inject-essos:
     desc: "Inject essos.local forest state into a running operation (usage: task red:multi:inject-essos OPERATION_ID=op-xxx)"

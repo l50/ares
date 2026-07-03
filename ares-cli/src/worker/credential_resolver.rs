@@ -305,6 +305,14 @@ pub async fn resolve_credentials(
             infer_domain_from_target(args_obj, conn, &reader)
                 .await
                 .or_else(|| primary_domain.clone())
+        } else if is_cross_forest_certipy_tool(tool_name) {
+            // certipy's `domain`/`target_domain` is the target forest (the CA's
+            // realm). Look up the forged inter-realm ccache under it so
+            // `resolve_cross_forest_ticket` injects `ticket_path` and the
+            // wrapper flips to `-k -no-pass` instead of NTLM (Bug B).
+            string_field(args_obj, "domain")
+                .or_else(|| string_field(args_obj, "target_domain"))
+                .or_else(|| primary_domain.clone())
         } else {
             None
         };
@@ -906,6 +914,8 @@ pub(crate) fn supports_kerberos_auth_mode(tool_name: &str) -> bool {
 ///   - `credential_access::misc::ldap_search_descriptions`
 ///   - `lateral::execution::{psexec,wmiexec,smbexec}_kerberos`
 ///   - `lateral::execution::secretsdump_kerberos`
+///   - `privesc::adcs::{certipy_find,certipy_request,certipy_ca,certipy_shadow}`
+///     (adcs.rs — `apply_certipy_kerberos` sets `-k -no-pass` + `KRB5CCNAME`)
 ///
 /// Adding a Kerberos-capable tool means appending its name here AND wiring
 /// the `optional_str("ticket_path")` read in the impl.
@@ -925,6 +935,25 @@ pub(crate) fn tool_consumes_ticket_path(tool_name: &str) -> bool {
             | "bloodyad_add_group_member"
             | "bloodyad_add_genericall"
             | "smbclient_kerberos_shares"
+            | "certipy_find"
+            | "certipy_request"
+            | "certipy_ca"
+            | "certipy_shadow"
+    )
+}
+
+/// Certipy enrollment/CA/shadow tools that authenticate to a foreign forest's
+/// LDAP + CA over `-k -no-pass` using a forged inter-realm ccache (Bug B — the
+/// certipy subset). They resolve the target realm from the `domain` /
+/// `target_domain` argument (which the automation sets to the target forest),
+/// not from the target host, so they get their own cross-forest gate rather
+/// than joining `requires_exact_realm` — whose IP→FQDN `target` rewrite and
+/// realm-strict hash lookup don't apply here. The tool impls read `ticket_path`
+/// (see [`tool_consumes_ticket_path`]) and prefer it over password/hash.
+pub(crate) fn is_cross_forest_certipy_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "certipy_find" | "certipy_request" | "certipy_ca" | "certipy_shadow"
     )
 }
 
@@ -2051,6 +2080,39 @@ mod tests {
         // Confirm the canary tool is covered by realm_strict so that the
         // cross-forest ticket injection fires for it.
         assert!(requires_exact_realm("bloodyad_set_password"));
+    }
+
+    #[test]
+    fn is_cross_forest_certipy_tool_covers_enrollment_tools() {
+        // The enrollment/CA/shadow tools authenticate to a foreign forest and
+        // must be gated for inter-realm ticket injection (Bug B, certipy subset).
+        assert!(is_cross_forest_certipy_tool("certipy_find"));
+        assert!(is_cross_forest_certipy_tool("certipy_request"));
+        assert!(is_cross_forest_certipy_tool("certipy_ca"));
+        assert!(is_cross_forest_certipy_tool("certipy_shadow"));
+        // certipy_auth consumes a PFX (not a ccache) and certipy_forge is
+        // offline — neither takes a cross-forest bind, so both stay excluded.
+        assert!(!is_cross_forest_certipy_tool("certipy_auth"));
+        assert!(!is_cross_forest_certipy_tool("certipy_forge"));
+        assert!(!is_cross_forest_certipy_tool("ldap_search"));
+    }
+
+    #[test]
+    fn tool_consumes_ticket_path_covers_certipy() {
+        // Each cross-forest certipy tool must also be on the consume allowlist
+        // or the resolver's injection is silently dropped (the whole point of
+        // Bug B). Keep this in lock-step with is_cross_forest_certipy_tool.
+        for t in [
+            "certipy_find",
+            "certipy_request",
+            "certipy_ca",
+            "certipy_shadow",
+        ] {
+            assert!(
+                is_cross_forest_certipy_tool(t) && tool_consumes_ticket_path(t),
+                "{t} must be gated AND on the ticket-path consume allowlist"
+            );
+        }
     }
 
     #[test]

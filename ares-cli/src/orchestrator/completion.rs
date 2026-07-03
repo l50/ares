@@ -99,6 +99,54 @@ pub async fn undominated_forests(state: &SharedState) -> Vec<String> {
     )
 }
 
+/// Whether any discovered `forest_trust_escalation` vuln is still unexploited
+/// and not written off — cross-forest work the op must not abandon.
+///
+/// Pure over the two vuln collections so it unit-tests without a live
+/// `SharedState`.
+fn has_pending_cross_forest_escalation(
+    discovered: &std::collections::HashMap<String, ares_core::models::VulnerabilityInfo>,
+    exploited: &HashSet<String>,
+) -> bool {
+    discovered.values().any(|v| {
+        v.vuln_type == "forest_trust_escalation"
+            && !exploited.contains(&v.vuln_id)
+            && !is_trust_escalation_written_off(v)
+    })
+}
+
+/// A cross-forest escalation is "written off" only once the fallback automation
+/// has flagged it: SID filtering blocks the ExtraSid DCSync path AND the
+/// ACL/MSSQL/enum fallbacks have been exhausted, at which point it stamps
+/// `details["written_off"] = true`. Until that flag is set the op stays alive
+/// so a retry burst or the operator escape hatch can still land the forge.
+/// This is the escape valve that keeps a genuinely-dead trust from pinning the
+/// op open to max_runtime forever.
+fn is_trust_escalation_written_off(vuln: &ares_core::models::VulnerabilityInfo) -> bool {
+    vuln.details
+        .get("written_off")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Backstop for [`undominated_forests`]: false while any cross-forest
+/// `forest_trust_escalation` remains unexploited and not written off.
+///
+/// [`compute_undominated_forests`] only marks a forest required when its trust
+/// is classified `is_cross_forest()` or a DC is keyed under the forest root. A
+/// `forest_trust_escalation` vuln can sit in state (queued against the foreign
+/// DC's IP) while neither holds — that gap let a two-forest op self-terminate
+/// with the parent forest still unowned and its escalation un-fired. Gating
+/// completion on the vuln directly closes it: the op runs on (bounded by
+/// max_runtime) until the escalation is exploited or explicitly written off.
+async fn is_multi_forest_op_complete(state: &SharedState) -> bool {
+    let inner = state.read().await;
+    !has_pending_cross_forest_escalation(
+        &inner.discovered_vulnerabilities,
+        &inner.exploited_vulnerabilities,
+    )
+}
+
 /// Redis-authoritative count of red-team tasks still pending completion.
 async fn redis_pending_red_tasks(dispatcher: &Arc<Dispatcher>) -> Result<usize, redis::RedisError> {
     let key = ares_core::state::build_key(
@@ -268,8 +316,15 @@ pub async fn wait_for_completion(
         // The grace-period check needs to know whether ALL forests are dominated.
         // That helper takes the SharedState (it reads inner under a fresh lock)
         // and is async, so it can't live inside the pure decision helper.
+        //
+        // Also require that no cross-forest `forest_trust_escalation` is left
+        // unexploited-and-not-written-off: `undominated_forests` misses a forest
+        // whose trust wasn't classified `is_cross_forest()` and whose DC isn't
+        // keyed under its root, so the vuln is the authoritative "cross-forest
+        // work remains" signal. Both must clear before the op is eligible to
+        // stop.
         let undominated_forests_empty = if has_da && !stop_on_da && !stop_on_gt {
-            undominated_forests(state).await.is_empty()
+            undominated_forests(state).await.is_empty() && is_multi_forest_op_complete(state).await
         } else {
             false
         };
@@ -691,6 +746,74 @@ mod tests {
     #[test]
     fn forest_root_of_deep_child() {
         assert_eq!(forest_root_of("sub.child.contoso.local"), "contoso.local");
+    }
+
+    fn make_forest_escalation_vuln(
+        vuln_id: &str,
+        written_off: bool,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut details = std::collections::HashMap::new();
+        if written_off {
+            details.insert("written_off".to_string(), serde_json::json!(true));
+        }
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: vuln_id.to_string(),
+            vuln_type: "forest_trust_escalation".to_string(),
+            target: "192.168.58.159".to_string(),
+            discovered_by: "trust_automation".to_string(),
+            discovered_at: Utc::now(),
+            details,
+            recommended_agent: "privesc".to_string(),
+            priority: 100,
+        }
+    }
+
+    #[test]
+    fn pending_escalation_blocks_completion() {
+        // A discovered, unexploited forest_trust_escalation keeps the op alive.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", false));
+        let exploited = HashSet::new();
+        assert!(has_pending_cross_forest_escalation(&discovered, &exploited));
+    }
+
+    #[test]
+    fn exploited_escalation_allows_completion() {
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", false));
+        let mut exploited = HashSet::new();
+        exploited.insert("v1".to_string());
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited
+        ));
+    }
+
+    #[test]
+    fn written_off_escalation_allows_completion() {
+        // The escape valve: a flagged-dead trust must not pin the op open.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", true));
+        let exploited = HashSet::new();
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited
+        ));
+    }
+
+    #[test]
+    fn non_forest_vulns_ignored_by_completion_gate() {
+        // Only forest_trust_escalation gates multi-forest completion; a stray
+        // unexploited esc1 (single-forest) must not block the op forever.
+        let mut discovered = std::collections::HashMap::new();
+        let mut esc1 = make_forest_escalation_vuln("v1", false);
+        esc1.vuln_type = "esc1".to_string();
+        discovered.insert("v1".to_string(), esc1);
+        let exploited = HashSet::new();
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited
+        ));
     }
 
     fn make_trust(domain: &str, trust_type: &str) -> ares_core::models::TrustInfo {

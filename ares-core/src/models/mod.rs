@@ -14,8 +14,8 @@ pub use blue::{
     TriageDecision, TriageRecord,
 };
 pub use core::{
-    is_always_disabled_account, CandidateDomain, Credential, DomainEvidence, Hash, Host,
-    KerberosTicket, Share, Target, TrustInfo, User,
+    is_always_disabled_account, CandidateDomain, Credential, DomainEvidence,
+    ForceInterRealmForgeRequest, Hash, Host, KerberosTicket, Share, Target, TrustInfo, User,
 };
 pub use op_state_event::{OpStateEvent, OpStateEventPayload};
 pub use operation::{AttackChainStep, OperationMeta, SharedRedTeamState};
