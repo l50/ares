@@ -95,7 +95,6 @@ Install and configure Active Directory ACL exploitation tools for Ares agents
 - **Install bloodyAD via pip** (ansible.builtin.pip) - Conditional
 - **Check if pywhisker is already installed** (ansible.builtin.command) - Conditional
 - **Install pywhisker via pip** (ansible.builtin.pip) - Conditional
-- **Check current pyOpenSSL version** (ansible.builtin.command) - Conditional
 - **Pin pyOpenSSL below 24 for pywhisker PKCS12 support** (ansible.builtin.pip) - Conditional
 - **Clone targetedKerberoast from GitHub** (ansible.builtin.git) - Conditional
 - **Create virtual environment for targetedKerberoast** (ansible.builtin.command) - Conditional
