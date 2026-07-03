@@ -1656,6 +1656,29 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                                 .chars()
                                 .rev()
                                 .collect();
+                            // Deterministic-failure signatures that will NOT
+                            // heal on the next 30s tick — the target DC's
+                            // Kerberos database won't sprout a `cifs/<apex>`
+                            // SPN, and impacket won't grow support for a
+                            // malformed target on retry. Keep dedup marked so
+                            // the wrapper doesn't hot-loop (we've seen 363
+                            // retries in ~50 min from this exact signature).
+                            let apex_spn_wedge = tail.contains("KDC_ERR_S_PRINCIPAL_UNKNOWN");
+                            if apex_spn_wedge {
+                                warn!(
+                                    err = %err,
+                                    source_domain = %source_domain_bg,
+                                    target_domain = %target_domain_bg,
+                                    trust_account = %trust_account_bg,
+                                    output_tail = %tail,
+                                    "forge_inter_realm_and_dump: KDC_ERR_S_PRINCIPAL_UNKNOWN — likely apex/malformed SPN; locking dedup (recon must persist a real DC FQDN before retry can succeed)"
+                                );
+                                {
+                                    let mut state = dispatcher_bg.state.write().await;
+                                    state.forge_in_flight.remove(&dedup_key_bg);
+                                }
+                                return;
+                            }
                             warn!(
                                 err = %err,
                                 source_domain = %source_domain_bg,

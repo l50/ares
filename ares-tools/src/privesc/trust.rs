@@ -340,6 +340,17 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
     let source_domain = required_str(args, "source_domain")?;
     let target_domain = required_str(args, "target_domain")?;
     let target = required_str(args, "target")?;
+
+    // Zone-apex guard: `target` is the host portion of `cifs/<target>` in the
+    // TGS-REQ. If it equals the target realm (or is a bare 2-label domain
+    // matching `target_domain`), the KDC has no service principal registered
+    // there and returns KDC_ERR_S_PRINCIPAL_UNKNOWN. Fail fast so the dispatch
+    // wrapper can lock dedup instead of clearing it and hot-looping.
+    if target.eq_ignore_ascii_case(target_domain) {
+        anyhow::bail!(
+            "forge_inter_realm_and_dump: target ({target}) is the realm apex; caller must resolve a DC FQDN like dc01.{target_domain} before dispatch — bare-domain SPN cifs/{target_domain} is not registered and yields KDC_ERR_S_PRINCIPAL_UNKNOWN"
+        );
+    }
     // target_sid currently unused by ticketer but accepted for API parity
     // with create_inter_realm_ticket; ticketer derives the realm from -domain.
     let _target_sid = optional_str(args, "target_sid");
@@ -962,6 +973,29 @@ mod tests {
         let result = rt.block_on(super::forge_inter_realm_and_dump(&args));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("target"));
+    }
+
+    #[test]
+    fn forge_inter_realm_and_dump_rejects_apex_target() {
+        // `target` becomes the host portion of `cifs/<target>` in the TGS-REQ.
+        // Passing the realm apex yields KDC_ERR_S_PRINCIPAL_UNKNOWN and, with
+        // the dispatch wrapper's default retry policy, a hot loop. Fail fast
+        // so the wrapper's apex-detection branch locks dedup instead.
+        let args = json!({
+            "trust_key": "aabbccdd",
+            "source_sid": "S-1-5-21-111",
+            "source_domain": "child.contoso.local",
+            "target_domain": "contoso.local",
+            "target": "contoso.local"
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::forge_inter_realm_and_dump(&args));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("realm apex") && msg.contains("KDC_ERR_S_PRINCIPAL_UNKNOWN"),
+            "expected apex-guard error, got: {msg}"
+        );
     }
 
     #[tokio::test]
