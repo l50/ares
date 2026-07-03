@@ -122,7 +122,7 @@ loki.process "windows" {
 {% endif %}
     }
   }
-  forward_to = [loki.write.remote.receiver]
+  forward_to = [otelcol.receiver.loki.default.receiver]
 }
 
 {% else %}
@@ -155,13 +155,25 @@ loki.process "linux" {
 {% endif %}
     }
   }
-  forward_to = [loki.write.remote.receiver]
+  forward_to = [otelcol.receiver.loki.default.receiver]
 }
 {% endif %}
 
-// Send logs to Loki
-loki.write "remote" {
-  endpoint {
-    url = "{{ alloy_loki_endpoint }}"
+// Fan out parsed logs to a Vector OTLP receiver and a Loki OTLP receiver.
+otelcol.receiver.loki "default" {
+  output {
+    logs = [otelcol.exporter.otlphttp.vector.input, otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+otelcol.exporter.otlphttp "vector" {
+  client {
+    endpoint = "{{ alloy_otlp_vector_endpoint }}"
+  }
+}
+
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "{{ alloy_otlp_loki_endpoint }}"
   }
 }
