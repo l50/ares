@@ -13,10 +13,17 @@ acl_tools_ubuntu_packages:
 # bloodyAD configuration (ACL exploitation framework)
 acl_tools_install_bloodyad: true
 acl_tools_bloodyad_package: "bloodyAD"
+acl_tools_bloodyad_apt_package: "bloodyad"
 
 # Pywhisker configuration (shadow credentials manipulation)
 acl_tools_install_pywhisker: true
 acl_tools_pywhisker_package: "pywhisker"
+# pywhisker's PFX export calls OpenSSL.crypto.PKCS12, which pyOpenSSL removed in
+# 24.0.0 — a stock image ships a newer pyOpenSSL, so the shadow-cred write lands
+# but the PFX dump crashes with "module 'OpenSSL.crypto' has no attribute
+# 'PKCS12'". Pin below 24 so pywhisker's PKCS12 path exists. (certipy shadow uses
+# the cryptography PFX API and is unaffected — it's the preferred path.)
+acl_tools_pyopenssl_package: "pyOpenSSL<24"
 
 # dacledit configuration (Impacket ACL editing)
 acl_tools_install_dacledit: true
