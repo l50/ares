@@ -140,14 +140,14 @@
 
 # pywhisker installs with --no-deps (above), so its pyOpenSSL dependency is not
 # pulled and the image's default pyOpenSSL (>=24, which dropped crypto.PKCS12)
-# leaks in — crashing pywhisker's PFX export. Force it below 24. Runs on every
-# converge (not gated on the install-check) so an image that already had a newer
-# pyOpenSSL gets downgraded.
+# leaks in — crashing pywhisker's PFX export. Downgrade to <24 when the current
+# version doesn't satisfy the constraint; the pip module's version handling
+# keeps this idempotent (no-op when already <24, downgrade when >=24).
 - name: Pin pyOpenSSL below 24 for pywhisker PKCS12 support
   ansible.builtin.pip:
     name: "{{ acl_tools_pyopenssl_package }}"
     executable: pip3
-    extra_args: "{{ ('--break-system-packages ' if (base_pip_break_required | default(false)) else '') ~ '--ignore-installed' }}"
+    extra_args: "{{ '--break-system-packages' if (base_pip_break_required | default(false)) else '' }}"
   become: true
   when:
     - ansible_facts['os_family'] == 'Debian'
