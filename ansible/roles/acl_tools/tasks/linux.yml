@@ -140,9 +140,19 @@
 
 # pywhisker installs with --no-deps (above), so its pyOpenSSL dependency is not
 # pulled and the image's default pyOpenSSL (>=24, which dropped crypto.PKCS12)
-# leaks in — crashing pywhisker's PFX export. Force it below 24. Runs on every
-# converge (not gated on the install-check) so an image that already had a newer
-# pyOpenSSL gets downgraded.
+# leaks in — crashing pywhisker's PFX export. Pre-check the version so the pip
+# downgrade only runs when needed; --ignore-installed forces the reinstall past
+# the system-managed dpkg copy, but gating on the check keeps reruns idempotent.
+- name: Check current pyOpenSSL version
+  ansible.builtin.command:
+    cmd: python3 -c "import OpenSSL, sys; sys.stdout.write(OpenSSL.__version__)"
+  register: acl_tools_pyopenssl_version
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - acl_tools_install_pywhisker
+
 - name: Pin pyOpenSSL below 24 for pywhisker PKCS12 support
   ansible.builtin.pip:
     name: "{{ acl_tools_pyopenssl_package }}"
@@ -152,6 +162,7 @@
   when:
     - ansible_facts['os_family'] == 'Debian'
     - acl_tools_install_pywhisker
+    - acl_tools_pyopenssl_version.rc != 0 or (acl_tools_pyopenssl_version.stdout | default('') | trim).split('.')[0] | int >= 24
 
 - name: Clone targetedKerberoast from GitHub
   ansible.builtin.git:
