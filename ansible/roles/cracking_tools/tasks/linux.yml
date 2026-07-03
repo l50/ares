@@ -140,15 +140,41 @@
     - cracking_tools_install_nvidia_driver | bool
     - cracking_tools_nvidia_install_result.rc | default(0) != 0
 
-- name: Install NVIDIA CUDA toolkit
-  ansible.builtin.apt:
-    name: "{{ cracking_tools_nvidia_cuda_toolkit_packages }}"
-    state: present
-    install_recommends: true
-  become: true
+# hashcat's CUDA backend needs libnvrtc (its runtime kernel compiler); the
+# driver API libcuda.so is already provided by the NVIDIA driver. The Debian
+# `nvidia-cuda-toolkit` metapackage isn't in Kali's archive and NVIDIA's CUDA
+# apt repo is only added on driver builds, so libnvrtc is pulled from NVIDIA's
+# official PyPI wheel (~25MB, distro-agnostic) and dropped into the linker
+# path. Without it hashcat logs "Failed to initialize NVIDIA RTC library /
+# CUDA SDK Toolkit not installed" and silently falls back to the slower
+# OpenCL backend.
+- name: Install CUDA libnvrtc for hashcat's native CUDA backend
   when:
     - cracking_tools_install_cuda_toolkit | bool
     - ansible_facts['os_family'] == 'Debian'
+  become: true
+  block:
+    - name: Ensure pip3 is available to fetch the nvrtc wheel
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+
+    - name: Install libnvrtc from NVIDIA's PyPI wheel into the linker path
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          pip3 download --no-deps --no-cache-dir {{ cracking_tools_cuda_nvrtc_pip_spec | quote }} -d "$tmp"
+          whl="$(ls "$tmp"/nvidia_cuda_nvrtc_cu12-*.whl | head -1)"
+          python3 -m zipfile -e "$whl" "$tmp/extracted"
+          install -m 0644 -t {{ cracking_tools_cuda_lib_dir | quote }} \
+            "$tmp"/extracted/nvidia/cuda_nvrtc/lib/libnvrtc.so.12 \
+            "$tmp"/extracted/nvidia/cuda_nvrtc/lib/libnvrtc-builtins.so.*
+          ln -sf libnvrtc.so.12 {{ cracking_tools_cuda_lib_dir | quote }}/libnvrtc.so
+          ldconfig
+        executable: /bin/bash
+        creates: "{{ cracking_tools_cuda_lib_dir }}/libnvrtc.so.12"
 
 - name: Install GPU support packages
   ansible.builtin.apt:
@@ -249,7 +275,3 @@
 - name: Install wordlists
   ansible.builtin.include_tasks: wordlists.yml
   when: cracking_tools_install_wordlists
-
-- name: Configure remote crackd client
-  ansible.builtin.include_tasks: crackd_client.yml
-  when: cracking_tools_install_crackd_client | bool

@@ -83,10 +83,12 @@ provisioners:
     inline:
       - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
       # Driver already installed in the previous step. Tell cracking_tools NOT to
-      # reinstall it (reboots mid-component, kills this local run) and NOT to
-      # install nvidia-cuda-toolkit (not a real Kali package; the OpenCL backend
-      # is enough — ~40 GH/s on a T4). hashcat from apt, not source.
-      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=false -e cracking_tools_install_cuda_toolkit=false -e cracking_tools_hashcat_from_source=false
+      # reinstall it (reboots mid-component, kills this local run). Enable the
+      # CUDA backend via cracking_tools_install_cuda_toolkit — it now pulls just
+      # libnvrtc from NVIDIA's PyPI wheel (the Debian nvidia-cuda-toolkit package
+      # isn't in Kali's archive), so hashcat uses the native CUDA backend rather
+      # than the slower OpenCL fallback. hashcat from apt, not source.
+      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=false -e cracking_tools_install_cuda_toolkit=true -e cracking_tools_hashcat_from_source=false
 
   - type: shell
     inline:

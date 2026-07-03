@@ -62,25 +62,11 @@ Install and configure password cracking tools for Ares agents
 | `cracking_tools_nvidia_driver_packages.3` | str | <code>nvidia-kernel-open-dkms</code> | No description |
 | `cracking_tools_nvidia_driver_packages.4` | str | <code>nvidia-driver-cuda</code> | No description |
 | `cracking_tools_nvidia_driver_packages.5` | str | <code>nvidia-opencl-icd</code> | No description |
-| `cracking_tools_nvidia_cuda_toolkit_packages` | list | <code>&#91;&#93;</code> | No description |
-| `cracking_tools_nvidia_cuda_toolkit_packages.0` | str | <code>nvidia-cuda-toolkit</code> | No description |
+| `cracking_tools_cuda_nvrtc_pip_spec` | str | <code>nvidia-cuda-nvrtc-cu12>=12.4,<12.5</code> | No description |
+| `cracking_tools_cuda_lib_dir` | str | <code>/usr/lib/x86_64-linux-gnu</code> | No description |
 | `cracking_tools_update_cache` | bool | <code>True</code> | No description |
-| `cracking_tools_install_crackd_client` | bool | <code>False</code> | No description |
-| `cracking_tools_crackd_url` | str | <code></code> | No description |
-| `cracking_tools_crackd_op_path` | str | <code></code> | No description |
-| `cracking_tools_crackd_systemd_unit` | str | <code>ares-worker@.service</code> | No description |
 
 ## Tasks
-
-### crackd_client.yml
-
-
-- **Validate crackd client config** (ansible.builtin.assert)
-- **Fetch crackd bearer token from 1Password** (ansible.builtin.set_fact)
-- **Ensure /etc/ares directory exists** (ansible.builtin.file)
-- **Render /etc/ares/secrets.env** (ansible.builtin.template)
-- **Ensure systemd drop-in dir for {{ cracking_tools_crackd_systemd_unit }}** (ansible.builtin.file)
-- **Install systemd drop-in that loads /etc/ares/secrets.env** (ansible.builtin.copy)
 
 ### hashcat.yml
 
@@ -127,7 +113,9 @@ Install and configure password cracking tools for Ares agents
 - **Dump DKMS make.log on failure** (ansible.builtin.shell) - Conditional
 - **Print DKMS make.log** (ansible.builtin.debug) - Conditional
 - **Fail if NVIDIA install failed** (ansible.builtin.fail) - Conditional
-- **Install NVIDIA CUDA toolkit** (ansible.builtin.apt) - Conditional
+- **Install CUDA libnvrtc for hashcat's native CUDA backend** (block) - Conditional
+- **Ensure pip3 is available to fetch the nvrtc wheel** (ansible.builtin.apt)
+- **Install libnvrtc from NVIDIA's PyPI wheel into the linker path** (ansible.builtin.shell)
 - **Install GPU support packages** (ansible.builtin.apt) - Conditional
 - **Create OpenCL vendors directory** (ansible.builtin.file) - Conditional
 - **Register NVIDIA OpenCL ICD** (ansible.builtin.copy) - Conditional
@@ -141,7 +129,6 @@ Install and configure password cracking tools for Ares agents
 - **Install hashcat** (ansible.builtin.include_tasks) - Conditional
 - **Install John the Ripper** (ansible.builtin.include_tasks) - Conditional
 - **Install wordlists** (ansible.builtin.include_tasks) - Conditional
-- **Configure remote crackd client** (ansible.builtin.include_tasks) - Conditional
 
 ### main.yml
 
