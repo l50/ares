@@ -1255,23 +1255,32 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             // orchestrator already owns every input; deliver them directly.
             //
             // Resolve the target DC hostname so Kerberos auth can match the
-            // SPN baked into the ticket. Falls back to the IP, which works
-            // when the worker can reverse-resolve via DNS.
+            // SPN baked into the ticket. Reject zone-apex A records where
+            // `hostname == target_domain`: the KDC has no `cifs/<bare-domain>`
+            // SPN registered, so the forged TGS request returns
+            // KDC_ERR_S_PRINCIPAL_UNKNOWN. A real DC FQDN carries a leading
+            // label (e.g. `dc01.contoso.local`). Falls back to the IP as a
+            // last resort.
             let target_dc_hostname = {
                 let s = dispatcher.state.read().await;
+                let target_lc = item.target_domain.to_lowercase();
+                let non_apex = |hostname: &str| {
+                    let lc = hostname.to_lowercase();
+                    !lc.is_empty() && lc != target_lc
+                };
                 s.hosts
                     .iter()
-                    .find(|h| h.ip == target_dc_ip && !h.hostname.is_empty())
+                    .find(|h| h.ip == target_dc_ip && non_apex(&h.hostname))
                     .map(|h| h.hostname.clone())
                     .or_else(|| {
                         s.hosts
                             .iter()
                             .find(|h| {
                                 (h.is_dc || h.detect_dc())
-                                    && h.hostname.to_lowercase().ends_with(&format!(
-                                        ".{}",
-                                        item.target_domain.to_lowercase()
-                                    ))
+                                    && non_apex(&h.hostname)
+                                    && h.hostname
+                                        .to_lowercase()
+                                        .ends_with(&format!(".{target_lc}"))
                             })
                             .map(|h| h.hostname.clone())
                     })
