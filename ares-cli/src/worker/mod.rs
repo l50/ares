@@ -123,7 +123,7 @@ pub async fn run() -> anyhow::Result<()> {
         config::WorkerMode::BlueTask => {
             // Blue team mode requires an LLM provider
             let model_spec = std::env::var("ARES_LLM_MODEL")
-                .unwrap_or_else(|_| "anthropic/claude-sonnet-4-20250514".to_string());
+                .unwrap_or_else(|_| "anthropic/claude-sonnet-4-6".to_string());
             let (provider, model_name) = match ares_llm::create_provider(&model_spec) {
                 Ok(p) => p,
                 Err(e) => {

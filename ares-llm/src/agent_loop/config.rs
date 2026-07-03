@@ -3,7 +3,7 @@ use std::path::PathBuf;
 /// Configuration for an agent loop execution.
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
-    /// LLM model identifier (e.g. "claude-sonnet-4-20250514").
+    /// LLM model identifier (e.g. "claude-sonnet-4-6").
     pub model: String,
     /// Maximum number of LLM steps before forcefully ending.
     pub max_steps: u32,
@@ -33,7 +33,7 @@ pub struct AgentLoopConfig {
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_steps: 75,
             max_tokens: 4096,
             temperature: None,
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn agent_loop_config_defaults() {
         let cfg = AgentLoopConfig::default();
-        assert_eq!(cfg.model, "claude-sonnet-4-20250514");
+        assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.max_steps, 75);
         assert_eq!(cfg.max_tokens, 4096);
         assert!(cfg.temperature.is_none());

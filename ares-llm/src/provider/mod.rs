@@ -256,7 +256,7 @@ pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Parse a model string like "anthropic/claude-sonnet-4-20250514" and create
+/// Parse a model string like "anthropic/claude-sonnet-4-6" and create
 /// the appropriate provider + extracted model name.
 ///
 /// Supported prefixes:
@@ -337,8 +337,8 @@ mod tests {
 
     #[test]
     fn llm_request_builder() {
-        let req = LlmRequest::new("claude-sonnet-4-20250514");
-        assert_eq!(req.model, "claude-sonnet-4-20250514");
+        let req = LlmRequest::new("claude-sonnet-4-6");
+        assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, 4096);
         assert!(req.tools.is_empty());
     }

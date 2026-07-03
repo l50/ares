@@ -77,10 +77,10 @@ pub struct ModelTokenUsage {
 /// are reported as "unpriced" in the breakdown.
 const MODEL_COSTS: &[(&str, f64, f64, f64)] = &[
     // Anthropic Claude — cache reads are 10% of input.
-    ("claude-sonnet-4-20250514", 3.0, 0.30, 15.0),
+    ("claude-sonnet-4-6", 3.0, 0.30, 15.0),
     ("claude-opus-4-20250514", 15.0, 1.50, 75.0),
     ("claude-haiku-3-5-20241022", 0.80, 0.08, 4.0),
-    ("anthropic/claude-sonnet-4-20250514", 3.0, 0.30, 15.0),
+    ("anthropic/claude-sonnet-4-6", 3.0, 0.30, 15.0),
     ("anthropic/claude-opus-4-20250514", 15.0, 1.50, 75.0),
     // OpenAI GPT-4.1 — auto-cache reads are 25% of input.
     ("gpt-4.1", 2.0, 0.50, 8.0),
@@ -407,7 +407,7 @@ mod tests {
     fn model_field_with_slashes_and_dots() {
         // Ensure models with special chars survive encoding
         let names = [
-            "anthropic/claude-sonnet-4-20250514",
+            "anthropic/claude-sonnet-4-6",
             "openai/gpt-4.1",
             "gemini/gemini-2.5-pro",
         ];

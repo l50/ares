@@ -303,7 +303,7 @@ mod tests {
         let cfg = SessionLogConfig {
             dir: Some(dir.path().to_path_buf()),
         };
-        let log = SessionLog::open(&cfg, "op-1", "t-1", "recon", "claude-sonnet-4-20250514");
+        let log = SessionLog::open(&cfg, "op-1", "t-1", "recon", "claude-sonnet-4-6");
         assert!(log.enabled());
         log.record_start("system", "do recon", &["nmap_scan".into()]);
         log.record_message(1, &ChatMessage::text(Role::User, "go"));
@@ -328,7 +328,7 @@ mod tests {
             assert_eq!(v["op_id"], "op-1");
             assert_eq!(v["task_id"], "t-1");
             assert_eq!(v["role"], "recon");
-            assert_eq!(v["model"], "claude-sonnet-4-20250514");
+            assert_eq!(v["model"], "claude-sonnet-4-6");
             assert!(v.get("ts").is_some());
         }
         // Replay roundtrips just the message-shaped lines.
