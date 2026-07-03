@@ -14,7 +14,14 @@ fi
 echo ""
 
 echo "=== Dispatch mode ==="
-echo "  in-process (ARES_TOOL_DISPATCH=local) — no separate worker fleet"
+if [ "$(printf '%s' "${ARES_TOOL_DISPATCH:-}")" = "local" ]; then
+	echo "  in-process (ARES_TOOL_DISPATCH=local) — no separate worker fleet"
+else
+	echo "  NATS worker fleet (ARES_TOOL_DISPATCH unset) — tools route to ares@<role>.service"
+	for role in recon credential_access cracker acl privesc lateral coercion; do
+		printf '  ares@%-18s %s\n' "$role" "$(systemctl is-active "ares@${role}.service" 2>/dev/null || echo unknown)"
+	done
+fi
 echo ""
 
 echo "=== Orchestrator ==="

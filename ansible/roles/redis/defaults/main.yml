@@ -14,10 +14,23 @@ redis_ares_config_dir: "/etc/ares"
 # Worker cgroup resource limits (per-role instance).
 # Workers spawn tool subprocesses (netexec, hashcat, nmap) that inherit the
 # service cgroup. Without limits these can exhaust system memory and OOM-kill
-# unrelated services like the SSM agent.
-redis_ares_worker_memory_high: "2G"
-redis_ares_worker_memory_max: "3G"
+# unrelated services like the SSM agent. The per-instance ceiling stays under
+# the system-ares.slice global cap below.
+redis_ares_worker_memory_high: "1500M"
+redis_ares_worker_memory_max: "2G"
 redis_ares_worker_tasks_max: 256
+
+# Global cgroup cap for the whole Ares fleet (orchestrator + all workers),
+# enforced by system-ares.slice. Backstops the per-instance limits so the
+# fleet in aggregate cannot exhaust the instance.
+redis_ares_slice_memory_high: "10G"
+redis_ares_slice_memory_max: "12G"
+redis_ares_slice_tasks_max: 8192
+
+# Extra environment threaded into each worker unit.
+# EnvironmentFile is optional (leading '-'): operators can drop per-op
+# overrides in {{ redis_ares_config_dir }}/env without editing the unit.
+redis_ares_otel_resource_attributes: "deployment.environment=staging,attack.team=red"
 
 # ares@<role>.service instances to enable. Each subscribes to ares.tools.exec.<role>;
 # a missing role means the orchestrator's tool calls for that role hang.

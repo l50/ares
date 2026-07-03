@@ -91,7 +91,7 @@
     base_rust_bin_path: "/root/.cargo/bin"
     base_pipx_bin_path: "/root/.local/bin"
     base_pipx_venv_path: "/root/.local/pipx/venvs"
-    cacheable: yes
+    cacheable: true
 
 - name: Check pip version
   ansible.builtin.command: "{{ base_pip_executable }} --version"
@@ -196,3 +196,9 @@
     mode: "{{ base_workspace_mode }}"
   become: true
   when: base_create_workspace
+
+# Host tuning (swap cushion + OOM sysctls) for the Ares worker fleet.
+# No-op unless base_configure_swap / base_oom_tuning are enabled (attack box).
+- name: Apply host tuning for the Ares worker fleet
+  ansible.builtin.include_tasks: tuning.yml
+  when: base_configure_swap or base_oom_tuning

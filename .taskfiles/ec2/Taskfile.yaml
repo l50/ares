@@ -2,14 +2,18 @@
 # EC2 deployment tasks — run ares directly on EC2 via AWS SSM
 # Alternative to K8s for faster testing iterations.
 #
-# Architecture: single EC2 with Redis + NATS + orchestrator.
-# Orchestrator runs per-operation and dispatches tool calls in-process
-# (ARES_TOOL_DISPATCH=local); there is no separate worker fleet on EC2.
-# The ares@{role} systemd template still exists for ad-hoc distributed-mode
-# testing but is not enabled by default.
+# Architecture: single EC2 with Redis + NATS + orchestrator + worker fleet.
+# The orchestrator leaves ARES_TOOL_DISPATCH unset and routes every tool call
+# over NATS to per-role ares@<role>.service workers, so heavy tools (hashcat,
+# netexec) run inside the worker's own cgroup rather than the orchestrator's.
+# The fleet (recon, credential_access, cracker, acl, privesc, lateral,
+# coercion) and its infra are baked into the attack-box AMI by the Ansible
+# collection in ansible/ (goad_attack_box.yml). If the workers are down,
+# dispatches return "no responders" and the operation wedges at zero progress;
+# ec2:setup verifies they are up.
 #
 # Usage:
-#   task ec2:setup EC2_NAME=ares-tools       # One-time: install Redis, create systemd units
+#   task ec2:setup EC2_NAME=ares-tools       # Readiness check: guard impacket drift, ensure fleet up, smoke test
 #   task ec2:deploy EC2_NAME=ares-tools      # Build + push Rust binaries via S3 + SSM
 #   task ec2:start EC2_NAME=ares-tools       # Start Redis + NATS (infra only)
 #   task ec2:status EC2_NAME=ares-tools      # Show process status
@@ -384,7 +388,7 @@ tasks:
   # One-Time Setup
   # ============================================================================
   setup:
-    desc: "One-time EC2 setup: install Redis, create log dirs, install systemd units (usage: task ec2:setup [EC2_NAME=ares-tools])"
+    desc: "EC2 readiness check: guard impacket drift, ensure baked fleet is up, smoke-test Redis+NATS (provisioning is baked into the AMI; usage: task ec2:setup [EC2_NAME=ares-tools])"
     silent: true
     cmds:
       - |
