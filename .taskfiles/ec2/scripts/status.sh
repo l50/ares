@@ -13,15 +13,20 @@ else
 fi
 echo ""
 
-echo "=== Workers ==="
-for role in recon credential_access cracker acl privesc lateral coercion; do
-	st=$(systemctl is-active ares@${role} 2>/dev/null || echo dead)
-	pid=""
-	if [ "$st" = "active" ]; then
-		pid=$(systemctl show ares@${role} --property=MainPID --value 2>/dev/null || echo "?")
-	fi
-	printf "  %-20s %-8s %s\n" "$role" "$st" "${pid:+PID: $pid}"
-done
+echo "=== Dispatch mode ==="
+if [ "$(printf '%s' "${ARES_TOOL_DISPATCH:-}")" = "local" ]; then
+	echo "  in-process (ARES_TOOL_DISPATCH=local) — no separate worker fleet"
+else
+	echo "  NATS worker fleet (ARES_TOOL_DISPATCH unset) — tools route to ares@<role>.service"
+	for role in recon credential_access cracker acl privesc lateral coercion; do
+		st=$(systemctl is-active ares@${role} 2>/dev/null || echo dead)
+		pid=""
+		if [ "$st" = "active" ]; then
+			pid=$(systemctl show ares@${role} --property=MainPID --value 2>/dev/null || echo "?")
+		fi
+		printf "  %-20s %-8s %s\n" "$role" "$st" "${pid:+PID: $pid}"
+	done
+fi
 echo ""
 
 echo "=== Orchestrator ==="

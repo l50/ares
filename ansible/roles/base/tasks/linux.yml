@@ -1,4 +1,21 @@
 ---
+# The Ares toolchain installs to /usr/local/bin (uv, and the pipx/venv tool
+# wrappers), but some images ship a sudoers secure_path that omits it, so every
+# `become: true` task that calls a bare tool name fails to resolve it. Restore
+# the standard secure_path via a validated drop-in (parsed after the main
+# sudoers file, so it overrides). This must run first, before any tool install.
+- name: Ensure sudo secure_path includes /usr/local
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/10-secure-path
+    content: |
+      Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    owner: root
+    group: root
+    mode: '0440'
+    validate: /usr/sbin/visudo -cf %s
+  become: true
+  when: ansible_facts['os_family'] == 'Debian'
+
 - name: Set DEBIAN_FRONTEND to noninteractive
   ansible.builtin.lineinfile:
     path: /etc/environment
@@ -95,7 +112,7 @@
     # /root is mode 0700.
     base_pipx_bin_path: "/usr/local/bin"
     base_pipx_venv_path: "/opt/pipx/venvs"
-    cacheable: yes
+    cacheable: true
 
 - name: Check pip version
   ansible.builtin.command: "{{ base_pip_executable }} --version"
@@ -200,3 +217,9 @@
     mode: "{{ base_workspace_mode }}"
   become: true
   when: base_create_workspace
+
+# Host tuning (swap cushion + OOM sysctls) for the Ares worker fleet.
+# No-op unless base_configure_swap / base_oom_tuning are enabled (attack box).
+- name: Apply host tuning for the Ares worker fleet
+  ansible.builtin.include_tasks: tuning.yml
+  when: base_configure_swap or base_oom_tuning
