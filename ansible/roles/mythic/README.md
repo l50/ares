@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # mythic
 
 ## Description
@@ -157,5 +156,4 @@ Install and configure Mythic C2 framework
 
 - Ubuntu: all
 - Debian: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

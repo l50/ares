@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # cracking_tools
 
 ## Description
@@ -167,5 +166,4 @@ Install and configure password cracking tools for Ares agents
 - Ubuntu: all
 - Debian: all
 - Kali: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

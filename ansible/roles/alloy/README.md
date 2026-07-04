@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # alloy
 
 ## Description
@@ -83,5 +82,4 @@ Install and configure Grafana Alloy for Windows hosts
 
 
 - Windows: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

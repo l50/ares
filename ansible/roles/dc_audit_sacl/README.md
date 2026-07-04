@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # dc_audit_sacl
 
 ## Description
@@ -60,5 +59,4 @@ Configure SACL auditing on Domain Controllers for attack detection
 
 
 - Windows: 2019, 2022
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

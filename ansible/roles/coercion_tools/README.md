@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # coercion_tools
 
 ## Description
@@ -171,5 +170,4 @@ Install and configure network poisoning and relay attack tools for Ares agents
 - Ubuntu: all
 - Debian: all
 - Kali: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

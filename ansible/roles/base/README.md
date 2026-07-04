@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # base
 
 ## Description
@@ -198,5 +197,4 @@ Base requirements for Ares AI agents
 - Ubuntu: all
 - Debian: all
 - Kali: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

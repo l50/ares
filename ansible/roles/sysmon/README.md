@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # sysmon
 
 ## Description
@@ -62,5 +61,4 @@ Install and configure Sysinternals Sysmon on Windows hosts
 
 
 - Windows: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

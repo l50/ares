@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # credential_access_tools
 
 ## Description
@@ -149,5 +148,4 @@ Install and configure credential access tooling for Ares agents
 - Ubuntu: all
 - Debian: all
 - Kali: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->
