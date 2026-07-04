@@ -16,7 +16,7 @@ Install and configure Grafana Alloy for Windows hosts
 
 | Variable | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
-| `alloy_version` | str | <code>1.17.0</code> | No description |
+| `alloy_version` | str | <code>1.17.1</code> | No description |
 | `alloy_env` | str | <code>dev</code> | No description |
 | `alloy_deployment_name` | str | <code></code> | No description |
 | `alloy_instance_id` | str | <code></code> | No description |

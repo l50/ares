@@ -1,6 +1,6 @@
 ---
 # Alloy version configuration
-alloy_version: "1.17.0"
+alloy_version: "1.17.1"
 
 # Alloy configuration
 alloy_env: "dev"
