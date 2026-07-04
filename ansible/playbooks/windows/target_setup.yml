@@ -9,7 +9,7 @@
     alloy_server_id: ""
     alloy_instance_id: ""
     alloy_loki_endpoint: "{{ alloy_loki_endpoint }}"
-    alloy_version: "1.17.0"
+    alloy_version: "1.17.1"
     alloy_enable_sysmon: true
 
   roles:
