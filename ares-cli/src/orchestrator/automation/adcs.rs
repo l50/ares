@@ -177,16 +177,27 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             // Same-domain creds first, same-forest cross-domain creds second,
             // and stop at the first unprocessed dedup key. Chained iterators —
             // no intermediate Vec — to satisfy clippy::needless_collect.
+            // Within each tier iterate NEWEST-first (`.rev()` over the
+            // insertion-ordered credential list). A principal freshly owned via
+            // an ACL kill-chain (ForceChangePassword / shadow credentials on a
+            // target user) is appended last; only one certipy_find is dispatched
+            // per CA host per tick, so oldest-first parks the just-gained
+            // principal at the back of the backlog and in a time-bounded op it
+            // never gets enumerated as itself — its ESC1/ESC4-controlled
+            // templates stay invisible. Newest-first hands the fresh win priority
+            // so the ACL→ADCS re-enum fires next tick. Dedup still guarantees
+            // older creds each get their turn — this only reorders, never drops.
             let cred = state
                 .credentials
                 .iter()
+                .rev()
                 .filter(|c| {
                     !c.password.is_empty()
                         && c.domain.to_lowercase() == domain_lower
                         && !state.is_delegation_account(&c.username)
                         && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
-                .chain(state.credentials.iter().filter(|c| {
+                .chain(state.credentials.iter().rev().filter(|c| {
                     let cd = c.domain.to_lowercase();
                     !c.password.is_empty()
                         && cd != domain_lower
@@ -199,57 +210,64 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
 
             // Look for NTLM hash (PTH) only if cred path is exhausted (no
             // unprocessed cred candidate exists). Same identity-aware dedup.
-            let hash_pick = if cred.is_none() {
-                let pred_admin_same = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
-                        && h.username.to_lowercase() == "administrator"
-                };
-                let pred_any_same = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
-                        && !state.is_delegation_account(&h.username)
-                };
-                let same_forest = |h: &&ares_core::models::Hash| -> bool {
-                    let hd = h.domain.to_lowercase();
-                    !hd.is_empty() && state.forest_root_of(&hd) == target_forest
-                };
-                let pred_admin_xdom = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && same_forest(h)
-                        && h.username.to_lowercase() == "administrator"
-                };
-                let pred_any_xdom = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && same_forest(h)
-                        && !state.is_delegation_account(&h.username)
-                };
+            let hash_pick =
+                if cred.is_none() {
+                    let pred_admin_same = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                            && h.username.to_lowercase() == "administrator"
+                    };
+                    let pred_any_same = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                            && !state.is_delegation_account(&h.username)
+                    };
+                    let same_forest = |h: &&ares_core::models::Hash| -> bool {
+                        let hd = h.domain.to_lowercase();
+                        !hd.is_empty() && state.forest_root_of(&hd) == target_forest
+                    };
+                    let pred_admin_xdom = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && same_forest(h)
+                            && h.username.to_lowercase() == "administrator"
+                    };
+                    let pred_any_xdom = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && same_forest(h)
+                            && !state.is_delegation_account(&h.username)
+                    };
 
-                let mut candidates: Vec<&ares_core::models::Hash> = Vec::new();
-                candidates.extend(state.hashes.iter().filter(pred_admin_same));
-                candidates.extend(state.hashes.iter().filter(pred_any_same).filter(|h| {
-                    h.username.to_lowercase() != "administrator"
-                        || (h.domain.to_lowercase() != domain_lower && !h.domain.is_empty())
-                }));
-                candidates.extend(
-                    state.hashes.iter().filter(pred_admin_xdom).filter(|h| {
-                        h.domain.to_lowercase() != domain_lower && !h.domain.is_empty()
-                    }),
-                );
-                candidates.extend(
-                    state
-                        .hashes
-                        .iter()
-                        .filter(pred_any_xdom)
-                        .filter(|h| h.username.to_lowercase() != "administrator"),
-                );
-                candidates
-                    .into_iter()
-                    .find(|h| !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash(&host_ip, h)))
-                    .cloned()
-            } else {
-                None
-            };
+                    // NEWEST-first within each tier (see the cred comment above): a
+                    // hash freshly dumped from a just-owned principal jumps its tier's
+                    // queue instead of waiting behind stale hashes.
+                    let mut candidates: Vec<&ares_core::models::Hash> = Vec::new();
+                    candidates.extend(state.hashes.iter().rev().filter(pred_admin_same));
+                    candidates.extend(state.hashes.iter().rev().filter(pred_any_same).filter(
+                        |h| {
+                            h.username.to_lowercase() != "administrator"
+                                || (h.domain.to_lowercase() != domain_lower && !h.domain.is_empty())
+                        },
+                    ));
+                    candidates.extend(state.hashes.iter().rev().filter(pred_admin_xdom).filter(
+                        |h| h.domain.to_lowercase() != domain_lower && !h.domain.is_empty(),
+                    ));
+                    candidates.extend(
+                        state
+                            .hashes
+                            .iter()
+                            .rev()
+                            .filter(pred_any_xdom)
+                            .filter(|h| h.username.to_lowercase() != "administrator"),
+                    );
+                    candidates
+                        .into_iter()
+                        .find(|h| {
+                            !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash(&host_ip, h))
+                        })
+                        .cloned()
+                } else {
+                    None
+                };
             // Kerberos ticket fallback — when no same-forest plaintext cred
             // or NTLM hash exists (common for a freshly-discovered foreign
             // forest), a pre-forged inter-realm ccache is enough for

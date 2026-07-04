@@ -141,6 +141,16 @@ pub struct StateInner {
     // so we don't defer indefinitely if AES never arrives.
     pub forge_aes_defers: HashMap<String, u32>,
 
+    // Per-trust counter: how many times the cross-forest forge has fired
+    // NTLM-only (the AES256 trust key never upserted within the defer window)
+    // and come back with zero hashes. AES-only target forests reject an RC4
+    // inter-realm ticket with KDC_ERR_ETYPE_NOSUPP, so a zero-hash result there
+    // is the etype rejection — not SID filtering. We clear dedup and re-wait
+    // for AES up to this bound so a late trust-key extraction can drive a
+    // successful AES forge; past the bound we lock so a genuinely-unreachable
+    // target can't hot-loop.
+    pub forge_ntlm_fallback_attempts: HashMap<String, u32>,
+
     // Per-(trust_follow dedup key) timestamp recording when the
     // cross-forest forge dispatch was marked-processed. `auto_trust_follow`
     // marks dedup *before* spawning the dispatch so the next 30s tick
@@ -253,6 +263,7 @@ impl StateInner {
             completed_tasks: HashMap::new(),
             quarantined_principals: HashMap::new(),
             forge_aes_defers: HashMap::new(),
+            forge_ntlm_fallback_attempts: HashMap::new(),
             forge_in_flight: HashMap::new(),
             mssql_link_pivot_attempts: HashMap::new(),
             krbtgt_transient_counts: HashMap::new(),

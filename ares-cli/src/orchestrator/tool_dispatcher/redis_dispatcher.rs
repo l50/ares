@@ -21,7 +21,7 @@ use ares_llm::{ToolCall, ToolExecResult};
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 
-use super::domain_validator::check_domain_arg;
+use super::domain_validator::{check_cross_realm_auth, check_domain_arg};
 use super::{
     extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
     ToolExecRequest, ToolExecResponse,
@@ -143,6 +143,15 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
             // domain — catches LLM typos before they pollute credential
             // records or misroute downstream tooling.
             if let Some(rejection) = check_domain_arg(&self.queue, &self.operation_id, call).await {
+                return Ok(rejection);
+            }
+
+            // Reject native-credential auth aimed across a forest boundary with
+            // no forged inter-realm ticket — a doomed KDC_ERR_WRONG_REALM the
+            // LLM would otherwise repeat every turn.
+            if let Some(rejection) =
+                check_cross_realm_auth(&self.queue, &self.operation_id, call).await
+            {
                 return Ok(rejection);
             }
 

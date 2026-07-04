@@ -195,9 +195,24 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                     if let Some(username) = username {
                         let username = username.trim();
                         if !username.is_empty() {
+                            // GetNPUsers echoes the principal exactly as
+                            // supplied; a UPN-form userlist entry (`sam@realm`)
+                            // is stored verbatim and later rendered as a doubled
+                            // `DOMAIN\sam@realm` in loot. Keep only the
+                            // sAMAccountName, and fall back to the UPN realm as
+                            // the domain when the task carried none.
+                            let (sam, upn_domain) = match username.split_once('@') {
+                                Some((s, d)) if !s.is_empty() && d.contains('.') => (s, Some(d)),
+                                _ => (username, None),
+                            };
+                            let user_domain = if domain.is_empty() {
+                                upn_domain.unwrap_or(domain)
+                            } else {
+                                domain
+                            };
                             valid_users.push(json!({
-                                "username": username,
-                                "domain": domain,
+                                "username": sam,
+                                "domain": user_domain,
                                 "source": "kerberos_enum",
                             }));
                         }
@@ -1029,6 +1044,49 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
     }
 
     #[test]
+    fn kerberos_user_enum_strips_upn_suffix() {
+        // GetNPUsers echoes the principal exactly as supplied. When the
+        // userlist carried a UPN-form entry, the `[-] User sam@realm ...`
+        // line must yield the bare sAMAccountName, not the whole UPN — else
+        // loot renders a doubled `DOMAIN\sam@realm`.
+        let output = "\
+[-] User bob@child.contoso.local doesn't have UF_DONT_REQUIRE_PREAUTH set
+[-] User alice does not have UF_DONT_REQUIRE_PREAUTH set
+";
+        let params = json!({"domain": "child.contoso.local", "dc_ip": "192.168.58.10"});
+        let disc = parse_tool_output("kerberos_user_enum_noauth", output, &params);
+        let users = disc["discovered_users"].as_array().unwrap();
+        let names: Vec<&str> = users
+            .iter()
+            .map(|u| u["username"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"bob"),
+            "UPN must be reduced to sAM, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains('@')),
+            "no UPN survives: {names:?}"
+        );
+        assert!(names.contains(&"alice"));
+        for u in users {
+            assert_eq!(u["domain"], "child.contoso.local");
+        }
+    }
+
+    #[test]
+    fn kerberos_user_enum_upn_domain_fallback_when_task_domainless() {
+        // No task domain: the UPN realm becomes the user's domain instead of
+        // an empty string.
+        let output = "[-] User carol@contoso.local doesn't have UF_DONT_REQUIRE_PREAUTH set\n";
+        let params = json!({"dc_ip": "192.168.58.10"});
+        let disc = parse_tool_output("kerberos_user_enum_noauth", output, &params);
+        let users = disc["discovered_users"].as_array().unwrap();
+        assert_eq!(users[0]["username"], "carol");
+        assert_eq!(users[0]["domain"], "contoso.local");
+    }
+
+    #[test]
     fn parse_tool_output_username_as_password_filters() {
         // Only creds where password == username should be kept
         let output = "[+] 192.168.58.1 CONTOSO\\alice:alice (Pwn3d!)\n\
@@ -1551,14 +1609,15 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
 
     #[test]
     fn parse_tool_output_mssql_enum_linked_servers_returns_vulns() {
-        // mssql linked server output varies by tool, but parse_mssql_linked_servers
-        // reads server names from keyword lines
-        let output = "SRV_NAME  PRODUCT  PROVIDER  DATA_SOURCE\n\
-                      sql02.fabrikam.local  SQL Server  SQLNCLI  sql02.fabrikam.local\n";
+        // `SELECT name FROM sys.servers WHERE is_linked = 1` — single `name`
+        // column; parse_mssql_linked_servers reads one linked server per row.
+        let output = "SQL (CONTOSO\\alice  guest@master)> name\n\
+                      -------\n\
+                      sql02\n\
+                      SQL (CONTOSO\\alice  guest@master)>\n";
         let params = json!({"target": "192.168.58.30", "domain": "contoso.local"});
         let disc = parse_tool_output("mssql_enum_linked_servers", output, &params);
-        // Whether vulns appear depends on the parser; just confirm no panic.
-        let _ = disc;
+        assert!(disc.get("vulnerabilities").is_some());
     }
 
     // ── enumerate_domain_trusts ───────────────────────────────────────
@@ -1634,7 +1693,7 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
     #[test]
     fn looks_like_ip_pub_accepts_valid() {
         assert!(looks_like_ip_pub("192.168.58.10"));
-        assert!(looks_like_ip_pub("10.0.0.1"));
+        assert!(looks_like_ip_pub("192.168.58.240"));
     }
 
     #[test]

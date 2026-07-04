@@ -591,6 +591,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_foreign_forest_credential_lands_in_state() {
+        // A verified foothold credential for a forest we do NOT own (its domain
+        // is absent from state.domains) must still persist to state.credentials.
+        // auto_adcs_enumeration reads state.credentials to build cred_domains
+        // and dispatch certipy_find against the foreign CA — if a spray/AS-REP/
+        // SMB-verified foreign cred were dropped here, cred_domains would never
+        // list the foreign forest and it could never fall. The domain is NOT
+        // promoted into the authoritative state.domains registry.
+        let state = SharedState::new("op-foreign".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+        }
+
+        let mut cred = make_cred("svc_sql", "Passw0rd!Foreign", "fabrikam.local");
+        cred.source = "password_spray".to_string();
+        let added = state.publish_credential(&q, cred).await.unwrap();
+        assert!(added, "foreign-forest foothold cred must be accepted");
+
+        let s = state.inner.read().await;
+        assert!(
+            s.credentials
+                .iter()
+                .any(|c| c.domain == "fabrikam.local" && c.username == "svc_sql"),
+            "foreign-forest cred must land in state.credentials, got {:?}",
+            s.credentials
+        );
+        assert!(
+            !s.domains.iter().any(|d| d == "fabrikam.local"),
+            "foreign domain must not be promoted into authoritative state.domains"
+        );
+    }
+
+    #[tokio::test]
     async fn publish_credential_rejects_phantom_description_field_dup() {
         // Forest-wide LDAP/GC searches can return a user from one domain while
         // the parser's tracked `current_domain` points at another. When that

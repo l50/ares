@@ -387,9 +387,19 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
 
     let tgt_ccache = cwd.join(format!("{username}.ccache"));
     if !tgt_ccache.exists() {
+        // ticketer exited 0 but no ccache landed on disk: a "Pick only one"
+        // flag conflict, an odd-length/malformed hash, or a username/case
+        // mismatch between our expected filename and the `Saving ticket in
+        // <name>.ccache` line ticketer actually wrote. Surface ticketer's own
+        // output so the reason is visible on attempt 1 instead of a bare "not
+        // produced" that costs blind retries (same swallow as the ADCS req
+        // path — see privesc/adcs.rs).
         anyhow::bail!(
-            "impacket-ticketer reported success but {} was not produced",
-            tgt_ccache.display()
+            "impacket-ticketer exited 0 but {} was not produced — inter-realm TGT NOT forged. \
+             ticketer stdout: {} || stderr: {}",
+            tgt_ccache.display(),
+            ticketer_output.stdout.trim(),
+            ticketer_output.stderr.trim(),
         );
     }
 
@@ -434,9 +444,18 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
     }
 
     if !tgs_ccache.exists() {
+        // Same swallow one step later: the helper exited 0 but wrote no TGS
+        // ccache. Surface both the ticketer and helper output so the real
+        // cause (KDC_ERR_S_PRINCIPAL_UNKNOWN from a bad SPN, KDC_ERR_WRONG_REALM,
+        // or an unresolvable target KDC) is diagnosable instead of a bare "not
+        // produced".
         anyhow::bail!(
-            "cross_realm_tgs helper reported success but {} was not produced",
-            tgs_ccache.display()
+            "cross_realm_tgs helper exited 0 but {} was not produced — cross-realm TGS NOT obtained. \
+             ticketer stdout: {} || cross_realm_tgs stdout: {} || stderr: {}",
+            tgs_ccache.display(),
+            ticketer_output.stdout.trim(),
+            getst_output.stdout.trim(),
+            getst_output.stderr.trim(),
         );
     }
 

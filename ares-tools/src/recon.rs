@@ -173,7 +173,13 @@ pub async fn enumerate_users(args: &Value) -> Result<ToolOutput> {
         .await?;
 
     // Check if --users returned actual user data (look for -Username- header
-    // followed by data lines, or any DOMAIN\user lines)
+    // followed by data lines, or any DOMAIN\user lines). A data row is
+    // `SMB IP PORT HOST USER <PW-set> BADPW [DESC..]`; the PW-set column is
+    // one token ("<never>") or two ("DATE TIME"), so a real row can be as
+    // short as 7 fields. Match the parser's `>= 6` floor here — a rigid
+    // `>= 8` gate wrongly declared "no users" for DCs whose accounts have
+    // never-set passwords / empty descriptions and forced a needless
+    // rid-brute fallback.
     let has_users = result.stdout.contains("-Username-")
         && result.stdout.lines().any(|l| {
             let l = l.trim();
@@ -182,7 +188,7 @@ pub async fn enumerate_users(args: &Value) -> Result<ToolOutput> {
                 && !l.contains("[+]")
                 && !l.contains("[-]")
                 && !l.contains("-Username-")
-                && l.split_whitespace().count() >= 8
+                && l.split_whitespace().count() >= 6
         });
 
     if has_users {
@@ -341,11 +347,27 @@ pub fn build_ldap_search(args: &Value) -> Result<CommandBuilder> {
     }
 
     if let Some(attrs) = attributes {
-        for attr in attrs.split(|c: char| c == ',' || c.is_whitespace()) {
-            let attr = attr.trim();
-            if !attr.is_empty() {
-                cmd = cmd.arg(attr);
-            }
+        // Always request objectClass alongside whatever the caller asked for.
+        // The orchestrator's user extractor drops group/computer records by
+        // matching an `objectClass: group` line; if the LLM enumerates groups
+        // with `attributes=sAMAccountName,cn` and omits objectClass, every
+        // group's sAMAccountName leaks in as a truncated `ldap_extraction`
+        // user ("Backup Operators" -> "Backup"). With no explicit attribute
+        // list ldapsearch returns them all (objectClass included), so this
+        // only matters when the caller narrows the request.
+        let mut requested: Vec<&str> = attrs
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .collect();
+        if !requested
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("objectClass"))
+        {
+            requested.push("objectClass");
+        }
+        for attr in requested {
+            cmd = cmd.arg(attr);
         }
     }
 
@@ -1267,6 +1289,50 @@ mod tests {
                 .iter()
                 .all(|(k, _)| k != "KRB5CCNAME"),
             "simple-bind branch must not export KRB5CCNAME"
+        );
+    }
+
+    #[test]
+    fn ldap_search_forces_objectclass_attribute() {
+        // A narrowed attribute list that omits objectClass must still request
+        // it, so the orchestrator's user extractor can tell group/computer
+        // records from real users. Without it, group sAMAccountNames leak in
+        // as truncated `ldap_extraction` users ("Backup Operators" -> "Backup").
+        let args = json!({
+            "target": "192.168.58.1",
+            "domain": "contoso.local",
+            "filter": "(objectClass=group)",
+            "attributes": "sAMAccountName,cn"
+        });
+        let cmd = super::build_ldap_search(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(
+            args_vec.iter().any(|a| a == "sAMAccountName"),
+            "caller's attributes must be preserved"
+        );
+        assert!(
+            args_vec.iter().any(|a| a == "objectClass"),
+            "objectClass must be appended when omitted, got: {args_vec:?}"
+        );
+    }
+
+    #[test]
+    fn ldap_search_does_not_duplicate_objectclass() {
+        // Already-present objectClass (any case) must not be appended twice.
+        let args = json!({
+            "target": "192.168.58.1",
+            "domain": "contoso.local",
+            "attributes": "samaccountname,ObjectClass"
+        });
+        let cmd = super::build_ldap_search(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert_eq!(
+            args_vec
+                .iter()
+                .filter(|a| a.eq_ignore_ascii_case("objectClass"))
+                .count(),
+            1,
+            "objectClass must appear exactly once, got: {args_vec:?}"
         );
     }
 

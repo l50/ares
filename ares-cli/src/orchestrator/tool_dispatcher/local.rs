@@ -11,7 +11,7 @@ use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 use crate::worker::credential_resolver::resolve_credentials;
 
-use super::domain_validator::check_domain_arg;
+use super::domain_validator::{check_cross_realm_auth, check_domain_arg};
 use super::{
     extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
 };
@@ -55,6 +55,13 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
     ) -> Result<ToolExecResult> {
         // Reject calls whose `domain` argument doesn't match a known domain.
         if let Some(rejection) = check_domain_arg(&self.queue, &self.operation_id, call).await {
+            return Ok(rejection);
+        }
+
+        // Reject native-credential auth aimed across a forest boundary with no
+        // forged inter-realm ticket — the doomed KDC_ERR_WRONG_REALM mechanic.
+        if let Some(rejection) = check_cross_realm_auth(&self.queue, &self.operation_id, call).await
+        {
             return Ok(rejection);
         }
 

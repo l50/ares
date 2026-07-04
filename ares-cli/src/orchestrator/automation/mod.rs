@@ -85,6 +85,7 @@ pub use credential_access::auto_credential_access;
 pub use credential_expansion::auto_credential_expansion;
 pub use credential_reuse::auto_credential_reuse;
 pub use cross_forest_enum::auto_cross_forest_enum;
+pub(crate) use cross_forest_enum::is_cross_forest;
 pub use dacl_abuse::auto_dacl_abuse;
 pub use delegation::auto_delegation_enumeration;
 pub use dfs_coercion::auto_dfs_coercion;

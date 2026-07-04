@@ -24,7 +24,12 @@ use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
 /// Check if a credential belongs to a different forest than the target domain.
-fn is_cross_forest(cred_domain: &str, target_domain: &str) -> bool {
+///
+/// Same domain or a parent/child pair (one is a DNS suffix of the other) counts
+/// as the same forest; only disjoint namespaces (e.g. `contoso.local` vs
+/// `fabrikam.local`) are cross-forest. Shared with the tool dispatcher's
+/// cross-realm auth guardrail so both use one definition of a forest boundary.
+pub(crate) fn is_cross_forest(cred_domain: &str, target_domain: &str) -> bool {
     let c = cred_domain.to_lowercase();
     let t = target_domain.to_lowercase();
     // Same domain or parent/child = same forest

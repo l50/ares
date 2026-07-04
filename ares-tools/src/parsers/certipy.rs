@@ -30,6 +30,10 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
 
     // Extract CA name from output if present (e.g. "CA Name: CONTOSO-CA")
     let ca_name = extract_ca_name(output);
+    // Extract the CA's real host FQDN (dNSHostName). The orchestrator resolves
+    // this to an IP against known hosts so exploitation targets the CA server,
+    // not the DC used for the LDAP bind — see `resolve_ca_host_from_dns_name`.
+    let ca_dns_name = extract_ca_dns_name(output);
 
     let mut vulns = Vec::new();
     let output_lower = output.to_lowercase();
@@ -73,7 +77,7 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
             // Write-holder ESCs (GenericAll/Write on the template, ManageCA,
             // GenericAll-on-user) require a SPECIFIC principal's credential, not
             // just any domain user. Capture the holder certipy names on the ESC
-            // line so credential selection targets it (e.g. ESC4 → khal.drogo).
+            // line so credential selection targets it (e.g. ESC4 → carol).
             // find_adcs_credential falls back to any same-domain cred if the
             // holder's credential isn't available yet, so this never regresses
             // the any-user ESCs (esc1/2/3/6/13/15), which we leave unset.
@@ -85,6 +89,9 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
             }
             if let Some(ref ca) = ca_name {
                 details["ca_name"] = json!(ca);
+            }
+            if let Some(ref dns) = ca_dns_name {
+                details["ca_dns_name"] = json!(dns);
             }
             if let Some(ref tmpl) = template_name {
                 details["template_name"] = json!(tmpl);
@@ -138,7 +145,7 @@ fn esc_word_boundary_match(text: &str, esc_type: &str) -> bool {
 }
 
 /// Extract the principal certipy names on an ESC line as holding the dangerous
-/// right, e.g. `ESC4 : 'ESSOS.LOCAL\khal.drogo' has dangerous permissions ...`.
+/// right, e.g. `ESC4 : 'CONTOSO.LOCAL\carol' has dangerous permissions ...`.
 /// Returns the bare sAMAccountName (portion after the domain backslash),
 /// lowercased. Returns `None` if no single-quoted principal is found.
 fn extract_esc_principal(output: &str, esc_type: &str) -> Option<String> {
@@ -179,6 +186,28 @@ fn extract_ca_name(output: &str) -> Option<String> {
     for line in output.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("CA Name") {
+            let name = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the CA's DNS host name (its `dNSHostName`) from certipy output.
+///
+/// certipy `find` prints the issuing CA's real host in the "Certificate
+/// Authorities" block as `DNS Name : <fqdn>`. This is the authoritative
+/// source for WHERE certificates enroll — frequently a different box than the
+/// DC used for the LDAP bind (a dedicated CA server). Exploitation must target
+/// this host: aiming the MS-ICPR enrollment RPC at the DC instead hits a host
+/// with no `certsvc`, and certipy exits 0 with no PFX ("EPT_S_NOT_REGISTERED").
+/// Templates don't emit a `DNS Name` line, so the first match is the CA host.
+fn extract_ca_dns_name(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("DNS Name") {
             let name = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
             if !name.is_empty() {
                 return Some(name.to_string());
@@ -264,7 +293,6 @@ pub fn parse_certipy_esc1_chain(output: &str, params: &Value) -> Vec<Value> {
         }
         let domain = realm.trim().to_lowercase();
         let user = user.trim().to_lowercase();
-        let _ = params; // params reserved for future correlation
         hashes.push(json!({
             "username": user,
             "domain": domain,
@@ -272,6 +300,65 @@ pub fn parse_certipy_esc1_chain(output: &str, params: &Value) -> Vec<Value> {
             "hash_value": format!("{lm}:{nt}"),
             "source": "certipy_esc1_full_chain",
         }));
+    }
+
+    // DCSync tail (RC4-disabled KDCs): `certipy auth` yields only a TGT, so the
+    // chain DCSyncs `krbtgt` with the ccache and the hash lands here as
+    // secretsdump NTDS output — `krbtgt:502:<lm>:<nt>:::` plus an
+    // `krbtgt:aes256-cts-hmac-sha1-96:<key>` line. Parse those so the krbtgt
+    // hash is published (and marks the forest dominated) even when no
+    // `Got hash for` line was ever printed. Domain comes from the request
+    // params (the target realm), since NTDS `-just-dc-user` rows omit it.
+    let dcsync_domain = params
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // First pass: collect AES256 keys keyed by sAMAccountName so they can be
+    // attached to the matching NTLM row.
+    let mut aes_by_user: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.trim().split(':').collect();
+        if parts.len() == 3 && parts[1].eq_ignore_ascii_case("aes256-cts-hmac-sha1-96") {
+            let user = parts[0].trim();
+            let key = parts[2].trim();
+            if !user.is_empty() && key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+                aes_by_user.insert(user.to_lowercase(), key.to_string());
+            }
+        }
+    }
+    for line in output.lines() {
+        // NTDS secretsdump row: `user:rid:lmhash:nthash:::`.
+        let parts: Vec<&str> = line.trim().split(':').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let user = parts[0].trim();
+        let rid = parts[1].trim();
+        let lm = parts[2].trim();
+        let nt = parts[3].trim();
+        let is_ntds_row = !user.is_empty()
+            && rid.chars().all(|c| c.is_ascii_digit())
+            && !rid.is_empty()
+            && lm.len() == 32
+            && lm.chars().all(|c| c.is_ascii_hexdigit())
+            && nt.len() == 32
+            && nt.chars().all(|c| c.is_ascii_hexdigit());
+        if !is_ntds_row {
+            continue;
+        }
+        let mut hash = json!({
+            "username": user.to_lowercase(),
+            "domain": dcsync_domain,
+            "hash_type": "NTLM",
+            "hash_value": format!("{lm}:{nt}"),
+            "source": "certipy_esc1_full_chain",
+        });
+        if let Some(aes) = aes_by_user.get(&user.to_lowercase()) {
+            hash["aes_key"] = json!(aes);
+        }
+        hashes.push(hash);
     }
     hashes
 }
@@ -327,21 +414,21 @@ mod tests {
 
     #[test]
     fn parse_certipy_esc4_captures_write_holder() {
-        let output = "[!] Vulnerabilities\n    ESC4 : 'ESSOS.LOCAL\\khal.drogo' has dangerous permissions over the template";
-        let params = json!({"target": "192.168.58.23", "domain": "essos.local"});
+        let output = "[!] Vulnerabilities\n    ESC4 : 'CONTOSO.LOCAL\\carol' has dangerous permissions over the template";
+        let params = json!({"target": "192.168.58.23", "domain": "contoso.local"});
         let vulns = parse_certipy_find(output, &params);
         assert_eq!(vulns.len(), 1);
         assert_eq!(vulns[0]["vuln_type"], "adcs_esc4");
         // The GenericAll holder is captured so credential selection targets it.
-        assert_eq!(vulns[0]["details"]["write_holder"], "khal.drogo");
-        assert_eq!(vulns[0]["details"]["account_name"], "khal.drogo");
+        assert_eq!(vulns[0]["details"]["write_holder"], "carol");
+        assert_eq!(vulns[0]["details"]["account_name"], "carol");
     }
 
     #[test]
     fn parse_certipy_esc1_no_write_holder() {
         // Any-user ESCs must NOT pin account_name (any domain cred works).
-        let output = "[!] Vulnerabilities\nESC1 : 'ESSOS.LOCAL\\Domain Users' can enroll";
-        let params = json!({"target": "192.168.58.23", "domain": "essos.local"});
+        let output = "[!] Vulnerabilities\nESC1 : 'CONTOSO.LOCAL\\Domain Users' can enroll";
+        let params = json!({"target": "192.168.58.23", "domain": "contoso.local"});
         let vulns = parse_certipy_find(output, &params);
         assert_eq!(vulns.len(), 1);
         assert!(vulns[0]["details"].get("account_name").is_none());
@@ -474,6 +561,41 @@ mod tests {
     #[test]
     fn extract_ca_name_empty_value() {
         assert_eq!(extract_ca_name("CA Name : "), None);
+    }
+
+    #[test]
+    fn extract_ca_dns_name_standard() {
+        let output =
+            "CA Name                             : CONTOSO-CA\nDNS Name                            : ca01.contoso.local";
+        assert_eq!(
+            extract_ca_dns_name(output),
+            Some("ca01.contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ca_dns_name_missing_or_empty() {
+        assert_eq!(extract_ca_dns_name("CA Name : CONTOSO-CA"), None);
+        assert_eq!(extract_ca_dns_name("DNS Name : "), None);
+        assert_eq!(extract_ca_dns_name(""), None);
+    }
+
+    #[test]
+    fn parse_certipy_find_populates_ca_dns_name() {
+        // CA runs on a dedicated host (ca01) distinct from the DC the LDAP
+        // bind targets (192.168.58.10) — the exact split that broke ESC1.
+        let output = "CA Name                             : CONTOSO-CA\n\
+                      DNS Name                            : ca01.contoso.local\n\
+                      [!] Vulnerabilities\n\
+                      ESC1 : 'CONTOSO.LOCAL\\\\Domain Users' can enroll, enrollee supplies subject";
+        let params = json!({ "domain": "contoso.local", "target": "192.168.58.10" });
+        let vulns = parse_certipy_find(output, &params);
+        assert!(
+            vulns
+                .iter()
+                .any(|v| v["details"]["ca_dns_name"] == "ca01.contoso.local"),
+            "expected ca_dns_name in vuln details, got {vulns:?}"
+        );
     }
 
     #[test]
@@ -621,5 +743,82 @@ mod tests {
             "esc13 : vulnerable",
             "esc13"
         ));
+    }
+
+    #[test]
+    fn parse_certipy_esc1_chain_extracts_krbtgt_from_dcsync_tail() {
+        // The essos forest root disables RC4, so `certipy auth` returns a TGT
+        // but no NT hash (KDC_ERR_ETYPE_NOSUPP). The chain DCSyncs krbtgt with
+        // the ccache; the krbtgt hash lands as secretsdump NTDS output. Domain
+        // comes from the request params (NTDS `-just-dc-user` rows omit it).
+        let output = "\
+=== certipy req (ESC1, upn=administrator@contoso.local, sid=S-1-5-21-1-2-3-500) ===\n\
+[*] Got certificate with UPN 'administrator@contoso.local'\n\
+=== certipy auth (esc1_1.pfx) ===\n\
+[*] Got TGT\n\
+[*] Saving credential cache to 'administrator.ccache'\n\
+[-] Failed to extract NT hash: Kerberos SessionError: KDC_ERR_ETYPE_NOSUPP(KDC has no support for encryption type)\n\
+=== secretsdump krbtgt DCSync (target=contoso.local/administrator@dc01.contoso.local) ===\n\
+[*] Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)\n\
+[*] Using the DRSUAPI method to get NTDS.DIT secrets\n\
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:9163a4143c00569b53db0feef6bdf2ad:::\n\
+[*] Kerberos keys grabbed\n\
+krbtgt:aes256-cts-hmac-sha1-96:ac960e5cfc69b6336f2ac9f4ba08aeda92ddb85c5607d0b6756a3e4c41a8adf9\n\
+krbtgt:des-cbc-md5:ab7c3e43b5b07ca7\n\
+[*] Cleaning up...";
+        let params = json!({ "domain": "contoso.local" });
+        let hashes = parse_certipy_esc1_chain(output, &params);
+        assert_eq!(hashes.len(), 1, "expected one krbtgt hash, got {hashes:?}");
+        let h = &hashes[0];
+        assert_eq!(h["username"], "krbtgt");
+        assert_eq!(h["domain"], "contoso.local");
+        assert_eq!(h["hash_type"], "NTLM");
+        assert_eq!(
+            h["hash_value"],
+            "aad3b435b51404eeaad3b435b51404ee:9163a4143c00569b53db0feef6bdf2ad"
+        );
+        assert_eq!(
+            h["aes_key"],
+            "ac960e5cfc69b6336f2ac9f4ba08aeda92ddb85c5607d0b6756a3e4c41a8adf9"
+        );
+    }
+
+    #[test]
+    fn parse_certipy_esc1_chain_still_parses_got_hash_line() {
+        // RC4-enabled KDC path: `certipy auth` recovers the NT hash directly.
+        // No DCSync tail runs; the "Got hash for" line must still be parsed.
+        let output =
+            "=== certipy auth (esc1_1.pfx) ===\n[*] Got hash for 'administrator@CONTOSO.LOCAL': aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0";
+        let hashes = parse_certipy_esc1_chain(output, &json!({ "domain": "contoso.local" }));
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "administrator");
+        assert_eq!(hashes[0]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn parse_certipy_find_padded_esc1_with_template() {
+        // The real `certipy find -vulnerable -text -stdout` format pads the ESC
+        // label with many spaces before the colon, and the vulnerable template
+        // is literally named ESC1 (both Template Name and the vuln id are the
+        // string "ESC1"). The parser must still surface adcs_esc1 with
+        // template_name="ESC1" and target the CA host, not the DC.
+        let output = "\
+Certificate Authorities\n  0\n    CA Name                             : CONTOSO-CA\n    DNS Name                            : ca01.contoso.local\n\
+Certificate Templates\n  0\n    Template Name                       : ESC1\n    [!] Vulnerabilities\n      ESC1                              : 'CONTOSO.LOCAL\\Domain Users' can enroll, enrollee supplies subject and template allows client authentication";
+        let params = json!({
+            "domain": "contoso.local",
+            "target": "192.168.58.10",   // DC (LDAP bind)
+            "ca_host_ip": "192.168.58.50" // CA host (enrollment)
+        });
+        let vulns = parse_certipy_find(output, &params);
+        let esc1 = vulns
+            .iter()
+            .find(|v| v["vuln_type"] == "adcs_esc1")
+            .unwrap_or_else(|| panic!("expected adcs_esc1 in {vulns:?}"));
+        assert_eq!(esc1["details"]["template_name"], "ESC1");
+        assert_eq!(esc1["details"]["ca_name"], "CONTOSO-CA");
+        assert_eq!(esc1["details"]["ca_dns_name"], "ca01.contoso.local");
+        // Exploitation must target the CA host, not the DC used for LDAP.
+        assert_eq!(esc1["target"], "192.168.58.50");
     }
 }

