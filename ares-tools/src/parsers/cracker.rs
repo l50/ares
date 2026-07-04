@@ -7,9 +7,12 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 
-/// Hashcat cracked TGS: $krb5tgs$23$*user$DOMAIN$spn*$hash:plaintext
+/// Hashcat cracked TGS: `$krb5tgs$23$*user$DOMAIN$spn*$hash:plaintext` (RC4) or
+/// `$krb5tgs$17$user$DOMAIN$*spn*$hash:plaintext` (AES). impacket moves the `*`
+/// from before the user (RC4) to before the SPN (AES, `$*spn*$`), so both the
+/// leading-user star and the leading-SPN star must be optional (`\*?`).
 static RE_CRACKED_TGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$krb5tgs\$\d+\$\*([^$*]+)\$([^$*]+)\$[^*]+\*\$[a-fA-F0-9$]+:(.+)$").unwrap()
+    Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$\*?[^*]+\*\$[a-fA-F0-9$]+:(.+)$").unwrap()
 });
 
 /// Cracked AS-REP: $krb5asrep$23$user@DOMAIN:hash:plaintext (hashcat)
@@ -30,9 +33,10 @@ static RE_JOHN_SHOW: LazyLock<Regex> = LazyLock::new(|| {
 /// John --show unknown user: ?:plaintext (john can't determine username from TGS hashes)
 static RE_JOHN_UNKNOWN_USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\?:(.+)$").unwrap());
 
-/// Extract username/domain from TGS hash value: $krb5tgs$TYPE$*USERNAME$REALM$...
+/// Extract username/domain from TGS hash value. `\*?` tolerates both RC4
+/// (`$krb5tgs$23$*user…`) and AES (`$krb5tgs$17$user…`) layouts.
 static RE_TGS_HASH_USER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$krb5tgs\$\d+\$\*([^$*]+)\$([^$*]+)").unwrap());
+    LazyLock::new(|| Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)").unwrap());
 
 /// Extract username/domain from AS-REP hash value: $krb5asrep$TYPE$USERNAME@REALM:...
 static RE_ASREP_HASH_USER: LazyLock<Regex> =
@@ -239,6 +243,22 @@ $krb5tgs$23$*sarah.connor$CHILD.CONTOSO.LOCAL$child.contoso.local/sarah.connor*$
         assert_eq!(creds[0]["password"], "MyPassword1");
         assert_eq!(creds[0]["domain"], "CHILD.CONTOSO.LOCAL");
         assert_eq!(creds[0]["source"], "cracked:hashcat");
+    }
+
+    #[test]
+    fn parse_hashcat_tgs_aes_cracked() {
+        // AES128 (etype 17) kerberoast --show line. Real impacket layout: no `*`
+        // before the user, `$*spn*$` around the SPN (format `$krb5tgs$%d$%s$%s$*%s*$…`).
+        // Regression guard for AES-capable SPN accounts (the AD/GOAD default).
+        let output = r#"--- hashcat --show ---
+$krb5tgs$17$svc_sql$CONTOSO.LOCAL$*MSSQLSvc/db01.contoso.local*$abc123$def456:MyPassword1
+"#;
+        let params = json!({"domain": "contoso.local"});
+        let creds = parse_cracker_output(output, &params);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["username"], "svc_sql");
+        assert_eq!(creds[0]["password"], "MyPassword1");
+        assert_eq!(creds[0]["domain"], "CONTOSO.LOCAL");
     }
 
     #[test]

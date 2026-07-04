@@ -103,6 +103,54 @@ pub async fn acquire_tool_permit() -> SemaphorePermit<'static> {
         .expect("tool semaphore unexpectedly closed")
 }
 
+/// Default number of concurrent hashcat crack jobs. hashcat is designed to
+/// own the GPU as a single instance: two jobs collide on the shared default
+/// session/restore/potfile ("already an instance" refusals, and the loser
+/// bails leaving the GPU at 0% util), while a second job that *does* start
+/// only time-slices the one GPU rather than adding throughput.
+///
+/// The orchestrator's `auto_crack_dispatch` already serializes at the *task*
+/// layer, but that guard is per-task: the agent loop dispatches every tool
+/// call in a single LLM turn concurrently, so a cracker that emits two
+/// `crack_with_hashcat` calls in one turn would otherwise run two hashcats
+/// under one task. This cap is the process-layer backstop that makes the
+/// documented "single hashcat slot" actually hold, on every path that reaches
+/// `crack_with_hashcat`. Override with `ARES_MAX_CONCURRENT_HASHCAT=<n>` (>1
+/// only makes sense with per-job session isolation and multiple GPUs).
+pub const DEFAULT_HASHCAT_CONCURRENCY: usize = 1;
+
+/// Override via `ARES_MAX_CONCURRENT_HASHCAT=<n>`. Values <1 are ignored.
+const HASHCAT_CONCURRENCY_ENV: &str = "ARES_MAX_CONCURRENT_HASHCAT";
+
+static HASHCAT_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
+    let cap = std::env::var(HASHCAT_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HASHCAT_CONCURRENCY);
+    Semaphore::new(cap)
+});
+
+/// Acquire the hashcat crack-job permit. Held for the full crack sequence
+/// (every wordlist/rules phase plus the final `--show`), so one crack job
+/// runs to completion before the next starts.
+///
+/// Composes with the global tool permit: the crack wrapper acquires this
+/// permit first (outer), then each hashcat spawn inside the job acquires the
+/// tool permit (inner) via `CommandBuilder::execute`. Consistent outer→inner
+/// order (matching the spider_plus cap) avoids deadlock; the inner tool
+/// permit is always released after each spawn, so holding this outer permit
+/// across several spawns can never starve itself.
+pub async fn acquire_hashcat_permit() -> SemaphorePermit<'static> {
+    if HASHCAT_PERMITS.available_permits() == 0 {
+        debug!("hashcat crack-job cap reached, queueing crack job");
+    }
+    HASHCAT_PERMITS
+        .acquire()
+        .await
+        .expect("hashcat semaphore unexpectedly closed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +191,21 @@ mod tests {
         assert_eq!(TOOL_PERMITS.available_permits(), initial.saturating_sub(1));
         drop(permit);
         assert_eq!(TOOL_PERMITS.available_permits(), initial);
+    }
+
+    #[tokio::test]
+    async fn hashcat_permit_serializes_to_single_slot() {
+        // The single-slot invariant the crack path relies on: only one crack
+        // job can hold the hashcat permit at a time (default cap = 1). Holding
+        // it drains availability to zero; dropping restores it.
+        assert_eq!(DEFAULT_HASHCAT_CONCURRENCY, 1);
+        let initial = HASHCAT_PERMITS.available_permits();
+        let permit = acquire_hashcat_permit().await;
+        assert_eq!(
+            HASHCAT_PERMITS.available_permits(),
+            initial.saturating_sub(1)
+        );
+        drop(permit);
+        assert_eq!(HASHCAT_PERMITS.available_permits(), initial);
     }
 }

@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -6,6 +7,24 @@ use serde_json::Value;
 use crate::args::{optional_bool, optional_i64, optional_str, required_str};
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
+
+/// Monotonic sequence for per-crack-job session names. Combined with the PID it
+/// yields a name that no other in-flight or prior crack job can reuse.
+static CRACK_SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A process-unique session name for a crack job (`ares-<tool>-<pid>-<seq>`).
+///
+/// hashcat and John both key their restore/`.rec`/log files off the session
+/// name and default to a single shared name. A crack job that is SIGKILLed on
+/// timeout leaves that shared restore file behind; the next job under the same
+/// name inherits the stale state and refuses to start ("already an instance",
+/// GPU idle at 0%). A per-job name plus `--restore-disable` removes the shared
+/// mutable state entirely, so neither a concurrent job nor a dead one's
+/// leftovers can wedge a fresh run.
+fn next_crack_session(tool: &str) -> String {
+    let seq = CRACK_SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("ares-{tool}-{}-{}", std::process::id(), seq)
+}
 
 /// Default wordlists tried in order.
 const DEFAULT_WORDLISTS: &[&str] = &[
@@ -22,15 +41,30 @@ const DEFAULT_RULES: &[&str] = &[
     "/usr/share/hashcat/rules/d3ad0ne.rule",
 ];
 
-/// Auto-detect hashcat mode from hash prefix.
+/// Auto-detect hashcat mode from a hash, honoring the embedded Kerberos etype.
 ///
-/// Returns the appropriate `-m` mode number:
-/// - `$krb5tgs$` prefix -> 13100 (Kerberoasting TGS-REP)
-/// - `$krb5asrep$` prefix -> 18200 (AS-REP roasting)
+/// The etype number in `$krb5tgs$<etype>$…` / `$krb5asrep$<etype>$…` selects the
+/// mode. Mapping every Kerberos hash to the RC4 mode (13100/18200) is wrong for
+/// the AES tickets impacket-GetUserSPNs / GetNPUsers return whenever the target
+/// account has AES keys — which is the AD/GOAD default. Feeding an AES (etype
+/// 17/18) hash to an RC4 mode makes hashcat reject it with a token-length error,
+/// so the hash never cracks even when its plaintext is in the wordlist.
+///
+/// - TGS-REP (Kerberoast):  etype 23 -> 13100, 17 -> 19600, 18 -> 19700
+/// - AS-REP (AS-REP roast): 18200 (impacket only emits the RC4 `$krb5asrep$`
+///   form; hashcat's AES modes 19800/19900 are a different `$krb5pa$` primitive)
 /// - Otherwise -> 1000 (NTLM)
 fn detect_hashcat_mode(hash_value: &str) -> i64 {
-    if hash_value.starts_with("$krb5tgs$") {
-        13100
+    // The etype is the integer field immediately after the `$krb5tgs$` prefix.
+    fn etype(rest: &str) -> Option<u32> {
+        rest.split('$').next()?.parse().ok()
+    }
+    if let Some(rest) = hash_value.strip_prefix("$krb5tgs$") {
+        match etype(rest) {
+            Some(17) => 19600,
+            Some(18) => 19700,
+            _ => 13100, // etype 23 (RC4) and any unrecognized etype
+        }
     } else if hash_value.starts_with("$krb5asrep$") {
         18200
     } else {
@@ -99,6 +133,20 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
 
     let mode =
         optional_i64(args, "hashcat_mode").unwrap_or_else(|| detect_hashcat_mode(hash_value));
+
+    // Serialize the whole crack job through the single hashcat slot. hashcat
+    // owns the GPU as one instance; two jobs collide on the shared session and
+    // the loser bails leaving the GPU idle. The orchestrator serializes crack
+    // *tasks*, but the agent loop dispatches every tool call in one LLM turn
+    // concurrently, so two `crack_with_hashcat` calls in a single turn would
+    // otherwise race. Held until this function returns (drop releases it).
+    let _hashcat_permit = crate::concurrency::acquire_hashcat_permit().await;
+
+    // Per-job session so a prior job SIGKILLed on timeout can't leave a stale
+    // restore file that wedges this run. `--restore-disable` (below) stops
+    // hashcat writing one at all; the unique name is belt-and-suspenders for
+    // any hashcat run that overlaps this one on the same box.
+    let session = next_crack_session("hc");
 
     // Write hash to a temp file that persists until command completes.
     let mut hash_file = tempfile::NamedTempFile::new()?;
@@ -172,6 +220,8 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
             .arg(&hash_path)
             .arg(&dyn_path)
             .flag("--runtime", per_list_secs.to_string())
+            .flag("--session", &session)
+            .arg("--restore-disable")
             .arg("--force")
             .timeout_secs(timeout_secs)
             .execute()
@@ -192,6 +242,8 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
             .arg(&hash_path)
             .arg(*wordlist)
             .flag("--runtime", per_list_secs.to_string())
+            .flag("--session", &session)
+            .arg("--restore-disable")
             .arg("--force")
             .timeout_secs(timeout_secs)
             .execute()
@@ -223,6 +275,8 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
                 .arg(rules_wordlist)
                 .flag("-r", rule.to_string())
                 .flag("--runtime", rules_per_combo.to_string())
+                .flag("--session", &session)
+                .arg("--restore-disable")
                 .arg("--force")
                 .timeout_secs(timeout_secs)
                 .execute()
@@ -242,6 +296,8 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
         .flag("-m", mode.to_string())
         .arg(&hash_path)
         .arg("--show")
+        .flag("--session", &session)
+        .arg("--restore-disable")
         .arg("--force")
         .timeout_secs(30)
         .execute()
@@ -280,6 +336,11 @@ pub async fn crack_with_john(args: &Value) -> Result<ToolOutput> {
 
     let hash_path = hash_file.path().to_string_lossy().to_string();
     let format_arg = hash_format.map(|f| format!("--format={f}"));
+
+    // Per-job John session so concurrent (or crash-leftover) runs don't collide
+    // on the default `.rec` restore file. `--show` reads the shared pot and
+    // needs no session.
+    let session_arg = format!("--session={}", next_crack_session("jtr"));
 
     // Build wordlist order
     let wordlists: Vec<&str> = if let Some(wl) = explicit_wordlist {
@@ -321,7 +382,8 @@ pub async fn crack_with_john(args: &Value) -> Result<ToolOutput> {
         let mut cmd = CommandBuilder::new("john")
             .arg(&hash_path)
             .arg(format!("--wordlist={dyn_path}"))
-            .arg(format!("--max-run-time={per_list_secs}"));
+            .arg(format!("--max-run-time={per_list_secs}"))
+            .arg(&session_arg);
         if let Some(ref fa) = format_arg {
             cmd = cmd.arg(fa);
         }
@@ -337,7 +399,8 @@ pub async fn crack_with_john(args: &Value) -> Result<ToolOutput> {
         let mut cmd = CommandBuilder::new("john")
             .arg(&hash_path)
             .arg(format!("--wordlist={wordlist}"))
-            .arg(format!("--max-run-time={per_list_secs}"));
+            .arg(format!("--max-run-time={per_list_secs}"))
+            .arg(&session_arg);
         if let Some(ref fa) = format_arg {
             cmd = cmd.arg(fa);
         }
@@ -374,7 +437,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_hashcat_mode_krb5tgs_aes() {
+        // impacket-GetUserSPNs returns AES tickets for AES-capable accounts
+        // (the AD/GOAD default). etype 17/18 must map to the AES TGS modes, not
+        // RC4's 13100 — otherwise hashcat rejects the hash and it never cracks.
+        // AES layout has no `*` after the etype: `$krb5tgs$17$user$realm$spn*$…`.
+        assert_eq!(
+            detect_hashcat_mode("$krb5tgs$17$user$realm$spn*$aabb$ccdd"),
+            19600
+        );
+        assert_eq!(
+            detect_hashcat_mode("$krb5tgs$18$user$realm$spn*$aabb$ccdd"),
+            19700
+        );
+    }
+
+    #[test]
     fn detect_hashcat_mode_krb5asrep() {
+        // impacket AS-REP roasting emits the RC4 `$krb5asrep$` form regardless
+        // of etype; mode 18200 is the only AS-REP mode that consumes it.
         assert_eq!(detect_hashcat_mode("$krb5asrep$23$user"), 18200);
     }
 

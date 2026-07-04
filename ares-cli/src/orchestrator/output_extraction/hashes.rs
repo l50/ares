@@ -5,8 +5,11 @@ use ares_core::models::{Credential, Hash};
 
 use super::{is_valid_credential, make_credential};
 
+// `\*?`: the `*` after the etype is present only in impacket's RC4 layout
+// (`$krb5tgs$23$*user$…`); AES tickets (etype 17/18) omit it
+// (`$krb5tgs$17$user$…`). Requiring it drops every AES kerberoast hash.
 static RE_TGS_HASH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\$krb5tgs\$\d+\$\*([^$*]+)\$([^$*]+)\$[^$]+\$[a-fA-F0-9$]+)").unwrap()
+    Regex::new(r"(\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$[^$]+\$[a-fA-F0-9$]+)").unwrap()
 });
 
 static RE_ASREP_HASH: LazyLock<Regex> =
@@ -408,9 +411,12 @@ fn is_well_known_local_sam(username: &str, rid: &str, has_domain_dump_evidence: 
     false
 }
 
-/// Hashcat cracked TGS: $krb5tgs$23$*user$DOMAIN$spn*$hash:plaintext
+/// Hashcat cracked TGS: `$krb5tgs$23$*user$DOMAIN$spn*$hash:plaintext` (RC4) or
+/// `$krb5tgs$17$user$DOMAIN$*spn*$hash:plaintext` (AES). impacket moves the `*`
+/// from before the user (RC4) to before the SPN (AES, `$*spn*$`), so both the
+/// leading-user star and the leading-SPN star must be optional (`\*?`).
 static RE_CRACKED_TGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$krb5tgs\$\d+\$\*([^$*]+)\$([^$*]+)\$[^*]+\*\$[a-fA-F0-9$]+:(.+)$").unwrap()
+    Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$\*?[^*]+\*\$[a-fA-F0-9$]+:(.+)$").unwrap()
 });
 
 /// Cracked AS-REP: $krb5asrep$23$user@DOMAIN:hash:plaintext (hashcat)
@@ -429,9 +435,10 @@ static RE_JOHN_SHOW: LazyLock<Regex> = LazyLock::new(|| {
 /// John --show unknown user: ?:plaintext (john can't determine username from TGS hashes)
 static RE_JOHN_UNKNOWN_USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\?:(.+)$").unwrap());
 
-/// Extract username/domain from a TGS hash in the output text.
+/// Extract username/domain from a TGS hash in the output text. `\*?` tolerates
+/// both RC4 (`$krb5tgs$23$*user…`) and AES (`$krb5tgs$17$user…`) layouts.
 static RE_TGS_HASH_USER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$krb5tgs\$\d+\$\*([^$*]+)\$([^$*]+)").unwrap());
+    LazyLock::new(|| Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)").unwrap());
 
 pub fn extract_cracked_passwords(output: &str, default_domain: &str) -> Vec<Credential> {
     let mut credentials = Vec::new();
@@ -603,6 +610,32 @@ WDAGUtilityAccount:504:aad3b435b51404eeaad3b435b51404ee:1234567890abcdef12345678
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0].hash_type, "kerberoast");
         assert_eq!(hashes[0].username, "svc_sql");
+    }
+
+    #[test]
+    fn extract_hashes_tgs_kerberoast_aes() {
+        // AES128 (etype 17) kerberoast from impacket. The real layout has NO `*`
+        // before the user and `$*spn*$` around the SPN (impacket format string
+        // `$krb5tgs$%d$%s$%s$*%s*$%s$%s`). Must be extracted so AES-capable SPN
+        // accounts reach the cracker.
+        let output = "$krb5tgs$17$svc_sql$CONTOSO.LOCAL$*MSSQLSvc/db01*$aabb$ccdd";
+        let hashes = extract_hashes(output, "CONTOSO.LOCAL");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].hash_type, "kerberoast");
+        assert_eq!(hashes[0].username, "svc_sql");
+        assert_eq!(hashes[0].domain, "CONTOSO.LOCAL");
+    }
+
+    #[test]
+    fn extract_cracked_passwords_hashcat_tgs_aes() {
+        // Cracked AES kerberoast --show line (mode 19600/19700 output). hashcat
+        // echoes the impacket hash verbatim, so the `*` sits before the SPN
+        // (`$*spn*$`), not after the etype.
+        let output = "$krb5tgs$17$svc_sql$CONTOSO.LOCAL$*MSSQLSvc/db01*$aabb$ccdd:Summer2024!";
+        let creds = extract_cracked_passwords(output, "CONTOSO.LOCAL");
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].username, "svc_sql");
+        assert_eq!(creds[0].password, "Summer2024!");
     }
 
     #[test]

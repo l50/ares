@@ -51,15 +51,21 @@ impl OperationRecoveryManager {
                 Ok(q) => q,
                 Err(e) => {
                     if attempt < MAX_CONNECTION_RETRIES {
+                        // `connect_state_only` opens both Redis and NATS, so a
+                        // failure here can originate from either backend (e.g. a
+                        // transient JetStream error). Don't pin the blame on
+                        // Redis — the wrong label previously read as "Redis
+                        // flapping" when the real fault was on the NATS side.
                         warn!(
                             attempt = attempt,
                             err = %e,
-                            "Redis connection failed, retrying"
+                            "State backend (Redis/NATS) connect failed, retrying"
                         );
                         last_err = Some(e);
                         continue;
                     }
-                    return Err(e).context("Failed to connect to Redis for recovery");
+                    return Err(e)
+                        .context("Failed to connect to state backend (Redis/NATS) for recovery");
                 }
             };
 
