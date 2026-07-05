@@ -13,7 +13,10 @@ use anyhow::{bail, Context, Result};
 use chrono::{Duration, Utc};
 use tracing::info;
 
-use ares_core::eval::ground_truth::create_ground_truth_from_red_state;
+use ares_core::eval::ground_truth::{
+    create_ground_truth_from_red_state, ExpectedIOC, ExpectedTimelineEvent,
+};
+use ares_core::models::PyramidLevel;
 use ares_core::state::RedisStateReader;
 
 use crate::redis_conn::{connect_redis, resolve_operation_id};
@@ -35,6 +38,7 @@ const DEFAULT_BENCHMARK_PROFILE: &str = "lab";
 const DEFAULT_BENCHMARK_REGION: &str = "us-west-1";
 
 /// Run the `benchmark capture` command.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_capture(
     redis_url: Option<String>,
     operation_id: Option<String>,
@@ -43,6 +47,7 @@ pub(crate) async fn run_capture(
     pre_window_hours: u32,
     post_window_minutes: u32,
     no_upload: bool,
+    attacker_ips: Vec<String>,
 ) -> Result<()> {
     eprint!("[1/8] Loading operation state from Redis...");
     let _ = std::io::stderr().flush();
@@ -97,7 +102,31 @@ pub(crate) async fn run_capture(
     info!("wrote {}", red_state_path.display());
 
     let techniques: Vec<String> = state.all_techniques.clone();
-    let ground_truth = create_ground_truth_from_red_state(&state, &techniques);
+    let mut ground_truth = create_ground_truth_from_red_state(&state, &techniques);
+    // Populate the expected attack timeline from the op's recorded event log
+    // (ares:op:{id}:timeline) so the blue investigation is scored on
+    // reconstructing the real sequence of attack events — otherwise the scorer
+    // sees an empty timeline and returns a vacuous perfect 1.0.
+    ground_truth.expected_timeline = fetch_expected_timeline(&mut conn, &op_id).await;
+    info!(
+        "captured {} expected timeline events",
+        ground_truth.expected_timeline.len()
+    );
+    // Operator-supplied attacker/source IPs: the attack's most blue-observable
+    // IOC, absent from the target-centric red state. Scored as required.
+    for ip in &attacker_ips {
+        ground_truth.expected_iocs.push(ExpectedIOC {
+            ioc_type: "ip".to_string(),
+            value: ip.clone(),
+            pyramid_level: PyramidLevel::IpAddresses,
+            mitre_techniques: Vec::new(),
+            required: true,
+            source: "attacker_infrastructure".to_string(),
+        });
+    }
+    if !attacker_ips.is_empty() {
+        info!("added {} attacker-source IOC(s)", attacker_ips.len());
+    }
     let gt_path = snapshot_dir.join("ground-truth.json");
     fs::write(&gt_path, serde_json::to_string_pretty(&ground_truth)?)
         .context("write ground-truth.json")?;
@@ -241,6 +270,53 @@ pub(crate) async fn run_capture(
     }
 
     Ok(())
+}
+
+/// A single event from the op's recorded attack timeline
+/// (`ares:op:{id}:timeline`). Only the fields the scorer needs are decoded;
+/// serde ignores the rest of the stored `TimelineEvent` payload.
+#[derive(serde::Deserialize)]
+struct RedTimelineEvent {
+    description: String,
+    #[serde(default)]
+    mitre_techniques: Vec<String>,
+    #[serde(default)]
+    timestamp: String,
+}
+
+/// Fetch the operation's recorded attack timeline and map it to the ground
+/// truth `ExpectedTimelineEvent` shape the blue-team scorer compares against.
+///
+/// Returns an empty vec if the op recorded no timeline (older ops) — the
+/// scorer then drops the timeline dimension rather than scoring it vacuously.
+async fn fetch_expected_timeline(
+    conn: &mut redis::aio::MultiplexedConnection,
+    op_id: &str,
+) -> Vec<ExpectedTimelineEvent> {
+    use redis::AsyncCommands;
+    let key = format!("ares:op:{op_id}:timeline");
+    let raw: Vec<String> = conn.lrange(&key, 0, -1).await.unwrap_or_default();
+    raw.iter()
+        .filter_map(|s| serde_json::from_str::<RedTimelineEvent>(s).ok())
+        // Keep only blue-observable events: drop red-internal notes such as
+        // failed exploit attempts and per-hash discovery — the hash values never
+        // reach defender telemetry (the dumping act is scored as a technique).
+        .filter(|e| {
+            let d = e.description.to_lowercase();
+            !d.starts_with("exploit attempted but failed") && !d.starts_with("hash discovered")
+        })
+        .map(|e| ExpectedTimelineEvent {
+            description_pattern: e.description,
+            mitre_techniques: e.mitre_techniques,
+            timestamp_range: chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                .ok()
+                .map(|t| {
+                    let u = t.with_timezone(&chrono::Utc);
+                    (u, u)
+                }),
+            required: true,
+        })
+        .collect()
 }
 
 /// Sync Loki S3 chunks and index files for the given time window.

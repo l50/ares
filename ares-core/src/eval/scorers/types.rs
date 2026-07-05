@@ -38,6 +38,7 @@ impl InvestigationSnapshot {
                 pyramid_level: e.pyramid_level.max(0) as u32,
                 confidence: e.confidence,
                 validated: e.validated,
+                mitre_techniques: e.mitre_techniques.clone(),
             })
             .collect();
 
@@ -47,7 +48,11 @@ impl InvestigationSnapshot {
             .max()
             .unwrap_or(0);
 
-        let timeline: Vec<TimelineEvent> = state
+        // Build the timeline from three sources so the agent's real
+        // reconstruction is scored — not just the explicit (and often unused)
+        // timeline: (1) explicit timeline events, (2) timestamped evidence,
+        // (3) lateral-movement connections.
+        let mut timeline: Vec<TimelineEvent> = state
             .timeline
             .iter()
             .map(|e| TimelineEvent {
@@ -55,6 +60,32 @@ impl InvestigationSnapshot {
                 mitre_techniques: e.mitre_techniques.iter().cloned().collect(),
             })
             .collect();
+        for e in &state.evidence {
+            if e.timestamp.is_some() {
+                // The description is matched against the expected red-event text,
+                // so use the evidence value (the IOC/observation). `source` is
+                // only a provenance label ("Where this evidence was found", e.g.
+                // "loki") and never matches the attack prose.
+                let description = if e.value.is_empty() {
+                    e.source.clone()
+                } else {
+                    e.value.clone()
+                };
+                timeline.push(TimelineEvent {
+                    description,
+                    mitre_techniques: e.mitre_techniques.iter().cloned().collect(),
+                });
+            }
+        }
+        for l in &state.lateral {
+            timeline.push(TimelineEvent {
+                description: format!(
+                    "{} lateral movement from {} to {} via {}",
+                    l.user, l.source_host, l.destination_host, l.method
+                ),
+                mitre_techniques: std::iter::once("T1021".to_string()).collect(),
+            });
+        }
 
         Self {
             stage: Some(state.stage.clone()),
@@ -76,6 +107,9 @@ pub struct EvidenceItem {
     pub pyramid_level: u32,
     pub confidence: f64,
     pub validated: bool,
+    /// MITRE technique tags on this evidence (so behavioral observations that
+    /// aren't a discrete IOC value can still be grounded by technique).
+    pub mitre_techniques: Vec<String>,
 }
 
 /// A timeline event.
@@ -131,6 +165,32 @@ mod tests {
         assert_eq!(e.pyramid_level, 3);
         assert!((e.confidence - 0.85).abs() < f64::EPSILON);
         assert!(e.validated);
+    }
+
+    #[test]
+    fn from_blue_state_evidence_timeline_uses_value() {
+        // A timestamped evidence item becomes a timeline event described by its
+        // value (the IOC), not its provenance label ("loki").
+        let mut state = empty_blue_state();
+        state.evidence.push(Evidence {
+            id: "e1".into(),
+            evidence_type: "ip".into(),
+            value: "192.168.58.1".into(),
+            source: "loki".into(),
+            timestamp: Some("2026-07-01T00:00:00Z".into()),
+            pyramid_level: 2,
+            mitre_techniques: vec![],
+            confidence: 0.9,
+            metadata: Default::default(),
+            validated: true,
+            source_query_id: None,
+        });
+        let snap = InvestigationSnapshot::from_blue_state(&state);
+        assert!(snap
+            .timeline
+            .iter()
+            .any(|t| t.description == "192.168.58.1"));
+        assert!(!snap.timeline.iter().any(|t| t.description == "loki"));
     }
 
     #[test]

@@ -30,6 +30,12 @@ pub(crate) enum BenchmarkCommands {
         /// Skip automatic S3 upload after capture
         #[arg(long)]
         no_upload: bool,
+
+        /// Attacker/operator source IP(s), comma-separated, scored as required
+        /// IOCs. The attack's most blue-observable indicator, which the
+        /// target-centric red state does not record — supply it here.
+        #[arg(long, value_delimiter = ',')]
+        attacker_ips: Vec<String>,
     },
 
     /// Import a snapshot's Loki data into a target Loki instance.

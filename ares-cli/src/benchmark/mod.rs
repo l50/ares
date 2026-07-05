@@ -24,6 +24,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
             pre_window_hours,
             post_window_minutes,
             no_upload,
+            attacker_ips,
         } => {
             capture::run_capture(
                 redis_url,
@@ -33,6 +34,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
                 pre_window_hours,
                 post_window_minutes,
                 no_upload,
+                attacker_ips,
             )
             .await
         }

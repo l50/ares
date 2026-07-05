@@ -59,6 +59,7 @@ fn techniques_for_vuln_type() {
 fn ground_truth_filters() {
     let gt = EvaluationGroundTruth {
         operation_id: "op-1".to_string(),
+        host_aliases: vec![],
         target_ip: "192.168.58.10".to_string(),
         expected_iocs: vec![
             ExpectedIOC {
