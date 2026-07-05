@@ -44,8 +44,20 @@ pub async fn query_instant(args: &Value) -> Result<ToolOutput> {
 
     let client = http_client();
     let mut params = vec![("query", promql.to_string())];
-    if let Some(t) = time {
-        params.push(("time", t.to_string()));
+    match time {
+        // An explicit `time` is passed through verbatim, including in replay:
+        // the agent is prompted in replay-clock time, so a caller-supplied
+        // instant is already attack-relative. A literal wall-clock value would
+        // fall outside the captured window and return nothing — the prompt
+        // anchor (see ares-llm prompt/blue.rs) exists to prevent that.
+        Some(t) => params.push(("time", t.to_string())),
+        // During replay, pin an omitted `time` to the replay clock so "now"
+        // resolves to attack-time instead of the Prometheus server's wall clock.
+        None => {
+            if super::replay_clock::is_replay() {
+                params.push(("time", super::replay_clock::replay_now().to_rfc3339()));
+            }
+        }
     }
 
     let resp = client

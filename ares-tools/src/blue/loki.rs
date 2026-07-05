@@ -355,17 +355,21 @@ pub(crate) fn time_window_around(
     let ts: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(timestamp)
         .or_else(|_| chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.fZ"))
         .map(|d| d.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now());
+        .unwrap_or_else(|_| super::replay_clock::replay_now());
     let start = ts - chrono::Duration::minutes(window_minutes);
     let end = ts + chrono::Duration::minutes(window_minutes);
     (start, end)
 }
 
 /// Compute a sliding `(start, end)` for "last `hours_back` hours from now".
+///
+/// "Now" is the replay clock ([`super::replay_clock::replay_now`]): wall-clock
+/// during a live investigation, or the attack-time anchor during a replay so
+/// stale-alert / "recent" queries land on the captured window.
 pub(crate) fn time_window_recent(
     hours_back: i64,
 ) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
-    let now = chrono::Utc::now();
+    let now = super::replay_clock::replay_now();
     let start = now - chrono::Duration::hours(hours_back);
     (start, now)
 }
@@ -416,7 +420,7 @@ pub async fn query_logs_progressive(args: &Value) -> Result<ToolOutput> {
     let limit = optional_i64(args, "limit").unwrap_or(100);
 
     let ts = chrono::DateTime::parse_from_rfc3339(reference_timestamp)
-        .unwrap_or_else(|_| chrono::Utc::now().into());
+        .unwrap_or_else(|_| super::replay_clock::replay_now().into());
 
     // Progressive windows: 30min, 1h, 6h (24h removed — causes Loki timeouts)
     for window_minutes in [30, 60, 360] {

@@ -130,6 +130,16 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let loki_url = replay_infra.loki_url();
     info!("Loki URL: {loki_url}");
 
+    // Point the blue agent's full observability surface at the replay box.
+    // LOKI_URL is (re)set inside run_replay_inner; these siblings flow through
+    // collect_env_vars → Redis → the orchestrator process alongside it.
+    // SAFETY: single-threaded replay setup, before any investigation runs.
+    unsafe {
+        std::env::set_var("GRAFANA_URL", replay_infra.grafana_url());
+        std::env::set_var("PROMETHEUS_URL", replay_infra.prometheus_url());
+        std::env::set_var("TEMPO_URL", replay_infra.tempo_url());
+    }
+
     // From here on, ensure teardown happens on error
     let result = run_replay_inner(
         &p,
@@ -207,6 +217,25 @@ async fn run_replay_inner(
     };
 
     info!("trigger built (mode={effective_trigger_mode})");
+
+    // Anchor the replay clock at the trigger time so the blue agent's
+    // "recent"/relative-window queries and the initial-alert prompt land on the
+    // captured attack instead of wall-clock now (read via ARES_REPLAY_CLOCK_START
+    // by ares-tools::blue::replay_clock and the prompt builder).
+    // SAFETY: single-threaded replay setup, before the investigation runs.
+    if let Some(anchor) = alert_json
+        .get("startsAt")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            alert_json
+                .pointer("/operation_context/attack_window_start")
+                .and_then(|v| v.as_str())
+        })
+    {
+        unsafe {
+            std::env::set_var("ARES_REPLAY_CLOCK_START", anchor);
+        }
+    }
 
     // ── Submit investigation via NATS ────────────────────────────────────
     let effective_model = resolve_model(&p.model);

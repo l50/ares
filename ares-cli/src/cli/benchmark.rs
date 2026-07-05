@@ -20,11 +20,11 @@ pub(crate) enum BenchmarkCommands {
         output_dir: String,
 
         /// Hours before attack start to include in the capture window
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 6)]
         pre_window_hours: u32,
 
         /// Minutes after attack end to include in the capture window
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 360)]
         post_window_minutes: u32,
 
         /// Skip automatic S3 upload after capture

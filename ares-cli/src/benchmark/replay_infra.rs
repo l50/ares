@@ -43,14 +43,30 @@ impl ReplayConfig {
     /// Optional: `BENCHMARK_S3_BUCKET`, `BENCHMARK_SUBNET_ID`, `BENCHMARK_INSTANCE_TYPE`,
     /// `BENCHMARK_AWS_PROFILE`, `BENCHMARK_AWS_REGION`.
     pub fn from_env() -> Result<Self> {
-        let security_group_id = std::env::var("BENCHMARK_SECURITY_GROUP_ID")
-            .context("BENCHMARK_SECURITY_GROUP_ID is required")?;
-        let instance_profile = std::env::var("BENCHMARK_INSTANCE_PROFILE")
-            .context("BENCHMARK_INSTANCE_PROFILE is required")?;
+        // External-stack mode (BENCHMARK_STACK_IP set) doesn't provision an EC2,
+        // so the launch params (SG / instance profile / subnet) are optional then.
+        let external = std::env::var("BENCHMARK_STACK_IP")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
 
-        let subnet_id = match std::env::var("BENCHMARK_SUBNET_ID") {
-            Ok(id) => id,
-            Err(_) => detect_subnet()?,
+        let security_group_id = std::env::var("BENCHMARK_SECURITY_GROUP_ID").unwrap_or_default();
+        let instance_profile = std::env::var("BENCHMARK_INSTANCE_PROFILE").unwrap_or_default();
+        if !external {
+            if security_group_id.is_empty() {
+                bail!("BENCHMARK_SECURITY_GROUP_ID is required");
+            }
+            if instance_profile.is_empty() {
+                bail!("BENCHMARK_INSTANCE_PROFILE is required");
+            }
+        }
+
+        let subnet_id = if external {
+            String::new()
+        } else {
+            match std::env::var("BENCHMARK_SUBNET_ID") {
+                Ok(id) => id,
+                Err(_) => detect_subnet()?,
+            }
         };
 
         Ok(Self {
@@ -89,6 +105,23 @@ impl ReplayInfra {
     /// 4. Runs setup via SSM (install Loki, download data, start)
     /// 5. Polls Loki readiness from the caller's perspective
     pub fn provision(op_id: &str, config: &ReplayConfig) -> Result<Self> {
+        // External-stack mode: point at an already-running, already-loaded replay
+        // stack box (BENCHMARK_STACK_IP=<private-ip>) instead of provisioning one.
+        // Used to run a blue investigation against a pre-provisioned in-fleet-VPC
+        // stack; teardown is a no-op (empty instance_id).
+        if let Ok(ip) = std::env::var("BENCHMARK_STACK_IP") {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() {
+                info!("using external replay stack at {ip} (BENCHMARK_STACK_IP set; skipping provisioning)");
+                return Ok(Self {
+                    instance_id: String::new(),
+                    private_ip: ip,
+                    aws_profile: config.aws_profile.clone(),
+                    aws_region: config.aws_region.clone(),
+                });
+            }
+        }
+
         // ── Resolve AMI ─────────────────────────────────────────────────
         let ami_id = resolve_ami(&config.aws_profile, &config.aws_region)?;
         info!("resolved AMI: {ami_id}");
@@ -268,6 +301,23 @@ impl ReplayInfra {
     /// Return the Loki URL for this replay instance.
     pub fn loki_url(&self) -> String {
         format!("http://{}:3100", self.private_ip)
+    }
+
+    /// Grafana URL for this replay instance — the blue agent's alert/annotation
+    /// surface, and (with a provisioned `loki` datasource) the Loki proxy.
+    pub fn grafana_url(&self) -> String {
+        format!("http://{}:3000", self.private_ip)
+    }
+
+    /// Prometheus URL for this replay instance (ThreatHunter metric queries).
+    pub fn prometheus_url(&self) -> String {
+        format!("http://{}:9090", self.private_ip)
+    }
+
+    /// Tempo URL for this replay instance (stack parity only; no blue tool
+    /// queries traces, but the datasource resolves so nothing errors).
+    pub fn tempo_url(&self) -> String {
+        format!("http://{}:3200", self.private_ip)
     }
 
     /// Terminate the replay EC2 instance.

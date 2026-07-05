@@ -50,6 +50,18 @@ pub struct SnapshotManifest {
     /// Number of Grafana alert annotations captured.
     pub alerts_captured: usize,
 
+    /// Number of Prometheus series captured over the window (via Grafana proxy).
+    #[serde(default)]
+    pub metrics_series: usize,
+
+    /// Number of Grafana dashboards captured.
+    #[serde(default)]
+    pub dashboards_captured: usize,
+
+    /// Number of Grafana annotations captured (all types, unfiltered).
+    #[serde(default)]
+    pub annotations_captured: usize,
+
     /// MITRE ATT&CK technique IDs used in this operation.
     pub techniques: Vec<String>,
 

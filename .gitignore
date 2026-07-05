@@ -46,8 +46,11 @@ __pycache__/
 # direnv
 .envrc
 
-# Benchmark snapshots (local Loki data)
-benchmarks/
+# Benchmark snapshots (local Loki data) — ignore data, keep the replay-stack code
+benchmarks/*
+!benchmarks/replay-stack/
+benchmarks/replay-stack/data/
+/snapshots*/
 
 # Misc
 TODO

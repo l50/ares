@@ -326,8 +326,11 @@ pub fn build_initial_alert_prompt(
         ctx.insert("target_users", &None::<String>);
     }
 
-    // Current time values for queries
-    let now = chrono::Utc::now();
+    // Current time values for queries. During a benchmark replay, anchor "now"
+    // to the shared replay clock (ARES_REPLAY_CLOCK_START = first fired alert) so
+    // the template's "query from now-2h to now" window lands on the captured
+    // attack instead of wall-clock now.
+    let now = ares_core::replay_clock::replay_now();
     ctx.insert("current_time", &now.to_rfc3339());
     ctx.insert(
         "current_time_minus_1h",

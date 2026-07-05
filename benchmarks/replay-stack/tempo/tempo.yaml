@@ -1,0 +1,11 @@
+# Minimal Tempo — parity only (no blue tool queries traces). Serves an empty
+# store so the Grafana Tempo datasource resolves.
+server:
+  http_listen_port: 3200
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
