@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # vector
 
 ## Description
@@ -77,5 +76,4 @@ Vector log shipper — file/syslog sources to an S3 store-and-forward sink for o
 - Ubuntu: all
 - Debian: all
 - Kali: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->

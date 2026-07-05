@@ -1,5 +1,4 @@
 <!-- DOCSIBLE START -->
-<!-- DOCSIBLE START -->
 # aws_ssm_agent
 
 ## Description
@@ -87,5 +86,4 @@ Install and configure AWS SSM Agent
 - Ubuntu: all
 - Debian: all
 - Windows: all
-<!-- DOCSIBLE END -->
 <!-- DOCSIBLE END -->
