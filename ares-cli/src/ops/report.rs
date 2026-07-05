@@ -66,6 +66,11 @@ pub(crate) async fn generate_and_cache_report(
         .set(&key, &report)
         .await
         .with_context(|| format!("Failed to cache report at {key}"))?;
+    // Written after finalize_operation's retention sweep, so bound its lifetime
+    // directly with the same TTL. Best-effort: caching succeeded either way.
+    let _: redis::RedisResult<i64> = conn
+        .expire(&key, ares_core::state::OP_RETENTION_TTL_SECS)
+        .await;
 
     Ok(report)
 }

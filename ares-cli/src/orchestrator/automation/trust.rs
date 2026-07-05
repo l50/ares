@@ -2132,7 +2132,8 @@ async fn dispatch_post_ticket_user_enumeration(
             "  {\"username\": \"samaccountname\", \"domain\": \"target.domain\", ",
             "\"source\": \"ldap_enumeration\", \"memberOf\": [\"Group1\"]}\n",
             "Flag DoesNotRequirePreAuth as vuln_type='asrep_roastable' and SPNs as ",
-            "vuln_type='kerberoastable'."
+            "vuln_type='kerberoastable'. For those findings set the finding `target` to ",
+            "the affected account's sAMAccountName (not an IP or DC hostname) so it is roasted."
         ),
     });
 

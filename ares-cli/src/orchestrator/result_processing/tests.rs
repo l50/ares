@@ -3,7 +3,9 @@ use super::admin_checks::{
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
 use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
-use super::{result_has_credential_evidence, result_has_parser_evidence};
+use super::{
+    extract_asrep_roastable_users, result_has_credential_evidence, result_has_parser_evidence,
+};
 use ares_core::models::{Credential, Hash};
 use serde_json::json;
 
@@ -2598,4 +2600,159 @@ fn keycredlink_denied_accepts_worker_error_string() {
         &None,
         "INSUFF_ACCESS_RIGHTS on msDS-KeyCredentialLink for target CB-ATTK1$"
     ));
+}
+
+// ── extract_asrep_roastable_users ──
+
+/// Shape a `report_finding` payload the way `merge_result_extras` / the
+/// `report_finding` callback produce it: an `llm_findings` array of
+/// `{vulnerabilities: [{vuln_type, target, details}]}` objects.
+fn asrep_finding(vuln: serde_json::Value) -> serde_json::Value {
+    json!({ "llm_findings": [ { "vulnerabilities": [vuln] } ] })
+}
+
+#[test]
+fn asrep_finding_target_names_account() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "alice",
+        "details": {"description": "DoesNotRequirePreAuth set"},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "alice");
+    assert_eq!(users[0].domain, "contoso.local");
+    assert_eq!(users[0].source, "asrep_roastable_finding");
+}
+
+#[test]
+fn asrep_finding_details_domain_overrides_default() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "bob",
+        "details": {"domain": "fabrikam.local"},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "bob");
+    assert_eq!(users[0].domain, "fabrikam.local");
+}
+
+#[test]
+fn asrep_finding_upn_target_yields_sam_and_realm() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "carol@fabrikam.local",
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "carol");
+    assert_eq!(users[0].domain, "fabrikam.local");
+}
+
+#[test]
+fn asrep_finding_netbios_qualified_target_strips_domain_prefix() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "CONTOSO\\alice",
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "alice");
+    // NetBIOS prefix is not a DNS realm — fall back to the task domain.
+    assert_eq!(users[0].domain, "contoso.local");
+}
+
+#[test]
+fn asrep_finding_ip_target_falls_back_to_description() {
+    // The agent put the DC IP in `target`; recover the account from the prose.
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "192.168.58.10",
+        "details": {"description": "User alice has DoesNotRequirePreAuth enabled."},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "alice");
+    assert_eq!(users[0].domain, "contoso.local");
+}
+
+#[test]
+fn asrep_finding_structured_account_field_preferred() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "192.168.58.10",
+        "details": {"account_name": "svc_backup", "domain": "contoso.local"},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "svc_backup");
+    assert_eq!(users[0].domain, "contoso.local");
+}
+
+#[test]
+fn asrep_finding_ignores_non_asrep_vuln_types() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "kerberoastable",
+        "target": "svc_sql",
+    }));
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_machine_account_target_rejected() {
+    // No structured account field and no prose principal; the `$`-suffixed
+    // target is not a roastable user.
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "DC01$",
+    }));
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_unresolvable_principal_skipped() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "192.168.58.10",
+        "details": {"description": "Domain controller allows AS-REP roasting."},
+    }));
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_no_llm_findings_key() {
+    let payload = json!({"discoveries": {"hashes": []}});
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_case_insensitive_vuln_type() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "ASREP_Roastable",
+        "target": "alice",
+    }));
+    assert_eq!(
+        extract_asrep_roastable_users(&payload, "contoso.local").len(),
+        1
+    );
+}
+
+#[test]
+fn asrep_finding_multiple_findings_all_recovered() {
+    let payload = json!({
+        "llm_findings": [
+            {"vulnerabilities": [{"vuln_type": "asrep_roastable", "target": "alice"}]},
+            {"vulnerabilities": [
+                {"vuln_type": "kerberoastable", "target": "svc_sql"},
+                {"vuln_type": "asrep_roastable", "target": "bob@fabrikam.local"},
+            ]},
+        ]
+    });
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].username, "alice");
+    assert_eq!(users[0].domain, "contoso.local");
+    assert_eq!(users[1].username, "bob");
+    assert_eq!(users[1].domain, "fabrikam.local");
 }

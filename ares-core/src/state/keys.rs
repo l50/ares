@@ -9,6 +9,15 @@ pub const LOCK_PREFIX: &str = "ares:lock";
 /// Redis key prefix for task status records.
 pub const TASK_STATUS_PREFIX: &str = "ares:task_status";
 
+/// Retention TTL (seconds) applied to every remaining `ares:op:{id}:*` key when
+/// an operation is finalized. Bounds Redis growth under the `noeviction` policy:
+/// most per-op keys (hosts, hashes, credentials, loot, techniques, ...) are
+/// written without a TTL and would otherwise accumulate across every operation
+/// ever run. 24h matches the meta key's TTL, so an operation's full state
+/// expires in step with its discoverability — reports and blue learning resolve
+/// operations via the meta key, which is already gone by then.
+pub const OP_RETENTION_TTL_SECS: i64 = 86_400;
+
 // Collection key suffixes (appended to `ares:op:{op_id}:`)
 /// Redis HASH key suffix for discovered credentials (dedup_key → JSON).
 pub const KEY_CREDENTIALS: &str = "credentials";

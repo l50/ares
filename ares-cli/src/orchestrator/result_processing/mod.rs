@@ -21,6 +21,7 @@ pub use discovery_polling::discovery_poller;
 use std::sync::Arc;
 
 use anyhow::Result;
+use ares_core::models::User;
 use redis::aio::ConnectionLike;
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -213,6 +214,13 @@ pub async fn process_completed_task(
             share_auth_label.as_deref(),
         )
         .await;
+
+        // Recover AS-REP-roastable principals the agent flagged via
+        // `report_finding` (routed into `llm_findings`, not `discoveries`) and
+        // publish them as users. Without this the deterministic `asrep_roast`
+        // automation — which reads its userlist from `state.users` — never
+        // targets an account that only ever surfaced as a finding.
+        publish_asrep_roastable_findings(payload, dispatcher, &default_domain).await;
     }
 
     // Mark host as owned when a credential_access task succeeds AND parser
@@ -1328,6 +1336,204 @@ fn roast_exploit_token(hash_value: &str, username: &str, domain: &str) -> Option
         Some(format!("asrep_roast_{key}"))
     } else {
         None
+    }
+}
+
+/// True when `s` is a dotted-quad IPv4 literal (four all-digit segments).
+/// Used to reject a finding `target` that names the DC IP rather than the
+/// affected account.
+fn is_ipv4_like(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// True when `s` is a usable bare `sAMAccountName` — no realm/domain
+/// qualifier, no whitespace, not an IP address, not a machine account.
+/// Keeps finding-derived userlists from feeding garbage principals to the
+/// deterministic AS-REP roast.
+fn is_plausible_username(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() > 1
+        && !s.contains(char::is_whitespace)
+        && !s.ends_with('$')
+        && !s.contains('/')
+        && !s.contains('@')
+        && !s.contains('\\')
+        && !is_ipv4_like(s)
+}
+
+/// Split a principal token into `(sAMAccountName, optional realm)`, unwrapping
+/// UPN (`sam@realm.tld`) and `DOMAIN\sam` forms. The realm is only returned
+/// for UPN input — a NetBIOS `DOMAIN\` prefix is not a DNS realm, so the
+/// caller falls back to the task domain there.
+fn split_principal(raw: &str) -> (String, Option<String>) {
+    let raw = raw.trim();
+    if let Some((sam, realm)) = raw.split_once('@') {
+        if !sam.is_empty() && realm.contains('.') {
+            return (sam.to_string(), Some(realm.to_string()));
+        }
+    }
+    if let Some((_, sam)) = raw.rsplit_once('\\') {
+        return (sam.trim().to_string(), None);
+    }
+    (raw.to_string(), None)
+}
+
+/// Best-effort principal recovery from a finding's free-text description.
+/// Prefers unambiguous UPN (`sam@realm.tld`) / `DOMAIN\sam` tokens, then falls
+/// back to the token following a `user`/`account` keyword (e.g.
+/// "User alice has DoesNotRequirePreAuth"). Returns the raw token; the caller
+/// normalises it via [`split_principal`].
+fn username_from_finding_description(desc: &str) -> Option<String> {
+    let clean = |t: &str| {
+        t.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '\'' | '"' | '(' | ')' | '`'))
+            .to_string()
+    };
+    let tokens: Vec<String> = desc
+        .split_whitespace()
+        .map(clean)
+        .filter(|t| !t.is_empty())
+        .collect();
+    for tok in &tokens {
+        if let Some((sam, realm)) = tok.split_once('@') {
+            if !sam.is_empty() && realm.contains('.') && is_plausible_username(sam) {
+                return Some(tok.clone());
+            }
+        }
+        if let Some((_, sam)) = tok.rsplit_once('\\') {
+            if is_plausible_username(sam) {
+                return Some(tok.clone());
+            }
+        }
+    }
+    for pair in tokens.windows(2) {
+        let kw = pair[0].to_lowercase();
+        if (kw == "user" || kw == "account") && is_plausible_username(&pair[1]) {
+            return Some(pair[1].clone());
+        }
+    }
+    None
+}
+
+/// Pull the raw principal token a `report_finding(vuln_type=asrep_roastable)`
+/// names, in priority order: a structured `details` account field, the finding
+/// `target` (where the recon prompts now place the sAMAccountName), then a
+/// principal parsed out of the description. Returns the raw token (possibly UPN
+/// or `DOMAIN\user`); [`split_principal`] normalises it.
+fn asrep_principal_candidate(vuln: &Value) -> Option<String> {
+    let details = vuln.get("details");
+    if let Some(d) = details {
+        for k in ["account_name", "username", "principal", "sam_account_name"] {
+            if let Some(s) = d.get(k).and_then(|v| v.as_str()) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(s) = vuln.get("target").and_then(|v| v.as_str()) {
+        let (sam, _) = split_principal(s);
+        if is_plausible_username(&sam) {
+            return Some(s.trim().to_string());
+        }
+    }
+    details
+        .and_then(|d| d.get("description"))
+        .and_then(|v| v.as_str())
+        .and_then(username_from_finding_description)
+}
+
+/// Recover AS-REP-roastable principals named in LLM `report_finding` findings
+/// as publishable [`User`] records. Pure — no Redis, no dispatcher.
+///
+/// The recon / cross-forest-enum prompts tell the agent to flag
+/// `DoesNotRequirePreAuth` accounts by calling `report_finding` with
+/// `vuln_type='asrep_roastable'`. Those findings route into `llm_findings`
+/// (never `discoveries`), so the named principal never reaches `state.users`
+/// and the already-wired deterministic `asrep_roast` — which reads its
+/// userlist from `state.users` — has nothing to roast. This recovers the
+/// principal so it can be published, mirroring the `ldap_extraction` recovery
+/// in 58a7d52 (a recon-only discovery path that never persisted its users).
+///
+/// Published with the low-trust `asrep_roastable_finding` source: it feeds
+/// `select_asrep_work` / `collect_known_users_for_domain` (which filter by
+/// domain, not source) without entering the verified loot roster — the roast
+/// itself is self-verifying, since a hallucinated account only draws
+/// `KDC_ERR_C_PRINCIPAL_UNKNOWN`.
+pub(crate) fn extract_asrep_roastable_users(payload: &Value, default_domain: &str) -> Vec<User> {
+    let Some(findings) = payload.get("llm_findings").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut users = Vec::new();
+    for finding in findings {
+        let Some(vulns) = finding.get("vulnerabilities").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for vuln in vulns {
+            let vuln_type = vuln.get("vuln_type").and_then(|v| v.as_str()).unwrap_or("");
+            if !vuln_type.eq_ignore_ascii_case("asrep_roastable") {
+                continue;
+            }
+            let Some(raw) = asrep_principal_candidate(vuln) else {
+                continue;
+            };
+            let (sam, upn_domain) = split_principal(&raw);
+            if !is_plausible_username(&sam) {
+                continue;
+            }
+            let domain = vuln
+                .get("details")
+                .and_then(|d| d.get("domain"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(upn_domain)
+                .unwrap_or_else(|| default_domain.to_string());
+            users.push(User {
+                username: sam,
+                domain,
+                description:
+                    "DoesNotRequirePreAuth (AS-REP roastable) — recovered from report_finding"
+                        .to_string(),
+                is_admin: false,
+                source: "asrep_roastable_finding".to_string(),
+            });
+        }
+    }
+    users
+}
+
+/// Publish AS-REP-roastable principals recovered from `report_finding`
+/// findings so the deterministic `asrep_roast` automation targets them.
+///
+/// See [`extract_asrep_roastable_users`]. Publishing each principal into
+/// `state.users` re-arms `select_asrep_work` for its domain — the userlist
+/// transitions from `:empty` to `:users` and `publish_user` clears the
+/// per-domain AS-REP dedup — which dispatches a deterministic
+/// `GetNPUsers -usersfile <known_users>` against the DC. That is the
+/// load-bearing no-cred foothold into a SID-filtered foreign forest.
+async fn publish_asrep_roastable_findings(
+    payload: &Value,
+    dispatcher: &Arc<Dispatcher>,
+    default_domain: &str,
+) {
+    for user in extract_asrep_roastable_users(payload, default_domain) {
+        let username = user.username.clone();
+        let domain = user.domain.clone();
+        match dispatcher.state.publish_user(&dispatcher.queue, user).await {
+            Ok(true) => info!(
+                username = %username,
+                domain = %domain,
+                "Published AS-REP-roastable principal from report_finding — armed deterministic asrep_roast"
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(err = %e, "Failed to publish AS-REP-roastable principal from finding"),
+        }
     }
 }
 

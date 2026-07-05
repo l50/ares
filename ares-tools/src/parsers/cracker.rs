@@ -7,12 +7,16 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 
-/// Hashcat cracked TGS: `$krb5tgs$23$*user$DOMAIN$spn*$hash:plaintext` (RC4) or
-/// `$krb5tgs$17$user$DOMAIN$*spn*$hash:plaintext` (AES). impacket moves the `*`
-/// from before the user (RC4) to before the SPN (AES, `$*spn*$`), so both the
-/// leading-user star and the leading-SPN star must be optional (`\*?`).
+/// Hashcat cracked TGS line, in the format hashcat itself *emits* (outfile /
+/// `--show`) — which differs by mode:
+///   RC4 (13100): `$krb5tgs$23$*user$realm$spn*$checksum$edata:plaintext`
+///   AES (17/18): `$krb5tgs$17$user$realm$checksum$edata:plaintext`  (no spn, no stars)
+/// hashcat normalizes AES tickets and strips the SPN in its output, so the
+/// whole `spn*$` segment must be optional, not just its leading star. Verified
+/// against hashcat's own example-hash cracked output for -m 19600 and -m 13100.
 static RE_CRACKED_TGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$\*?[^*]+\*\$[a-fA-F0-9$]+:(.+)$").unwrap()
+    Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$(?:[^*:]+\*\$)?[a-fA-F0-9$]+:(.+)$")
+        .unwrap()
 });
 
 /// Cracked AS-REP: $krb5asrep$23$user@DOMAIN:hash:plaintext (hashcat)
@@ -247,11 +251,12 @@ $krb5tgs$23$*sarah.connor$CHILD.CONTOSO.LOCAL$child.contoso.local/sarah.connor*$
 
     #[test]
     fn parse_hashcat_tgs_aes_cracked() {
-        // AES128 (etype 17) kerberoast --show line. Real impacket layout: no `*`
-        // before the user, `$*spn*$` around the SPN (format `$krb5tgs$%d$%s$%s$*%s*$…`).
-        // Regression guard for AES-capable SPN accounts (the AD/GOAD default).
+        // AES128 (etype 17) cracked line in the format hashcat actually EMITS:
+        // it normalizes the ticket and strips the SPN, so there is no `*`/spn —
+        // `$krb5tgs$17$user$realm$checksum$edata:plaintext`. (Captured live from
+        // `-m 19600` outfile on the T4.) Regression guard for the AD/GOAD default.
         let output = r#"--- hashcat --show ---
-$krb5tgs$17$svc_sql$CONTOSO.LOCAL$*MSSQLSvc/db01.contoso.local*$abc123$def456:MyPassword1
+$krb5tgs$17$svc_sql$CONTOSO.LOCAL$abc1230000000000000000ab$def4567890abcdef1234567890abcdef:MyPassword1
 "#;
         let params = json!({"domain": "contoso.local"});
         let creds = parse_cracker_output(output, &params);

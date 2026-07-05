@@ -411,12 +411,16 @@ fn is_well_known_local_sam(username: &str, rid: &str, has_domain_dump_evidence: 
     false
 }
 
-/// Hashcat cracked TGS: `$krb5tgs$23$*user$DOMAIN$spn*$hash:plaintext` (RC4) or
-/// `$krb5tgs$17$user$DOMAIN$*spn*$hash:plaintext` (AES). impacket moves the `*`
-/// from before the user (RC4) to before the SPN (AES, `$*spn*$`), so both the
-/// leading-user star and the leading-SPN star must be optional (`\*?`).
+/// Hashcat cracked TGS line, in the format hashcat itself *emits* (outfile /
+/// `--show`) — which differs by mode:
+///   RC4 (13100): `$krb5tgs$23$*user$realm$spn*$checksum$edata:plaintext`
+///   AES (17/18): `$krb5tgs$17$user$realm$checksum$edata:plaintext`  (no spn, no stars)
+/// hashcat normalizes AES tickets and strips the SPN in its output, so the
+/// whole `spn*$` segment must be optional, not just its leading star. Verified
+/// against hashcat's own example-hash cracked output for -m 19600 and -m 13100.
 static RE_CRACKED_TGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$\*?[^*]+\*\$[a-fA-F0-9$]+:(.+)$").unwrap()
+    Regex::new(r"\$krb5tgs\$\d+\$\*?([^$*]+)\$([^$*]+)\$(?:[^*:]+\*\$)?[a-fA-F0-9$]+:(.+)$")
+        .unwrap()
 });
 
 /// Cracked AS-REP: $krb5asrep$23$user@DOMAIN:hash:plaintext (hashcat)
@@ -628,10 +632,10 @@ WDAGUtilityAccount:504:aad3b435b51404eeaad3b435b51404ee:1234567890abcdef12345678
 
     #[test]
     fn extract_cracked_passwords_hashcat_tgs_aes() {
-        // Cracked AES kerberoast --show line (mode 19600/19700 output). hashcat
-        // echoes the impacket hash verbatim, so the `*` sits before the SPN
-        // (`$*spn*$`), not after the etype.
-        let output = "$krb5tgs$17$svc_sql$CONTOSO.LOCAL$*MSSQLSvc/db01*$aabb$ccdd:Summer2024!";
+        // Cracked AES kerberoast line as hashcat EMITS it for -m 19600/19700:
+        // the SPN is stripped/normalized away, leaving `$krb5tgs$17$user$realm$
+        // checksum$edata:plaintext` — no `*` anywhere. (Captured live on the T4.)
+        let output = "$krb5tgs$17$svc_sql$CONTOSO.LOCAL$aabb0000000000000000aabb$ccdd1234567890abcdef:Summer2024!";
         let creds = extract_cracked_passwords(output, "CONTOSO.LOCAL");
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].username, "svc_sql");

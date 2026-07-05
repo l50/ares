@@ -194,7 +194,9 @@ pub async fn auto_cross_forest_enum(
                     "  {\"username\": \"samaccountname\", \"domain\": \"contoso.local\", ",
                     "\"source\": \"ldap_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}\n",
                     "Also report users with DoesNotRequirePreAuth as vulnerabilities with ",
-                    "vuln_type='asrep_roastable', and users with SPNs as vuln_type='kerberoastable'."
+                    "vuln_type='asrep_roastable', and users with SPNs as vuln_type='kerberoastable'. ",
+                    "For those findings set the finding `target` to the affected account's ",
+                    "sAMAccountName (not an IP or DC hostname) so the account is roasted."
                 ),
             });
             if let Some(bind_domain) =

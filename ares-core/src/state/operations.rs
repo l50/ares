@@ -72,6 +72,7 @@ pub async fn set_operation_status(
 /// 2. Write status key
 /// 3. Delete operation lock
 /// 4. Delete `ares:op:active` if it points to this operation
+/// 5. Apply a retention TTL to every remaining key for this operation
 pub async fn finalize_operation(
     conn: &mut impl AsyncCommands,
     operation_id: &str,
@@ -93,7 +94,8 @@ pub async fn finalize_operation(
         serde_json::to_string(&false).unwrap_or_default(),
     )
     .await?;
-    conn.expire::<_, ()>(&meta_key, 86400).await?;
+    conn.expire::<_, ()>(&meta_key, OP_RETENTION_TTL_SECS)
+        .await?;
 
     // 2. Write status key
     set_operation_status(conn, operation_id, status).await?;
@@ -106,6 +108,18 @@ pub async fn finalize_operation(
     let active: Option<String> = conn.get("ares:op:active").await?;
     if active.as_deref() == Some(operation_id) {
         conn.del::<_, ()>("ares:op:active").await?;
+    }
+
+    // 5. Bound Redis growth: apply a retention TTL to every remaining key for
+    //    this operation. Most per-op keys (hosts, hashes, credentials, loot,
+    //    techniques, ...) are written without a TTL, so under `noeviction` they
+    //    would accumulate across every operation ever run. Best-effort: a scan
+    //    or expire failure must not fail finalization, which already did the
+    //    important cleanup above.
+    if let Ok(keys) = scan_keys(conn, &format!("{KEY_PREFIX}:{operation_id}:*")).await {
+        for key in &keys {
+            let _: redis::RedisResult<i64> = conn.expire(key, OP_RETENTION_TTL_SECS).await;
+        }
     }
 
     Ok(())
@@ -503,6 +517,33 @@ mod tests {
 
         let active: Option<String> = conn.get("ares:op:active").await.unwrap();
         assert_eq!(active.as_deref(), Some("op-other"));
+    }
+
+    #[tokio::test]
+    async fn finalize_operation_sweeps_op_keys_without_corrupting_state() {
+        let mut conn = MockRedisConnection::new();
+        let meta_key = build_key("op-1", KEY_META);
+        let _: () = conn
+            .hset(&meta_key, "started_at", "\"2024-06-01T00:00:00Z\"")
+            .await
+            .unwrap();
+
+        // Per-op keys that are normally written without a TTL and would leak.
+        let creds_key = build_key("op-1", KEY_CREDENTIALS);
+        let _: () = conn.hset(&creds_key, "c1", "{}").await.unwrap();
+        let hosts_key = build_key("op-1", KEY_HOSTS);
+        let _: () = conn.rpush(&hosts_key, "{}").await.unwrap();
+
+        finalize_operation(&mut conn, "op-1", "completed")
+            .await
+            .unwrap();
+
+        // The retention sweep issues a best-effort EXPIRE per key; the mock
+        // treats EXPIRE as a no-op, so the sweep must leave state readable.
+        let creds_exist: bool = conn.exists(&creds_key).await.unwrap();
+        assert!(creds_exist);
+        let hosts: Vec<String> = conn.lrange(&hosts_key, 0, -1).await.unwrap();
+        assert_eq!(hosts.len(), 1);
     }
 
     #[tokio::test]
