@@ -29,7 +29,8 @@ pub use mssql::{parse_mssql_impersonation, parse_mssql_linked_servers};
 pub use nmap::{flush_nmap_host, parse_nmap_output};
 pub use ntsd::parse_acl_enumeration;
 pub use secrets::{
-    extract_mssql_hosts_from_kerberoast, parse_asrep_roast, parse_kerberoast, parse_secretsdump,
+    extract_mssql_hosts_from_kerberoast, parse_asrep_roast, parse_kerberoast, parse_netntlmv2,
+    parse_secretsdump,
 };
 pub use smb::{parse_netexec_smb, parse_smb_signing};
 pub use spider::parse_spider_credentials;
@@ -508,6 +509,32 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                         "target_ip": target,
                     },
                 }]);
+            }
+        }
+        "start_responder" | "responder" => {
+            // Responder captures NTLMv2-SSP authentications on disk *and* in
+            // its foreground stdout. The orchestrator may not see the on-disk
+            // logs (worker rootfs vs orchestrator pod), but the stdout buffer
+            // is what `parse_tool_output` sees and what the LLM would otherwise
+            // try to interpret unstructured. Extract NetNTLMv2 hashes (mode
+            // 5600) so `auto_crack_dispatch` enqueues them automatically.
+            let hashes = secrets::parse_netntlmv2(output, params, "start_responder");
+            if !hashes.is_empty() {
+                discoveries["hashes"] = Value::Array(hashes);
+            }
+        }
+        "petitpotam" | "coercer" | "dfscoerce" => {
+            // The coercion tools themselves don't capture hashes — they only
+            // trigger the target to authenticate outbound. But when invoked in
+            // tandem with a Responder/ntlmrelayx listener (which is the only
+            // reason to call them), the captured hash often ends up echoed
+            // into the same stdout buffer (impacket builds that fold listener
+            // output, or the operator running both as one bash chain).
+            // Reuse the NetNTLMv2 extractor — best effort — so the captured
+            // machine-account hash never gets dropped on the floor.
+            let hashes = secrets::parse_netntlmv2(output, params, tool_name);
+            if !hashes.is_empty() {
+                discoveries["hashes"] = Value::Array(hashes);
             }
         }
         _ => {}

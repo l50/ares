@@ -8,6 +8,60 @@ use crate::ToolOutput;
 /// Default timeout for tool execution (2 minutes).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Map a program name to a prioritized list of candidate executables that
+/// satisfy the same role. Used to recover when an image ships a broken or
+/// missing symlink for the canonical name (e.g. the Kali pipx install of
+/// NetExec creates `/usr/local/bin/NetExec` but the lowercase
+/// `/usr/local/bin/netexec` symlink is sometimes broken/self-referential).
+///
+/// First candidate that resolves on PATH (or is an absolute path that
+/// exists) wins. Returns `None` to mean "use the program as-is".
+fn resolve_program_alias(program: &str) -> Option<&'static [&'static str]> {
+    match program {
+        // NetExec a.k.a. nxc a.k.a. legacy crackmapexec.
+        "netexec" | "nxc" | "NetExec" => Some(&[
+            "netexec",
+            "nxc",
+            "NetExec",
+            "/opt/pipx/venvs/netexec/bin/NetExec",
+            "/opt/pipx/venvs/netexec/bin/netexec",
+            "crackmapexec",
+        ]),
+        _ => None,
+    }
+}
+
+/// Return the first candidate that is resolvable (either an absolute path
+/// that exists, or a bare name that `which`-resolves on PATH).
+fn first_resolvable<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
+    use std::path::Path;
+    for cand in candidates {
+        if cand.contains('/') {
+            // Absolute or relative path — check existence directly so we
+            // sidestep broken symlinks (readlink returns Ok for those).
+            if Path::new(cand).exists() {
+                return Some(cand);
+            }
+            continue;
+        }
+        // Bare name — walk $PATH and check that each candidate resolves to
+        // a file that actually exists. `metadata()` follows symlinks, so a
+        // self-referential symlink returns Err and we skip it.
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in path_var.split(':') {
+                if dir.is_empty() {
+                    continue;
+                }
+                let full = Path::new(dir).join(cand);
+                if std::fs::metadata(&full).is_ok() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Builder for constructing and executing subprocess commands with timeout support.
 pub struct CommandBuilder {
     program: String,
@@ -122,7 +176,24 @@ impl CommandBuilder {
         // spawn+wait lifetime; released when this function returns.
         let _tool_permit = crate::concurrency::acquire_tool_permit().await;
 
-        let mut cmd = Command::new(&self.program);
+        // Resolve aliases like `netexec` -> `NetExec` when the canonical
+        // name isn't resolvable on PATH (broken symlink, etc.).
+        let resolved_program: String = match resolve_program_alias(&self.program) {
+            Some(candidates) => match first_resolvable(candidates) {
+                Some(found) => found.to_string(),
+                None => self.program.clone(),
+            },
+            None => self.program.clone(),
+        };
+        if resolved_program != self.program {
+            tracing::debug!(
+                requested = %self.program,
+                resolved = %resolved_program,
+                "resolved program alias"
+            );
+        }
+
+        let mut cmd = Command::new(&resolved_program);
         cmd.args(&self.args);
 
         if let Some(ref dir) = self.cwd {

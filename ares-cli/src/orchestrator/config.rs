@@ -218,6 +218,58 @@ impl OrchestratorConfig {
         })
     }
 
+    /// Expand `target_ips` to cover the entire /24 around any cluster of
+    /// 2+ existing target IPs. Returns the count of IPs added.
+    ///
+    /// Bootstrap launches in CTF / lab scenarios typically pass just the
+    /// known DC IPs (`10.1.10.10,11,12,22,23`). The interesting attack
+    /// surface lives elsewhere in the same /24 — SQL server, web server,
+    /// CA web enrollment, workstation. With `target_ips` limited to the
+    /// 5 DCs, [`crate::orchestrator::dispatcher::Dispatcher::request_recon`]
+    /// only probes those five and [`ares_tools::scope::OperationScope`]
+    /// rejects single-target attacks against anything else, leaving the
+    /// agent loop unable to pivot onto discovered hosts.
+    ///
+    /// Gated on `ARES_SCOPE_EXPAND_SUBNETS=1` so production engagements
+    /// keep the strict "only authorized IPs" guarantee. When enabled, we
+    /// add every host in each clustered /24 (`a.b.c.1` through `a.b.c.254`,
+    /// skipping the network and broadcast addresses) to `target_ips`.
+    pub fn expand_scope_to_subnets(&mut self) -> usize {
+        if std::env::var("ARES_SCOPE_EXPAND_SUBNETS").ok().as_deref() != Some("1") {
+            return 0;
+        }
+        use std::collections::BTreeSet;
+        use std::net::Ipv4Addr;
+        let mut prefixes: std::collections::BTreeMap<[u8; 3], usize> =
+            std::collections::BTreeMap::new();
+        for s in &self.target_ips {
+            if let Ok(ip) = s.parse::<Ipv4Addr>() {
+                let oc = ip.octets();
+                *prefixes.entry([oc[0], oc[1], oc[2]]).or_insert(0) += 1;
+            }
+        }
+        let cluster_prefixes: Vec<[u8; 3]> = prefixes
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(p, _)| p)
+            .collect();
+        if cluster_prefixes.is_empty() {
+            return 0;
+        }
+        let mut existing: BTreeSet<String> = self.target_ips.iter().cloned().collect();
+        let mut added = 0;
+        for p in cluster_prefixes {
+            for host in 1u8..=254 {
+                let ip = format!("{}.{}.{}.{}", p[0], p[1], p[2], host);
+                if existing.insert(ip.clone()) {
+                    self.target_ips.push(ip);
+                    added += 1;
+                }
+            }
+        }
+        added
+    }
+
     /// Hard cap = 1.5x the soft concurrency limit. Tasks above this are deferred.
     pub fn hard_cap(&self) -> usize {
         (self.max_concurrent_tasks as f64 * 1.5) as usize
@@ -442,6 +494,47 @@ mod tests {
         assert!(parse_credential_spec("admin:@contoso.local", "").is_none());
         // Empty password without domain
         assert!(parse_credential_spec("admin:", "").is_none());
+    }
+
+    #[test]
+    fn expand_scope_to_subnets_combined() {
+        // Single test to avoid env-var races between parallel tests. Mirrors
+        // the from_env_plain_and_json_and_missing test pattern.
+        std::env::remove_var("ARES_SCOPE_EXPAND_SUBNETS");
+
+        // Env unset → no expansion even when targets are clustered.
+        {
+            let mut cfg = make_config(8);
+            cfg.target_ips = vec!["10.1.10.10".into(), "10.1.10.11".into()];
+            assert_eq!(cfg.expand_scope_to_subnets(), 0);
+            assert_eq!(cfg.target_ips.len(), 2);
+        }
+
+        // Env set, but no /24 has 2+ targets → no expansion.
+        std::env::set_var("ARES_SCOPE_EXPAND_SUBNETS", "1");
+        {
+            let mut cfg = make_config(8);
+            cfg.target_ips = vec!["10.1.10.10".into(), "10.1.20.10".into()];
+            assert_eq!(cfg.expand_scope_to_subnets(), 0);
+        }
+
+        // Env set + clustered targets → fans out to full /24 (skipping .0/.255).
+        {
+            let mut cfg = make_config(8);
+            cfg.target_ips = vec![
+                "10.1.10.10".into(),
+                "10.1.10.11".into(),
+                "10.1.10.12".into(),
+            ];
+            assert_eq!(cfg.expand_scope_to_subnets(), 251);
+            assert_eq!(cfg.target_ips.len(), 254);
+            assert!(cfg.target_ips.contains(&"10.1.10.50".to_string()));
+            assert!(cfg.target_ips.contains(&"10.1.10.254".to_string()));
+            assert!(!cfg.target_ips.contains(&"10.1.10.0".to_string()));
+            assert!(!cfg.target_ips.contains(&"10.1.10.255".to_string()));
+        }
+
+        std::env::remove_var("ARES_SCOPE_EXPAND_SUBNETS");
     }
 
     #[test]

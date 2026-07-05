@@ -92,10 +92,24 @@ async fn run_inner() -> Result<()> {
         }
     };
 
-    let config = Arc::new(
-        OrchestratorConfig::from_env_with_yaml(ares_config.as_deref())
-            .context("Failed to load config from environment")?,
-    );
+    let mut config = OrchestratorConfig::from_env_with_yaml(ares_config.as_deref())
+        .context("Failed to load config from environment")?;
+
+    // When ARES_SCOPE_EXPAND_SUBNETS=1, fan target_ips out over the /24 of
+    // any clustered targets. Lab launches (GOAD/CTF) pass just the known DC
+    // IPs, but the actual attack surface (SQL/web/CA/workstation) lives
+    // elsewhere in the same subnet. Without expansion the scope filter blocks
+    // single-target tools against any host the subnet sweep discovers.
+    let scope_expanded = config.expand_scope_to_subnets();
+    if scope_expanded > 0 {
+        info!(
+            added_ips = scope_expanded,
+            total_ips = config.target_ips.len(),
+            "Expanded operation scope to clustered /24 subnets (ARES_SCOPE_EXPAND_SUBNETS=1)"
+        );
+    }
+
+    let config = Arc::new(config);
 
     info!(
         operation_id = %config.operation_id,
@@ -112,10 +126,21 @@ async fn run_inner() -> Result<()> {
     let scope = ares_tools::scope::OperationScope::new(config.target_ips.clone());
     ares_tools::scope::init_scope(scope);
     if !config.target_ips.is_empty() {
-        info!(
-            target_ips = %config.target_ips.join(","),
-            "Installed operation scope — out-of-scope single-IP tool calls will be rejected"
-        );
+        // Log just a count once expansion is in play — 5 IPs is fine to print,
+        // 1270 IPs (5×254) is just noise.
+        if config.target_ips.len() <= 16 {
+            info!(
+                target_ips = %config.target_ips.join(","),
+                "Installed operation scope — out-of-scope single-IP tool calls will be rejected"
+            );
+        } else {
+            info!(
+                target_ip_count = config.target_ips.len(),
+                first_ip = %config.target_ips[0],
+                last_ip = %config.target_ips[config.target_ips.len() - 1],
+                "Installed operation scope (expanded subnet) — out-of-scope single-IP tool calls will be rejected"
+            );
+        }
     }
 
     let queue = TaskQueue::connect(&config.redis_url, &config.nats_url)
@@ -811,6 +836,16 @@ async fn run_inner() -> Result<()> {
     if !config.target_ips.is_empty() {
         let recon_count = dispatch_initial_recon(&dispatcher, &config).await;
         info!(tasks = recon_count, "Initial recon dispatched");
+
+        // Subnet sweep: when target IPs are clustered in /24s (typical for
+        // lab/CTF engagements), also dispatch a sweep over each /24 to
+        // discover non-DC hosts (SQL server, web server, ADCS, workstation).
+        // Without this, the recon agent only ever probes the explicit IP
+        // list — missing the bulk of the attack surface in lab scenarios.
+        let sweep_count = bootstrap::dispatch_subnet_sweep(&dispatcher, &config).await;
+        if sweep_count > 0 {
+            info!(tasks = sweep_count, "Subnet sweep dispatched");
+        }
     } else {
         warn!("No target IPs configured — skipping initial recon dispatch");
     }

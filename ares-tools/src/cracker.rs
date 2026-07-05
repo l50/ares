@@ -53,6 +53,10 @@ const DEFAULT_RULES: &[&str] = &[
 /// - TGS-REP (Kerberoast):  etype 23 -> 13100, 17 -> 19600, 18 -> 19700
 /// - AS-REP (AS-REP roast): 18200 (impacket only emits the RC4 `$krb5asrep$`
 ///   form; hashcat's AES modes 19800/19900 are a different `$krb5pa$` primitive)
+/// - NetNTLMv2 (`USER::DOMAIN:CHALLENGE:NT_PROOF:BLOB`, Responder / PetitPotam
+///   captures) -> 5600. Without this branch a captured machine-account hash is
+///   handed to hashcat as mode 1000 (NTLM 32-hex) and rejected as malformed,
+///   dropping the crack on the floor.
 /// - Otherwise -> 1000 (NTLM)
 fn detect_hashcat_mode(hash_value: &str) -> i64 {
     // The etype is the integer field immediately after the `$krb5tgs$` prefix.
@@ -67,9 +71,35 @@ fn detect_hashcat_mode(hash_value: &str) -> i64 {
         }
     } else if hash_value.starts_with("$krb5asrep$") {
         18200
+    } else if is_netntlmv2_format(hash_value) {
+        5600
     } else {
         1000
     }
+}
+
+/// Structural check for NetNTLMv2 hashcat-5600 layout. Cheap, no-allocation.
+/// Format: `USER::DOMAIN:CHALLENGE(16hex):NT_PROOF(32hex):BLOB(>=16hex)`.
+fn is_netntlmv2_format(s: &str) -> bool {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return false;
+    }
+    // parts[0] = username (non-empty), parts[1] = "" (the `::`),
+    // parts[2] = domain (may be empty), parts[3..6] hex with required lengths.
+    if parts[0].is_empty() || !parts[1].is_empty() {
+        return false;
+    }
+    let challenge = parts[3];
+    let nt_proof = parts[4];
+    let blob = parts[5];
+    challenge.len() == 16
+        && challenge.chars().all(|c| c.is_ascii_hexdigit())
+        && nt_proof.len() == 32
+        && nt_proof.chars().all(|c| c.is_ascii_hexdigit())
+        && blob.len() >= 16
+        && blob.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Build a dynamic wordlist from known usernames.
@@ -457,6 +487,27 @@ mod tests {
         // impacket AS-REP roasting emits the RC4 `$krb5asrep$` form regardless
         // of etype; mode 18200 is the only AS-REP mode that consumes it.
         assert_eq!(detect_hashcat_mode("$krb5asrep$23$user"), 18200);
+    }
+
+    #[test]
+    fn detect_hashcat_mode_netntlmv2() {
+        // Responder-style capture: user::DOMAIN:16hex:32hex:>=16hex
+        let h = "dc01$::CONTOSO:1122334455667788:9c8e64ac5db4e4a72b1cd2e1cd2e1cd2:0101000000000000aabbccdd";
+        assert_eq!(detect_hashcat_mode(h), 5600);
+
+        // Missing the `::` between user and domain → not NetNTLMv2.
+        let not = "dc01$:CONTOSO:1122334455667788:9c8e64ac5db4e4a72b1cd2e1cd2e1cd2:0101000000000000aabbccdd";
+        assert_ne!(detect_hashcat_mode(not), 5600);
+
+        // Wrong CHALLENGE length → not NetNTLMv2.
+        let not2 = "dc01$::CONTOSO:11223344556677:9c8e64ac5db4e4a72b1cd2e1cd2e1cd2:0101000000000000aabbccdd";
+        assert_ne!(detect_hashcat_mode(not2), 5600);
+
+        // bare NTLM (NT only) still falls back to 1000.
+        assert_eq!(
+            detect_hashcat_mode("aad3b435b51404eeaad3b435b51404ee"),
+            1000,
+        );
     }
 
     #[test]

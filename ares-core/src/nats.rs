@@ -152,11 +152,18 @@ pub struct NatsBroker {
 impl NatsBroker {
     /// Connect to NATS at the given URL (e.g. `nats://nats.attack-simulation.svc:4222`).
     pub async fn connect(url: &str) -> Result<Self> {
-        let client = async_nats::connect(url)
+        // Default async_nats request_timeout is 10s — far too short for
+        // long-running tool dispatches (nmap full-port, secretsdump DRSUAPI,
+        // ESC8 relay chains). Override to 30 min so the orchestrator's
+        // outer tokio::time::timeout (1500s) is the actual deadline,
+        // not the NATS client's internal one.
+        let client = async_nats::ConnectOptions::new()
+            .request_timeout(Some(std::time::Duration::from_secs(1800)))
+            .connect(url)
             .await
             .with_context(|| format!("Failed to connect to NATS at {url}"))?;
         let jetstream = jetstream::new(client.clone());
-        info!(url, "Connected to NATS");
+        info!(url, request_timeout_secs = 1800, "Connected to NATS");
         Ok(Self { client, jetstream })
     }
 
