@@ -664,8 +664,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── format_loki_response ────────────────────────────────────────
-
     #[test]
     fn format_loki_response_no_results() {
         let body = r#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
@@ -735,8 +733,6 @@ mod tests {
         assert_eq!(format_loki_response(&body), "No results found.");
     }
 
-    // ── is_retryable_status ─────────────────────────────────────────
-
     #[test]
     fn retryable_statuses() {
         use reqwest::StatusCode;
@@ -756,8 +752,6 @@ mod tests {
         assert!(!is_retryable_status(StatusCode::NOT_FOUND));
         assert!(!is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
     }
-
-    // ── cache_key ───────────────────────────────────────────────────
 
     #[test]
     fn cache_key_deterministic() {
@@ -788,8 +782,6 @@ mod tests {
         assert_ne!(k1, k2);
     }
 
-    // ── make_output / make_error ────────────────────────────────────
-
     #[test]
     fn make_output_success() {
         let out = make_output("hello");
@@ -807,8 +799,6 @@ mod tests {
         assert_eq!(out.stderr, "boom");
         assert_eq!(out.exit_code, Some(1));
     }
-
-    // ── combine_query_patterns ──────────────────────────────────────
 
     #[test]
     fn combine_query_patterns_single_pattern() {
@@ -860,8 +850,6 @@ mod tests {
         assert!(result.stdout.contains("foo\\.bar"));
         assert!(result.stdout.contains("baz\\(qux\\)"));
     }
-
-    // ── tests for new pure helpers ────────────────────────────────────
 
     #[test]
     fn time_window_around_rfc3339_centred_window() {

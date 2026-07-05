@@ -44,7 +44,6 @@ pub(crate) async fn run_capture(
     post_window_minutes: u32,
     no_upload: bool,
 ) -> Result<()> {
-    // ── Resolve operation ────────────────────────────────────────────────
     eprint!("[1/8] Loading operation state from Redis...");
     let _ = std::io::stderr().flush();
     let mut conn = connect_redis(redis_url).await?;
@@ -64,7 +63,6 @@ pub(crate) async fn run_capture(
     let completed_at = state.completed_at.unwrap();
     eprintln!(" done ({op_id})");
 
-    // ── Capture window ───────────────────────────────────────────────────
     let export_start = state.started_at - Duration::hours(pre_window_hours as i64);
     let export_end = completed_at + Duration::minutes(post_window_minutes as i64);
 
@@ -76,7 +74,6 @@ pub(crate) async fn run_capture(
         post_window_minutes,
     );
 
-    // ── Create output directory ──────────────────────────────────────────
     let snapshot_dir = Path::new(output_dir).join(&op_id);
     let loki_dir = snapshot_dir.join("loki");
     fs::create_dir_all(&loki_dir)
@@ -90,7 +87,6 @@ pub(crate) async fn run_capture(
     fs::create_dir_all(&dashboards_dir)
         .with_context(|| format!("create dashboards directory: {}", dashboards_dir.display()))?;
 
-    // ── Serialize red state ──────────────────────────────────────────────
     let red_state_json = serialize_red_state(&state);
     let red_state_path = snapshot_dir.join("red-state.json");
     fs::write(
@@ -100,7 +96,6 @@ pub(crate) async fn run_capture(
     .context("write red-state.json")?;
     info!("wrote {}", red_state_path.display());
 
-    // ── Generate ground truth ────────────────────────────────────────────
     let techniques: Vec<String> = state.all_techniques.clone();
     let ground_truth = create_ground_truth_from_red_state(&state, &techniques);
     let gt_path = snapshot_dir.join("ground-truth.json");
@@ -108,7 +103,6 @@ pub(crate) async fn run_capture(
         .context("write ground-truth.json")?;
     info!("wrote {}", gt_path.display());
 
-    // ── Sync Loki chunks from S3 ─────────────────────────────────────────
     eprint!("[2/8] Syncing Loki chunks from S3...");
     let _ = std::io::stderr().flush();
     let (chunk_count, index_count) = sync_loki_s3(&loki_dir, export_start, export_end).await?;
@@ -116,7 +110,6 @@ pub(crate) async fn run_capture(
 
     info!("synced {chunk_count} chunks + {index_count} index files from S3");
 
-    // ── Export fired Grafana alerts ──────────────────────────────────────
     eprint!("[3/8] Exporting Grafana alerts...");
     let _ = std::io::stderr().flush();
     let fired_alerts = export_grafana_alerts(export_start, export_end).await?;
@@ -126,7 +119,6 @@ pub(crate) async fn run_capture(
         .context("write fired-alerts.json")?;
     info!("captured {} fired alerts", fired_alerts.len());
 
-    // ── Export Prometheus metrics (via Grafana datasource proxy) ─────────
     eprint!("[4/8] Exporting Prometheus metrics...");
     let _ = std::io::stderr().flush();
     // Metrics only over a bounded window around the attack (the agent's
@@ -138,14 +130,12 @@ pub(crate) async fn run_capture(
     eprintln!(" done ({metrics_series} series)");
     info!("captured {metrics_series} Prometheus series");
 
-    // ── Export Grafana dashboards ────────────────────────────────────────
     eprint!("[5/8] Exporting Grafana dashboards...");
     let _ = std::io::stderr().flush();
     let dashboards_captured = export_dashboards(&snapshot_dir).await;
     eprintln!(" done ({dashboards_captured} dashboards)");
     info!("captured {dashboards_captured} dashboards");
 
-    // ── Export all Grafana annotations (unfiltered) ──────────────────────
     eprint!("[6/8] Exporting all annotations...");
     let _ = std::io::stderr().flush();
     let annotations_captured =
@@ -153,7 +143,6 @@ pub(crate) async fn run_capture(
     eprintln!(" done ({annotations_captured} annotations)");
     info!("captured {annotations_captured} annotations");
 
-    // ── Write manifest ──────────────────────────────────────────────────
     eprint!("[7/8] Writing manifest and ground truth...");
     let _ = std::io::stderr().flush();
     let target_domain = state
@@ -196,7 +185,6 @@ pub(crate) async fn run_capture(
     info!("wrote {}", manifest_path.display());
     eprintln!(" done");
 
-    // ── Upload to benchmark S3 bucket ───────────────────────────────────
     if !no_upload {
         let bucket = std::env::var("BENCHMARK_S3_BUCKET")
             .unwrap_or_else(|_| DEFAULT_BENCHMARK_BUCKET.to_string());
@@ -234,7 +222,6 @@ pub(crate) async fn run_capture(
         eprintln!("[8/8] Skipping S3 upload (--no-upload)");
     }
 
-    // ── Summary ─────────────────────────────────────────────────────────
     println!("Snapshot captured: {}", snapshot_dir.display());
     println!("  Operation:    {op_id}");
     println!("  Loki chunks:  {chunk_count}");
@@ -276,7 +263,7 @@ async fn sync_loki_s3(
     let start_ms = start.timestamp_millis();
     let end_ms = end.timestamp_millis();
 
-    // ── Identify relevant index tables (24h periods, days since epoch) ──
+    // Index tables are 24h periods keyed by days since epoch.
     let start_table = start
         .date_naive()
         .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
@@ -286,7 +273,6 @@ async fn sync_loki_s3(
         .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
         .num_days();
 
-    // ── Sync index files for relevant days ──────────────────────────────
     let mut index_count: u64 = 0;
     for table in start_table..=end_table {
         let prefix = format!("index/loki_index_{table}/");
@@ -311,7 +297,6 @@ async fn sync_loki_s3(
         if !status.success() {
             bail!("failed to sync index table {table}");
         }
-        // Count files synced
         let count = fs::read_dir(&local_index)
             .map(|rd| rd.flatten().count() as u64)
             .unwrap_or(0);
@@ -320,7 +305,6 @@ async fn sync_loki_s3(
         index_count += count.max(count_nested);
     }
 
-    // ── List all chunk objects for the date range ───────────────────────
     // Use aws s3api list-objects-v2 with JSON output, filter by
     // LastModified falling in our date range.
     let list_start = start.format("%Y-%m-%d").to_string();
@@ -358,7 +342,6 @@ async fn sync_loki_s3(
 
     info!("found {} chunk objects in date range", keys.len());
 
-    // ── Filter chunks by hex timestamp overlap ──────────────────────────
     let mut matching_keys: Vec<String> = Vec::new();
     for key in &keys {
         let parts: Vec<&str> = key.split('/').collect();
@@ -388,7 +371,6 @@ async fn sync_loki_s3(
         keys.len() - matching_keys.len()
     );
 
-    // ── Download matching chunks in parallel ────────────────────────────
     // Write keys to a temp file and use a shell script for parallel download.
     let keys_file = loki_dir.join(".chunk_keys.txt");
     fs::write(&keys_file, matching_keys.join("\n")).context("write chunk keys file")?;
@@ -435,7 +417,6 @@ echo "$COUNT"
         bail!("chunk download failed: {stderr}");
     }
 
-    // Clean up temp file
     let _ = fs::remove_file(&keys_file);
 
     let chunk_count = matching_keys.len() as u64;
@@ -604,7 +585,6 @@ async fn export_grafana_alerts(
         });
     }
 
-    // Sort by fire time
     alerts.sort_by_key(|a| a.fired_at);
 
     Ok(alerts)
@@ -657,7 +637,6 @@ async fn export_prometheus_metrics(
 
     let client = reqwest::Client::new();
 
-    // ── Resolve the Prometheus datasource UID ───────────────────────────
     let ds_url = format!("{grafana_url}/api/datasources");
     let ds_resp = match with_grafana_auth(client.get(&ds_url), &api_key)
         .send()
@@ -697,7 +676,6 @@ async fn export_prometheus_metrics(
         return 0;
     };
 
-    // ── Fetch all metric names ──────────────────────────────────────────
     let names_url =
         format!("{grafana_url}/api/datasources/proxy/uid/{uid}/api/v1/label/__name__/values");
     let names: Vec<String> = match with_grafana_auth(client.get(&names_url), &api_key)
@@ -730,7 +708,6 @@ async fn export_prometheus_metrics(
         return 0;
     }
 
-    // ── Range-query in batches by metric name ───────────────────────────
     // A single all-series query ({__name__=~".+"}) over the window times out;
     // ~80 names per batch is sub-second. Merge the matrices into one result.
     let query_url = format!("{grafana_url}/api/datasources/proxy/uid/{uid}/api/v1/query_range");
@@ -773,7 +750,6 @@ async fn export_prometheus_metrics(
         }
     }
 
-    // ── Write the merged matrix in query_range response shape ───────────
     let merged = serde_json::json!({
         "status": "success",
         "data": { "resultType": "matrix", "result": all_series },
@@ -810,7 +786,6 @@ async fn export_dashboards(snapshot_dir: &Path) -> usize {
 
     let client = reqwest::Client::new();
 
-    // ── List all dashboards ─────────────────────────────────────────────
     let search_url = format!("{grafana_url}/api/search?type=dash-db&limit=500");
     let search_resp = match with_grafana_auth(client.get(&search_url), &api_key)
         .send()
@@ -837,7 +812,6 @@ async fn export_dashboards(snapshot_dir: &Path) -> usize {
         }
     };
 
-    // ── Fetch each dashboard by UID ─────────────────────────────────────
     let dashboards_dir = snapshot_dir.join("grafana").join("dashboards");
     let mut count: usize = 0;
     for item in &items {

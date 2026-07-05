@@ -505,8 +505,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── format_alerts_response ────────────────────────────────────
-
     #[test]
     fn alerts_empty_array() {
         assert_eq!(format_alerts_response("[]"), "No alerts found.");
@@ -596,8 +594,6 @@ mod tests {
         assert!(out.contains("Alert: B"));
     }
 
-    // ── format_annotations_response ───────────────────────────────
-
     #[test]
     fn annotations_empty_array() {
         assert_eq!(format_annotations_response("[]"), "No annotations found.");
@@ -642,8 +638,6 @@ mod tests {
         let out = format_annotations_response(&body);
         assert!(out.contains("total"));
     }
-
-    // ── format_dashboard_search_response ──────────────────────────
 
     #[test]
     fn dashboard_search_empty() {
@@ -693,8 +687,6 @@ mod tests {
         let out = format_dashboard_search_response(&body);
         assert!(out.contains("count"));
     }
-
-    // ── format_dashboard_response ─────────────────────────────────
 
     #[test]
     fn dashboard_full() {
@@ -750,8 +742,6 @@ mod tests {
     fn dashboard_invalid_json() {
         assert_eq!(format_dashboard_response("broken"), "broken");
     }
-
-    // ── format_json_pretty ────────────────────────────────────────
 
     #[test]
     fn json_pretty_object() {

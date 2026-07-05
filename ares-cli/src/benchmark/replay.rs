@@ -42,8 +42,6 @@ pub(crate) struct ReplayParams {
     pub time_compression: f64,
 }
 
-// ─── Load command ────────────────────────────────────────────────────────
-
 /// Import a snapshot's Loki data into a target Loki instance.
 ///
 /// For `s3-chunks` snapshots, copies the chunk/index data into Loki's
@@ -85,8 +83,6 @@ pub(crate) async fn run_load(
     Ok(())
 }
 
-// ─── Run command ─────────────────────────────────────────────────────────
-
 /// Full replay: provision EC2 → configure Loki → investigate → score → teardown.
 ///
 /// Supports two replay modes:
@@ -105,7 +101,6 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         );
     }
 
-    // ── Resolve snapshot location ───────────────────────────────────────
     let replay_config = ReplayConfig::from_env()?;
     let (snapshot_path, _is_temp) =
         resolve_snapshot(&p.snapshot, p.snapshot_dir.as_deref(), &replay_config)?;
@@ -123,7 +118,6 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         manifest.operation_id,
     );
 
-    // ── Provision replay EC2 with Loki ──────────────────────────────────
     info!("provisioning replay EC2 for {}...", manifest.operation_id);
     let mut replay_infra = ReplayInfra::provision(&manifest.operation_id, &replay_config)
         .context("provision replay infrastructure")?;
@@ -152,7 +146,6 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     )
     .await;
 
-    // ── Teardown ────────────────────────────────────────────────────────
     info!("tearing down replay infrastructure...");
     if let Err(e) = replay_infra.teardown() {
         eprintln!("WARNING: failed to tear down replay EC2: {e}");
@@ -175,14 +168,12 @@ async fn run_replay_inner(
     let import_duration = import_start.elapsed().as_secs_f64();
     info!("Loki data loaded on replay EC2 (via SSM), import phase: {import_duration:.1}s");
 
-    // ── Override LOKI_URL so the blue team queries the replay instance ───
     // SAFETY: this is the documented mechanism for pointing the blue agent
     // at a specific Loki. The env var is read by loki_config() in loki.rs.
     unsafe {
         std::env::set_var("LOKI_URL", loki_url);
     }
 
-    // ── Timeline mode: quiet period ──────────────────────────────────────
     let quiet_period_secs = if is_timeline {
         let secs = p.quiet_period.unwrap_or_else(|| {
             // Pseudo-random quiet period between 60-300s using nanosecond jitter.
@@ -201,7 +192,6 @@ async fn run_replay_inner(
         None
     };
 
-    // ── Build investigation trigger ──────────────────────────────────────
     // Timeline mode always uses alert-replay (no attack_window_end).
     let snapshot_dir_str = snapshot_path.to_str().unwrap();
     let effective_trigger_mode = if is_timeline {
@@ -237,7 +227,6 @@ async fn run_replay_inner(
         }
     }
 
-    // ── Submit investigation via NATS ────────────────────────────────────
     let effective_model = resolve_model(&p.model);
     let mut env_vars = collect_env_vars(BLUE_ENV_VAR_NAMES);
     // Ensure LOKI_URL points to the replay EC2
@@ -275,7 +264,6 @@ async fn run_replay_inner(
 
     info!("investigation {run_id} submitted");
 
-    // ── Poll for completion ──────────────────────────────────────────────
     let investigation_start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(45 * 60); // 45 minutes
     let poll_interval = std::time::Duration::from_secs(10);
@@ -319,7 +307,6 @@ async fn run_replay_inner(
 
     let investigation_duration = investigation_start.elapsed().as_secs_f64();
 
-    // ── Score against ground truth ───────────────────────────────────────
     let red_state_path = snapshot_path.join("red-state.json");
     let (red_state, techniques) = load_red_state_from_file(&red_state_path)?;
     let ground_truth = create_ground_truth_from_red_state(&red_state, &techniques);
@@ -343,7 +330,6 @@ async fn run_replay_inner(
     );
     let gap_analysis = analyze_detection_gaps(&eval_result);
 
-    // ── Write result ─────────────────────────────────────────────────────
     let trigger_alert = match effective_trigger_mode {
         "alert-replay" => alert_json
             .get("labels")
@@ -382,7 +368,6 @@ async fn run_replay_inner(
     fs::write(&result_path, serde_json::to_string_pretty(&result)?)
         .with_context(|| format!("write result: {}", result_path.display()))?;
 
-    // ── Summary ─────────────────────────────────────────────────────────
     println!("Benchmark complete: {}", result_path.display());
     println!("  Run ID:         {run_id}");
     println!("  Mode:           {}", p.replay_mode);
@@ -408,8 +393,6 @@ async fn run_replay_inner(
 
     Ok(())
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────
 
 /// Resolve snapshot location: use local dir override if provided, otherwise
 /// download metadata from S3.

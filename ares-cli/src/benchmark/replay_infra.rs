@@ -122,11 +122,9 @@ impl ReplayInfra {
             }
         }
 
-        // ── Resolve AMI ─────────────────────────────────────────────────
         let ami_id = resolve_ami(&config.aws_profile, &config.aws_region)?;
         info!("resolved AMI: {ami_id}");
 
-        // ── Launch instance ─────────────────────────────────────────────
         let instance_name = format!("ares-replay-{op_id}");
         let tag_spec = format!(
             "ResourceType=instance,Tags=[\
@@ -186,7 +184,6 @@ impl ReplayInfra {
             aws_region: config.aws_region.clone(),
         };
 
-        // ── Wait for running + status checks ────────────────────────────
         info!("waiting for instance to pass status checks...");
         let mut wait_cmd = Command::new("aws");
         wait_cmd.args([
@@ -206,7 +203,6 @@ impl ReplayInfra {
             bail!("instance {instance_id} failed status checks");
         }
 
-        // ── Get private IP ──────────────────────────────────────────────
         let mut ip_cmd = Command::new("aws");
         ip_cmd.args([
             "ec2",
@@ -238,7 +234,6 @@ impl ReplayInfra {
         }
         info!("instance private IP: {}", infra.private_ip);
 
-        // ── Configure via SSM ───────────────────────────────────────────
         let setup_script = build_setup_script(op_id, &config.s3_bucket, &config.aws_region);
         info!("configuring Loki via SSM...");
 
@@ -279,7 +274,6 @@ impl ReplayInfra {
             .to_string();
         info!("SSM command: {command_id}");
 
-        // ── Wait for SSM command to complete ────────────────────────────
         wait_for_ssm_command(
             &command_id,
             &instance_id,
@@ -287,7 +281,6 @@ impl ReplayInfra {
             &config.aws_region,
         )?;
 
-        // ── Verify Loki is queryable ────────────────────────────────────
         info!("verifying Loki readiness on {}:3100...", infra.private_ip);
         verify_loki_ready(&infra.private_ip)?;
 
@@ -361,8 +354,6 @@ impl Drop for ReplayInfra {
         }
     }
 }
-
-// ─── AWS helpers ─────────────────────────────────────────────────────────
 
 /// Append `--profile <p> --region <r>` to a command.
 /// Skips `--profile` when profile is empty (uses default credential chain / instance role).

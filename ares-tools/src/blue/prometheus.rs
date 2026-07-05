@@ -227,8 +227,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── format_prometheus_response ──────────────────────────────────
-
     #[test]
     fn format_no_results() {
         let body = r#"{"status":"success","data":{"resultType":"vector","result":[]}}"#;
@@ -321,8 +319,6 @@ mod tests {
         assert!(result.contains("instance=\"a\""));
         assert!(result.contains("instance=\"b\""));
     }
-
-    // ── make_output / make_error ────────────────────────────────────
 
     #[test]
     fn make_output_success() {

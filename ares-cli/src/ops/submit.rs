@@ -150,7 +150,6 @@ pub(crate) async fn ops_submit(p: OpsSubmitParams) -> Result<String> {
     info!("Target: {target} ({domain})");
     info!("IPs: {}", ips.join(", "));
 
-    // Collect environment variables
     let env_vars = collect_env_vars(OPS_ENV_VAR_NAMES);
     if !env_vars.is_empty() {
         let mut keys: Vec<&str> = env_vars.keys().map(|s| s.as_str()).collect();
@@ -160,7 +159,6 @@ pub(crate) async fn ops_submit(p: OpsSubmitParams) -> Result<String> {
         warn!("No env vars found to submit with operation request");
     }
 
-    // Resolve model
     let effective_model = resolve_model(&model);
     if let Some(ref m) = effective_model {
         if m.starts_with("gpt-") && std::env::var("OPENAI_API_KEY").is_err() {
@@ -326,7 +324,6 @@ mod tests {
         const NAME_B: &str = "ARES_TEST_SUBMIT_COLLECT_B_9c1a";
         const NAME_C: &str = "ARES_TEST_SUBMIT_COLLECT_C_9c1a";
 
-        // --- collect_env_vars ---
         std::env::remove_var(NAME_A);
         std::env::remove_var(NAME_B);
         std::env::remove_var(NAME_C);
@@ -345,7 +342,6 @@ mod tests {
         std::env::remove_var(NAME_A);
         std::env::remove_var(NAME_B);
 
-        // --- resolve_model ---
         const ORCH: &str = "ARES_ORCHESTRATOR_MODEL";
         const LEGACY: &str = "ARES_MODEL";
         // Snapshot + clear so we don't trample a developer-set var.

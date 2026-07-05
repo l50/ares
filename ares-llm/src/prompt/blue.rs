@@ -353,10 +353,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // -----------------------------------------------------------------------
-    // generate_blue_task_prompt
-    // -----------------------------------------------------------------------
-
     #[test]
     fn generate_blue_task_prompt_returns_none_for_unknown_type() {
         let params = json!({});
@@ -405,10 +401,6 @@ mod tests {
         assert!(generate_blue_task_prompt("host_investigation", "t-7", &params, "state").is_some());
     }
 
-    // -----------------------------------------------------------------------
-    // blue_role_template
-    // -----------------------------------------------------------------------
-
     #[test]
     fn role_template_triage() {
         assert_eq!(
@@ -456,10 +448,6 @@ mod tests {
             templates::TEMPLATE_BLUE_TRIAGE
         );
     }
-
-    // -----------------------------------------------------------------------
-    // build_blue_system_prompt
-    // -----------------------------------------------------------------------
 
     #[test]
     fn system_prompt_succeeds_for_triage() {
@@ -520,10 +508,6 @@ mod tests {
         // even if the triage template doesn't explicitly render it.
         assert!(!result.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // build_initial_alert_prompt
-    // -----------------------------------------------------------------------
 
     #[test]
     fn initial_alert_prompt_extracts_alert_name_from_labels() {
