@@ -473,11 +473,17 @@ impl SharedState {
             let mut state = self.inner.write().await;
             let host = state.hosts.iter_mut().find(|h| h.ip == ip);
             if let Some(h) = host {
-                if h.owned {
-                    return Ok(()); // already owned
+                // Log only the genuine false→true flip, but ALWAYS fall through
+                // to the Redis persist below. The old early-return on an
+                // already-owned in-memory record skipped the write entirely, so
+                // an in-memory/Redis disagreement (owned in state, `owned:false`
+                // in the list — the shape that gated the MSSQL-link foothold out
+                // of the SAM-dump chain) never reconciled. Re-persisting is
+                // cheap and idempotent.
+                if !h.owned {
+                    h.owned = true;
+                    tracing::info!(ip = %ip, hostname = %h.hostname, "Host marked as owned");
                 }
-                h.owned = true;
-                tracing::info!(ip = %ip, hostname = %h.hostname, "Host marked as owned");
                 let json = serde_json::to_string(h).unwrap_or_default();
                 (json, state.operation_id.clone())
             } else {
@@ -501,7 +507,10 @@ impl SharedState {
             }
         };
 
-        // Persist to Redis
+        // Persist to Redis. `add_host` is a blind RPUSH with no dedup, so the
+        // list can hold several rows for one IP; update EVERY matching row (not
+        // just the first) so a stale duplicate can't keep shadowing the owned
+        // flag for `auto_lsassy_dump` / loot readers.
         let host_key = format!("{}:{}:{}", state::KEY_PREFIX, op_id, state::KEY_HOSTS);
         let mut conn = queue.connection();
         let entries: Vec<String> = redis::AsyncCommands::lrange(&mut conn, &host_key, 0, -1)
@@ -515,7 +524,6 @@ impl SharedState {
                         redis::AsyncCommands::lset(&mut conn, &host_key, idx as isize, &host_json)
                             .await;
                     found = true;
-                    break;
                 }
             }
         }
@@ -564,6 +572,36 @@ mod tests {
         assert_eq!(s.hosts.len(), 1);
         assert_eq!(s.hosts[0].ip, "192.168.58.5");
         assert_eq!(s.hosts[0].hostname, "srv01.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn mark_host_owned_sets_flag_and_is_idempotent() {
+        let state = SharedState::new("op-mho".to_string());
+        let q = mock_queue();
+        state
+            .publish_host(&q, make_host("192.168.58.51", "sql01.contoso.local", false))
+            .await
+            .unwrap();
+
+        async fn owned(state: &SharedState, ip: &str) -> bool {
+            state
+                .inner
+                .read()
+                .await
+                .hosts
+                .iter()
+                .any(|h| h.ip == ip && h.owned)
+        }
+        assert!(!owned(&state, "192.168.58.51").await);
+
+        state.mark_host_owned(&q, "192.168.58.51").await.unwrap();
+        assert!(owned(&state, "192.168.58.51").await);
+
+        // Second call on an already-owned host must still succeed (the persist
+        // path now runs unconditionally instead of early-returning) and leave
+        // the flag set.
+        state.mark_host_owned(&q, "192.168.58.51").await.unwrap();
+        assert!(owned(&state, "192.168.58.51").await);
     }
 
     #[tokio::test]

@@ -289,6 +289,24 @@ impl RedisStateReader {
         host: &Host,
     ) -> Result<(), redis::RedisError> {
         let key = self.key(KEY_HOSTS);
+        // Dedup by IP (fall back to hostname), like `add_user`. This used to be
+        // a blind RPUSH, so a re-discovery of an already-listed host appended a
+        // duplicate row — including phantom empty-IP rows when the hostname was
+        // known but the IP wasn't. Duplicate rows let a stale `owned:false`
+        // shadow a later `owned:true` (`mark_host_owned` could only rewrite so
+        // many of them), which starved the ownership-gated SAM-dump chain.
+        let existing: Vec<String> = conn.lrange(&key, 0, -1).await?;
+        for item in &existing {
+            if let Ok(h) = serde_json::from_str::<Host>(item) {
+                let ip_dup = !host.ip.is_empty() && h.ip == host.ip;
+                let host_dup =
+                    !host.hostname.is_empty() && h.hostname.eq_ignore_ascii_case(&host.hostname);
+                if ip_dup || host_dup {
+                    let _: () = conn.expire(&key, OP_TTL_SECS).await?;
+                    return Ok(());
+                }
+            }
+        }
         let data = serde_json::to_string(host).unwrap_or_default();
         let _: () = conn.rpush(&key, &data).await?;
         let _: () = conn.expire(&key, OP_TTL_SECS).await?;
@@ -997,6 +1015,38 @@ mod tests {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].ip, "192.168.58.5");
         assert_eq!(hosts[0].hostname, "dc01.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn add_host_dedups_by_ip_and_hostname() {
+        let mut conn = MockRedisConnection::new();
+        let reader = make_reader();
+
+        // First insert lands.
+        reader
+            .add_host(&mut conn, &make_host("192.168.58.5", "dc01.contoso.local"))
+            .await
+            .unwrap();
+        // Same IP (hostname differs) — deduped.
+        reader
+            .add_host(&mut conn, &make_host("192.168.58.5", "other.contoso.local"))
+            .await
+            .unwrap();
+        // Same hostname, empty IP (the phantom-row shape) — deduped.
+        reader
+            .add_host(&mut conn, &make_host("", "dc01.contoso.local"))
+            .await
+            .unwrap();
+        // A genuinely different host still lands.
+        reader
+            .add_host(&mut conn, &make_host("192.168.58.6", "sql01.contoso.local"))
+            .await
+            .unwrap();
+
+        let hosts = reader.get_hosts(&mut conn).await.unwrap();
+        assert_eq!(hosts.len(), 2, "duplicates should collapse: {hosts:?}");
+        assert!(hosts.iter().any(|h| h.ip == "192.168.58.5"));
+        assert!(hosts.iter().any(|h| h.ip == "192.168.58.6"));
     }
 
     // -- get_users / add_user ------------------------------------------------

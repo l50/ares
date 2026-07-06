@@ -1,7 +1,8 @@
 //! auto_crack_dispatch -- submit crack tasks for new hashes.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -29,7 +30,7 @@ fn crack_priority(hash_type: &str) -> u8 {
 }
 
 /// Whether a hash can never be recovered by wordlist cracking and so must be
-/// kept out of the single hashcat slot. All three cases share the property
+/// kept out of the hashcat pool. All three cases share the property
 /// that the secret is machine-generated (not a human password) and that
 /// *possessing the hash is already the win*, so a crack attempt only burns
 /// `MAX_CRACK_ATTEMPTS` runs apiece and starves genuinely crackable user
@@ -77,6 +78,73 @@ pub(crate) const MAX_CRACK_ATTEMPTS: u32 = 3;
 /// uncracked and downstream scoreboard credit unclaimed.
 const NTLM_TURN_AFTER_ROASTABLE_STREAK: u32 = 2;
 
+const DEFAULT_MAX_ACTIVE_CRACK_TASKS: usize = 2;
+const CRACK_INFLIGHT_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
+fn max_active_crack_tasks() -> usize {
+    std::env::var("ARES_MAX_ACTIVE_CRACK_TASKS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_ACTIVE_CRACK_TASKS)
+}
+
+/// Slot-time cost class for a hash's hashcat mode. Lower cracks fast; higher
+/// can grind for the whole budget. The two AES kerberoast modes (19600/19700)
+/// are ~1000x slower per candidate than RC4/NTLM, so a single AES batch can
+/// hold the AES-exclusive hashcat slot for its full budget; every other mode
+/// exhausts rockyou in seconds.
+///
+/// Used only as a *secondary* sort key inside the roastable priority bucket, so
+/// a fast, high-crack-probability RC4 AS-REP (mode 18200) or RC4 kerberoast
+/// (13100) is dispatched before a slow, usually-uncrackable AES kerberoast
+/// ticket. AS-REP roast in particular is the classic cross-forest foothold: its
+/// plaintext is a human password (near-certain rockyou hit) that unlocks
+/// authenticated action in a far domain. Losing that race to a slow AES ticket
+/// has cost a whole second forest — a far-domain AS-REP hash cracked ~46 min
+/// after capture, stuck behind other crack work, with no time left to DCSync
+/// that domain's krbtgt before the op ended.
+fn crack_mode_cost(hash_value: &str) -> u8 {
+    match ares_tools::cracker::hashcat_mode_for(hash_value) {
+        19600 | 19700 => 1, // AES kerberoast — can burn the whole slot budget
+        _ => 0,             // RC4 AS-REP / RC4 kerberoast / NTLM — crack fast
+    }
+}
+
+/// Order the crack work list breadth-first: by crack priority, then by cheapest
+/// hashcat mode, then by fewest prior attempts on that exact hash. Ensures every
+/// uncracked roastable hash gets attempt #1 before any hash gets attempt #2, and
+/// that a fast RC4 AS-REP/kerberoast is never queued behind a slow AES ticket.
+///
+/// Without the attempts tiebreak the priority sort is stable, so `work.first()`
+/// stays pinned to the same hash every tick. That hash is then re-dispatched on
+/// each tick until it either cracks or exhausts `MAX_CRACK_ATTEMPTS` — so an
+/// AES-only kerberoast ticket (etype 18, mode 19700) whose password isn't in the
+/// wordlist burns all three ~10-min crack slots back-to-back before the next
+/// hash is ever tried, starving a genuinely crackable ticket queued behind it
+/// (e.g. an SPN account whose password *is* in rockyou) until the op ends.
+/// Cycling through every hash once before any retry also makes the retries worth
+/// more: by attempt #2 the op has usually harvested more cleartext, so the
+/// known-password seed list fed to hashcat has grown.
+///
+/// The mode-cost tiebreak sits *between* priority and attempts: it never lets an
+/// NTLM hash jump ahead of a roastable (priority dominates), but within the
+/// roastable bucket it puts the fast, high-value RC4 modes first so the single
+/// hashcat pool recovers the likely cross-forest foothold before spending the
+/// AES budget on a ticket that probably isn't in the wordlist at all.
+fn sort_crack_work(
+    work: &mut [(String, ares_core::models::Hash)],
+    attempts: &std::collections::HashMap<String, u32>,
+) {
+    work.sort_by_key(|(dedup, h)| {
+        (
+            crack_priority(&h.hash_type),
+            crack_mode_cost(&h.hash_value),
+            *attempts.get(dedup).unwrap_or(&0),
+        )
+    });
+}
+
 /// Pick the next hash to dispatch given a priority-sorted work list and the
 /// current roastable streak. Pure function — exercised directly by the unit
 /// tests so the fairness invariant doesn't drift back into starvation.
@@ -101,6 +169,7 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
     // Tracks consecutive roastable dispatches so NTLM hashes from
     // secretsdump aren't starved by a continuous roastable inflow.
     let mut roastable_streak: u32 = 0;
+    let mut inflight_crack_dedup: HashMap<String, Instant> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -111,77 +180,89 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             break;
         }
 
+        let active_crack_tasks = dispatcher.tracker.count_for_role("cracker").await;
+        if active_crack_tasks == 0 {
+            inflight_crack_dedup.clear();
+        } else {
+            let now = Instant::now();
+            inflight_crack_dedup
+                .retain(|_, submitted_at| now.duration_since(*submitted_at) < CRACK_INFLIGHT_TTL);
+        }
+
         // Collect unprocessed hashes, then sort by crack priority so the
-        // single hashcat slot serves roastable hashes first. Without this,
+        // hashcat pool serves roastable hashes first. Without this,
         // a backlog of NTLM machine-account hashes from secretsdump (already
         // PtH-usable) would starve the lone kerberoast/asrep hash that
         // unlocks a service-account password.
-        let mut work: Vec<(String, ares_core::models::Hash)> = {
+        let (mut work, attempts): (
+            Vec<(String, ares_core::models::Hash)>,
+            std::collections::HashMap<String, u32>,
+        ) = {
             let state = dispatcher.state.read().await;
-            state
+            let work = state
                 .hashes
                 .iter()
                 .filter(|h| h.cracked_password.is_none())
                 .filter(|h| !is_uncrackable(h))
                 .filter_map(|h| {
                     let dedup = crack_dedup_key(h);
-                    if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
+                    if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup)
+                        || inflight_crack_dedup.contains_key(&dedup)
+                    {
                         None
                     } else {
                         Some((dedup, h.clone()))
                     }
                 })
-                .collect()
+                .collect();
+            (work, state.crack_attempts.clone())
         };
-        work.sort_by_key(|(_, h)| crack_priority(&h.hash_type));
+        sort_crack_work(&mut work, &attempts);
 
-        // Serialize crack tasks: hashcat only allows one instance at a time.
-        // Skip this tick if a cracker task is already running.
-        if dispatcher.tracker.count_for_role("cracker").await > 0 {
-            debug!("Crack task already active, skipping dispatch this tick");
+        // Allow multiple distinct crack tasks up to the configured cap. Same-mode
+        // roastables are still batched into one task, and in-flight dedup keys
+        // above prevent the next tick from re-submitting the same hash while an
+        // earlier batch is still running.
+        let max_active = max_active_crack_tasks();
+        if active_crack_tasks >= max_active {
+            debug!(
+                active = active_crack_tasks,
+                max_active, "Crack task cap reached, skipping dispatch this tick"
+            );
             continue;
         }
 
-        // Only dispatch one crack task per tick to avoid hashcat PID conflicts.
-        // Remaining hashes will be picked up on subsequent ticks.
+        // Dispatch one crack task per tick (hashcat is a single serialized
+        // slot). The `select_next_crack` pick is the primary hash; a roastable
+        // pick then pulls in every other uncracked roastable of the same hashcat
+        // mode so they crack together in one run (see `batch_same_mode_roastable`).
         let next = select_next_crack(&work, roastable_streak).cloned();
-        if let Some((dedup_key, hash)) = next {
-            if crack_priority(&hash.hash_type) == 0 {
+        if let Some((_primary_dedup, primary)) = next {
+            let batch = if crack_priority(&primary.hash_type) == 0 {
                 roastable_streak = roastable_streak.saturating_add(1);
+                batch_same_mode_roastable(&work, &primary)
             } else {
+                // NTLM: never batched — its cracked line (`<32hex>:pw`) carries
+                // no principal, so attribution needs the per-task username, which
+                // only holds for one hash.
                 roastable_streak = 0;
-            }
-            match dispatcher.request_crack(&hash).await {
+                vec![(crack_dedup_key(&primary), primary.clone())]
+            };
+
+            let hashes: Vec<ares_core::models::Hash> =
+                batch.iter().map(|(_, h)| h.clone()).collect();
+            match dispatcher.request_crack_batch(&hashes).await {
                 Ok(Some(task_id)) => {
-                    debug!(task_id = %task_id, hash_type = %hash.hash_type, "Crack task dispatched");
-                    // Increment the per-hash attempt counter. Cap reached
-                    // → write the dedup marker (persisted) so future ticks
-                    // and post-restart ticks skip this hash permanently.
-                    // Before the cap, do NOT write the dedup — that lets a
-                    // failed crack (cracked_password still None when the
-                    // task finishes) be retried on the next tick.
-                    let attempts = {
-                        let mut state = dispatcher.state.write().await;
-                        let entry = state.crack_attempts.entry(dedup_key.clone()).or_insert(0);
-                        *entry += 1;
-                        *entry
-                    };
-                    if attempts >= MAX_CRACK_ATTEMPTS {
-                        warn!(
-                            dedup_key = %dedup_key,
-                            hash_type = %hash.hash_type,
-                            attempts,
-                            "Crack attempts exhausted; giving up on hash"
-                        );
-                        dispatcher
-                            .state
-                            .write()
-                            .await
-                            .mark_processed(DEDUP_CRACK_REQUESTS, dedup_key.clone());
-                        let _ = dispatcher
-                            .state
-                            .persist_dedup(&dispatcher.queue, DEDUP_CRACK_REQUESTS, &dedup_key)
-                            .await;
+                    debug!(
+                        task_id = %task_id,
+                        hash_type = %primary.hash_type,
+                        batch = hashes.len(),
+                        "Crack task dispatched"
+                    );
+                    let now = Instant::now();
+                    for (dedup, hash) in &batch {
+                        inflight_crack_dedup.insert(dedup.clone(), now);
+                        record_crack_attempt(&dispatcher, dedup, &hash.hash_type).await;
                     }
                 }
                 Ok(None) => {} // deferred or throttled
@@ -191,14 +272,71 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
     }
 }
 
+/// All uncracked roastable hashes in `work` that share `primary`'s hashcat mode
+/// (including `primary`). These crack together in one hashcat run: a crackable
+/// ticket is recovered in the first wordlist pass instead of waiting out every
+/// other ticket's full crack budget one task at a time. Grouping by
+/// [`ares_tools::cracker::hashcat_mode_for`] keeps the batch to a single `-m`
+/// mode, which is required — hashcat runs one mode per invocation.
+fn batch_same_mode_roastable(
+    work: &[(String, ares_core::models::Hash)],
+    primary: &ares_core::models::Hash,
+) -> Vec<(String, ares_core::models::Hash)> {
+    let mode = ares_tools::cracker::hashcat_mode_for(&primary.hash_value);
+    work.iter()
+        .filter(|(_, h)| {
+            crack_priority(&h.hash_type) == 0
+                && ares_tools::cracker::hashcat_mode_for(&h.hash_value) == mode
+        })
+        .cloned()
+        .collect()
+}
+
+/// Record one crack attempt against `dedup_key`: bump the per-hash counter and,
+/// at `MAX_CRACK_ATTEMPTS`, write the permanent dedup marker (in-memory +
+/// persisted) so the hash is never re-dispatched, even after the op restarts.
+async fn record_crack_attempt(
+    dispatcher: &Arc<crate::orchestrator::dispatcher::Dispatcher>,
+    dedup_key: &str,
+    hash_type: &str,
+) {
+    let attempts = {
+        let mut state = dispatcher.state.write().await;
+        let entry = state
+            .crack_attempts
+            .entry(dedup_key.to_string())
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    };
+    if attempts >= MAX_CRACK_ATTEMPTS {
+        warn!(
+            dedup_key = %dedup_key,
+            hash_type = %hash_type,
+            attempts,
+            "Crack attempts exhausted; giving up on hash"
+        );
+        dispatcher
+            .state
+            .write()
+            .await
+            .mark_processed(DEDUP_CRACK_REQUESTS, dedup_key.to_string());
+        let _ = dispatcher
+            .state
+            .persist_dedup(&dispatcher.queue, DEDUP_CRACK_REQUESTS, dedup_key)
+            .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        crack_priority, is_krbtgt, is_uncrackable, select_next_crack, MAX_CRACK_ATTEMPTS,
-        NTLM_TURN_AFTER_ROASTABLE_STREAK,
+        batch_same_mode_roastable, crack_priority, is_krbtgt, is_uncrackable, select_next_crack,
+        sort_crack_work, MAX_CRACK_ATTEMPTS, NTLM_TURN_AFTER_ROASTABLE_STREAK,
     };
     use crate::orchestrator::state::{StateInner, DEDUP_CRACK_REQUESTS};
     use ares_core::models::Hash;
+    use std::collections::HashMap;
 
     fn mk(hash_type: &str) -> (String, Hash) {
         (
@@ -310,6 +448,117 @@ mod tests {
     fn unknown_hash_types_share_ntlm_bucket() {
         assert_eq!(crack_priority("ntlm"), crack_priority("netntlmv2"));
         assert_eq!(crack_priority("ntlm"), crack_priority(""));
+    }
+
+    #[test]
+    fn breadth_first_prefers_unattempted_hash_over_retry() {
+        // Two roastable hashes at equal priority: `starved` (a slow, so-far
+        // uncrackable AES kerberoast ticket) has already burned attempts;
+        // `fresh` has none. The un-attempted hash must sort first so it isn't
+        // starved behind the other's back-to-back retries. Regression guard for
+        // an AES-only kerberoast ticket (mode 19700, ~10 min/attempt) whose
+        // password isn't in the wordlist monopolizing the AES hashcat slot
+        // for all MAX_CRACK_ATTEMPTS runs while a rockyou-crackable ticket
+        // queued behind it never gets a turn before the op ends.
+        let starved = (
+            "k:starved".to_string(),
+            mk_hash("svc_web", "kerberoast", false),
+        );
+        let fresh = ("k:fresh".to_string(), mk_hash("carol", "kerberoast", false));
+        let mut work = vec![starved, fresh];
+        let mut attempts = HashMap::new();
+        attempts.insert("k:starved".to_string(), MAX_CRACK_ATTEMPTS - 1);
+        sort_crack_work(&mut work, &attempts);
+        assert_eq!(
+            work[0].0, "k:fresh",
+            "an un-attempted hash must be dispatched before another hash's retry"
+        );
+        // And the picker chooses it (streak below the NTLM-turn threshold).
+        let chosen = select_next_crack(&work, 0).unwrap();
+        assert_eq!(chosen.1.username, "carol");
+    }
+
+    #[test]
+    fn batch_groups_same_mode_roastables_only() {
+        // A batch pulls in every uncracked roastable sharing the primary's
+        // hashcat mode — and nothing else: not a different-mode roastable (an
+        // AS-REP ticket is mode 18200, AES kerberoast is 19700), not an NTLM
+        // hash (mode 1000, and NTLM can't be batched anyway). So every etype-18
+        // kerberoast ticket cracks in one run; the AS-REP one waits its own turn.
+        fn roast(dedup: &str, user: &str, hv: &str) -> (String, Hash) {
+            let mut h = mk_hash(user, "kerberoast", false);
+            h.hash_value = hv.into();
+            (dedup.into(), h)
+        }
+        let aes1 = roast(
+            "k:aes1",
+            "carol",
+            "$krb5tgs$18$carol$CONTOSO.LOCAL$*HTTP/web01*$aa$bb",
+        );
+        let aes2 = roast(
+            "k:aes2",
+            "svc_sql",
+            "$krb5tgs$18$svc_sql$CONTOSO.LOCAL$*MSSQLSvc/sql01*$cc$dd",
+        );
+        let mut asrep_h = mk_hash("bob", "asrep", false);
+        asrep_h.hash_value = "$krb5asrep$23$bob@CONTOSO.LOCAL:aa$bb".into();
+        let asrep = ("a:bob".to_string(), asrep_h);
+        let ntlm = ("n:alice".to_string(), mk_hash("alice", "ntlm", false));
+
+        let work = vec![aes1.clone(), asrep, ntlm, aes2];
+        let batch = batch_same_mode_roastable(&work, &aes1.1);
+        let users: Vec<&str> = batch.iter().map(|(_, h)| h.username.as_str()).collect();
+        assert_eq!(
+            batch.len(),
+            2,
+            "only the two etype-18 kerberoast tickets batch together, got {users:?}"
+        );
+        assert!(users.contains(&"carol") && users.contains(&"svc_sql"));
+    }
+
+    #[test]
+    fn breadth_first_keeps_roastable_ahead_of_never_tried_ntlm() {
+        // Priority still dominates the attempts tiebreak: a roastable hash that
+        // has already been retried outranks a never-tried NTLM hash, so the
+        // fairness fix doesn't let cheap PtH-usable NTLM starve roastables.
+        let roast = (
+            "k:roast".to_string(),
+            mk_hash("svc_sql", "kerberoast", false),
+        );
+        let ntlm = ("n:ntlm".to_string(), mk_hash("alice", "ntlm", false));
+        let mut work = vec![ntlm, roast];
+        let mut attempts = HashMap::new();
+        attempts.insert("k:roast".to_string(), MAX_CRACK_ATTEMPTS - 1);
+        sort_crack_work(&mut work, &attempts);
+        assert_eq!(work[0].1.hash_type, "kerberoast");
+    }
+
+    #[test]
+    fn cheap_rc4_asrep_sorts_ahead_of_slow_aes_kerberoast() {
+        // Within the roastable bucket, a fast RC4 AS-REP (mode 18200) must be
+        // dispatched before a slow AES kerberoast ticket (etype 18, mode 19700).
+        // The AS-REP is the likely cross-forest foothold — its plaintext is a
+        // human password that cracks in seconds and unlocks a far domain —
+        // whereas the AES ticket can hold the AES hashcat slot for its whole
+        // budget and usually isn't in the wordlist at all. Regression guard for
+        // a far-domain AS-REP foothold losing the crack-slot race to an AES
+        // ticket (which cost a whole second forest).
+        let mut aes = mk_hash("svc_sql", "kerberoast", false);
+        aes.hash_value = "$krb5tgs$18$svc_sql$FABRIKAM.LOCAL$*MSSQLSvc/sql01*$aa$bb".into();
+        let mut asrep = mk_hash("carol", "asrep", false);
+        asrep.hash_value = "$krb5asrep$23$carol@FABRIKAM.LOCAL:aa$bb".into();
+        // AES appears first and has no more attempts, so only the mode-cost
+        // tiebreak can float the AS-REP ahead of it.
+        let mut work = vec![("k:aes".to_string(), aes), ("a:carol".to_string(), asrep)];
+        let attempts = HashMap::new();
+        sort_crack_work(&mut work, &attempts);
+        assert_eq!(
+            work[0].1.hash_type, "asrep",
+            "a fast RC4 AS-REP must sort ahead of a slow AES kerberoast ticket"
+        );
+        // And the picker chooses it (streak below the NTLM-turn threshold).
+        let chosen = select_next_crack(&work, 0).unwrap();
+        assert_eq!(chosen.1.username, "carol");
     }
 
     #[test]

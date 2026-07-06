@@ -590,12 +590,12 @@ fn dispatch_error_result_handles_anyhow_errors() {
 #[test]
 fn dispatch_timeout_result_renders_seconds() {
     use redis_dispatcher::dispatch_timeout_result;
-    let r = dispatch_timeout_result("hashcat", std::time::Duration::from_secs(1500));
+    let r = dispatch_timeout_result("hashcat", std::time::Duration::from_secs(5700));
     assert_eq!(r.output, "");
     assert!(r.discoveries.is_none());
     let err = r.error.as_deref().unwrap();
     assert!(err.contains("hashcat"));
-    assert!(err.contains("1500s"));
+    assert!(err.contains("5700s"));
     assert!(err.contains("timed out"));
 }
 
@@ -607,9 +607,9 @@ fn dispatch_timeout_result_zero_seconds_still_well_formed() {
 }
 
 #[test]
-fn default_tool_timeout_is_25_minutes() {
-    // 1500s = 25min — must exceed worst-case hashcat queue + run time.
-    assert_eq!(DEFAULT_TOOL_TIMEOUT_SECS, 25 * 60);
+fn default_tool_timeout_is_95_minutes() {
+    // 5700s = 95min — must exceed worst-case AES hashcat queue + run time.
+    assert_eq!(DEFAULT_TOOL_TIMEOUT_SECS, 95 * 60);
 }
 
 #[test]

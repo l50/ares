@@ -182,6 +182,14 @@ pub async fn run_tool_exec_loop(
     let inflight = Arc::new(AtomicUsize::new(0));
     let worker_role = config.worker_role.clone();
 
+    // Long-lived workers (EC2 systemd units) start with operation_id=None, so
+    // the startup `/etc/hosts` sync in `worker::run` never fires — they only
+    // learn the op from incoming requests. Bind the sync lazily off the first
+    // request that carries one; without this, FQDN/Kerberos tools fail with
+    // `getaddrinfo: Name or service not known`. Seeded with the startup op so
+    // the K8s path (op known at boot) doesn't double-spawn.
+    let mut hosts_guard = crate::worker::hosts::HostsSyncGuard::seeded(config.operation_id.clone());
+
     loop {
         let next = tokio::select! {
             m = sub.next() => m,
@@ -203,6 +211,12 @@ pub async fn run_tool_exec_loop(
                 continue;
             }
         };
+
+        // Ensure the /etc/hosts sync is running for this request's operation so
+        // FQDN/Kerberos-based tools can resolve DC and member-server names.
+        if let Some(ref op) = request.operation_id {
+            hosts_guard.ensure(&conn, op, &config.agent_name, shutdown.clone());
+        }
 
         // Acquire the per-worker permit BEFORE spawning so the loop
         // backpressures on the cap. `acquire_owned` returns a permit whose

@@ -316,6 +316,7 @@ mod tests {
             max_tasks_per_role: 3,
             dispatch_delay: std::time::Duration::from_millis(0),
             stale_task_timeout: std::time::Duration::from_secs(300),
+            non_llm_task_timeout: std::time::Duration::from_secs(6000),
             deferred_task_max_age: std::time::Duration::from_secs(300),
             max_deferred_per_type: 5,
             max_deferred_total: 20,

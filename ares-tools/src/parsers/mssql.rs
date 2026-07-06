@@ -131,6 +131,21 @@ pub fn parse_mssql_impersonation(output: &str, params: &Value) -> Vec<Value> {
     vulns
 }
 
+/// Is `s` shaped like a real SQL Server `sys.servers.name` (sysname)?
+///
+/// Linked-server names are a single token — a NetBIOS name (`SQL01`), an
+/// instance (`SQL01\SQLEXPRESS`), or an FQDN/IP (`sql01.contoso.local`). None
+/// contain whitespace or the punctuation that shows up in impacket crash
+/// tracebacks (parens, quotes, commas, colons, tildes, carets). Accept only
+/// `[A-Za-z0-9_.\-\\$]` so error text and traceback fragments can never be
+/// promoted to a phantom linked-server vuln. Bounded to sysname's 128 chars.
+fn is_plausible_linked_server_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '\\' | '$'))
+}
+
 /// Parse `mssql_enum_linked_servers` output for linked server connections.
 ///
 /// The tool runs `SELECT name FROM sys.servers WHERE is_linked = 1`, so the
@@ -156,6 +171,20 @@ pub fn parse_mssql_linked_servers(output: &str, params: &Value) -> Vec<Value> {
         return vulns;
     }
 
+    // Tool-crash guard: when impacket-mssqlclient dies mid-enum (e.g. a DNS
+    // `getaddrinfo` failure resolving the linked server's host), it dumps a
+    // Python traceback to the captured output. Without this, every traceback
+    // LINE below survives the row filters and becomes a phantom
+    // `mssql_linked_server` vuln (`"Traceback (most recent call last):"`,
+    // `socket.gaierror…`, the `~~~^^^` caret underline). Bail on the crash
+    // markers so a failed enum yields zero links, not garbage.
+    if lower.contains("traceback (most recent call last)")
+        || lower.contains("socket.gaierror")
+        || lower.contains("--- stderr ---")
+    {
+        return vulns;
+    }
+
     let mut seen = std::collections::HashSet::new();
     for raw in output.lines() {
         let line = strip_sql_prompt(raw).trim();
@@ -169,6 +198,14 @@ pub fn parse_mssql_linked_servers(output: &str, params: &Value) -> Vec<Value> {
         }
         // Separator row (dashes) and the single `name` column header.
         if line.chars().all(|c| c == '-' || c == ' ') || line.eq_ignore_ascii_case("name") {
+            continue;
+        }
+        // A sys.servers.name (sysname) is a single token — reject anything that
+        // isn't shaped like a server name. This is the per-line backstop to the
+        // traceback guard above: stray error text, socket-module fragments, and
+        // caret-underline rows all carry spaces or punctuation a real link name
+        // never does.
+        if !is_plausible_linked_server_name(line) {
             continue;
         }
 
@@ -243,11 +280,12 @@ class   class_desc   major_id   minor_id   grantee_principal_id   grantor_princi
 SQL> SELECT 'server' AS scope, gr.name ...
 scope   grantee          impersonate_target
 ------  ---------------  ------------------
-server  samwell.tarly    sa
-server  brandon.stark    jon.snow
-master  arya.stark       dbo
+server  alice            sa
+server  bob              svc_sql
+master  carol            dbo
 "#;
-        let params = json!({"target": "192.168.58.51", "domain": "north.local", "username": "samwell.tarly"});
+        let params =
+            json!({"target": "192.168.58.51", "domain": "contoso.local", "username": "alice"});
         let vulns = parse_mssql_impersonation(output, &params);
         assert_eq!(vulns.len(), 3, "got {vulns:?}");
         // Distinct vuln_ids (per grantee→target), not collapsed to one host key.
@@ -256,19 +294,19 @@ master  arya.stark       dbo
             .map(|v| v["vuln_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids.len(), 3);
-        // brandon → jon.snow target captured (not hardcoded sa).
-        let brandon = vulns
+        // bob → svc_sql target captured (not hardcoded sa).
+        let bob = vulns
             .iter()
-            .find(|v| v["details"]["account_name"] == "brandon.stark")
+            .find(|v| v["details"]["account_name"] == "bob")
             .unwrap();
-        assert_eq!(brandon["details"]["impersonate_target"], "jon.snow");
+        assert_eq!(bob["details"]["impersonate_target"], "svc_sql");
         // Database-scope grant captured.
-        let arya = vulns
+        let carol = vulns
             .iter()
-            .find(|v| v["details"]["account_name"] == "arya.stark")
+            .find(|v| v["details"]["account_name"] == "carol")
             .unwrap();
-        assert_eq!(arya["details"]["scope"], "master");
-        assert_eq!(arya["details"]["impersonate_target"], "dbo");
+        assert_eq!(carol["details"]["scope"], "master");
+        assert_eq!(carol["details"]["impersonate_target"], "dbo");
     }
 
     #[test]
@@ -341,6 +379,63 @@ SQL (CONTOSO\alice  guest@master)>
             .iter()
             .any(|v| v["details"]["linked_server"] == "SQL"
                 || v["details"]["linked_server"] == "name"));
+    }
+
+    #[test]
+    fn parse_linked_servers_ignores_crash_traceback() {
+        // Regression: impacket-mssqlclient crashed on a DNS getaddrinfo failure
+        // resolving the linked server's host and dumped a Python traceback into
+        // the captured output. Every traceback line used to survive the row
+        // filters and become a phantom `mssql_linked_server` vuln. The parser
+        // must yield ZERO links for a crashed enum.
+        let output = "SQL (CONTOSO\\alice  guest@master)> \n\
+                      --- stderr ---\n\
+                      Traceback (most recent call last):\n\
+                        File \"/opt/impacket/examples/mssqlclient.py\", line 91, in <module>\n\
+                          ms_sql.connect()\n\
+                        File \"/opt/impacket/impacket/tds.py\", line 554, in connect\n\
+                          af, socktype, proto, canonname, sa = socket.getaddrinfo(self.server, self.port)\n\
+                          ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\
+                      socket.gaierror: [Errno -2] Name or service not known\n";
+        let params = json!({"target": "sql01.contoso.local", "domain": "contoso.local"});
+        let vulns = parse_mssql_linked_servers(output, &params);
+        assert!(
+            vulns.is_empty(),
+            "crash traceback produced phantom links: {vulns:?}"
+        );
+    }
+
+    #[test]
+    fn parse_linked_servers_rejects_non_servername_rows() {
+        // Even without the traceback header, individual error/junk lines must
+        // not be promoted: only sysname-shaped tokens survive the per-line
+        // filter. The real link on the same output is still captured.
+        let output = "SQL (CONTOSO\\alice  guest@master)> name\n\
+                      -------\n\
+                      sql01\n\
+                      for res in _socket.getaddrinfo(host, port, family):\n\
+                      ~~~~~~~~~~~~~~^^\n\
+                      SQL (CONTOSO\\alice  guest@master)>\n";
+        let params = json!({"target": "192.168.58.12", "domain": "contoso.local"});
+        let vulns = parse_mssql_linked_servers(output, &params);
+        assert_eq!(vulns.len(), 1, "got {vulns:?}");
+        assert_eq!(vulns[0]["details"]["linked_server"], "sql01");
+    }
+
+    #[test]
+    fn plausible_linked_server_name_accepts_real_shapes_rejects_junk() {
+        assert!(is_plausible_linked_server_name("SQL01"));
+        assert!(is_plausible_linked_server_name("SQL01\\SQLEXPRESS"));
+        assert!(is_plausible_linked_server_name("sql01.contoso.local"));
+        assert!(is_plausible_linked_server_name("192.168.58.12"));
+        assert!(!is_plausible_linked_server_name(""));
+        assert!(!is_plausible_linked_server_name(
+            "Traceback (most recent call last):"
+        ));
+        assert!(!is_plausible_linked_server_name("ms_sql.connect()"));
+        assert!(!is_plausible_linked_server_name("~~~~^^^^"));
+        assert!(!is_plausible_linked_server_name("--- stderr ---"));
+        assert!(!is_plausible_linked_server_name(&"a".repeat(129)));
     }
 
     #[test]

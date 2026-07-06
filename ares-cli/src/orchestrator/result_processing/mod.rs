@@ -1786,22 +1786,31 @@ async fn extract_from_raw_text(
                 new_count += 1;
                 create_credential_timeline_event(dispatcher, &source, &username, &domain, is_admin)
                     .await;
-                // When a cracked credential is published, update the corresponding
-                // hash's cracked_password field in state and Redis.
-                if is_cracked {
-                    let _ = dispatcher
-                        .state
-                        .update_hash_cracked_password(
-                            &dispatcher.queue,
-                            &username,
-                            &domain,
-                            &password,
-                        )
-                        .await;
-                }
             }
-            Ok(false) => {} // duplicate
-            Err(e) => warn!(err = %e, "Failed to publish text-extracted credential"),
+            Ok(false) => {} // duplicate credential — the hash stamp below still runs
+            Err(e) => {
+                warn!(err = %e, "Failed to publish text-extracted credential");
+                continue;
+            }
+        }
+        // Stamp the matching raw-ticket hash as cracked whenever we recovered a
+        // cracked plaintext — even when the credential row itself was a duplicate.
+        // A kerberoast/AS-REP hash dedups by principal, so an account holds one
+        // ticket Hash row per op. When that account's password is already known
+        // from another source (GPP, cleartext, a prior crack of a different
+        // ticket, a spray hit), cracking the ticket re-derives the same plaintext
+        // and `publish_credential` dedups it (the key is domain+user+password,
+        // source-independent) → Ok(false). Without stamping on this path the
+        // ticket Hash stays at cracked_password=None, so `is_reportable_hash`
+        // surfaces the raw blob as an *uncracked* finding alongside the cracked
+        // Credential — double-counting the account on the external scoreboard and
+        // showing it as raw material in loot's Hashes view. Stamping here keeps
+        // the Credentials/Hashes views and the scoreboard consistent.
+        if is_cracked {
+            let _ = dispatcher
+                .state
+                .update_hash_cracked_password(&dispatcher.queue, &username, &domain, &password)
+                .await;
         }
     }
 
@@ -1970,22 +1979,24 @@ async fn extract_discoveries(
                 debug!("Published new credential from result");
                 create_credential_timeline_event(dispatcher, &source, &username, &domain, is_admin)
                     .await;
-                // When a cracked credential is published, update the corresponding
-                // hash's cracked_password field in state and Redis.
-                if is_cracked {
-                    let _ = dispatcher
-                        .state
-                        .update_hash_cracked_password(
-                            &dispatcher.queue,
-                            &username,
-                            &domain,
-                            &password,
-                        )
-                        .await;
-                }
             }
-            Ok(false) => {} // duplicate
-            Err(e) => warn!(err = %e, "Failed to publish credential"),
+            Ok(false) => {} // duplicate credential — the hash stamp below still runs
+            Err(e) => {
+                warn!(err = %e, "Failed to publish credential");
+                continue;
+            }
+        }
+        // Stamp the matching raw-ticket hash as cracked even when the credential
+        // row was a duplicate — see the full rationale in `extract_from_raw_text`.
+        // A kerberoast/AS-REP crack of an account whose password is already known
+        // dedups the credential (Ok(false)); without this it leaves the ticket at
+        // cracked_password=None and double-reports alongside the cracked Credential
+        // (see `is_reportable_hash`).
+        if is_cracked {
+            let _ = dispatcher
+                .state
+                .update_hash_cracked_password(&dispatcher.queue, &username, &domain, &password)
+                .await;
         }
     }
 

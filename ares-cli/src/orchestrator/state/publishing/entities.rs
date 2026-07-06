@@ -124,12 +124,28 @@ impl SharedState {
             // forest where DCSync via the trust key won't work — AS-REP roast
             // of a vulnerable account is the only no-cred-needed entry point.
             if !user_domain.is_empty() {
-                let mut state = self.inner.write().await;
-                state.unmark_processed(super::super::DEDUP_ASREP_DOMAINS, &user_domain);
-                drop(state);
-                let _ = self
-                    .unpersist_dedup(queue, super::super::DEDUP_ASREP_DOMAINS, &user_domain)
-                    .await;
+                // The roast dedups on `{domain}:empty` / `{domain}:users`
+                // (see `asrep_dedup_key`), NOT the bare domain — clearing the
+                // bare domain here was a silent no-op, so a roastable account
+                // discovered AFTER the first userlist roast (e.g. a foreign-
+                // forest account found late via cross-forest LDAP) never
+                // triggered a re-roast and its AS-REP hash was never captured.
+                // Clear both suffixed variants so the next tick re-dispatches
+                // with the now-larger userlist.
+                let keys = crate::orchestrator::automation::credential_access::asrep_dedup_keys(
+                    &user_domain,
+                );
+                {
+                    let mut state = self.inner.write().await;
+                    for key in &keys {
+                        state.unmark_processed(super::super::DEDUP_ASREP_DOMAINS, key);
+                    }
+                }
+                for key in &keys {
+                    let _ = self
+                        .unpersist_dedup(queue, super::super::DEDUP_ASREP_DOMAINS, key)
+                        .await;
+                }
             }
         }
         Ok(added)

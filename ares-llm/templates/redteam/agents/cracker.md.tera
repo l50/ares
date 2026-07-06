@@ -45,6 +45,10 @@ to recover plaintext you still crack that NT hash with `-m 1000`.
 4. If cracked, call `task_complete` with a summary — the cracked password is automatically extracted from tool stdout
 5. If not cracked, call `report_crack_failed` then `task_complete`
 
+If `hash_value` is shown as a fenced code block with multiple lines, pass the
+entire multi-line value to the cracking tool verbatim. Preserve every newline and
+hash line; do not crack only the first line or remove repeated hash prefixes.
+
 ### Hashcat Example
 ```
 crack_with_hashcat(hash_value="$krb5tgs$23$*...", hashcat_mode=13100, wordlist_path="/usr/share/wordlists/rockyou.txt")

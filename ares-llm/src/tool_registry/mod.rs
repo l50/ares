@@ -661,6 +661,21 @@ mod tests {
     }
 
     #[test]
+    fn rpcclient_command_schema_exposes_null_session() {
+        let tools = tools_for_role(AgentRole::Recon);
+        let rpcclient = tools
+            .iter()
+            .find(|t| t.name == "rpcclient_command")
+            .expect("recon should expose rpcclient_command");
+        assert!(
+            rpcclient.input_schema["properties"]
+                .as_object()
+                .is_some_and(|props| props.contains_key("null_session")),
+            "rpcclient_command schema must advertise null_session fallback"
+        );
+    }
+
+    #[test]
     fn privesc_has_key_tools() {
         let tools = tools_for_role(AgentRole::Privesc);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();

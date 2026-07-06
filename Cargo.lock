@@ -135,6 +135,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rstest",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

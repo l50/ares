@@ -759,6 +759,25 @@ FABRIKAM\\CONTOSO$:aes256-cts-hmac-sha1-96:4444444444444444444444444444444444444
     }
 
     #[test]
+    fn extract_cracked_passwords_batch_distinct_accounts() {
+        // Batch crack: one hashcat run over several same-mode tickets emits a
+        // cracked line per account. Each must attribute to its own principal
+        // (the SPN account is embedded in the `$krb5tgs$` line), so a batched
+        // crack recovers every crackable ticket, not just the first.
+        let output = "\
+$krb5tgs$18$svc_web$CONTOSO.LOCAL$aabb0000000000000000aabb$ccdd:WebPass1\n\
+$krb5tgs$18$svc_sql$CONTOSO.LOCAL$eeff0000000000000000eeff$1122:SqlPass2";
+        let creds = extract_cracked_passwords(output, "CONTOSO.LOCAL");
+        assert_eq!(creds.len(), 2, "both cracked accounts must be extracted");
+        let by_user: std::collections::HashMap<_, _> = creds
+            .iter()
+            .map(|c| (c.username.as_str(), c.password.as_str()))
+            .collect();
+        assert_eq!(by_user.get("svc_web"), Some(&"WebPass1"));
+        assert_eq!(by_user.get("svc_sql"), Some(&"SqlPass2"));
+    }
+
+    #[test]
     fn extract_cracked_passwords_empty() {
         assert!(extract_cracked_passwords("", "CONTOSO").is_empty());
     }

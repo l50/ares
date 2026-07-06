@@ -55,10 +55,11 @@ pub struct ToolExecResponse {
     pub discoveries: Option<serde_json::Value>,
 }
 
-/// Default timeout waiting for a tool result (25 minutes).
-/// Must exceed queue wait time + longest tool runtime (hashcat can queue
-/// behind another hashcat, so 2x runtime + buffer).
-pub(super) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1500;
+/// Default timeout waiting for a tool result (95 minutes).
+/// Must exceed queue wait time + longest tool runtime. AES Kerberoast defaults
+/// to a 45-minute pass and can queue behind one AES-exclusive job, so this is
+/// 2x runtime plus buffer.
+pub(super) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 95 * 60;
 
 /// Tools that require netexec/ldapsearch and must be routed to the recon
 /// worker queue regardless of the calling agent's role.

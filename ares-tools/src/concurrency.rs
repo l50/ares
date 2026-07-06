@@ -103,21 +103,19 @@ pub async fn acquire_tool_permit() -> SemaphorePermit<'static> {
         .expect("tool semaphore unexpectedly closed")
 }
 
-/// Default number of concurrent hashcat crack jobs. hashcat is designed to
-/// own the GPU as a single instance: two jobs collide on the shared default
-/// session/restore/potfile ("already an instance" refusals, and the loser
-/// bails leaving the GPU at 0% util), while a second job that *does* start
-/// only time-slices the one GPU rather than adding throughput.
+/// Default number of concurrent hashcat crack jobs. Per-job session names keep
+/// hashcat instances from colliding on restore/potfile state, so cheaper modes
+/// can run beside an expensive one. AES Kerberoast has its own exclusive cap
+/// below because two mode 19600/19700 kernels can exhaust a single T4's memory.
 ///
 /// The orchestrator's `auto_crack_dispatch` already serializes at the *task*
 /// layer, but that guard is per-task: the agent loop dispatches every tool
 /// call in a single LLM turn concurrently, so a cracker that emits two
 /// `crack_with_hashcat` calls in one turn would otherwise run two hashcats
 /// under one task. This cap is the process-layer backstop that makes the
-/// documented "single hashcat slot" actually hold, on every path that reaches
-/// `crack_with_hashcat`. Override with `ARES_MAX_CONCURRENT_HASHCAT=<n>` (>1
-/// only makes sense with per-job session isolation and multiple GPUs).
-pub const DEFAULT_HASHCAT_CONCURRENCY: usize = 1;
+/// documented hashcat pool actually hold, on every path that reaches
+/// `crack_with_hashcat`. Override with `ARES_MAX_CONCURRENT_HASHCAT=<n>`.
+pub const DEFAULT_HASHCAT_CONCURRENCY: usize = 2;
 
 /// Override via `ARES_MAX_CONCURRENT_HASHCAT=<n>`. Values <1 are ignored.
 const HASHCAT_CONCURRENCY_ENV: &str = "ARES_MAX_CONCURRENT_HASHCAT";
@@ -131,9 +129,9 @@ static HASHCAT_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
     Semaphore::new(cap)
 });
 
-/// Acquire the hashcat crack-job permit. Held for the full crack sequence
-/// (every wordlist/rules phase plus the final `--show`), so one crack job
-/// runs to completion before the next starts.
+/// Acquire a hashcat crack-job permit. Held for the full crack sequence
+/// (every wordlist/rules phase plus the final `--show`), so each submitted
+/// crack job occupies one slot until completion.
 ///
 /// Composes with the global tool permit: the crack wrapper acquires this
 /// permit first (outer), then each hashcat spawn inside the job acquires the
@@ -149,6 +147,23 @@ pub async fn acquire_hashcat_permit() -> SemaphorePermit<'static> {
         .acquire()
         .await
         .expect("hashcat semaphore unexpectedly closed")
+}
+
+static AES_KERBEROAST_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
+
+/// Acquire the exclusive AES Kerberoast permit. Modes 19600/19700 are
+/// memory-heavy enough that two concurrent jobs on the current T4 profile can
+/// fail or throttle each other harder than a serialized run. Same-mode
+/// roastable hashes are batched upstream, so this preserves useful parallelism
+/// without duplicating the most expensive kernel.
+pub async fn acquire_aes_kerberoast_permit() -> SemaphorePermit<'static> {
+    if AES_KERBEROAST_PERMITS.available_permits() == 0 {
+        debug!("AES Kerberoast cap reached, queueing crack job");
+    }
+    AES_KERBEROAST_PERMITS
+        .acquire()
+        .await
+        .expect("AES Kerberoast semaphore unexpectedly closed")
 }
 
 #[cfg(test)]
@@ -194,11 +209,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hashcat_permit_serializes_to_single_slot() {
-        // The single-slot invariant the crack path relies on: only one crack
-        // job can hold the hashcat permit at a time (default cap = 1). Holding
-        // it drains availability to zero; dropping restores it.
-        assert_eq!(DEFAULT_HASHCAT_CONCURRENCY, 1);
+    async fn hashcat_permit_uses_default_pool() {
+        // The crack path relies on a bounded hashcat pool. Holding one permit
+        // drains one slot; dropping restores it.
+        assert_eq!(DEFAULT_HASHCAT_CONCURRENCY, 2);
         let initial = HASHCAT_PERMITS.available_permits();
         let permit = acquire_hashcat_permit().await;
         assert_eq!(

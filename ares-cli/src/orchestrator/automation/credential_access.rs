@@ -144,6 +144,34 @@ fn is_host_domain_related(host_domain: &str, cred_domain: &str) -> bool {
     h == c || h.ends_with(&format!(".{c}")) || c.ends_with(&format!(".{h}"))
 }
 
+/// AS-REP roast dedup key for `domain`, keyed on whether a real userlist is
+/// known yet (`:users`) or not (`:empty`).
+///
+/// Centralised so the dispatcher ([`select_asrep_work`]), the spray
+/// prerequisite gate ([`common_spray_prereqs_met`]), and the user-publish
+/// re-arm (`publish_user`) all agree on the exact string. A past drift — the
+/// re-arm cleared the bare `{domain}` while the dispatcher marked
+/// `{domain}:users` — silently broke re-arming, so a foreign-forest roastable
+/// account discovered *after* the first userlist roast (e.g. found late via
+/// cross-forest LDAP) never triggered a second pass and its AS-REP hash was
+/// never captured.
+pub(crate) fn asrep_dedup_key(domain: &str, has_users: bool) -> String {
+    format!(
+        "{}:{}",
+        domain.to_lowercase(),
+        if has_users { "users" } else { "empty" }
+    )
+}
+
+/// Both AS-REP dedup key variants for `domain` — used to re-arm the roast on
+/// new-user discovery regardless of which variant was last dispatched.
+pub(crate) fn asrep_dedup_keys(domain: &str) -> [String; 2] {
+    [
+        asrep_dedup_key(domain, false),
+        asrep_dedup_key(domain, true),
+    ]
+}
+
 /// One unit of AS-REP roast work: `(domain, dc_ip, dedup_key)`. Re-armable on
 /// the `:empty`/`:users` transition so a freshly-enumerated foreign-forest
 /// userlist triggers a second pass.
@@ -166,7 +194,7 @@ pub(crate) fn select_asrep_work(state: &StateInner) -> Vec<AsrepWorkItem> {
                     && !u.username.is_empty()
                     && !u.username.ends_with('$')
             });
-            let dedup_key = format!("{}:{}", dom_l, if has_users { "users" } else { "empty" });
+            let dedup_key = asrep_dedup_key(domain, has_users);
             if state.is_processed(DEDUP_ASREP_DOMAINS, &dedup_key) {
                 return None;
             }
@@ -609,8 +637,7 @@ pub(crate) fn select_credential_secretsdump_work(
 /// can be tested independently of the outer dispatcher loop.
 pub(crate) fn common_spray_prereqs_met(state: &StateInner, domain: &str) -> bool {
     let d = domain.to_lowercase();
-    let empty_key = format!("{d}:empty");
-    let users_key = format!("{d}:users");
+    let [empty_key, users_key] = asrep_dedup_keys(domain);
     let asrep_done = state.is_processed(DEDUP_ASREP_DOMAINS, &empty_key)
         || state.is_processed(DEDUP_ASREP_DOMAINS, &users_key);
     if !asrep_done {
@@ -1205,6 +1232,44 @@ pub async fn auto_credential_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- asrep_dedup_key / asrep_dedup_keys ---
+
+    #[test]
+    fn asrep_dedup_key_is_lowercased_and_suffixed() {
+        assert_eq!(
+            asrep_dedup_key("CONTOSO.LOCAL", false),
+            "contoso.local:empty"
+        );
+        assert_eq!(
+            asrep_dedup_key("contoso.local", true),
+            "contoso.local:users"
+        );
+    }
+
+    #[test]
+    fn asrep_rearm_keys_cover_both_dispatch_variants() {
+        // The user-publish re-arm clears `asrep_dedup_keys(domain)`; the
+        // dispatcher (`select_asrep_work`) marks `asrep_dedup_key(domain,
+        // has_users)`. If these ever drift, a roastable account discovered
+        // AFTER the first userlist roast never re-triggers a roast — the bug
+        // that left a late-discovered foreign-forest account un-roasted and
+        // the second forest without a foothold. Lock the exact strings so the
+        // publisher and the dispatcher can never disagree again.
+        let dispatched_empty = asrep_dedup_key("contoso.local", false);
+        let dispatched_users = asrep_dedup_key("contoso.local", true);
+        // Re-arm is case-insensitive (user.domain may differ in case from the
+        // state.domains entry) and must cover BOTH variants.
+        let rearm = asrep_dedup_keys("CONTOSO.LOCAL");
+        assert!(
+            rearm.contains(&dispatched_empty),
+            "re-arm must clear the :empty key the dispatcher marks"
+        );
+        assert!(
+            rearm.contains(&dispatched_users),
+            "re-arm must clear the :users key the dispatcher marks"
+        );
+    }
 
     // --- kerberoast_dedup_key ---
 

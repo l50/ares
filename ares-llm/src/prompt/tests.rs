@@ -42,19 +42,24 @@ fn generate_recon_prompt() {
     assert!(prompt.contains("192.168.58.0/24"));
     assert!(prompt.contains("contoso.local"));
     assert!(prompt.contains("- nmap_scan"));
+    assert!(prompt.contains("Invalid credentials (49)"));
+    assert!(prompt.contains("null_session=true"));
 }
 
 #[test]
 fn generate_crack_prompt() {
     let payload = serde_json::json!({
         "hash_type": "ntlm",
-        "hash_value": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+        "hash_value": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0\n$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$spn*$aa$bb",
         "username": "admin",
         "domain": "contoso.local"
     });
     let prompt = generate_task_prompt("crack", "task-002", &payload, None).unwrap();
     assert!(prompt.contains("Crack Task: task-002"));
     assert!(prompt.contains("ntlm"));
+    assert!(prompt.contains("```text\naad3b435b51404eeaad3b435b51404ee"));
+    assert!(prompt.contains("\n$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$spn*$aa$bb\n```"));
+    assert!(prompt.contains("entire multi-line value"));
     assert!(prompt.contains("admin"));
 }
 

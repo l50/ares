@@ -147,14 +147,33 @@ async fn run_inner() -> Result<()> {
         .await
         .context("Failed to connect to Redis/NATS")?;
 
-    let acquired = queue
+    match queue
         .try_acquire_lock(&config.operation_id, config.lock_ttl)
-        .await?;
-    if !acquired {
-        anyhow::bail!(
-            "Operation {} is locked by another orchestrator",
-            config.operation_id
-        );
+        .await?
+    {
+        self::task_queue::LockAcquire::Acquired => {}
+        self::task_queue::LockAcquire::Reclaimed => {
+            warn!(
+                operation_id = %config.operation_id,
+                holder = self::task_queue::lock_holder_id(),
+                "Operation lock reclaimed from a prior crashed run on this host"
+            );
+        }
+        self::task_queue::LockAcquire::TakenOver { previous_holder } => {
+            warn!(
+                operation_id = %config.operation_id,
+                previous_holder = %previous_holder,
+                new_holder = self::task_queue::lock_holder_id(),
+                "Operation lock forcibly taken over (ARES_LOCK_TAKEOVER=1)"
+            );
+        }
+        self::task_queue::LockAcquire::Contested { current_holder } => {
+            anyhow::bail!(
+                "Operation {} is locked by another orchestrator (holder={}); set ARES_LOCK_TAKEOVER=1 to force takeover",
+                config.operation_id,
+                current_holder
+            );
+        }
     }
 
     let mut shared_state = SharedState::new(config.operation_id.clone());
@@ -937,6 +956,25 @@ async fn run_inner() -> Result<()> {
         _ = tokio::time::sleep(shutdown_timeout) => {
             warn!("Background task shutdown timed out");
         }
+    }
+
+    // CAS release before the unconditional finalize DEL so a stray same-op
+    // holder mismatch (should be impossible, but cheap to guard) doesn't
+    // silently clobber someone else's lock.
+    match queue.release_lock(&config.operation_id).await {
+        Ok(true) => info!(
+            operation_id = %config.operation_id,
+            "Operation lock released on shutdown"
+        ),
+        Ok(false) => debug!(
+            operation_id = %config.operation_id,
+            "Operation lock already gone or held by another orchestrator at shutdown"
+        ),
+        Err(e) => warn!(
+            operation_id = %config.operation_id,
+            err = %e,
+            "release_lock failed on shutdown"
+        ),
     }
 
     // Write completion metadata, status key, clear lock and active pointer.

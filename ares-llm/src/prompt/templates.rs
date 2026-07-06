@@ -486,6 +486,8 @@ mod tests {
         assert!(result.contains("- nmap_scan"));
         assert!(result.contains("- enumerate_users"));
         assert!(result.contains("- run_bloodhound"));
+        assert!(result.contains("data 52e"));
+        assert!(result.contains("null_session=true"));
     }
 
     #[test]
@@ -640,11 +642,14 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert(
             "hash_value".to_string(),
-            "$krb5tgs$23$*svc_sql$".to_string(),
+            "$krb5tgs$23$*svc_sql$\n$krb5tgs$23$*svc_web$".to_string(),
         );
         vars.insert("hash_type".to_string(), "Kerberos TGS".to_string());
         let result = render_task_template(TEMPLATE_CRACKER_TASK, &vars).unwrap();
         assert!(result.contains("$krb5tgs$23$*svc_sql$"));
+        assert!(result.contains("$krb5tgs$23$*svc_sql$\n$krb5tgs$23$*svc_web$"));
+        assert!(result.contains("```text"));
+        assert!(result.contains("entire multi-line value"));
         assert!(result.contains("Kerberos TGS"));
     }
 

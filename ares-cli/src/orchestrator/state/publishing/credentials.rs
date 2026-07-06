@@ -639,7 +639,7 @@ mod tests {
         let real = Credential {
             id: uuid::Uuid::new_v4().to_string(),
             username: "alice".to_string(),
-            password: "Heartsbane".to_string(),
+            password: "P@ssw0rd!".to_string(),
             domain: "child.contoso.local".to_string(),
             source: "initial".to_string(),
             discovered_at: None,
@@ -652,7 +652,7 @@ mod tests {
         let phantom = Credential {
             id: uuid::Uuid::new_v4().to_string(),
             username: "alice".to_string(),
-            password: "Heartsbane".to_string(),
+            password: "P@ssw0rd!".to_string(),
             domain: "contoso.local".to_string(),
             source: "description_field".to_string(),
             discovered_at: None,
@@ -1032,6 +1032,62 @@ mod tests {
             .await
             .unwrap();
         assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn cracked_kerberoast_hash_stamped_when_password_already_known() {
+        // Kerberoast/AS-REP hashes dedup by principal (`krb:{domain}:{user}:{spn}`
+        // / `asrep:{domain}:{user}`), so an account has a single ticket Hash row
+        // per op regardless of re-roasts. The gap this guards: when the account's
+        // password is *already known* from another source (GPP, cleartext, a
+        // prior crack, a spray hit), cracking the ticket re-derives that same
+        // plaintext and `publish_credential` dedups it — the credential key is
+        // `cred:{domain}:{user}:{md5(password)}`, independent of source, so the
+        // publish returns Ok(false). Result processing must still stamp the
+        // ticket Hash's cracked_password on that duplicate path; otherwise
+        // `is_reportable_hash` surfaces the raw ticket blob *alongside* the
+        // cracked Credential and the external scoreboard double-counts the
+        // account. This exercises the primitive the fix relies on: the stamp is
+        // independent of whether the credential row was new.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        // svc_sql's password is already known — a Credential exists (e.g. GPP).
+        state
+            .publish_credential(&q, make_cred("svc_sql", "SqlPass1", "contoso.local"))
+            .await
+            .unwrap();
+        // Its kerberoast ticket lands uncracked.
+        let ticket = make_hash(
+            "svc_sql",
+            "contoso.local",
+            "kerberoast",
+            "$krb5tgs$18$svc_sql$CONTOSO.LOCAL$aaaa0000$bbbb",
+        );
+        state.publish_hash(&q, ticket).await.unwrap();
+
+        // The crack re-derives the known plaintext; the credential is a duplicate.
+        assert!(
+            !state
+                .publish_credential(&q, make_cred("svc_sql", "SqlPass1", "contoso.local"))
+                .await
+                .unwrap(),
+            "a cracked credential for an already-known password dedups to Ok(false)"
+        );
+
+        // The ticket Hash must still be stamped so it drops from the loot report
+        // (is_reportable_hash keys on cracked_password.is_some()).
+        assert!(state
+            .update_hash_cracked_password(&q, "svc_sql", "contoso.local", "SqlPass1")
+            .await
+            .unwrap());
+        let s = state.inner.read().await;
+        let ticket = s
+            .hashes
+            .iter()
+            .find(|h| h.hash_type == "kerberoast")
+            .expect("kerberoast ticket present");
+        assert_eq!(ticket.cracked_password.as_deref(), Some("SqlPass1"));
     }
 
     #[tokio::test]
