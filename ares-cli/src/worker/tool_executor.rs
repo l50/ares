@@ -190,6 +190,20 @@ pub async fn run_tool_exec_loop(
     // the K8s path (op known at boot) doesn't double-spawn.
     let mut hosts_guard = crate::worker::hosts::HostsSyncGuard::seeded(config.operation_id.clone());
 
+    // Cracker-only: wipe hashcat's persistent potfile at every op transition
+    // so plaintexts cracked in a prior op don't leak into the next as free
+    // candidates in the known-password reuse pass (which would silently
+    // inflate benchmark compromise numbers with prior ops' crack work). The
+    // guard is fresh (not seeded with `config.operation_id`) so a worker
+    // restart mid-op still wipes — a restarted worker cannot prove the
+    // potfile is uncontaminated. Set `ARES_KEEP_POTFILE=1` to disable.
+    let mut potfile_guard: Option<ares_tools::cracker::PotfileResetGuard> =
+        if worker_role == "cracker" {
+            Some(ares_tools::cracker::PotfileResetGuard::new())
+        } else {
+            None
+        };
+
     loop {
         let next = tokio::select! {
             m = sub.next() => m,
@@ -216,6 +230,9 @@ pub async fn run_tool_exec_loop(
         // FQDN/Kerberos-based tools can resolve DC and member-server names.
         if let Some(ref op) = request.operation_id {
             hosts_guard.ensure(&conn, op, &config.agent_name, shutdown.clone());
+            if let Some(guard) = potfile_guard.as_mut() {
+                guard.ensure(op);
+            }
         }
 
         // Acquire the per-worker permit BEFORE spawning so the loop

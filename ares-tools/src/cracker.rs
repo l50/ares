@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::args::{optional_bool, optional_i64, optional_str, required_str};
 use crate::executor::CommandBuilder;
@@ -327,6 +327,100 @@ fn default_hashcat_potfile() -> Option<PathBuf> {
             candidates.push(PathBuf::from(&home).join(".hashcat/hashcat.potfile"));
         }
         candidates.into_iter().find(|p| p.is_file())
+    }
+}
+
+/// Environment gate for [`PotfileResetGuard`]. `ARES_KEEP_POTFILE=1|true` opts
+/// out of the per-op wipe. Realistic tradecraft (attacker carries cracked
+/// plaintexts between engagements against the same target) and the local
+/// dev-loop (don't re-grind between iterations) are the intended use cases;
+/// the default — wipe on op change — is the right posture for benchmarking,
+/// where cross-op plaintext reuse would silently inflate compromise numbers
+/// with prior ops' crack work.
+fn keep_potfile_env() -> bool {
+    matches!(
+        std::env::var("ARES_KEEP_POTFILE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Truncate hashcat's potfile the first time the cracker worker sees a new
+/// `operation_id`, so plaintexts cracked in a prior op don't leak into the
+/// next as free candidates in the known-password reuse pass
+/// ([`build_known_password_wordlist`]). Without this, op N's "compromise
+/// time" silently benefits from every previous op's crack work — a
+/// benchmark-contaminating warm-start.
+///
+/// Held by the cracker worker's tool-executor loop across NATS requests
+/// (mirrors [`crate::worker::hosts::HostsSyncGuard`] for `/etc/hosts`).
+/// `.ensure` is cheap on every request: it no-ops when the op is unchanged,
+/// when the potfile does not exist, or when `ARES_KEEP_POTFILE=1` opts out.
+///
+/// Note: only the cracker worker holds this guard, so non-cracker roles never
+/// touch the file — no cross-role race.
+#[derive(Default)]
+pub struct PotfileResetGuard {
+    current_op: Option<String>,
+}
+
+impl PotfileResetGuard {
+    /// Fresh guard bound to no op — the first `ensure` call with a non-empty
+    /// op ID becomes the first transition. The initial wipe fires even when
+    /// the worker restarts mid-op, which is the safe default: a restarted
+    /// worker cannot prove the potfile is uncontaminated, so it clears.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Truncate the potfile if `operation_id` differs from the last one this
+    /// guard saw. Empty IDs are ignored (same policy as `HostsSyncGuard`).
+    /// Idempotent within an op; safe to call on every incoming request.
+    pub fn ensure(&mut self, operation_id: &str) {
+        if !self.should_reset(operation_id, keep_potfile_env()) {
+            return;
+        }
+        let Some(potfile) = default_hashcat_potfile() else {
+            return;
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&potfile)
+        {
+            Ok(_) => {
+                info!(
+                    target: "cracker.potfile_reset",
+                    path = %potfile.display(),
+                    operation_id = operation_id,
+                    "Truncated hashcat potfile on op transition (set ARES_KEEP_POTFILE=1 to disable)",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %potfile.display(),
+                    err = %e,
+                    "Failed to truncate hashcat potfile on op transition — cracks may inherit prior op's plaintexts",
+                );
+            }
+        }
+    }
+
+    /// IO-free half of the transition decision — factored out so the state
+    /// machine (op change detection + env gate + empty-ID guard) is
+    /// unit-testable without hitting the filesystem or fiddling with process
+    /// env. Advances `current_op` iff it returns `true`.
+    fn should_reset(&mut self, operation_id: &str, gated: bool) -> bool {
+        if operation_id.is_empty() {
+            return false;
+        }
+        if gated {
+            return false;
+        }
+        if self.current_op.as_deref() == Some(operation_id) {
+            return false;
+        }
+        self.current_op = Some(operation_id.to_string());
+        true
     }
 }
 
@@ -1155,6 +1249,48 @@ $HEX[6c65742069743a676f]:ignored_only_first_field
     #[test]
     fn default_rules_defined() {
         assert!(!DEFAULT_RULES.is_empty());
+    }
+
+    #[test]
+    fn potfile_guard_first_op_triggers_reset() {
+        let mut g = PotfileResetGuard::new();
+        assert!(g.should_reset("op-a", false));
+    }
+
+    #[test]
+    fn potfile_guard_same_op_idempotent() {
+        let mut g = PotfileResetGuard::new();
+        assert!(g.should_reset("op-a", false));
+        assert!(!g.should_reset("op-a", false));
+        assert!(!g.should_reset("op-a", false));
+    }
+
+    #[test]
+    fn potfile_guard_new_op_triggers_reset() {
+        let mut g = PotfileResetGuard::new();
+        assert!(g.should_reset("op-a", false));
+        assert!(g.should_reset("op-b", false));
+        assert!(!g.should_reset("op-b", false));
+        assert!(g.should_reset("op-c", false));
+    }
+
+    #[test]
+    fn potfile_guard_env_gate_suppresses_reset() {
+        // Gated → never fires, and the current_op is NOT advanced, so a later
+        // un-gated call still sees the op as new. That's intentional: toggling
+        // the escape hatch off mid-run should not skip a wipe.
+        let mut g = PotfileResetGuard::new();
+        assert!(!g.should_reset("op-a", true));
+        assert!(!g.should_reset("op-b", true));
+        assert!(g.should_reset("op-a", false));
+    }
+
+    #[test]
+    fn potfile_guard_empty_op_is_ignored() {
+        let mut g = PotfileResetGuard::new();
+        assert!(!g.should_reset("", false));
+        // Empty op didn't advance state, so a real op still counts as first.
+        assert!(g.should_reset("op-a", false));
     }
 
     #[tokio::test]
