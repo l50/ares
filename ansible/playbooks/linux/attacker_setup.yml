@@ -25,8 +25,8 @@
 
   roles:
     # Nimbus Range roles for Ansible system configuration and monitoring
-    - role: dreadnode.nimbus_range.aws_ssm_agent
-    - role: dreadnode.nimbus_range.aws_cloudwatch_agent
+    - role: l50.bulwark.aws_ssm_agent
+    - role: l50.bulwark.aws_cloudwatch_agent
 
     # Ares pentesting tools
     - role: dreadnode.nimbus_range.recon_tools

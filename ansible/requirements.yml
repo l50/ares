@@ -22,3 +22,6 @@ collections:
   - name: https://github.com/l50/ansible-collection-arsenal.git
     type: git
     version: main
+  - name: https://github.com/l50/ansible-collection-bulwark.git
+    type: git
+    version: main
