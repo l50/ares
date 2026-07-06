@@ -847,6 +847,20 @@ tasks:
       ops list
       {{if eq .LATEST "true"}}--latest{{end}}
 
+  ops:ids:
+    desc: "List all operation IDs on EC2 with started_at + derived status, columns separated by ' | ' (usage: task ec2:ops:ids [EC2_NAME=kali-ares])"
+    silent: true
+    cmds:
+      - |
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+
+        PAYLOAD=$(cat .taskfiles/ec2/scripts/list-ops.sh)
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 60
+
   # ============================================================================
   # Watch + auto-report
   # ============================================================================
