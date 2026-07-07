@@ -1050,6 +1050,61 @@ fn read_role_model(yaml: Option<&serde_yaml::Value>, role: &str) -> Option<Strin
 /// Run in blue-only mode: just the investigation poller, no red team.
 ///
 /// Requires only `ARES_REDIS_URL` and an LLM model. No operation ID needed.
+/// Spawn an ephemeral in-process blue-orchestrator consumer, returning its join
+/// handle and a shutdown sender. Lets `benchmark run` be self-contained — it
+/// consumes and runs the investigation it submits without a separately-running
+/// blue orchestrator, and the consumer dies with the process. Send `true` on the
+/// returned sender to stop it. Uses the isolated `ARES_BLUE_TASKS` stream, so it
+/// never interferes with a red fleet's `ARES_TASKS`.
+#[cfg(feature = "blue")]
+pub(crate) async fn spawn_inprocess_blue_consumer(
+    model_spec: &str,
+    redis_url: &str,
+    nats_url: &str,
+) -> Result<(tokio::task::JoinHandle<()>, watch::Sender<bool>)> {
+    let (provider, model_name) =
+        ares_llm::create_provider(model_spec).context("Failed to create LLM provider")?;
+    let queue = self::task_queue::TaskQueue::connect_state_only(redis_url, nats_url)
+        .await
+        .context("Failed to connect to Redis/NATS for blue consumer")?;
+    let auth_throttle = tool_dispatcher::AuthThrottle::new(3, std::time::Duration::from_secs(30));
+    // The benchmark consumer is self-contained (no separate worker fleet). The
+    // evidence validator's query-result store is a per-PROCESS static, so the
+    // query and its follow-up `add_evidence` MUST run in the same process — under
+    // Redis dispatch they land on different workers, the store is empty, and every
+    // add_evidence is rejected ("value not found in any recorded query result"),
+    // giving 0 evidence / 0 techniques. Default to local (in-process) dispatch,
+    // which the old working recipe forced via ARES_TOOL_DISPATCH=local. Honor an
+    // explicit ARES_TOOL_DISPATCH=redis for callers that do run a worker fleet.
+    let dispatcher: Arc<dyn ares_llm::ToolDispatcher> =
+        if std::env::var("ARES_TOOL_DISPATCH").as_deref() == Ok("redis") {
+            info!("blue consumer tool dispatch: Redis queue");
+            Arc::new(tool_dispatcher::RedisToolDispatcher::new(
+                queue,
+                "blue-orchestrator".to_string(),
+                auth_throttle,
+            ))
+        } else {
+            info!("blue consumer tool dispatch: local (in-process, shared evidence store)");
+            Arc::new(tool_dispatcher::LocalToolDispatcher::new(
+                queue,
+                "blue-orchestrator".to_string(),
+                auth_throttle,
+            ))
+        };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    info!(model = %model_name, "in-process blue consumer spawned for replay");
+    let handle = blue::spawn_blue_orchestrator(
+        provider,
+        model_name,
+        dispatcher,
+        redis_url.to_string(),
+        nats_url.to_string(),
+        shutdown_rx,
+    );
+    Ok((handle, shutdown_tx))
+}
+
 #[cfg(feature = "blue")]
 async fn run_blue_only() -> Result<()> {
     info!("Running in BLUE-ONLY mode (no red team orchestrator)");

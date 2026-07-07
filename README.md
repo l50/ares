@@ -22,6 +22,7 @@ LLM-coordinated autonomous security operations platform with two modes:
 - [CLI Reference](#cli-reference)
 - [Red Team Operations](#red-team-operations)
 - [Blue Team Investigations](#blue-team-investigations)
+- [Benchmark Replay](#benchmark-replay)
 - [Infrastructure](#infrastructure)
 - [Development](#development)
 - [Configuration](#configuration)
@@ -341,6 +342,46 @@ task blue:reports:consolidate LATEST=true
 | `blue:multi:cleanup`       | Clean up old investigations              |
 
 See [Blue Team Documentation](docs/blue.md) for full command reference.
+
+## Benchmark Replay
+
+Snapshot a completed red op's observability state and re-run the blue team
+against it, so iterative blue-side changes are comparable across runs. The
+workflow splits by concern:
+
+- `ares benchmark capture` — dumps Loki, Prometheus (as TSDB blocks), Grafana
+  dashboards, and fired alerts to S3. `--wait-for-flush` blocks until Loki's
+  ingester lands the attack window (otherwise the snapshot silently misses it).
+- `task benchmark:replay:provision` / `:teardown` — EC2 lifecycle for the
+  replay-stack box (all AWS-CLI orchestration in Taskfile, not Rust).
+- `ares benchmark run --stack-ip <ip>` — submits the investigation, polls
+  Redis, computes the score.
+- `task benchmark:replay OP_ID=<op>` — end-to-end wrapper: provision → run →
+  teardown (deferred via shell `trap`, fires on failure too).
+
+```bash
+# Capture from a completed op
+ares benchmark capture op-20260706-123045 --wait-for-flush
+
+# List captured snapshots
+ares benchmark list
+
+# End-to-end replay
+task benchmark:replay OP_ID=op-20260706-123045
+
+# Or split provision/run/teardown when iterating
+eval "$(task benchmark:replay:provision OP_ID=op-20260706-123045 | grep -E '^(STACK_IP|INSTANCE_ID)=')"
+ares benchmark run op-20260706-123045 --stack-ip "$STACK_IP" --max-steps 75
+task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID"
+```
+
+Provisioning prefers a pre-baked `ares-replay-stack` AMI
+(`warpgate build ares-replay-stack --only 'ami.*'`); it falls back to stock
+AL2023 if none is published (set `BENCHMARK_REQUIRE_BAKED_AMI=1` to fail
+instead).
+
+See [Benchmark Replay Operator Guide](docs/benchmark-replay.md) for env-var
+setup, replay modes (`timeline` vs `static`), AMI baking, and troubleshooting.
 
 ## Infrastructure
 

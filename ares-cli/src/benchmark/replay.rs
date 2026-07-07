@@ -26,7 +26,7 @@ use crate::ops::submit::{collect_env_vars, resolve_model, BLUE_ENV_VAR_NAMES};
 use crate::redis_conn::connect_redis;
 
 use super::manifest::{BenchmarkResult, FiredAlert, SnapshotManifest};
-use super::replay_infra::{ReplayConfig, ReplayInfra};
+use super::snapshot_s3::SnapshotConfig;
 
 /// Parameters for the `benchmark run` command.
 pub(crate) struct ReplayParams {
@@ -40,6 +40,10 @@ pub(crate) struct ReplayParams {
     pub max_steps: u32,
     pub quiet_period: Option<f64>,
     pub time_compression: f64,
+    /// Private IP of an already-provisioned replay stack. The stack is stood
+    /// up by `task benchmark:replay:provision`; `benchmark run` only runs the
+    /// investigation against it.
+    pub stack_ip: String,
 }
 
 /// Import a snapshot's Loki data into a target Loki instance.
@@ -83,9 +87,15 @@ pub(crate) async fn run_load(
     Ok(())
 }
 
-/// Full replay: provision EC2 → configure Loki → investigate → score → teardown.
+/// Run a blue investigation against an already-provisioned replay stack.
 ///
-/// Supports two replay modes:
+/// The stack is stood up by `task benchmark:replay:provision` (or the caller
+/// running the equivalent AWS-CLI commands) and its private IP is passed as
+/// `--stack-ip`. This function submits the investigation to NATS, polls
+/// Redis for completion, and computes the score — no provisioning, no
+/// teardown.
+///
+/// Replay modes:
 /// - `static`: all data pre-loaded, agent knows full attack window (operation trigger)
 /// - `timeline`: quiet period before first alert, alert-replay trigger (no end window),
 ///   simulating an unfolding attack
@@ -101,14 +111,30 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         );
     }
 
-    let replay_config = ReplayConfig::from_env()?;
+    // Point the blue agent's observability surface at the caller-supplied
+    // stack and pull LLM keys from Secrets Manager if they're missing (e.g.
+    // when `benchmark run` runs on an EC2 box that doesn't have `op`).
+    // SAFETY: single-threaded — tokio hasn't spawned anything yet.
+    let loki_url = format!("http://{}:3100", p.stack_ip);
+    let grafana_url = format!("http://{}:3000", p.stack_ip);
+    let prometheus_url = format!("http://{}:9090", p.stack_ip);
+    let tempo_url = format!("http://{}:3200", p.stack_ip);
+    unsafe {
+        std::env::set_var("LOKI_URL", &loki_url);
+        std::env::set_var("GRAFANA_URL", &grafana_url);
+        std::env::set_var("PROMETHEUS_URL", &prometheus_url);
+        std::env::set_var("TEMPO_URL", &tempo_url);
+    }
+    ensure_llm_secrets();
+
+    let snapshot_config = SnapshotConfig::from_env();
     let (snapshot_path, _is_temp) =
-        resolve_snapshot(&p.snapshot, p.snapshot_dir.as_deref(), &replay_config)?;
+        resolve_snapshot(&p.snapshot, p.snapshot_dir.as_deref(), &snapshot_config)?;
 
     let manifest = load_manifest(snapshot_path.to_str().unwrap())?;
 
     info!(
-        "benchmark run {run_id} [mode={}, trigger={}] for operation {}",
+        "benchmark run {run_id} [mode={}, trigger={}] for operation {} against stack {}",
         p.replay_mode,
         if is_timeline {
             "alert-replay"
@@ -116,26 +142,10 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
             &p.trigger_mode
         },
         manifest.operation_id,
+        p.stack_ip,
     );
 
-    info!("provisioning replay EC2 for {}...", manifest.operation_id);
-    let mut replay_infra = ReplayInfra::provision(&manifest.operation_id, &replay_config)
-        .context("provision replay infrastructure")?;
-    let loki_url = replay_infra.loki_url();
-    info!("Loki URL: {loki_url}");
-
-    // Point the blue agent's full observability surface at the replay box.
-    // LOKI_URL is (re)set inside run_replay_inner; these siblings flow through
-    // collect_env_vars → Redis → the orchestrator process alongside it.
-    // SAFETY: single-threaded replay setup, before any investigation runs.
-    unsafe {
-        std::env::set_var("GRAFANA_URL", replay_infra.grafana_url());
-        std::env::set_var("PROMETHEUS_URL", replay_infra.prometheus_url());
-        std::env::set_var("TEMPO_URL", replay_infra.tempo_url());
-    }
-
-    // From here on, ensure teardown happens on error
-    let result = run_replay_inner(
+    run_replay_inner(
         &p,
         &manifest,
         &loki_url,
@@ -144,14 +154,25 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         is_timeline,
         run_started_at,
     )
-    .await;
+    .await
+}
 
-    info!("tearing down replay infrastructure...");
-    if let Err(e) = replay_infra.teardown() {
-        eprintln!("WARNING: failed to tear down replay EC2: {e}");
+/// Ensure LLM API keys are in the environment. Delegates to the shared
+/// Secrets Manager loader in `secrets.rs` for the "re-exec'd onto an EC2 box"
+/// case, where `op` is unavailable but instance credentials are — no-op when
+/// the keys are already set. Region resolution favors `BENCHMARK_AWS_REGION`
+/// so the fetch lands in the same account as the replay stack.
+fn ensure_llm_secrets() {
+    if std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return;
     }
-
-    result
+    let secret_id = std::env::var("ARES_SECRETS_ID").ok();
+    let region = std::env::var("BENCHMARK_AWS_REGION").ok();
+    match crate::secrets::load_secrets_manager_secrets(secret_id.as_deref(), region.as_deref()) {
+        Ok(n) if n > 0 => info!("LLM keys loaded from Secrets Manager ({n})"),
+        Ok(_) => {}
+        Err(e) => eprintln!("WARNING: could not fetch LLM keys from Secrets Manager: {e:#}; the investigation may fail to start"),
+    }
 }
 
 /// Inner replay logic, separated so teardown always runs.
@@ -164,10 +185,6 @@ async fn run_replay_inner(
     is_timeline: bool,
     run_started_at: chrono::DateTime<Utc>,
 ) -> Result<()> {
-    let import_start = std::time::Instant::now();
-    let import_duration = import_start.elapsed().as_secs_f64();
-    info!("Loki data loaded on replay EC2 (via SSM), import phase: {import_duration:.1}s");
-
     // SAFETY: this is the documented mechanism for pointing the blue agent
     // at a specific Loki. The env var is read by loki_config() in loki.rs.
     unsafe {
@@ -175,14 +192,9 @@ async fn run_replay_inner(
     }
 
     let quiet_period_secs = if is_timeline {
-        let secs = p.quiet_period.unwrap_or_else(|| {
-            // Pseudo-random quiet period between 60-300s using nanosecond jitter.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() as f64;
-            60.0 + (nanos % 240_000_000.0) / 1_000_000.0
-        });
+        let secs = p
+            .quiet_period
+            .unwrap_or_else(|| rand::random_range(60.0..=300.0));
         if secs > 0.0 {
             info!("timeline mode: quiet period {secs:.0}s before first alert");
             tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
@@ -258,6 +270,30 @@ async fn run_replay_inner(
         .await
         .context("connect to NATS for investigation submission")?;
     nats.ensure_streams().await?;
+
+    // Spawn an ephemeral in-process blue consumer so the investigation we submit
+    // actually runs — this makes `benchmark run` self-contained (no separately
+    // running blue orchestrator required). It dies with the process and uses the
+    // isolated ARES_BLUE_TASKS stream, so it never interferes with a red fleet.
+    let redis_url_str = p.redis_url.clone().unwrap_or_else(|| {
+        std::env::var("ARES_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    });
+    let nats_url_str = NatsBroker::url_from_env();
+    let consumer_model = effective_model
+        .clone()
+        .or_else(|| std::env::var("ARES_BLUE_LLM_MODEL").ok())
+        .or_else(|| std::env::var("ARES_LLM_MODEL").ok())
+        .unwrap_or_else(|| "openai/gpt-5.2".to_string());
+    let (blue_handle, blue_shutdown) = crate::orchestrator::spawn_inprocess_blue_consumer(
+        &consumer_model,
+        &redis_url_str,
+        &nats_url_str,
+    )
+    .await
+    .context("spawn in-process blue consumer")?;
+
     BlueTaskQueue::submit_investigation_request(&nats, &request)
         .await
         .context("submit investigation request to NATS")?;
@@ -304,6 +340,10 @@ async fn run_replay_inner(
 
         tokio::time::sleep(poll_interval).await;
     }
+
+    // Investigation finished — stop the in-process blue consumer cleanly.
+    let _ = blue_shutdown.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), blue_handle).await;
 
     let investigation_duration = investigation_start.elapsed().as_secs_f64();
 
@@ -356,7 +396,6 @@ async fn run_replay_inner(
         } else {
             None
         },
-        import_duration_secs: import_duration,
         investigation_duration_secs: investigation_duration,
         evaluation: eval_result.to_value(),
         gap_analysis: gap_analysis.to_markdown(),
@@ -399,7 +438,7 @@ async fn run_replay_inner(
 fn resolve_snapshot(
     snapshot_id: &str,
     snapshot_dir_override: Option<&str>,
-    config: &ReplayConfig,
+    config: &SnapshotConfig,
 ) -> Result<(PathBuf, bool)> {
     if let Some(dir) = snapshot_dir_override {
         info!("using local snapshot directory: {dir}");
@@ -409,7 +448,7 @@ fn resolve_snapshot(
     // Download metadata from S3 to a temp directory
     let tmp_dir = PathBuf::from(format!("/tmp/ares-benchmark-{snapshot_id}"));
     info!("downloading snapshot metadata from S3 for {snapshot_id}...");
-    super::replay_infra::download_snapshot_metadata(
+    super::snapshot_s3::download_snapshot_metadata(
         snapshot_id,
         &config.aws_profile,
         &config.aws_region,

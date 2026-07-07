@@ -24,6 +24,9 @@ version: "3"
 set: [errexit, pipefail]
 
 vars:
+  # Local ares CLI (matches the README build output + the red/blue includes).
+  # Passed in from the root Taskfile; defaults so this taskfile works standalone.
+  ARES_CLI: '{{.ARES_CLI | default "./target/release/ares"}}'
   INFO: '\033[0;34m[INFO]\033[0m'
   SUCCESS: '\033[0;32m[SUCCESS]\033[0m'
   ERROR: '\033[0;31m[ERROR]\033[0m'
@@ -219,15 +222,27 @@ tasks:
           JOBS_FLAG="-j $JOBS"
         fi
 
-        # Use sccache if available for dependency caching.
-        # For the `cross` path, sccache runs INSIDE the container (installed
-        # via Cross.toml pre-build); RUSTC_WRAPPER + SCCACHE_DIR are passed
-        # through, and SCCACHE_DIR is bind-mounted so the cache persists.
-        if command -v sccache >/dev/null 2>&1 || [ "$BUILD_TOOL" = "cross" ]; then
+        # Use sccache for dependency caching, but ONLY when it's actually
+        # installed on the host. The cross path passes RUSTC_WRAPPER through to
+        # the container (where Cross.toml also installs sccache) and bind-mounts
+        # SCCACHE_DIR — but exporting the wrapper without a host sccache breaks
+        # cross's host-side `rustc` version probe ("couldn't fetch the rustc
+        # version"). sccache stays a genuine optional accelerator: the build
+        # works with or without it.
+        if command -v sccache >/dev/null 2>&1; then
           export RUSTC_WRAPPER=sccache
           export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
           mkdir -p "$SCCACHE_DIR"
           echo -e "{{.INFO}} Using sccache (cache: $SCCACHE_DIR)"
+        fi
+
+        # cross-rs images publish amd64 only; on an Apple Silicon (arm64) host
+        # Docker finds no native manifest ("no match for platform in manifest")
+        # and the pre-build fails. Pin the platform so it builds the amd64 image
+        # under emulation. No-op on amd64 hosts and for non-cross build tools.
+        if [ "$BUILD_TOOL" = "cross" ] && [ "$(uname -m)" = "arm64" ]; then
+          export DOCKER_DEFAULT_PLATFORM=linux/amd64
+          echo -e "{{.INFO}} arm64 host — building amd64 cross image under emulation (DOCKER_DEFAULT_PLATFORM=linux/amd64)"
         fi
 
         case "$BUILD_TOOL" in
@@ -493,7 +508,7 @@ tasks:
       - sh: '[ -n "{{.OPERATION_ID}}" ] || [ "{{.LATEST}}" = "true" ]'
         msg: "Provide OPERATION_ID=op-xxx or LATEST=true"
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops stop
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -728,7 +743,7 @@ tasks:
       JSON: '{{.JSON | default "false"}}'
       DIFF: '{{.DIFF | default "false"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops loot
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -742,7 +757,7 @@ tasks:
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
       LATEST: '{{.LATEST | default "true"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops runtime
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -843,7 +858,7 @@ tasks:
     vars:
       LATEST: '{{.LATEST | default "false"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops list
       {{if eq .LATEST "true"}}--latest{{end}}
 
@@ -900,7 +915,7 @@ tasks:
             exit 1
           fi
 
-          STATUS_OUT=$(ares --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}} \
+          STATUS_OUT=$({{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}} \
             ops status $OP_ARG $LATEST_FLAG 2>&1 || true)
 
           STATUS=$(echo "$STATUS_OUT" | grep -E '^Status: ' | head -1 | awk '{print $2}')
@@ -952,6 +967,8 @@ tasks:
       POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
       MAX_WAIT: '{{.MAX_WAIT | default "7200"}}'
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+      # Opt-in: auto-capture a benchmark snapshot once the op completes (WAIT=true).
+      CAPTURE: '{{.CAPTURE | default "false"}}'
     cmds:
       - |
         export AWS_PROFILE="{{.AWS_PROFILE}}"
@@ -1005,7 +1022,20 @@ tasks:
         if [ -z "$LOKI_URL_VAL" ]; then
           LOKI_URL_VAL="{{.LOKI_URL}}"
         fi
+        LOKI_AUTH_TOKEN_VAL=$(echo "$SECRETS" | jq -r '.LOKI_AUTH_TOKEN // empty')
         DREADNODE_API_KEY=$(echo "$SECRETS" | jq -r '.DREADNODE_API_KEY // empty')
+
+        # Parse host:port from URLs for box-side reachability probes. The
+        # observability endpoints in Secrets Manager may live in a VPC the box
+        # can't reach (e.g. loki.dev.plundr.ai is behind the plundr VPC ingress
+        # while personal-account kali-ares is in a separate VPC with no
+        # peering). We probe TCP connect from the box and only inject the
+        # values if the probe succeeds — blue tools then fall through to their
+        # built-in defaults instead of wedging on a black-holed URL.
+        _url_host() { printf %s "$1" | awk -F/ '{print $3}' | cut -d: -f1; }
+        _url_port() { case "$1" in http://*) echo 80 ;; https://*|*) echo 443 ;; esac; }
+        GRAFANA_HOST=$(_url_host "$GRAFANA_URL_VAL"); GRAFANA_PORT=$(_url_port "$GRAFANA_URL_VAL")
+        LOKI_HOST=$(_url_host "$LOKI_URL_VAL");       LOKI_PORT=$(_url_port "$LOKI_URL_VAL")
         OTEL_TRACES_ENDPOINT="{{.OTEL_TRACES_ENDPOINT}}"
 
         FLUSH_CMD=""
@@ -1017,13 +1047,18 @@ tasks:
         ENV_FILE_CMD="mkdir -p /etc/ares"
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OPENAI_API_KEY=${OPENAI_KEY}' > /etc/ares/env"
         if [ -n "$GRAFANA_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; echo 'GRAFANA_URL=${GRAFANA_URL_VAL}' >> /etc/ares/env"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${GRAFANA_HOST}/${GRAFANA_PORT}' 2>/dev/null; then echo 'GRAFANA_URL=${GRAFANA_URL_VAL}' >> /etc/ares/env"
           if [ -n "$GRAFANA_TOKEN_VAL" ]; then
             ENV_FILE_CMD="$ENV_FILE_CMD; echo 'GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_TOKEN_VAL}' >> /etc/ares/env"
           fi
+          ENV_FILE_CMD="$ENV_FILE_CMD; else echo 'SKIP: GRAFANA_URL ${GRAFANA_URL_VAL} unreachable from box' >&2; fi"
         fi
         if [ -n "$LOKI_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; echo 'LOKI_URL=${LOKI_URL_VAL}' >> /etc/ares/env"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${LOKI_HOST}/${LOKI_PORT}' 2>/dev/null; then echo 'LOKI_URL=${LOKI_URL_VAL}' >> /etc/ares/env"
+          if [ -n "$LOKI_AUTH_TOKEN_VAL" ]; then
+            ENV_FILE_CMD="$ENV_FILE_CMD; echo 'LOKI_AUTH_TOKEN=${LOKI_AUTH_TOKEN_VAL}' >> /etc/ares/env"
+          fi
+          ENV_FILE_CMD="$ENV_FILE_CMD; else echo 'SKIP: LOKI_URL ${LOKI_URL_VAL} unreachable from box' >&2; fi"
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_DEPLOYMENT={{.EC2_DEPLOYMENT}}' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'NATS_URL=nats://127.0.0.1:4222' >> /etc/ares/env"
@@ -1044,9 +1079,11 @@ tasks:
         pkill -f 'ares orchestrator' 2>/dev/null || true; sleep 1
         export OPENAI_API_KEY='${OPENAI_KEY}'
         export ANTHROPIC_API_KEY='${ANTHROPIC_KEY}'
-        export GRAFANA_URL='${GRAFANA_URL_VAL}'
-        export GRAFANA_SERVICE_ACCOUNT_TOKEN='${GRAFANA_TOKEN_VAL}'
-        export LOKI_URL='${LOKI_URL_VAL}'
+        # Observability endpoints (GRAFANA_URL/LOKI_URL and tokens) are gated by
+        # the box-side probe above and only appear in /etc/ares/env when
+        # reachable. Source rather than re-export so we never leak an
+        # unreachable URL from Secrets Manager into the orchestrator process.
+        set -a; . /etc/ares/env; set +a
         export ARES_REDIS_URL=redis://127.0.0.1:6379
         export NATS_URL=nats://127.0.0.1:4222
         {{- if .LLM_MODEL}}
@@ -1089,6 +1126,29 @@ tasks:
             POLL_INTERVAL={{.POLL_INTERVAL}} \
             MAX_WAIT={{.MAX_WAIT}} \
             OUTPUT_DIR={{.OUTPUT_DIR}}
+
+          # Opt-in benchmark capture, client-side. Runs here (this host has the
+          # infra + lab creds the account-segmented box lacks) rather than on the
+          # box. Flush-aware: --wait-for-flush blocks until Loki has flushed the
+          # attack window to S3. Non-fatal — the op is finalized regardless.
+          if [ "{{.CAPTURE}}" = "true" ]; then
+            echo -e "{{.INFO}} CAPTURE=true — auto-capturing benchmark snapshot for $OP_ID (waits for Loki flush)"
+            ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+              --instance-ids "$INSTANCE_ID" \
+              --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true
+            lsof -ti:16379 | xargs kill 2>/dev/null || true; sleep 1
+            aws ssm start-session --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" --target "$INSTANCE_ID" \
+              --document-name AWS-StartPortForwardingSession \
+              --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}' >/tmp/ares-capture-fwd.log 2>&1 &
+            PF_PID=$!
+            for _ in $(seq 1 20); do nc -z localhost 16379 2>/dev/null && break; sleep 2; done
+            {{.ARES_CLI}} benchmark capture "$OP_ID" \
+              --redis-url redis://localhost:16379 \
+              --wait-for-flush \
+              ${ATTACKER_IP:+--attacker-ips "$ATTACKER_IP"} \
+              || echo -e "{{.WARN}} auto-capture failed — op is finalized; run 'ares benchmark capture $OP_ID --wait-for-flush' later"
+            kill "$PF_PID" 2>/dev/null || true
+          fi
         fi
 
   # ============================================================================

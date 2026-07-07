@@ -5,16 +5,32 @@ version: "3"
 dotenv: ['.env']
 
 includes:
-  aws: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/aws/Taskfile.yaml"
-  github: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/github/Taskfile.yaml"
-  pre-commit: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/pre-commit/Taskfile.yaml"
-  renovate: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/renovate/Taskfile.yaml"
-  secrets: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/secrets/Taskfile.yaml"  # pragma: allowlist secret
+  aws:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/aws/Taskfile.yaml"
+    optional: true
+  github:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/github/Taskfile.yaml"
+    optional: true
+  pre-commit:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/pre-commit/Taskfile.yaml"
+    optional: true
+  renovate:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/renovate/Taskfile.yaml"
+    optional: true
+  secrets:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/secrets/Taskfile.yaml"  # pragma: allowlist secret
+    optional: true
   remote:
     taskfile: .taskfiles/remote/Taskfile.yaml
     optional: true
     vars:
       K8S_NAMESPACE: '{{.K8S_NAMESPACE}}'
+  benchmark:
+    taskfile: .taskfiles/benchmark/Taskfile.yaml
+    optional: true
+    vars:
+      ARES_CLI: '{{.ARES_CLI}}'
+      AWS_PROFILE: '{{.AWS_PROFILE}}'
   red:
     taskfile: .taskfiles/red/Taskfile.yaml
     optional: true
@@ -47,6 +63,7 @@ includes:
     optional: true
     vars:
       EC2_NAME: '{{.EC2_NAME}}'
+      ARES_CLI: '{{.ARES_CLI}}'
       AWS_PROFILE: '{{.AWS_PROFILE}}'
       AWS_REGION: '{{.AWS_REGION}}'
       ARES_CONFIG: '{{.ARES_CONFIG}}'
@@ -76,6 +93,9 @@ includes:
       DREADNODE_WORKSPACE: '{{.DREADNODE_WORKSPACE}}'
       DREADNODE_PROJECT: '{{.DREADNODE_PROJECT}}'
       K8S_NAMESPACE: '{{.K8S_NAMESPACE}}'
+  obs:
+    taskfile: .taskfiles/obs/Taskfile.yaml
+    optional: true
 
 vars:
   API_DIR: "."

@@ -6,6 +6,10 @@
 #   Parity-only (no blue tool queries them; present so the stack matches
 #   argonaut and datasources resolve): tempo, mimir, alertmanager
 #
+# NOTE: the prometheus image tag below MUST match
+# `ares-cli/src/benchmark/versions.rs::PROMETHEUS_IMAGE` — capture builds TSDB
+# blocks with that promtool version and mismatched Prometheus can't load them.
+#
 # Per-snapshot data is staged into ./data by setup.sh before `docker compose up`.
 services:
   loki:

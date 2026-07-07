@@ -3,13 +3,15 @@
 //! Subcommands:
 //! - `capture`: snapshot a completed operation's Loki state + red team data
 //! - `load`: import a snapshot into a target Loki instance
-//! - `run`: full replay pipeline (EC2 Loki → investigate → score → teardown)
+//! - `run`: run a blue investigation against an already-provisioned replay
+//!   stack (provisioning + teardown live in `.taskfiles/benchmark/`)
 //! - `list`: list available snapshots from the benchmark S3 bucket
 
 mod capture;
 pub(crate) mod manifest;
 mod replay;
-pub(crate) mod replay_infra;
+pub(crate) mod snapshot_s3;
+pub(crate) mod versions;
 
 use anyhow::Result;
 
@@ -25,6 +27,8 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
             post_window_minutes,
             no_upload,
             attacker_ips,
+            wait_for_flush,
+            flush_timeout_mins,
         } => {
             capture::run_capture(
                 redis_url,
@@ -35,6 +39,8 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
                 post_window_minutes,
                 no_upload,
                 attacker_ips,
+                wait_for_flush,
+                flush_timeout_mins,
             )
             .await
         }
@@ -53,6 +59,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
             max_steps,
             quiet_period,
             time_compression,
+            stack_ip,
         } => {
             replay::run_replay(replay::ReplayParams {
                 redis_url,
@@ -65,6 +72,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
                 max_steps,
                 quiet_period,
                 time_compression,
+                stack_ip,
             })
             .await
         }
@@ -74,15 +82,12 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
 
 /// List available benchmark snapshots from S3.
 fn run_list() -> Result<()> {
-    let bucket = std::env::var("BENCHMARK_S3_BUCKET")
-        .unwrap_or_else(|_| "ares-benchmark-us-west-1".to_string());
-    let profile = std::env::var("BENCHMARK_AWS_PROFILE").unwrap_or_else(|_| "lab".to_string());
-    let region = std::env::var("BENCHMARK_AWS_REGION").unwrap_or_else(|_| "us-west-1".to_string());
-
-    let snapshots = replay_infra::list_snapshots(&profile, &region, &bucket)?;
+    let config = snapshot_s3::SnapshotConfig::from_env();
+    let snapshots =
+        snapshot_s3::list_snapshots(&config.aws_profile, &config.aws_region, &config.s3_bucket)?;
 
     if snapshots.is_empty() {
-        println!("No snapshots found in s3://{bucket}/snapshots/");
+        println!("No snapshots found in s3://{}/snapshots/", config.s3_bucket);
         return Ok(());
     }
 

@@ -8,9 +8,11 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, Utc};
+use futures::stream::{self, StreamExt};
 use tracing::info;
 
 use ares_core::eval::ground_truth::{
@@ -23,12 +25,12 @@ use crate::redis_conn::{connect_redis, resolve_operation_id};
 
 use super::manifest::{FiredAlert, SnapshotManifest, MANIFEST_VERSION};
 
-/// S3 bucket where Loki stores chunks and index (infra account).
-const LOKI_S3_BUCKET: &str = "dev-argonaut-loki";
-/// AWS region for the Loki S3 bucket.
-const LOKI_S3_REGION: &str = "us-west-2";
-/// AWS CLI profile for infrastructure account access.
-const LOKI_S3_PROFILE: &str = "infrastructure";
+/// Default S3 bucket where Loki stores chunks and index (infra account).
+const DEFAULT_LOKI_S3_BUCKET: &str = "dev-argonaut-loki";
+/// Default AWS region for the Loki S3 bucket.
+const DEFAULT_LOKI_S3_REGION: &str = "us-west-2";
+/// Default AWS CLI profile for infrastructure account access.
+const DEFAULT_LOKI_S3_PROFILE: &str = "infrastructure";
 
 /// Default benchmark S3 bucket in the labs account.
 const DEFAULT_BENCHMARK_BUCKET: &str = "ares-benchmark-us-west-1";
@@ -36,6 +38,36 @@ const DEFAULT_BENCHMARK_BUCKET: &str = "ares-benchmark-us-west-1";
 const DEFAULT_BENCHMARK_PROFILE: &str = "lab";
 /// Default AWS region for the labs account.
 const DEFAULT_BENCHMARK_REGION: &str = "us-west-1";
+
+/// Where the source Loki actually stores its chunks — overridable via
+/// `LOKI_S3_BUCKET` / `LOKI_S3_REGION` / `LOKI_S3_PROFILE` for non-lab
+/// environments. Defaults match dev-argonaut, which is where the ares
+/// benchmark ops currently ship logs.
+struct LokiS3 {
+    bucket: String,
+    region: String,
+    profile: String,
+}
+
+impl LokiS3 {
+    fn from_env() -> Self {
+        Self {
+            bucket: std::env::var("LOKI_S3_BUCKET")
+                .unwrap_or_else(|_| DEFAULT_LOKI_S3_BUCKET.to_string()),
+            region: std::env::var("LOKI_S3_REGION")
+                .unwrap_or_else(|_| DEFAULT_LOKI_S3_REGION.to_string()),
+            profile: std::env::var("LOKI_S3_PROFILE")
+                .unwrap_or_else(|_| DEFAULT_LOKI_S3_PROFILE.to_string()),
+        }
+    }
+}
+
+/// Shared HTTP client — reqwest holds a connection pool per-instance, so
+/// building one per call kills keep-alive across the Grafana surface.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 /// Run the `benchmark capture` command.
 #[allow(clippy::too_many_arguments)]
@@ -48,8 +80,10 @@ pub(crate) async fn run_capture(
     post_window_minutes: u32,
     no_upload: bool,
     attacker_ips: Vec<String>,
+    wait_for_flush: bool,
+    flush_timeout_mins: u32,
 ) -> Result<()> {
-    eprint!("[1/8] Loading operation state from Redis...");
+    eprint!("[1/5] Loading operation state from Redis...");
     let _ = std::io::stderr().flush();
     let mut conn = connect_redis(redis_url).await?;
     let op_id = resolve_operation_id(&mut conn, operation_id, latest).await?;
@@ -78,6 +112,15 @@ pub(crate) async fn run_capture(
         pre_window_hours,
         post_window_minutes,
     );
+
+    // Loki's ingester flushes chunks to S3 with ~30-60 min latency, so a capture
+    // run right after an op silently misses the attack-window logs. When asked,
+    // block until those chunks have actually landed in S3.
+    if wait_for_flush {
+        eprintln!("[flush] waiting for Loki to flush the attack window to S3 (timeout {flush_timeout_mins}m)...");
+        wait_for_attack_flush(state.started_at, completed_at, flush_timeout_mins).await?;
+        eprintln!("[flush] attack window is in S3 — proceeding with capture");
+    }
 
     let snapshot_dir = Path::new(output_dir).join(&op_id);
     let loki_dir = snapshot_dir.join("loki");
@@ -132,47 +175,58 @@ pub(crate) async fn run_capture(
         .context("write ground-truth.json")?;
     info!("wrote {}", gt_path.display());
 
-    eprint!("[2/8] Syncing Loki chunks from S3...");
+    eprint!("[2/5] Syncing Loki chunks from S3...");
     let _ = std::io::stderr().flush();
     let (chunk_count, index_count) = sync_loki_s3(&loki_dir, export_start, export_end).await?;
     eprintln!(" done ({chunk_count} chunks, {index_count} index files)");
 
     info!("synced {chunk_count} chunks + {index_count} index files from S3");
 
-    eprint!("[3/8] Exporting Grafana alerts...");
-    let _ = std::io::stderr().flush();
-    let fired_alerts = export_grafana_alerts(export_start, export_end).await?;
-    eprintln!(" done ({} alerts)", fired_alerts.len());
-    let alerts_path = snapshot_dir.join("fired-alerts.json");
-    fs::write(&alerts_path, serde_json::to_string_pretty(&fired_alerts)?)
-        .context("write fired-alerts.json")?;
-    info!("captured {} fired alerts", fired_alerts.len());
-
-    eprint!("[4/8] Exporting Prometheus metrics...");
-    let _ = std::io::stderr().flush();
     // Metrics only over a bounded window around the attack (the agent's
     // clock-anchored Prometheus queries land here) — the full padded log
     // window × every metric series would be gigabytes.
     let metrics_start = state.started_at - Duration::minutes(30);
     let metrics_end = completed_at + Duration::minutes(30);
-    let metrics_series = export_prometheus_metrics(&snapshot_dir, metrics_start, metrics_end).await;
-    eprintln!(" done ({metrics_series} series)");
-    info!("captured {metrics_series} Prometheus series");
 
-    eprint!("[5/8] Exporting Grafana dashboards...");
+    eprint!(
+        "[3/5] Exporting Grafana surface (alerts, metrics, dashboards, annotations) in parallel..."
+    );
     let _ = std::io::stderr().flush();
-    let dashboards_captured = export_dashboards(&snapshot_dir).await;
-    eprintln!(" done ({dashboards_captured} dashboards)");
-    info!("captured {dashboards_captured} dashboards");
+    // All four exports hit independent Grafana endpoints — run them concurrently
+    // instead of the sequential [3/8]..[6/8] the old code did.
+    let (alerts_res, metrics_series, dashboards_captured, annotations_captured) = tokio::join!(
+        export_grafana_alerts(export_start, export_end),
+        export_prometheus_metrics(&snapshot_dir, metrics_start, metrics_end),
+        export_dashboards(&snapshot_dir),
+        export_all_annotations(&snapshot_dir, export_start, export_end),
+    );
+    let fired_alerts = alerts_res?;
+    eprintln!(
+        " done ({} alerts, {metrics_series} series, {dashboards_captured} dashboards, {annotations_captured} annotations)",
+        fired_alerts.len()
+    );
+    let alerts_path = snapshot_dir.join("fired-alerts.json");
+    fs::write(&alerts_path, serde_json::to_string_pretty(&fired_alerts)?)
+        .context("write fired-alerts.json")?;
+    info!(
+        "captured {} fired alerts, {metrics_series} metric series, {dashboards_captured} dashboards, {annotations_captured} annotations",
+        fired_alerts.len()
+    );
 
-    eprint!("[6/8] Exporting all annotations...");
-    let _ = std::io::stderr().flush();
-    let annotations_captured =
-        export_all_annotations(&snapshot_dir, export_start, export_end).await;
-    eprintln!(" done ({annotations_captured} annotations)");
-    info!("captured {annotations_captured} annotations");
+    if metrics_series > 0 {
+        eprint!("      Pre-building Prometheus TSDB blocks (capture-time)...");
+        let _ = std::io::stderr().flush();
+        match build_prometheus_tsdb_blocks(&snapshot_dir) {
+            Ok(true) => eprintln!(" done"),
+            Ok(false) => eprintln!(" skipped (docker/python3 unavailable — replay backfills)"),
+            Err(e) => {
+                eprintln!(" failed — replay backfills from metrics.json");
+                info!("prometheus tsdb pre-build failed: {e}");
+            }
+        }
+    }
 
-    eprint!("[7/8] Writing manifest and ground truth...");
+    eprint!("[4/5] Writing manifest and ground truth...");
     let _ = std::io::stderr().flush();
     let target_domain = state
         .target
@@ -223,7 +277,7 @@ pub(crate) async fn run_capture(
             .unwrap_or_else(|_| DEFAULT_BENCHMARK_REGION.to_string());
 
         let s3_dest = format!("s3://{bucket}/snapshots/{op_id}/");
-        eprint!("[8/8] Uploading snapshot to {s3_dest}...");
+        eprint!("[5/5] Uploading snapshot to {s3_dest}...");
         let _ = std::io::stderr().flush();
         info!("uploading snapshot to {s3_dest}");
 
@@ -248,7 +302,7 @@ pub(crate) async fn run_capture(
         eprintln!(" done");
         info!("S3 upload complete: {s3_dest}");
     } else {
-        eprintln!("[8/8] Skipping S3 upload (--no-upload)");
+        eprintln!("[5/5] Skipping S3 upload (--no-upload)");
     }
 
     println!("Snapshot captured: {}", snapshot_dir.display());
@@ -319,6 +373,106 @@ async fn fetch_expected_timeline(
         .collect()
 }
 
+/// Poll the source Loki S3 until the ingester has flushed chunks covering the
+/// attack window's end. Loki flushes with ~30-60 min latency, so a capture run
+/// right after an op silently misses the attack-window logs; this blocks until
+/// they've landed, or errors at the timeout rather than producing a
+/// silently-incomplete snapshot.
+async fn wait_for_attack_flush(
+    attack_start: chrono::DateTime<chrono::Utc>,
+    attack_end: chrono::DateTime<chrono::Utc>,
+    timeout_mins: u32,
+) -> Result<()> {
+    let end_ms = attack_end.timestamp_millis();
+    const POLL_SECS: u64 = 30;
+    let max_polls = (timeout_mins as u64 * 60) / POLL_SECS;
+    for poll in 0..=max_polls {
+        match latest_flushed_chunk_end(attack_start, attack_end)? {
+            Some(chunk_end) if chunk_end >= end_ms => {
+                info!("Loki flush complete: S3 chunks cover the attack window end");
+                return Ok(());
+            }
+            Some(chunk_end) => {
+                let behind_min = (end_ms - chunk_end).max(0) / 60_000;
+                eprintln!("  [flush] S3 covers up to ~{behind_min}m before attack end — waiting ({poll}/{max_polls})...");
+            }
+            None => {
+                eprintln!(
+                    "  [flush] no attack-window chunks in S3 yet — waiting ({poll}/{max_polls})..."
+                );
+            }
+        }
+        if poll < max_polls {
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+        }
+    }
+    bail!(
+        "Loki flush wait timed out after {timeout_mins}m — attack-window logs not fully flushed to S3. \
+         Re-run later or raise --flush-timeout-mins."
+    );
+}
+
+/// Max end-time (ms) among flushed S3 chunks whose content overlaps
+/// `[start, end]`, or `None` if none are present yet. Mirrors the chunk-key
+/// parsing in [`sync_loki_s3`].
+fn latest_flushed_chunk_end(
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<i64>> {
+    let start_ms = start.timestamp_millis();
+    let end_ms = end.timestamp_millis();
+    let list_start = start.format("%Y-%m-%d").to_string();
+    let list_end = (end + Duration::days(1)).format("%Y-%m-%d").to_string();
+    let loki = LokiS3::from_env();
+
+    let output = std::process::Command::new("aws")
+        .args([
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            &loki.bucket,
+            "--prefix",
+            "fake/",
+            "--profile",
+            &loki.profile,
+            "--region",
+            &loki.region,
+            "--query",
+            &format!("Contents[?LastModified>='{list_start}' && LastModified<'{list_end}'].Key"),
+            "--output",
+            "json",
+        ])
+        .output()
+        .context("aws s3api list-objects-v2 (flush check)")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("s3api list-objects-v2 failed (flush check): {stderr}");
+    }
+    let keys: Vec<String> = serde_json::from_slice(&output.stdout).context("parse s3api output")?;
+
+    let mut max_end: Option<i64> = None;
+    for key in &keys {
+        let parts: Vec<&str> = key.split('/').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let ts_parts: Vec<&str> = parts[2].split(':').collect();
+        if ts_parts.len() < 2 {
+            continue;
+        }
+        let (Ok(chunk_start), Ok(chunk_end)) = (
+            i64::from_str_radix(ts_parts[0], 16),
+            i64::from_str_radix(ts_parts[1], 16),
+        ) else {
+            continue;
+        };
+        if chunk_end >= start_ms && chunk_start <= end_ms {
+            max_end = Some(max_end.map_or(chunk_end, |m| m.max(chunk_end)));
+        }
+    }
+    Ok(max_end)
+}
+
 /// Sync Loki S3 chunks and index files for the given time window.
 ///
 /// 1. Lists all chunk objects modified in the date range.
@@ -331,6 +485,7 @@ async fn sync_loki_s3(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<(u64, u64)> {
+    let loki = LokiS3::from_env();
     let chunks_dir = loki_dir.join("fake");
     let index_dir = loki_dir.join("index");
     fs::create_dir_all(&chunks_dir).context("create chunks dir")?;
@@ -355,17 +510,20 @@ async fn sync_loki_s3(
         let local_index = index_dir.join(format!("loki_index_{table}"));
         fs::create_dir_all(&local_index)?;
 
-        info!("syncing index table {table} from s3://{LOKI_S3_BUCKET}/{prefix}");
+        info!(
+            "syncing index table {table} from s3://{}/{prefix}",
+            loki.bucket
+        );
         let status = std::process::Command::new("aws")
             .args([
                 "s3",
                 "sync",
-                &format!("s3://{LOKI_S3_BUCKET}/{prefix}"),
+                &format!("s3://{}/{prefix}", loki.bucket),
                 local_index.to_str().unwrap(),
                 "--profile",
-                LOKI_S3_PROFILE,
+                &loki.profile,
                 "--region",
-                LOKI_S3_REGION,
+                &loki.region,
                 "--quiet",
             ])
             .status()
@@ -373,12 +531,7 @@ async fn sync_loki_s3(
         if !status.success() {
             bail!("failed to sync index table {table}");
         }
-        let count = fs::read_dir(&local_index)
-            .map(|rd| rd.flatten().count() as u64)
-            .unwrap_or(0);
-        // Also count in subdirectories (e.g., fake/)
-        let count_nested = walkdir_count(&local_index);
-        index_count += count.max(count_nested);
+        index_count += count_files_recursive(&local_index);
     }
 
     // Use aws s3api list-objects-v2 with JSON output, filter by
@@ -394,13 +547,13 @@ async fn sync_loki_s3(
             "s3api",
             "list-objects-v2",
             "--bucket",
-            LOKI_S3_BUCKET,
+            &loki.bucket,
             "--prefix",
             "fake/",
             "--profile",
-            LOKI_S3_PROFILE,
+            &loki.profile,
             "--region",
-            LOKI_S3_REGION,
+            &loki.region,
             "--query",
             &format!("Contents[?LastModified>='{list_start}' && LastModified<'{list_end}'].Key"),
             "--output",
@@ -418,101 +571,113 @@ async fn sync_loki_s3(
 
     info!("found {} chunk objects in date range", keys.len());
 
-    let mut matching_keys: Vec<String> = Vec::new();
-    for key in &keys {
-        let parts: Vec<&str> = key.split('/').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let chunk_name = parts[2];
-        let ts_parts: Vec<&str> = chunk_name.split(':').collect();
-        if ts_parts.len() < 2 {
-            continue;
-        }
-        let Ok(chunk_start) = i64::from_str_radix(ts_parts[0], 16) else {
-            continue;
-        };
-        let Ok(chunk_end) = i64::from_str_radix(ts_parts[1], 16) else {
-            continue;
-        };
-        // Overlap: chunk_end >= window_start AND chunk_start <= window_end
-        if chunk_end >= start_ms && chunk_start <= end_ms {
-            matching_keys.push(key.clone());
-        }
-    }
+    let matching_keys: Vec<String> = keys
+        .iter()
+        .filter(|key| {
+            let parts: Vec<&str> = key.split('/').collect();
+            let Some(chunk_name) = parts.get(2) else {
+                return false;
+            };
+            let ts_parts: Vec<&str> = chunk_name.split(':').collect();
+            if ts_parts.len() < 2 {
+                return false;
+            }
+            let (Ok(chunk_start), Ok(chunk_end)) = (
+                i64::from_str_radix(ts_parts[0], 16),
+                i64::from_str_radix(ts_parts[1], 16),
+            ) else {
+                return false;
+            };
+            // Overlap: chunk_end >= window_start AND chunk_start <= window_end
+            chunk_end >= start_ms && chunk_start <= end_ms
+        })
+        .cloned()
+        .collect();
 
     info!(
         "{} chunks overlap the capture window ({} filtered out)",
         matching_keys.len(),
         keys.len() - matching_keys.len()
     );
-
-    // Write keys to a temp file and use a shell script for parallel download.
-    let keys_file = loki_dir.join(".chunk_keys.txt");
-    fs::write(&keys_file, matching_keys.join("\n")).context("write chunk keys file")?;
-
-    let script = format!(
-        r#"
-DEST="{dest}"
-BUCKET="{bucket}"
-PROFILE="{profile}"
-REGION="{region}"
-TOTAL=$(wc -l < "{keys_file}" | tr -d ' ')
-COUNT=0
-while IFS= read -r key; do
-    COUNT=$((COUNT + 1))
-    dir="$DEST/$(dirname "$key")"
-    mkdir -p "$dir"
-    aws s3 cp "s3://$BUCKET/$key" "$DEST/$key" --profile "$PROFILE" --region "$REGION" --quiet &
-    if (( COUNT % 20 == 0 )); then
-        wait
-    fi
-done < "{keys_file}"
-wait
-echo "$COUNT"
-"#,
-        dest = loki_dir.display(),
-        bucket = LOKI_S3_BUCKET,
-        profile = LOKI_S3_PROFILE,
-        region = LOKI_S3_REGION,
-        keys_file = keys_file.display(),
-    );
-
     info!(
         "downloading {} chunks (20 parallel)...",
         matching_keys.len()
     );
-    let dl_output = std::process::Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .output()
-        .context("download chunks")?;
 
-    if !dl_output.status.success() {
-        let stderr = String::from_utf8_lossy(&dl_output.stderr);
-        bail!("chunk download failed: {stderr}");
+    // 20-way concurrent download via async streams — one `aws s3 cp` per chunk.
+    // Replaces the prior bash heredoc, which had no path escaping and no
+    // error propagation from individual failures.
+    let results: Vec<Result<()>> = stream::iter(matching_keys.iter().cloned())
+        .map(|key| {
+            let bucket = loki.bucket.clone();
+            let profile = loki.profile.clone();
+            let region = loki.region.clone();
+            let loki_dir = loki_dir.to_path_buf();
+            async move {
+                let local = loki_dir.join(&key);
+                if let Some(parent) = local.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .with_context(|| format!("create parent dir for {key}"))?;
+                }
+                let src = format!("s3://{bucket}/{key}");
+                let status = tokio::process::Command::new("aws")
+                    .args([
+                        "s3",
+                        "cp",
+                        &src,
+                        local.to_str().unwrap(),
+                        "--profile",
+                        &profile,
+                        "--region",
+                        &region,
+                        "--quiet",
+                    ])
+                    .status()
+                    .await
+                    .with_context(|| format!("spawn aws s3 cp for {key}"))?;
+                if !status.success() {
+                    bail!("aws s3 cp {src} failed");
+                }
+                Ok(())
+            }
+        })
+        .buffer_unordered(20)
+        .collect()
+        .await;
+
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    if failed > 0 {
+        // Surface the first error but count the rest.
+        let first = results.into_iter().find_map(|r| r.err()).unwrap();
+        bail!(
+            "{failed}/{} chunk downloads failed (first error: {first:#})",
+            matching_keys.len()
+        );
     }
-
-    let _ = fs::remove_file(&keys_file);
 
     let chunk_count = matching_keys.len() as u64;
     Ok((chunk_count, index_count))
 }
 
-/// Count files recursively under a directory.
-fn walkdir_count(dir: &Path) -> u64 {
-    let mut count = 0u64;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
+/// Count files recursively under a directory. Used for post-sync index counting.
+fn count_files_recursive(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
             let path = entry.path();
             if path.is_file() {
-                count += 1;
+                1
             } else if path.is_dir() {
-                count += walkdir_count(&path);
+                count_files_recursive(&path)
+            } else {
+                0
             }
-        }
-    }
-    count
+        })
+        .sum()
 }
 
 /// Build a SavedRedState-compatible JSON value from SharedRedTeamState.
@@ -591,7 +756,7 @@ async fn export_grafana_alerts(
     let url =
         format!("{grafana_url}/api/annotations?from={from_ms}&to={to_ms}&type=alert&limit=5000");
 
-    let client = reqwest::Client::new();
+    let client = http();
     let mut req = client.get(&url);
     if let Some(key) = &api_key {
         req = req.bearer_auth(key);
@@ -690,6 +855,93 @@ fn with_grafana_auth(
     }
 }
 
+/// The OpenMetrics converter, embedded so capture needs no repo checkout.
+const PROM_BACKFILL_PY: &str = include_str!("../../../benchmarks/replay-stack/prom_backfill.py");
+
+/// Whether `<cmd> --version` succeeds — used to detect docker/python3 at capture.
+fn tool_available(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Pre-build the Prometheus TSDB blocks at capture time so replay just copies
+/// them instead of running the multi-minute OpenMetrics→promtool conversion on
+/// every run. Writes `<snapshot>/prometheus/tsdb/` (metrics.json stays as a
+/// fallback — full parity either way). Returns `Ok(false)` when docker/python3
+/// aren't available (replay then backfills). promtool comes from the pinned
+/// Prometheus image via docker, matching the replay Prometheus version.
+fn build_prometheus_tsdb_blocks(snapshot_dir: &Path) -> Result<bool> {
+    let prometheus_dir = snapshot_dir.join("prometheus");
+    let metrics_json = prometheus_dir.join("metrics.json");
+    if !metrics_json.exists() {
+        return Ok(false);
+    }
+    if !tool_available("docker") || !tool_available("python3") {
+        return Ok(false);
+    }
+
+    let script = prometheus_dir.join(".prom_backfill.py");
+    let om_path = prometheus_dir.join(".metrics.om");
+    let tsdb_dir = prometheus_dir.join("tsdb");
+    let _ = fs::remove_file(&om_path);
+    let _ = fs::remove_dir_all(&tsdb_dir);
+    fs::write(&script, PROM_BACKFILL_PY).context("stage prom_backfill.py")?;
+
+    // 1) Emit OpenMetrics text (pure python3 — portable, no promtool needed).
+    let emit = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--emit-openmetrics")
+        .arg(&metrics_json)
+        .arg(&om_path)
+        .output()
+        .context("run prom_backfill.py --emit-openmetrics")?;
+    let _ = fs::remove_file(&script);
+    if !emit.status.success() {
+        let _ = fs::remove_file(&om_path);
+        bail!(
+            "openmetrics emit failed: {}",
+            String::from_utf8_lossy(&emit.stderr).trim()
+        );
+    }
+    if !om_path.exists() {
+        return Ok(false); // no series emitted
+    }
+
+    // 2) Build TSDB blocks with the pinned promtool via docker (into ./tsdb).
+    fs::create_dir_all(&tsdb_dir).context("create tsdb dir")?;
+    let prom_abs = prometheus_dir
+        .canonicalize()
+        .context("canonicalize prometheus dir")?;
+    let promtool = std::process::Command::new("docker")
+        .args(["run", "--rm", "--entrypoint", "promtool"])
+        .arg("-v")
+        .arg(format!("{}:/data", prom_abs.display()))
+        .arg(super::versions::PROMETHEUS_IMAGE)
+        .args([
+            "tsdb",
+            "create-blocks-from",
+            "openmetrics",
+            "/data/.metrics.om",
+            "/data/tsdb",
+        ])
+        .output()
+        .context("run promtool via docker")?;
+    let _ = fs::remove_file(&om_path);
+    if !promtool.status.success() {
+        let _ = fs::remove_dir_all(&tsdb_dir);
+        bail!(
+            "promtool create-blocks failed: {}",
+            String::from_utf8_lossy(&promtool.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
 /// Export Prometheus metrics over the capture window via the Grafana
 /// datasource proxy.
 ///
@@ -711,7 +963,7 @@ async fn export_prometheus_metrics(
         return 0;
     };
 
-    let client = reqwest::Client::new();
+    let client = http();
 
     let ds_url = format!("{grafana_url}/api/datasources");
     let ds_resp = match with_grafana_auth(client.get(&ds_url), &api_key)
@@ -792,6 +1044,7 @@ async fn export_prometheus_metrics(
     const BATCH: usize = 80;
     let total_batches = names.len().div_ceil(BATCH);
     let mut all_series: Vec<serde_json::Value> = Vec::new();
+    let mut failed_batches: usize = 0;
     for (i, chunk) in names.chunks(BATCH).enumerate() {
         let selector = format!(r#"{{__name__=~"{}"}}"#, chunk.join("|"));
         let params: [(&str, &str); 4] = [
@@ -817,13 +1070,26 @@ async fn export_prometheus_metrics(
                     }
                 }
             }
-            Ok(r) => info!(
-                "metrics batch {}/{total_batches} returned {}",
-                i + 1,
-                r.status()
-            ),
-            Err(e) => info!("metrics batch {}/{total_batches} failed: {e}", i + 1),
+            Ok(r) => {
+                failed_batches += 1;
+                info!(
+                    "metrics batch {}/{total_batches} returned {}",
+                    i + 1,
+                    r.status()
+                );
+            }
+            Err(e) => {
+                failed_batches += 1;
+                info!("metrics batch {}/{total_batches} failed: {e}", i + 1);
+            }
         }
+    }
+    if failed_batches > 0 {
+        // Surface partial failure to the operator — an all-info log message
+        // gets lost in a busy capture.
+        eprintln!(
+            "  warning: {failed_batches}/{total_batches} Prometheus batches failed — metrics.json is incomplete"
+        );
     }
 
     let merged = serde_json::json!({
@@ -860,7 +1126,7 @@ async fn export_dashboards(snapshot_dir: &Path) -> usize {
         return 0;
     };
 
-    let client = reqwest::Client::new();
+    let client = http();
 
     let search_url = format!("{grafana_url}/api/search?type=dash-db&limit=500");
     let search_resp = match with_grafana_auth(client.get(&search_url), &api_key)
@@ -945,7 +1211,7 @@ async fn export_all_annotations(
     let to_ms = end.timestamp_millis();
     let url = format!("{grafana_url}/api/annotations?from={from_ms}&to={to_ms}&limit=5000");
 
-    let client = reqwest::Client::new();
+    let client = http();
     let resp = match with_grafana_auth(client.get(&url), &api_key).send().await {
         Ok(r) => r,
         Err(e) => {

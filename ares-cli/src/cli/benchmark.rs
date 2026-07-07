@@ -36,6 +36,17 @@ pub(crate) enum BenchmarkCommands {
         /// target-centric red state does not record — supply it here.
         #[arg(long, value_delimiter = ',')]
         attacker_ips: Vec<String>,
+
+        /// Wait for Loki to flush the attack-window logs to S3 before capturing.
+        /// Loki's ingester flushes with ~30-60 min latency, so a capture right
+        /// after an op silently misses the attack logs; this blocks until they
+        /// land (or errors at the timeout rather than capturing a thin snapshot).
+        #[arg(long)]
+        wait_for_flush: bool,
+
+        /// Max minutes to wait for the Loki flush (with --wait-for-flush).
+        #[arg(long, default_value_t = 60)]
+        flush_timeout_mins: u32,
     },
 
     /// Import a snapshot's Loki data into a target Loki instance.
@@ -56,16 +67,20 @@ pub(crate) enum BenchmarkCommands {
         loki_token: Option<String>,
     },
 
-    /// Run a full benchmark replay: provision EC2, load Loki, investigate, score.
+    /// Run a blue investigation against a pre-provisioned replay stack.
     ///
-    /// Provisions an ephemeral EC2 instance with Loki in the labs account,
-    /// downloads the snapshot data, triggers a blue team investigation, scores
-    /// the results against ground truth, and terminates the EC2 instance.
+    /// The stack is stood up by `task benchmark:replay:provision OP_ID=<op>`
+    /// (or the equivalent AWS-CLI orchestration); its private IP is passed
+    /// as `--stack-ip`. This command submits the investigation to NATS,
+    /// polls Redis for completion, and computes the score. It does NOT
+    /// provision or tear down the stack — see `.taskfiles/benchmark/` for
+    /// the end-to-end flow (`task benchmark:replay`).
     ///
     /// Two replay modes are supported:
-    /// - `static` (default): all data is pre-loaded, agent knows the full attack window.
-    /// - `timeline`: a quiet period precedes the first alert, trigger uses
-    ///   alert-replay (no attack_window_end), simulating an unfolding attack.
+    /// - `timeline` (default): a quiet period precedes the first alert,
+    ///   trigger uses alert-replay (no attack_window_end), simulating an
+    ///   unfolding attack. The realistic mode.
+    /// - `static`: all data pre-loaded, agent knows the full attack window.
     Run {
         /// Snapshot ID (operation ID, e.g. op-20260630-222023).
         /// Downloaded from the benchmark S3 bucket.
@@ -75,9 +90,11 @@ pub(crate) enum BenchmarkCommands {
         #[arg(long)]
         snapshot_dir: Option<String>,
 
-        /// Replay mode: "static" loads all data upfront with full attack window;
-        /// "timeline" adds a quiet period and uses alert-replay trigger (no end window)
-        #[arg(long, default_value = "static")]
+        /// Replay mode: "timeline" (default) adds a quiet period and uses the
+        /// alert-replay trigger (no end window), simulating an unfolding attack —
+        /// the realistic mode. "static" loads all data upfront with the full
+        /// attack window handed to the agent (convenient but less realistic).
+        #[arg(long, default_value = "timeline")]
         replay_mode: String,
 
         /// Trigger mode: "alert-replay" uses the first captured alert,
@@ -109,6 +126,13 @@ pub(crate) enum BenchmarkCommands {
         /// Default: 10.0.
         #[arg(long, default_value_t = 10.0)]
         time_compression: f64,
+
+        /// Private IP of an already-provisioned replay stack. Stand the stack
+        /// up with `task benchmark:replay:provision OP_ID=<op>` (or invoke
+        /// `task benchmark:replay` for the full provision → investigate →
+        /// teardown flow).
+        #[arg(long, required = true)]
+        stack_ip: String,
     },
 
     /// List available benchmark snapshots from S3.

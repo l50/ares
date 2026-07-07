@@ -33,10 +33,16 @@ if [ -d "$DATA/loki/chunks/fake" ]; then
 	done
 fi
 
-echo "[2/6] backfilling Prometheus metrics (if captured)..."
+echo "[2/6] loading Prometheus metrics (if captured)..."
 rm -rf "$DATA/prometheus"
 mkdir -p "$DATA/prometheus"
-if [ -f "$SNAP/prometheus/metrics.json" ] && [ -f "$STACK_DIR/prom_backfill.py" ]; then
+if [ -d "$SNAP/prometheus/tsdb" ]; then
+	# Pre-built TSDB blocks (created at capture time) — just copy them in,
+	# avoiding the multi-minute OpenMetrics→promtool conversion on every replay.
+	cp -r "$SNAP/prometheus/tsdb/." "$DATA/prometheus/"
+	echo "  (loaded pre-built TSDB blocks)"
+elif [ -f "$SNAP/prometheus/metrics.json" ] && [ -f "$STACK_DIR/prom_backfill.py" ]; then
+	# Fallback for older snapshots without pre-built blocks: convert at replay.
 	python3 "$STACK_DIR/prom_backfill.py" "$SNAP/prometheus/metrics.json" "$DATA/prometheus" ||
 		echo "  (metric backfill failed — Prometheus will serve empty)"
 else

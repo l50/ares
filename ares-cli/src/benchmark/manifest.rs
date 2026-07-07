@@ -137,9 +137,6 @@ pub struct BenchmarkResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_compression: Option<f64>,
 
-    /// Seconds spent importing data into Loki.
-    pub import_duration_secs: f64,
-
     /// Seconds the blue team investigation took.
     pub investigation_duration_secs: f64,
 
