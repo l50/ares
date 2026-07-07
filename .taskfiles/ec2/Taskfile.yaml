@@ -730,6 +730,39 @@ tasks:
           --document-name "AWS-StartPortForwardingSession" \
           --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}'
 
+  nats:forward:
+    desc: "SSM port-forward NATS to localhost:14222 for local CLI access (usage: task ec2:nats:forward [EC2_NAME=kali-ares])"
+    silent: true
+    cmds:
+      - |
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" \
+          --output text | head -1)
+
+        if [ -z "$INSTANCE_ID" ]; then
+          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
+          exit 1
+        fi
+
+        lsof -ti:14222 | xargs kill 2>/dev/null || true
+        sleep 1
+
+        echo -e "{{.INFO}} Port-forwarding NATS: localhost:14222 -> $INSTANCE_ID:4222"
+        echo -e "{{.INFO}} Use: NATS_URL=nats://localhost:14222 (pair with ARES_REDIS_URL=redis://localhost:16379)"
+        echo -e "{{.INFO}} Press Ctrl+C to stop"
+        echo ""
+
+        aws ssm start-session \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --target "$INSTANCE_ID" \
+          --document-name "AWS-StartPortForwardingSession" \
+          --parameters '{"portNumber":["4222"],"localPortNumber":["14222"]}'
+
   # ============================================================================
   # CLI Operations (loot, runtime, report, list)
   # These use `ares --ec2` which handles instance resolution and SSM.

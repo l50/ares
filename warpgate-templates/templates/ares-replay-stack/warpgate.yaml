@@ -27,7 +27,9 @@ base:
     owners:
       - "137112412989"
     filters:
-      name: "al2023-ami-*-x86_64"
+      # `al2023-ami-2023.*-kernel-*-x86_64` — standard AL2023 (~8 GB root),
+      # not `al2023-ami-minimal-*` (2 GB root, too small for Docker + 6 images).
+      name: "al2023-ami-2023.*-kernel-*-x86_64"
       architecture: "x86_64"
     most_recent: true
 
@@ -41,6 +43,16 @@ sources:
       path: ../../../benchmarks/replay-stack
 
 provisioners:
+  # Expand /dev/xvda to whatever the builder EBS volume was launched with
+  # (warpgate sets that via aws.ami.volume_size). Without this, Docker + the
+  # six image pulls overflow the base AMI's small default root and the file
+  # provisioner never runs. `--use-max` is a no-op when already at max.
+  - type: shell
+    inline:
+      - growpart /dev/xvda 1 || true
+      - xfs_growfs / || resize2fs /dev/xvda1 || true
+      - df -h /
+
   # Install Docker + the compose plugin. Keep the compose version in sync with
   # the `docker/compose/releases/download/v...` line in
   # .taskfiles/benchmark/Taskfile.yaml (stock-AL2023 fallback path).

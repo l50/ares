@@ -783,8 +783,13 @@ tasks:
       EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
       AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
       AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
-      BLUE_ENABLED: '{{.BLUE_ENABLED | default "0"}}'
+      BLUE_ENABLED: '{{.BLUE_ENABLED | default "1"}}'
       BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
+      # Box-context obs endpoints — plundr defaults are reachable from
+      # kali-ares (verified TCP:443 + /api/v1/labels 200). Distinct from
+      # GRAFANA_URL/LOKI_URL which remain the laptop's obs:forward localhost.
+      EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL | default "https://grafana.dev.plundr.ai"}}'
+      EC2_LOKI_URL: '{{.EC2_LOKI_URL | default "https://loki.dev.plundr.ai"}}'
       EC2_DEPLOYMENT: '{{.EC2_DEPLOYMENT | default "alpha-operator-range"}}'
       STRATEGY: '{{.STRATEGY | default "comprehensive"}}'
       RESOLVED_TARGETS:
@@ -930,8 +935,8 @@ tasks:
               -e "s|__DREADNODE_WORKSPACE__|{{.DREADNODE_WORKSPACE}}|" \
               -e "s|__DREADNODE_PROJECT__|{{.DREADNODE_PROJECT}}|" \
               -e "s|__GRAFANA_TOKEN__|${GRAFANA_SERVICE_ACCOUNT_TOKEN:-}|" \
-              -e "s|__GRAFANA_URL__|{{.GRAFANA_URL}}|" \
-              -e "s|__LOKI_URL__|{{.LOKI_URL}}|" \
+              -e "s|__GRAFANA_URL__|{{.EC2_GRAFANA_URL}}|" \
+              -e "s|__LOKI_URL__|{{.EC2_LOKI_URL}}|" \
               -e "s|__ARES_LLM_MODEL__|{{.MODEL}}|" \
               -e "s|__ARES_BLUE_ENABLED__|{{.BLUE_ENABLED}}|" \
               -e "s|__ARES_BLUE_LLM_MODEL__|{{.BLUE_LLM_MODEL}}|" \

@@ -43,6 +43,8 @@ includes:
       REPORT_DIR: '{{.REPORT_DIR}}'
       GRAFANA_URL: '{{.GRAFANA_URL}}'
       LOKI_URL: '{{.LOKI_URL}}'
+      EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL}}'
+      EC2_LOKI_URL: '{{.EC2_LOKI_URL}}'
       DREADNODE_SERVER_URL: '{{.DREADNODE_SERVER_URL}}'
       DREADNODE_ORGANIZATION: '{{.DREADNODE_ORGANIZATION}}'
       DREADNODE_WORKSPACE: '{{.DREADNODE_WORKSPACE}}'
@@ -133,9 +135,19 @@ vars:
   # AWS profile/region: honor standard AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION env vars.
   AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
   AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
-  # Blue team (set BLUE_ENABLED=1 to run blue alongside red)
-  BLUE_ENABLED: '{{.BLUE_ENABLED | default "0"}}'
+  # Blue team on by default (BLUE_ENABLED=0 to skip). The default deployment
+  # target is kali-ares on EC2, where the box can reach plundr obs directly;
+  # running with blue off there just wastes a launch.
+  BLUE_ENABLED: '{{.BLUE_ENABLED | default "1"}}'
   BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
+  # Box-context observability endpoints — used when the orchestrator/workers
+  # run on EC2 and need to reach Loki/Grafana themselves. GRAFANA_URL/LOKI_URL
+  # in .env stay as the laptop's obs:forward localhost URLs; these are the
+  # values baked into the launch script that ships to the box. Direct Loki
+  # (not the Grafana datasource proxy) — proxy IDs get renumbered when
+  # datasources are recreated, direct DNS is stable.
+  EC2_LOKI_URL: '{{.EC2_LOKI_URL | default "https://loki.dev.plundr.ai"}}'
+  EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL | default "https://grafana.dev.plundr.ai"}}'
 
 tasks:
   default:
@@ -143,6 +155,13 @@ tasks:
     silent: true
     cmds:
       - task --list --sort none
+
+  run:
+    desc: "One-shot: stop any live orchestrator on EC2 and launch a fresh red+blue op (usage: task run [TARGET=dreadgoad] [EC2_NAME=kali-ares])"
+    silent: true
+    cmds:
+      - task: ec2:stop
+      - task: red:ec2:multi
 
   # Setup and initialization tasks
   check-command:
