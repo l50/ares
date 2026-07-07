@@ -169,10 +169,15 @@ async fn submit_investigation(
     let grafana_url = std::env::var("GRAFANA_URL").ok();
     let grafana_token = std::env::var("GRAFANA_SERVICE_ACCOUNT_TOKEN").ok();
 
+    // Parse the op's start time from its ID (op-YYYYMMDD-HHMMSS). This is the
+    // stable timestamp source we have without adding a Redis round-trip here;
+    // falling back to `now` would give blue a zero-width window and score 0.
+    let attack_window_start = crate::ops::delete::parse_operation_timestamp(op_id).unwrap_or(now);
+
     // Build synthetic alert (mirrors `ares blue from-operation`)
     let operation_context = serde_json::json!({
         "operation_id": op_id,
-        "attack_window_start": now.to_rfc3339(),
+        "attack_window_start": attack_window_start.to_rfc3339(),
         "attack_window_end": now.to_rfc3339(),
         "techniques_used": techniques,
         "domains": domains,

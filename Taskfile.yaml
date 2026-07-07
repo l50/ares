@@ -157,11 +157,56 @@ tasks:
       - task --list --sort none
 
   run:
-    desc: "One-shot: stop any live orchestrator on EC2 and launch a fresh red+blue op (usage: task run [TARGET=dreadgoad] [EC2_NAME=kali-ares])"
+    desc: "One-shot: stop, launch red+blue op, optionally wait + capture snapshot + print benchmark:replay command (usage: task run [WAIT=true] [CAPTURE=true] [TARGET=dreadgoad] [EC2_NAME=kali-ares])"
     silent: true
+    vars:
+      WAIT: '{{.WAIT | default "false"}}'
+      CAPTURE: '{{.CAPTURE | default "false"}}'
     cmds:
       - task: ec2:stop
       - task: red:ec2:multi
+      - |
+        if [ "{{.WAIT}}" != "true" ] && [ "{{.CAPTURE}}" != "true" ]; then
+          exit 0
+        fi
+        # CAPTURE implies WAIT — capture must run against a completed op.
+        task ec2:watch EC2_NAME="{{.EC2_NAME}}" LATEST=true
+      - |
+        if [ "{{.CAPTURE}}" != "true" ]; then exit 0; fi
+
+        # Resolve op id + attacker private IP for the capture.
+        OP_ID=$({{.ARES_CLI}} --ec2 "{{.EC2_NAME}}" --ec2-profile "{{.AWS_PROFILE}}" --ec2-region "{{.AWS_REGION}}" \
+          ops list --latest 2>/dev/null | grep -oE 'op-[0-9]+-[0-9]+' | head -1)
+        if [ -z "$OP_ID" ]; then
+          echo "capture: could not resolve latest op id — run 'ares benchmark capture --latest --wait-for-flush' manually"
+          exit 1
+        fi
+        INSTANCE_ID=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" --output text | head -1)
+        ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+          --instance-ids "$INSTANCE_ID" \
+          --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true
+
+        # SSM-forward the box's Redis so `ares benchmark capture` can read op state.
+        lsof -ti:16379 | xargs kill 2>/dev/null || true
+        aws ssm start-session --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" --target "$INSTANCE_ID" \
+          --document-name AWS-StartPortForwardingSession \
+          --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}' >/tmp/ares-run-capture-fwd.log 2>&1 &
+        PF_PID=$!
+        trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+        for _ in $(seq 1 20); do nc -z localhost 16379 2>/dev/null && break; sleep 2; done
+
+        echo "▶ capturing snapshot for $OP_ID (waits for Loki flush — up to ~60 min)..."
+        {{.ARES_CLI}} benchmark capture "$OP_ID" \
+          --redis-url redis://localhost:16379 \
+          --wait-for-flush \
+          ${ATTACKER_IP:+--attacker-ips "$ATTACKER_IP"} \
+          || { echo "capture failed — run 'ares benchmark capture $OP_ID --wait-for-flush' later"; exit 1; }
+
+        echo ""
+        echo "▶ Snapshot captured. To evaluate blue against it:"
+        echo "    task benchmark:replay OP_ID=$OP_ID"
 
   # Setup and initialization tasks
   check-command:

@@ -19,6 +19,7 @@ LLM-coordinated autonomous security operations platform with two modes:
 
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
+- [EC2 workflow (kali-ares)](#ec2-workflow-kali-ares)
 - [CLI Reference](#cli-reference)
 - [Red Team Operations](#red-team-operations)
 - [Blue Team Investigations](#blue-team-investigations)
@@ -126,6 +127,72 @@ cp .env.example .env
 
 # Verify configuration
 task ares:config:check
+```
+
+## EC2 workflow (kali-ares)
+
+The default deployment for ops is EC2 (`kali-ares` in the `lab` account,
+`us-west-1`). Observability lives in the `infrastructure` account's plundr
+cluster; the box reaches it directly, the laptop reaches it via kubectl
+port-forward.
+
+**One-time setup:**
+
+```bash
+# 1. AWS SSO — lab (kali-ares + secret) + infrastructure (plundr EKS)
+aws sso login --profile lab
+aws sso login --profile infrastructure
+
+# 2. Register the plundr EKS context (for obs:forward)
+aws eks update-kubeconfig --profile infrastructure --region us-west-2 \
+  --name dev-argonaut --alias plundr
+
+# 3. Apple Silicon: enable Docker Desktop → Settings → General →
+#    "Use Rosetta for x86_64/amd64 emulation" (task ec2:deploy cross-compiles
+#    amd64 under Rosetta; QEMU segfaults rustc)
+
+# 4. Populate .env from AWS Secrets Manager
+./scripts/env-from-secrets.sh
+```
+
+**Common gotchas:**
+
+- Tailscale MagicDNS (100.100.100.100) will eat EKS API endpoint lookups if
+  the node isn't approved by the tailnet admin. Sign in to Tailscale or add
+  a `/etc/hosts` override for the EKS API endpoint.
+- `task ec2:deploy` must use an S3 bucket in the **same account** as
+  `kali-ares` (currently the lab account). Pass `S3_BUCKET=ares-benchmark-us-west-1`
+  when deploying, or set it in `.env`.
+
+**Run an op:**
+
+```bash
+task run                              # fire-and-forget (blue enabled by default)
+task run WAIT=true                    # wait for op completion, auto-fetch red report
+task run WAIT=true CAPTURE=true       # wait + capture Loki snapshot to S3 (waits
+                                      #   for Loki flush, ~5 min after op end);
+                                      #   prints the exact benchmark:replay command
+```
+
+**Evaluate blue via replay:**
+
+```bash
+# Provisions a fresh replay stack, imports the captured Loki timeline,
+# runs a blue investigation against it, scores, tears down. Deterministic —
+# rerun anytime without re-running red.
+task benchmark:replay OP_ID=op-YYYYMMDD-HHMMSS
+```
+
+Reports land in `./reports/blue/investigations/inv-*.md` with IOC-detection
+score, MITRE technique coverage, and grade.
+
+**Blue tooling on the laptop (optional):**
+
+```bash
+# Port-forward plundr Loki+Grafana to localhost so ares blue commands
+# work from the laptop.
+task obs:forward     # keep running in a separate terminal
+task obs:status      # health check the tunnels
 ```
 
 ## CLI Reference

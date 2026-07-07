@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -618,9 +618,24 @@ async fn auto_submit_blue_investigation(
         .await
         .unwrap_or_default();
 
+    // Read the op's real start time from Redis — bootstrap.rs writes it once
+    // via HSETNX so this survives restarts. Falling back to `now` would give
+    // blue a zero-width window and score 0.
+    let meta_key = format!("ares:op:{op_id}:meta");
+    let started_at_raw: Option<String> = redis::cmd("HGET")
+        .arg(&meta_key)
+        .arg("started_at")
+        .query_async(conn)
+        .await
+        .unwrap_or_default();
+    let attack_window_start = started_at_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<DateTime<Utc>>(s).ok())
+        .unwrap_or(now);
+
     let operation_context = serde_json::json!({
         "operation_id": op_id,
-        "attack_window_start": now.to_rfc3339(),
+        "attack_window_start": attack_window_start.to_rfc3339(),
         "attack_window_end": now.to_rfc3339(),
         "techniques_used": &techniques[..std::cmp::min(techniques.len(), 20)],
         "deployment": target_env,

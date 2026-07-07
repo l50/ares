@@ -1,7 +1,7 @@
 mod backfill;
 #[cfg(feature = "blue")]
 mod correlate;
-mod delete;
+pub(crate) mod delete;
 #[cfg(feature = "blue")]
 mod evaluate;
 mod inject;

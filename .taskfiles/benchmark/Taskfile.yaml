@@ -130,14 +130,21 @@ tasks:
           fi
         fi
 
-        # Launch. 20 GB gp3 fits Docker + the 6 images + snapshot data.
+        # Root volume must be >= the AMI's baked snapshot size. Pre-baked
+        # ares-replay-stack AMIs ship a 40 GB snapshot (Docker + 6 images +
+        # room for the imported Loki chunks); stock AL2023 is much smaller.
+        # Query the AMI and take max(default_size, ami_snapshot_size).
+        AMI_SNAP_SIZE=$(aws ec2 describe-images --image-ids "$AMI_ID" \
+          --query 'Images[0].BlockDeviceMappings[0].Ebs.VolumeSize' --output text 2>/dev/null || echo 20)
+        VOL_SIZE=$([ "$AMI_SNAP_SIZE" -gt 40 ] && echo "$AMI_SNAP_SIZE" || echo 40)
+
         INSTANCE_ID=$(aws ec2 run-instances \
           --image-id "$AMI_ID" \
           --instance-type "{{.INSTANCE_TYPE}}" \
           --subnet-id "{{.SUBNET_ID}}" \
           --security-group-ids "{{.SECURITY_GROUP_ID}}" \
           --iam-instance-profile "Name={{.INSTANCE_PROFILE}}" \
-          --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=20,VolumeType=gp3}' \
+          --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${VOL_SIZE},VolumeType=gp3}" \
           --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=ares-replay-{{.OP_ID}}},{Key=ares:component,Value=benchmark-replay},{Key=ares:operation,Value={{.OP_ID}}}]" \
           --count 1 \
           --query 'Instances[0].InstanceId' --output text)
