@@ -257,6 +257,10 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
         }
 
         steps += 1;
+        // Advance the benchmark replay clock (step mode) so logs and alerts
+        // unfold as the investigation progresses. Monotonic + global across the
+        // multi-agent hand-offs; no-op outside a step-mode replay.
+        ares_core::replay_clock::advance_step();
 
         // Wrap-up nudge: when we're WRAPUP_THRESHOLD steps from the cap,
         // inject one user-role reminder telling the agent to call

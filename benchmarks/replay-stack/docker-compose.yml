@@ -32,6 +32,11 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      # Captured TSDB blocks carry their real (historical) attack timestamps.
+      # Without this, Prometheus's default 15d retention reaps them on startup /
+      # compaction whenever a snapshot is replayed >15 days after capture —
+      # silently serving empty metrics. Effectively disable time-based retention.
+      - --storage.tsdb.retention.time=10y
     ports: ["9090:9090"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro

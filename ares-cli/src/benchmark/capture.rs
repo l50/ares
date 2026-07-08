@@ -406,10 +406,16 @@ async fn wait_for_attack_flush(
             tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
         }
     }
-    bail!(
-        "Loki flush wait timed out after {timeout_mins}m — attack-window logs not fully flushed to S3. \
-         Re-run later or raise --flush-timeout-mins."
+    // Some streams didn't reach the attack end within the window. This can mean the
+    // ingester is still buffering (thin snapshot) OR a low-volume stream simply has
+    // no data near the attack end (nothing left to flush). We can't tell which from
+    // S3 alone, so warn loudly and proceed rather than fail the whole capture.
+    eprintln!(
+        "  [flush] WARNING: not all Loki streams reached the attack end within {timeout_mins}m — \
+         proceeding with current S3 chunks. If the snapshot looks thin, re-run with a larger \
+         --flush-timeout-mins."
     );
+    Ok(())
 }
 
 /// Max end-time (ms) among flushed S3 chunks whose content overlaps
@@ -450,12 +456,20 @@ fn latest_flushed_chunk_end(
     }
     let keys: Vec<String> = serde_json::from_slice(&output.stdout).context("parse s3api output")?;
 
-    let mut max_end: Option<i64> = None;
+    // Each Loki stream (fingerprint = the `fake/<fp>/...` path segment) flushes
+    // independently, so completion must be gated on the SLOWEST stream reaching the
+    // attack end. Taking the max across all streams let one high-volume stream
+    // catching up mask a low-volume stream (e.g. windows-directory-service, carrying
+    // late DCSync/LDAP evidence) still buffered in the ingester — silently dropping
+    // the attack tail. Track each stream's newest flushed chunk_end covering the
+    // window and return the minimum across streams.
+    let mut per_stream: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     for key in &keys {
         let parts: Vec<&str> = key.split('/').collect();
         if parts.len() < 3 {
             continue;
         }
+        let stream_fp = parts[1];
         let ts_parts: Vec<&str> = parts[2].split(':').collect();
         if ts_parts.len() < 2 {
             continue;
@@ -467,10 +481,13 @@ fn latest_flushed_chunk_end(
             continue;
         };
         if chunk_end >= start_ms && chunk_start <= end_ms {
-            max_end = Some(max_end.map_or(chunk_end, |m| m.max(chunk_end)));
+            per_stream
+                .entry(stream_fp)
+                .and_modify(|m| *m = (*m).max(chunk_end))
+                .or_insert(chunk_end);
         }
     }
-    Ok(max_end)
+    Ok(per_stream.values().copied().min())
 }
 
 /// Sync Loki S3 chunks and index files for the given time window.

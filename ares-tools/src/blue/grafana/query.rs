@@ -101,7 +101,11 @@ pub async fn get_annotations(args: &Value) -> Result<ToolOutput> {
     if let Some(f) = from {
         params.push(("from", f.to_string()));
     }
-    if let Some(t) = to {
+    // Replay: bound the upper time at the replay clock so firings from the
+    // agent's future don't leak (overrides any caller-supplied `to`).
+    if let Some(ceiling) = crate::blue::replay_clock::replay_clamp_end() {
+        params.push(("to", ceiling.timestamp_millis().to_string()));
+    } else if let Some(t) = to {
         params.push(("to", t.to_string()));
     }
     if let Some(t) = tags {

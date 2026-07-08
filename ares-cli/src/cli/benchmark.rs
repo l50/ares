@@ -37,14 +37,14 @@ pub(crate) enum BenchmarkCommands {
         #[arg(long, value_delimiter = ',')]
         attacker_ips: Vec<String>,
 
-        /// Wait for Loki to flush the attack-window logs to S3 before capturing.
-        /// Loki's ingester flushes with ~30-60 min latency, so a capture right
-        /// after an op silently misses the attack logs; this blocks until they
-        /// land (or errors at the timeout rather than capturing a thin snapshot).
+        /// Skip waiting for Loki to flush the attack-window logs to S3 before
+        /// capturing. Waiting is the DEFAULT — Loki's ingester flushes with
+        /// ~30-60 min latency, so an immediate capture silently misses the attack
+        /// tail. Pass this only to capture immediately, accepting a thin snapshot.
         #[arg(long)]
-        wait_for_flush: bool,
+        no_wait_for_flush: bool,
 
-        /// Max minutes to wait for the Loki flush (with --wait-for-flush).
+        /// Max minutes to wait for the Loki flush before proceeding with a warning.
         #[arg(long, default_value_t = 60)]
         flush_timeout_mins: u32,
     },
@@ -121,11 +121,11 @@ pub(crate) enum BenchmarkCommands {
         #[arg(long)]
         quiet_period: Option<f64>,
 
-        /// Time compression factor for alert delivery (timeline mode).
-        /// 1.0 = real-time, 10.0 = 10x faster, 0 = instant delivery.
-        /// Default: 10.0.
-        #[arg(long, default_value_t = 10.0)]
-        time_compression: f64,
+        /// Timeline clock advance: "step" (deterministic — the attack unfolds
+        /// across the agent's step budget; default) or "wallclock" (real-time).
+        /// Ignored in static mode.
+        #[arg(long, default_value = "step")]
+        clock: String,
 
         /// Private IP of an already-provisioned replay stack. Stand the stack
         /// up with `task benchmark:replay:provision OP_ID=<op>` (or invoke

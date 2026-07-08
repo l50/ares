@@ -993,6 +993,16 @@ tasks:
       CRED_PASS: '{{.CRED_PASS | default "Heartsbane"}}'
       CRED_DOMAIN: '{{.CRED_DOMAIN | default "north.sevenkingdoms.local"}}'
       SECRETS_ID: '{{.SECRETS_ID | default "ares/api-keys"}}'
+      # Postgres history DB (ares-history). The orchestrator's projector + op
+      # finalizer persist every run here so red ops are comparable across runs.
+      # Password comes from Secrets Manager (never committed); host/user/db are
+      # stable lab defaults. Set RDS_SECRET_ID="" to disable SQL persistence, or
+      # pass ARES_DATABASE_URL=... to override the constructed URL entirely.
+      ARES_DATABASE_URL: '{{.ARES_DATABASE_URL | default ""}}'
+      RDS_SECRET_ID: '{{.RDS_SECRET_ID | default "ares/rds/master"}}'
+      RDS_ENDPOINT: '{{.RDS_ENDPOINT | default "ares-history.cr8uqakiuqnq.us-west-1.rds.amazonaws.com"}}'
+      RDS_USER: '{{.RDS_USER | default "ares_admin"}}'
+      RDS_DB: '{{.RDS_DB | default "ares_history"}}'
       LLM_MODEL: '{{.LLM_MODEL | default ""}}'
       FLUSH_REDIS: '{{.FLUSH_REDIS | default "true"}}'
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
@@ -1058,6 +1068,25 @@ tasks:
         LOKI_AUTH_TOKEN_VAL=$(echo "$SECRETS" | jq -r '.LOKI_AUTH_TOKEN // empty')
         DREADNODE_API_KEY=$(echo "$SECRETS" | jq -r '.DREADNODE_API_KEY // empty')
 
+        # Build ARES_DATABASE_URL for the ares-history Postgres so the
+        # orchestrator's projector + op finalizer persist every run to SQL.
+        # Explicit ARES_DATABASE_URL wins; otherwise construct it from the RDS
+        # master password in Secrets Manager. The password stays out of git and
+        # the /etc/ares/env file is chmod 600 below.
+        ARES_DATABASE_URL_VAL="{{.ARES_DATABASE_URL}}"
+        if [ -z "$ARES_DATABASE_URL_VAL" ] && [ -n "{{.RDS_SECRET_ID}}" ]; then
+          DB_PASSWORD=$(aws secretsmanager get-secret-value \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
+            --secret-id "{{.RDS_SECRET_ID}}" \
+            --query SecretString --output text 2>/dev/null) || true
+          if [ -n "$DB_PASSWORD" ]; then
+            ARES_DATABASE_URL_VAL="postgresql://{{.RDS_USER}}:${DB_PASSWORD}@{{.RDS_ENDPOINT}}:5432/{{.RDS_DB}}"
+          else
+            echo -e "{{.WARN}} could not read {{.RDS_SECRET_ID}} — SQL history persistence disabled for this op" >&2
+          fi
+        fi
+
         # Parse host:port from URLs for box-side reachability probes. The
         # observability endpoints in Secrets Manager may live in a VPC the box
         # can't reach (e.g. loki.dev.plundr.ai is behind the plundr VPC ingress
@@ -1103,6 +1132,12 @@ tasks:
         # Env var name per ares-llm/src/agent_loop/config.rs.
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_SESSION_LOG_DIR=/var/log/ares/session' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; mkdir -p /var/log/ares/session && chmod 0755 /var/log/ares/session"
+        # ares-history Postgres — gated on box→RDS reachability (5432) so an
+        # unreachable DB never wedges orchestrator startup; the projector +
+        # finalizer both no-op cleanly when ARES_DATABASE_URL is absent.
+        if [ -n "$ARES_DATABASE_URL_VAL" ]; then
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/{{.RDS_ENDPOINT}}/5432' 2>/dev/null; then echo 'ARES_DATABASE_URL=${ARES_DATABASE_URL_VAL}' >> /etc/ares/env; else echo 'SKIP: ARES_DATABASE_URL {{.RDS_ENDPOINT}}:5432 unreachable from box' >&2; fi"
+        fi
         ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 /etc/ares/env; echo Wrote /etc/ares/env"
 
         LAUNCH_SCRIPT="#!/bin/bash
@@ -1177,9 +1212,8 @@ tasks:
             for _ in $(seq 1 20); do nc -z localhost 16379 2>/dev/null && break; sleep 2; done
             {{.ARES_CLI}} benchmark capture "$OP_ID" \
               --redis-url redis://localhost:16379 \
-              --wait-for-flush \
               ${ATTACKER_IP:+--attacker-ips "$ATTACKER_IP"} \
-              || echo -e "{{.WARN}} auto-capture failed — op is finalized; run 'ares benchmark capture $OP_ID --wait-for-flush' later"
+              || echo -e "{{.WARN}} auto-capture failed — op is finalized; run 'ares benchmark capture $OP_ID' later (flush-wait is on by default)"
             kill "$PF_PID" 2>/dev/null || true
           fi
         fi

@@ -45,12 +45,10 @@ pub async fn query_instant(args: &Value) -> Result<ToolOutput> {
     let client = http_client();
     let mut params = vec![("query", promql.to_string())];
     match time {
-        // An explicit `time` is passed through verbatim, including in replay:
-        // the agent is prompted in replay-clock time, so a caller-supplied
-        // instant is already attack-relative. A literal wall-clock value would
-        // fall outside the captured window and return nothing — the prompt
-        // anchor (see ares-llm prompt/blue.rs) exists to prevent that.
-        Some(t) => params.push(("time", t.to_string())),
+        // Cap a caller-supplied instant at the replay clock (unfolding modes) so
+        // the agent can't sample metrics from its own future; no-op passthrough
+        // in static/frozen replay and live.
+        Some(t) => params.push(("time", super::loki::clamp_end_to_replay(t))),
         // During replay, pin an omitted `time` to the replay clock so "now"
         // resolves to attack-time instead of the Prometheus server's wall clock.
         None => {
@@ -81,7 +79,8 @@ pub async fn query_instant(args: &Value) -> Result<ToolOutput> {
 pub async fn query_range(args: &Value) -> Result<ToolOutput> {
     let promql = required_str(args, "promql")?;
     let start_time = required_str(args, "start_time")?;
-    let end_time = required_str(args, "end_time")?;
+    let end_time_owned = super::loki::clamp_end_to_replay(required_str(args, "end_time")?);
+    let end_time = end_time_owned.as_str();
     let step = optional_str(args, "step").unwrap_or("60s");
 
     let client = http_client();

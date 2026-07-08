@@ -212,10 +212,28 @@ impl BudgetConfig {
 /// tool result, terminal outcome) is appended as a JSON line under
 /// `dir/{op_id}/{task_id}.jsonl`. The log is the primary source of truth
 /// for crash recovery / `--resume` and post-hoc debugging.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SessionLogConfig {
     /// Root directory for session logs. `None` disables logging.
     pub dir: Option<PathBuf>,
+    /// Team owning this session (`red` | `blue`). Stamped on every record so red
+    /// and blue activity are separable in the analytical DB.
+    pub team: String,
+    /// Overrides the op_id used for the log path + records (env
+    /// `ARES_SESSION_OP_ID`). Lets the blue benchmark file its transcript under
+    /// the replayed operation id without reusing `investigation.operation_id`
+    /// (which would trigger red-state correlation).
+    pub op_id: Option<String>,
+}
+
+impl Default for SessionLogConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            team: "red".to_string(),
+            op_id: None,
+        }
+    }
 }
 
 impl SessionLogConfig {
@@ -225,11 +243,28 @@ impl SessionLogConfig {
     ///
     /// When enabled with no explicit dir, defaults to `~/.ares/sessions`.
     pub fn from_env() -> Self {
+        let team = std::env::var("ARES_SESSION_TEAM")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "red".to_string());
+        let op_id = std::env::var("ARES_SESSION_OP_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Self {
+            dir: Self::resolve_dir(),
+            team,
+            op_id,
+        }
+    }
+
+    /// Resolve the session-log root: explicit `ARES_SESSION_LOG_DIR` wins, else
+    /// `~/.ares/sessions` when logging is enabled, else `None` (disabled).
+    fn resolve_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("ARES_SESSION_LOG_DIR") {
             if !dir.trim().is_empty() {
-                return Self {
-                    dir: Some(PathBuf::from(dir)),
-                };
+                return Some(PathBuf::from(dir));
             }
         }
         if parse_env_bool("ARES_SESSION_LOG_ENABLED", true) {
@@ -237,10 +272,10 @@ impl SessionLogConfig {
                 let mut p = PathBuf::from(home);
                 p.push(".ares");
                 p.push("sessions");
-                return Self { dir: Some(p) };
+                return Some(p);
             }
         }
-        Self { dir: None }
+        None
     }
 
     /// Default session-log root used when `ARES_SESSION_LOG_DIR` is unset.

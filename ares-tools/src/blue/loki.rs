@@ -188,10 +188,48 @@ fn cache_key(logql: &str, start: &str, end: &str) -> u64 {
 ///
 /// Retries up to 3 times on transient failures (timeouts, 429/502/503/504)
 /// with exponential backoff (1s, 2s, 4s). Respects `Retry-After` header on 429s.
+/// In the unfolding replay modes, cap a query's `end_time` at the replay clock so
+/// the blue agent can never retrieve events from its own future. Returns the
+/// input unchanged when not clamping (live, `static`, or legacy-frozen replay) or
+/// when the timestamp can't be parsed.
+pub(crate) fn clamp_end_to_replay(end: &str) -> String {
+    let Some(ceiling) = super::replay_clock::replay_clamp_end() else {
+        return end.to_string();
+    };
+    match chrono::DateTime::parse_from_rfc3339(end.trim()) {
+        Ok(dt) if dt.with_timezone(&chrono::Utc) > ceiling => ceiling.to_rfc3339(),
+        _ => end.to_string(),
+    }
+}
+
+/// True when the (clamped) query window lies entirely at/after the replay clock —
+/// the attack hasn't reached it yet, so there's nothing to return.
+pub(crate) fn replay_window_is_future(start: &str, clamped_end: &str) -> bool {
+    if super::replay_clock::replay_clamp_end().is_none() {
+        return false;
+    }
+    match (
+        chrono::DateTime::parse_from_rfc3339(start.trim()),
+        chrono::DateTime::parse_from_rfc3339(clamped_end.trim()),
+    ) {
+        (Ok(s), Ok(e)) => s >= e,
+        _ => false,
+    }
+}
+
 pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
     let logql = required_str(args, "logql")?;
     let start_time = required_str(args, "start_time")?;
-    let end_time = required_str(args, "end_time")?;
+    let end_time_arg = required_str(args, "end_time")?;
+    // Replay: cap the end at the replay clock so the agent can't see its future.
+    let end_time_clamped = clamp_end_to_replay(end_time_arg);
+    if replay_window_is_future(start_time, &end_time_clamped) {
+        return Ok(make_output(
+            "No results — that window is at or after the current replay time; \
+             the attack hasn't reached that point yet.",
+        ));
+    }
+    let end_time = end_time_clamped.as_str();
     let limit = optional_i64(args, "limit").unwrap_or(50).min(100);
 
     // Reject bare label selectors with no line filter — these scan too much data

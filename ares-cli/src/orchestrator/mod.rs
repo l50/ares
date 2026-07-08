@@ -68,6 +68,9 @@ async fn run_inner() -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "ares-orchestrator starting"
     );
+    // Op start time, for the Postgres finalize at op-end (ec2:launch flushes
+    // Redis and starts a fresh orchestrator per op, so this ≈ op launch).
+    let op_started_at = chrono::Utc::now();
 
     #[cfg(feature = "blue")]
     if std::env::var("ARES_BLUE_ONLY").as_deref() == Ok("1") {
@@ -1024,6 +1027,119 @@ async fn run_inner() -> Result<()> {
                 err = %e,
                 "Failed to auto-generate red team report on completion"
             ),
+        }
+
+        // Finalize the operation to the ares-history Postgres so runs stay
+        // comparable (cost, domain-admin, entity counts). The live projector
+        // keeps entity tables current during the op but has no completion event,
+        // so it never stamps completed_at / DA / counts / cost — this is the
+        // op-end finalize that fills them. No-op when ARES_DATABASE_URL is unset
+        // (K8s/local); every step is fault-tolerant so a PG hiccup never fails
+        // op teardown, and it's idempotent with the projector (ON CONFLICT
+        // upserts on operations + the uq_* entity constraints).
+        if let Some(database_url) = std::env::var("ARES_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            match ares_core::persistent_store::PersistentStore::connect(&database_url).await {
+                Ok(store) => {
+                    let offload = {
+                        let st = shared_state.read().await;
+                        ares_core::persistent_store::OperationOffload {
+                            operation_id: config.operation_id.clone(),
+                            target_ip: config.target_ips.first().cloned(),
+                            target_domain: (!config.target_domain.is_empty())
+                                .then(|| config.target_domain.clone()),
+                            environment: std::env::var("ARES_DEPLOYMENT")
+                                .ok()
+                                .filter(|s| !s.is_empty()),
+                            started_at: op_started_at,
+                            completed_at: Some(chrono::Utc::now()),
+                            has_domain_admin: st.has_domain_admin,
+                            has_golden_ticket: st.has_golden_ticket,
+                            domain_admin_path: st.domain_admin_path.clone(),
+                            da_hash_id: None,
+                            credentials: st.credentials.clone(),
+                            hashes: st.hashes.clone(),
+                            hosts: st.hosts.clone(),
+                            users: st.users.clone(),
+                            vulnerabilities: st.discovered_vulnerabilities.clone(),
+                            exploited_vulnerabilities: st.exploited_vulnerabilities.clone(),
+                        }
+                    };
+                    match store.offload_operation(&offload).await {
+                        Ok(_) => info!(
+                            operation_id = %config.operation_id,
+                            "Operation finalized to Postgres (ares-history)"
+                        ),
+                        Err(e) => warn!(
+                            operation_id = %config.operation_id,
+                            err = %e,
+                            "PG finalize: offload_operation failed"
+                        ),
+                    }
+                    // Token usage + cost from Redis → operations.total_cost/tokens.
+                    match ares_core::token_usage::get_token_usage(&mut conn, &config.operation_id)
+                        .await
+                    {
+                        Ok(Some(usage)) => {
+                            let (total_cost, breakdown, _unpriced) =
+                                ares_core::token_usage::estimate_usage_cost(&usage);
+                            let model_usage = if usage.models.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                let mut m = serde_json::Map::new();
+                                for (name, mu) in &usage.models {
+                                    let cost = breakdown
+                                        .iter()
+                                        .find(|b| &b.model == name)
+                                        .map(|b| b.cost)
+                                        .unwrap_or(0.0);
+                                    m.insert(
+                                        name.clone(),
+                                        serde_json::json!({
+                                            "input_tokens": mu.input_tokens,
+                                            "output_tokens": mu.output_tokens,
+                                            "cost": cost,
+                                        }),
+                                    );
+                                }
+                                serde_json::Value::Object(m)
+                            };
+                            if let Err(e) = store
+                                .update_cost(
+                                    &config.operation_id,
+                                    usage.input_tokens as i64,
+                                    usage.output_tokens as i64,
+                                    total_cost.unwrap_or(0.0),
+                                    &model_usage,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    operation_id = %config.operation_id,
+                                    err = %e,
+                                    "PG finalize: update_cost failed"
+                                );
+                            }
+                        }
+                        Ok(None) => debug!(
+                            operation_id = %config.operation_id,
+                            "PG finalize: no token usage in Redis to record"
+                        ),
+                        Err(e) => warn!(
+                            operation_id = %config.operation_id,
+                            err = %e,
+                            "PG finalize: token usage read failed"
+                        ),
+                    }
+                }
+                Err(e) => warn!(
+                    operation_id = %config.operation_id,
+                    err = %e,
+                    "PG finalize: connect failed; operation not persisted to Postgres"
+                ),
+            }
         }
     }
 

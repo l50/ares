@@ -151,6 +151,10 @@ pub async fn run_investigation(
         model: investigation.model.clone(),
         max_steps: 75,
         max_tool_calls_per_name: 25,
+        // Capture the blue transcript (messages + tool calls) to
+        // ARES_SESSION_LOG_DIR — the same introspection red gets. Plain
+        // `..default()` ships a disabled SessionLogConfig, so opt in here.
+        session_log: ares_llm::SessionLogConfig::from_env(),
         ..AgentLoopConfig::default()
     };
 

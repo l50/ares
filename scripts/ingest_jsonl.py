@@ -85,6 +85,7 @@ def upsert_messages(conn, entries: list[dict]) -> tuple[int, int]:
                 e.get("model"),
                 json.dumps(data) if data is not None else None,
                 e.get("ts"),
+                e.get("team", "red"),
             )
         )
     if not rows:
@@ -95,7 +96,7 @@ def upsert_messages(conn, entries: list[dict]) -> tuple[int, int]:
     # the matching unique index for arbitration with the column-list form.
     sql = """
         INSERT INTO llm_messages (
-            op_id, task_id, worker, turn_idx, role, model, request, ts
+            op_id, task_id, worker, turn_idx, role, model, request, ts, team
         ) VALUES %s
         ON CONFLICT (op_id, task_id, turn_idx, role, ts) DO NOTHING
     """
@@ -187,6 +188,7 @@ def upsert_tool_calls(conn, entries: list[dict]) -> int:
             None,  # error_kind
             call["ts"],
             call["tool_use_id"],
+            call.get("team", "red"),
         ))
 
     for e in entries:
@@ -212,6 +214,7 @@ def upsert_tool_calls(conn, entries: list[dict]) -> int:
                     "op_id": op_id,
                     "task_id": task_id,
                     "worker": worker,
+                    "team": e.get("team", "red"),
                     "tool_name": part.get("name"),
                     "arguments": part.get("input"),
                     "ts": ts,
@@ -245,7 +248,7 @@ def upsert_tool_calls(conn, entries: list[dict]) -> int:
     sql = """
         INSERT INTO tool_calls (
             op_id, task_id, worker, tool_name, arguments, result,
-            duration_ms, exit_status, error_kind, ts, tool_use_id
+            duration_ms, exit_status, error_kind, ts, tool_use_id, team
         ) VALUES %s
         ON CONFLICT (op_id, tool_use_id) WHERE tool_use_id IS NOT NULL DO NOTHING
     """

@@ -27,7 +27,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
             post_window_minutes,
             no_upload,
             attacker_ips,
-            wait_for_flush,
+            no_wait_for_flush,
             flush_timeout_mins,
         } => {
             capture::run_capture(
@@ -39,7 +39,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
                 post_window_minutes,
                 no_upload,
                 attacker_ips,
-                wait_for_flush,
+                !no_wait_for_flush,
                 flush_timeout_mins,
             )
             .await
@@ -58,7 +58,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
             model,
             max_steps,
             quiet_period,
-            time_compression,
+            clock,
             stack_ip,
         } => {
             replay::run_replay(replay::ReplayParams {
@@ -71,7 +71,7 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
                 model,
                 max_steps,
                 quiet_period,
-                time_compression,
+                clock_mode: clock,
                 stack_ip,
             })
             .await

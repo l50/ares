@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use redis::AsyncCommands;
-use tracing::info;
+use tracing::{info, warn};
 
 use ares_core::eval::gap_analysis::analyze_detection_gaps;
-use ares_core::eval::ground_truth::create_ground_truth_from_red_state;
+use ares_core::eval::ground_truth::{create_ground_truth_from_red_state, EvaluationGroundTruth};
 use ares_core::eval::scorers::{self, InvestigationSnapshot};
 use ares_core::eval::workflow::load_red_state_from_file;
 use ares_core::nats::NatsBroker;
@@ -39,7 +39,8 @@ pub(crate) struct ReplayParams {
     pub model: Option<String>,
     pub max_steps: u32,
     pub quiet_period: Option<f64>,
-    pub time_compression: f64,
+    /// Timeline clock advance mode: "step" (default) or "wallclock".
+    pub clock_mode: String,
     /// Private IP of an already-provisioned replay stack. The stack is stood
     /// up by `task benchmark:replay:provision`; `benchmark run` only runs the
     /// investigation against it.
@@ -119,12 +120,27 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let grafana_url = format!("http://{}:3000", p.stack_ip);
     let prometheus_url = format!("http://{}:9090", p.stack_ip);
     let tempo_url = format!("http://{}:3200", p.stack_ip);
+    // Capture the blue investigation transcript (every LLM message + tool call)
+    // the same way red ops are — into the analytical DB's session-log root so the
+    // ingester picks it up. Tag it team=blue and file it under the *replayed*
+    // op_id (ARES_SESSION_OP_ID overrides the log path without triggering
+    // red-state correlation). The blue agents' task_id is the run_id, so repeated
+    // runs land in distinct files — /var/log/ares/session/<op_id>/<run_id>.jsonl —
+    // joinable to red on op_id and separable per-run by task_id/run_id.
+    let session_dir = std::env::var("ARES_SESSION_LOG_DIR")
+        .unwrap_or_else(|_| "/var/log/ares/session".to_string());
+    let _ = std::fs::create_dir_all(&session_dir);
     unsafe {
         std::env::set_var("LOKI_URL", &loki_url);
         std::env::set_var("GRAFANA_URL", &grafana_url);
         std::env::set_var("PROMETHEUS_URL", &prometheus_url);
         std::env::set_var("TEMPO_URL", &tempo_url);
+        std::env::set_var("ARES_SESSION_LOG_DIR", &session_dir);
+        std::env::set_var("ARES_SESSION_TEAM", "blue");
+        // ARES_SESSION_OP_ID (= the replayed op) is set in run_replay_inner where
+        // the manifest is in scope, before the blue config is built.
     }
+    info!("blue investigation transcript → {session_dir}/<op>/{run_id}.jsonl (team=blue → SQL)");
     ensure_llm_secrets();
 
     let snapshot_config = SnapshotConfig::from_env();
@@ -239,6 +255,28 @@ async fn run_replay_inner(
         }
     }
 
+    // Configure the replay clock so the world unfolds correctly: `static` holds
+    // the whole concluded attack (frozen at attack end, everything visible);
+    // timeline advances (step-based by default) and the query tools clamp
+    // visibility to the clock. Set before collect_env_vars so these propagate to
+    // the in-process blue consumer.
+    unsafe {
+        std::env::set_var("ARES_REPLAY_CLOCK_END", manifest.completed_at.to_rfc3339());
+        std::env::set_var("ARES_REPLAY_MAX_STEPS", p.max_steps.to_string());
+        std::env::set_var(
+            "ARES_REPLAY_CLOCK_MODE",
+            if is_timeline {
+                p.clock_mode.as_str()
+            } else {
+                "static"
+            },
+        );
+        // File the blue transcript under the replayed op (team=blue) so it joins
+        // to red on op_id in the analytical DB. Overrides the SessionLog op_id
+        // without touching investigation.operation_id (avoids red-state leak).
+        std::env::set_var("ARES_SESSION_OP_ID", &manifest.operation_id);
+    }
+
     let effective_model = resolve_model(&p.model);
     let mut env_vars = collect_env_vars(BLUE_ENV_VAR_NAMES);
     // Ensure LOKI_URL points to the replay EC2
@@ -349,7 +387,12 @@ async fn run_replay_inner(
 
     let red_state_path = snapshot_path.join("red-state.json");
     let (red_state, techniques) = load_red_state_from_file(&red_state_path)?;
-    let ground_truth = create_ground_truth_from_red_state(&red_state, &techniques);
+    // Prefer the ENRICHED ground-truth.json written at capture time (attack
+    // timeline + attacker-source IPs); the scorer used to regenerate a stripped
+    // GT from red-state and ignore this file (#89 gap). Fall back to regeneration
+    // only for older snapshots that predate the enrichment.
+    let ground_truth = load_enriched_ground_truth(snapshot_path)
+        .unwrap_or_else(|| create_ground_truth_from_red_state(&red_state, &techniques));
 
     let blue_reader = BlueStateReader::new(run_id.to_string());
     let blue_state = blue_reader
@@ -391,11 +434,7 @@ async fn run_replay_inner(
         started_at: run_started_at,
         completed_at: Utc::now(),
         quiet_period_secs,
-        time_compression: if is_timeline {
-            Some(p.time_compression)
-        } else {
-            None
-        },
+        time_compression: None,
         investigation_duration_secs: investigation_duration,
         evaluation: eval_result.to_value(),
         gap_analysis: gap_analysis.to_markdown(),
@@ -407,8 +446,29 @@ async fn run_replay_inner(
     fs::write(&result_path, serde_json::to_string_pretty(&result)?)
         .with_context(|| format!("write result: {}", result_path.display()))?;
 
+    // Guard: `operation` trigger hands the agent the ground-truth techniques and
+    // IOCs it is graded on (see build_operation_trigger). It's an oracle/debug
+    // mode, never a valid score — flag it loudly so nobody reports it.
+    let contaminated = effective_trigger_mode == "operation";
+    if contaminated {
+        eprintln!(
+            "\n⚠️  trigger-mode=operation hands the agent the ground-truth techniques and \
+             IOCs it is graded on — this score is CONTAMINATED and must NOT be used for \
+             comparison. Use the default (alert-replay) for real scoring.\n"
+        );
+    }
+
     println!("Benchmark complete: {}", result_path.display());
     println!("  Run ID:         {run_id}");
+    if contaminated {
+        println!("  ⚠ SCORE INVALID: trigger=operation leaked ground truth (oracle mode).");
+    }
+    println!(
+        "  Transcript:     {}/{}/{run_id}.jsonl  (team=blue → SQL)",
+        std::env::var("ARES_SESSION_LOG_DIR")
+            .unwrap_or_else(|_| "/var/log/ares/session".to_string()),
+        manifest.operation_id
+    );
     println!("  Mode:           {}", p.replay_mode);
     println!("  Operation:      {}", manifest.operation_id);
     if let Some(qp) = quiet_period_secs {
@@ -431,6 +491,28 @@ async fn run_replay_inner(
     println!("  Pass:           {}", eval_result.passed());
 
     Ok(())
+}
+
+/// Load the enriched ground truth (attack timeline + attacker-source IPs) written
+/// at capture time. Returns None (→ caller regenerates from red-state) when the
+/// file is absent (legacy snapshots) or unparsable.
+fn load_enriched_ground_truth(snapshot_path: &Path) -> Option<EvaluationGroundTruth> {
+    let path = snapshot_path.join("ground-truth.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<EvaluationGroundTruth>(&raw) {
+        Ok(gt) => {
+            info!(
+                "scoring against enriched ground-truth.json ({} timeline events, {} IOCs)",
+                gt.expected_timeline.len(),
+                gt.expected_iocs.len()
+            );
+            Some(gt)
+        }
+        Err(e) => {
+            warn!("ground-truth.json present but unparsable ({e}); regenerating from red-state");
+            None
+        }
+    }
 }
 
 /// Resolve snapshot location: use local dir override if provided, otherwise
@@ -520,8 +602,13 @@ fn build_alert_replay_trigger(
     let raw = fs::read_to_string(&alerts_path).context("read fired-alerts.json")?;
     let alerts: Vec<FiredAlert> = serde_json::from_str(&raw).context("parse fired-alerts.json")?;
 
+    // Start at the first alert *at or after* the attack began — not the globally
+    // earliest firing, which is usually pre-attack infra noise. The manifest
+    // carries the attack start.
     let alert = alerts
-        .first()
+        .iter()
+        .find(|a| a.fired_at >= manifest.started_at)
+        .or_else(|| alerts.first())
         .context("no fired alerts in snapshot — use --trigger-mode=operation instead")?;
 
     info!(
