@@ -26,6 +26,29 @@ MSSQL impersonation/linked-server, delegation, advanced ADCS) and **Phase 3**
 (lab principals). Selection diversity is necessary but not sufficient for 80–100
 unique paths until the dark families actually enter the queue.
 
+## Operator workflow
+
+Turning the knobs on and measuring the result is driven by two Taskfile tasks
+and a Claude skill:
+
+- **`task benchmark:diversity-sweep N=10 TARGET=dreadgoad RESET=true`** —
+  preflight-checks the deployed config, optionally wipes novelty memory, loops
+  N `red:ec2:multi` ops sequentially (novelty needs prior prefixes; do not
+  parallelize), pulls `ares:op:<op>:path_record` back through SSM, and writes
+  `reports/diversity/<campaign>/coverage.csv` with `(op_id, step_index,
+  technique, target)` rows. This is the Phase 0 measurement loop.
+- **`task benchmark:diversity-diff BEFORE=reports/red AFTER=reports/diversity/<campaign>`** —
+  auto-detects CSV vs `reports/red`-style markdown, then prints technique
+  set-diff, `(technique, target)` pair coverage delta, path length
+  distribution, and a top-technique ranked table. Use it to answer "did the
+  sweep unlock techniques the baseline never exploited?"
+- **`.claude/skills/attack-path-diversity-sweep/SKILL.md`** — end-to-end
+  playbook covering config activation, running the sweep, reading the diff, a
+  symptom→fix troubleshooting table for bad sweeps, and temperature iteration
+  guidance.
+
+Both tasks live in `.taskfiles/benchmark/Taskfile.yaml`.
+
 ## Phase 2 audit findings (recon→queue coverage)
 
 The original premise — "whole families are dark / never enumerated" — turned out

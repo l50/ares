@@ -48,6 +48,20 @@
 #   task benchmark:generalize [HOLDOUT=benchmarks/holdout.yaml] [OUTPUT_DIR=./reports/generalize] [FAIL_UNDER=0.0]
 #     replays every op in the held-out set, aggregates scores, writes a
 #     generalize-summary.json — continues past per-op failures
+#
+#   task benchmark:diversity-sweep N=10 TARGET=dreadgoad [RESET=true]
+#     Sequential N-op red-team sweep with the attack-path diversity knobs on.
+#     Preflight-checks that `selection_temperature > 0` in the deployed config,
+#     optionally wipes novelty memory, then loops `red:ec2:multi` N times and
+#     pulls `ares:op:<op>:path_record` into
+#     `reports/diversity/<campaign>/coverage.csv`. See
+#     docs/attack-path-diversity.md and
+#     .claude/skills/attack-path-diversity-sweep/SKILL.md.
+#
+#   task benchmark:diversity-diff BEFORE=reports/red AFTER=reports/diversity/<campaign>
+#     Compare two op directories (sweep CSV or reports/red-style markdown).
+#     Prints technique set-diff, (technique,target) pair coverage delta, path
+#     length distribution, and a top-technique ranked table.
 version: "3"
 
 set: [errexit, pipefail]
@@ -533,3 +547,287 @@ tasks:
             exit 1
           fi
         fi
+  diversity-sweep:
+    desc: "Loop N red ops with diversity knobs on and dump a per-step coverage CSV (usage: task benchmark:diversity-sweep N=10 TARGET=dreadgoad [CAMPAIGN=name] [RESET=true] [EC2_NAME=kali-ares])"
+    requires:
+      vars: [N, TARGET]
+    vars:
+      EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
+      RESET: '{{.RESET | default "false"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports/diversity"}}'
+      SWEEP_AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+      SWEEP_AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default "us-west-1"}}'
+      CAMPAIGN_COMPUTED:
+        sh: |
+          if [ -n "{{.CAMPAIGN}}" ]; then
+            echo "{{.CAMPAIGN}}"
+          else
+            echo "diversity-$(date +%Y%m%d-%H%M%S)"
+          fi
+    cmds:
+      - |
+        set -euo pipefail
+        CAMPAIGN="{{.CAMPAIGN_COMPUTED}}"
+        SWEEP_DIR="{{.OUTPUT_DIR}}/${CAMPAIGN}"
+        mkdir -p "${SWEEP_DIR}"
+        CSV="${SWEEP_DIR}/coverage.csv"
+        MANIFEST="${SWEEP_DIR}/ops.txt"
+        echo "op_id,step_index,technique,target" > "${CSV}"
+        : > "${MANIFEST}"
+        echo -e "{{.INFO}} campaign=${CAMPAIGN} N={{.N}} target={{.TARGET}}"
+        echo -e "{{.INFO}} output=${SWEEP_DIR}"
+
+      # Preflight: verify the four diversity knobs are actually on in the
+      # deployed config. Runs blind to what's in git — checks the live box.
+      - |
+        set -euo pipefail
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" --output text | head -1)
+        if [ -z "$INSTANCE_ID" ]; then
+          echo -e "{{.ERROR}} no running EC2 matching {{.EC2_NAME}}"; exit 1
+        fi
+        echo -e "{{.INFO}} preflight on $INSTANCE_ID"
+        PARAMS=$(mktemp)
+        jq -n '{"commands": ["grep -E \"^  (selection_temperature|randomize_entry_foothold|emit_path_records):\" /etc/ares/config.yaml || true; grep -E \"^  novelty:|^    enabled:\" /etc/ares/config.yaml || true"]}' > "$PARAMS"
+        CMD_ID=$(aws ssm send-command --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+          --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+          --parameters "file://$PARAMS" --query 'Command.CommandId' --output text)
+        rm -f "$PARAMS"
+        for _ in $(seq 1 30); do
+          STATUS=$(aws ssm list-command-invocations --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+            --command-id "$CMD_ID" --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo "Pending")
+          [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] && break
+          sleep 2
+        done
+        OUT=$(aws ssm list-command-invocations --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+          --command-id "$CMD_ID" --details --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text)
+        echo "$OUT" | sed 's/^/    /'
+        if ! echo "$OUT" | grep -qE '^  selection_temperature: 0*\.[1-9]|^  selection_temperature: [1-9]'; then
+          echo -e "{{.ERROR}} selection_temperature is 0 or missing on box — sweep would run deterministic."
+          echo -e "{{.ERROR}} Uncomment the diversity knobs in config/ares.yaml then run: task ec2:deploy"
+          exit 1
+        fi
+        if ! echo "$OUT" | grep -q 'enabled: true'; then
+          echo -e "{{.WARN}} novelty.enabled != true — sweep will still run but coverage will be lower."
+        fi
+        echo -e "{{.SUCCESS}} diversity knobs active on {{.EC2_NAME}}"
+
+      # Optionally wipe novelty memory so the sweep starts fresh.
+      - |
+        set -euo pipefail
+        if [ "{{.RESET}}" != "true" ]; then
+          echo -e "{{.INFO}} RESET=false — reusing existing novelty memory (set RESET=true to start fresh)"
+          exit 0
+        fi
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" --output text | head -1)
+        echo -e "{{.INFO}} wiping novelty memory (all scopes)"
+        PARAMS=$(mktemp)
+        jq -n '{"commands": ["redis-cli --scan --pattern \"ares:novelty:*:steps\" | xargs -r redis-cli del"]}' > "$PARAMS"
+        aws ssm send-command --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+          --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+          --parameters "file://$PARAMS" --query 'Command.CommandId' --output text >/dev/null
+        rm -f "$PARAMS"
+
+      # Sequential loop — novelty memory needs prior runs' prefixes to bias
+      # against, so DO NOT parallelize.
+      - |
+        set -euo pipefail
+        CAMPAIGN="{{.CAMPAIGN_COMPUTED}}"
+        SWEEP_DIR="{{.OUTPUT_DIR}}/${CAMPAIGN}"
+        MANIFEST="${SWEEP_DIR}/ops.txt"
+        for i in $(seq 1 {{.N}}); do
+          OP_ID="op-$(date +%Y%m%d-%H%M%S)"
+          echo -e "{{.INFO}} [${i}/{{.N}}] launching ${OP_ID}"
+          if task red:ec2:multi \
+              TARGET="{{.TARGET}}" \
+              EC2_NAME="{{.EC2_NAME}}" \
+              OPERATION_ID="${OP_ID}" \
+              OUTPUT_DIR="${SWEEP_DIR}/red" \
+              FOLLOW=true; then
+            echo "${OP_ID}" >> "${MANIFEST}"
+            echo -e "{{.SUCCESS}} [${i}/{{.N}}] ${OP_ID} completed"
+          else
+            echo -e "{{.WARN}} [${i}/{{.N}}] ${OP_ID} failed — continuing sweep"
+            echo "${OP_ID} FAILED" >> "${MANIFEST}"
+          fi
+          sleep 5
+        done
+        echo -e "{{.SUCCESS}} sweep complete — $(wc -l < ${MANIFEST}) ops attempted"
+
+      # Pull path_record lists for every op and emit CSV rows.
+      - |
+        set -euo pipefail
+        CAMPAIGN="{{.CAMPAIGN_COMPUTED}}"
+        SWEEP_DIR="{{.OUTPUT_DIR}}/${CAMPAIGN}"
+        CSV="${SWEEP_DIR}/coverage.csv"
+        MANIFEST="${SWEEP_DIR}/ops.txt"
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" --output text | head -1)
+        while read -r op; do
+          op=${op%% *}
+          [ -z "$op" ] && continue
+          echo -e "{{.INFO}} pulling path_record for ${op}"
+          PARAMS=$(mktemp)
+          jq -n --arg op "$op" '{"commands": [("redis-cli --no-raw LRANGE ares:op:" + $op + ":path_record 0 -1")]}' > "$PARAMS"
+          CMD_ID=$(aws ssm send-command --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --parameters "file://$PARAMS" --query 'Command.CommandId' --output text)
+          rm -f "$PARAMS"
+          for _ in $(seq 1 30); do
+            STATUS=$(aws ssm list-command-invocations --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+              --command-id "$CMD_ID" --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo "Pending")
+            [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] && break
+            sleep 2
+          done
+          OUT=$(aws ssm list-command-invocations --profile "{{.SWEEP_AWS_PROFILE}}" --region "{{.SWEEP_AWS_REGION}}" \
+            --command-id "$CMD_ID" --details --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text)
+          # Strip redis-cli's leading "N) " list markers, keep JSON, one per line.
+          idx=0
+          while IFS= read -r line; do
+            json=$(echo "$line" | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]*"?//; s/"?[[:space:]]*$//; s/\\"/"/g')
+            [ -z "$json" ] && continue
+            tech=$(echo "$json" | jq -r '.technique // empty' 2>/dev/null || true)
+            tgt=$(echo "$json"  | jq -r '.target // empty'    2>/dev/null || true)
+            [ -z "$tech" ] && continue
+            echo "${op},${idx},${tech},${tgt}" >> "${CSV}"
+            idx=$((idx + 1))
+          done <<< "$OUT"
+        done < "${MANIFEST}"
+        echo -e "{{.SUCCESS}} coverage written to ${CSV}"
+        echo -e "{{.INFO}} summary:"
+        UNIQ=$(awk -F, 'NR>1 {print $3":"$4}' "${CSV}" | sort -u | wc -l | tr -d ' ')
+        OPS=$(awk -F, 'NR>1 {print $1}' "${CSV}" | sort -u | wc -l | tr -d ' ')
+        TOTAL=$(($(wc -l < "${CSV}") - 1))
+        echo "    ops with path records: ${OPS}"
+        echo "    total steps recorded:  ${TOTAL}"
+        echo "    unique (technique,target) pairs: ${UNIQ}"
+        echo -e "{{.INFO}} top techniques:"
+        awk -F, 'NR>1 {print $3}' "${CSV}" | sort | uniq -c | sort -rn | head -10 | sed 's/^/    /'
+
+  diversity-diff:
+    desc: "Compare two directories of ops (sweep campaigns or reports/red-style dirs) — shows technique overlap and coverage delta (usage: task benchmark:diversity-diff BEFORE=reports/red AFTER=reports/diversity/sweep-1)"
+    requires:
+      vars: [BEFORE, AFTER]
+    cmds:
+      - |
+        set -euo pipefail
+        if [ ! -d "{{.BEFORE}}" ]; then
+          echo -e "{{.ERROR}} BEFORE={{.BEFORE}} is not a directory"; exit 1
+        fi
+        if [ ! -d "{{.AFTER}}" ]; then
+          echo -e "{{.ERROR}} AFTER={{.AFTER}} is not a directory"; exit 1
+        fi
+
+        # Extract (op, technique, target) rows from a directory. Prefers
+        # coverage.csv when present (full path_record); falls back to grepping
+        # EXPLOITED markers out of reports/*.md.
+        extract() {
+          local dir="$1" out="$2"
+          if [ -f "${dir}/coverage.csv" ]; then
+            awk -F, 'NR>1 {print $1","$3","$4}' "${dir}/coverage.csv" > "$out"
+            return
+          fi
+          # Search reports/*.md at $dir root and one level down (covers both
+          # reports/red/*.md and reports/diversity/<camp>/red/*.md).
+          : > "$out"
+          for md in "$dir"/*.md "$dir"/red/*.md; do
+            [ -f "$md" ] || continue
+            op=$(basename "$md" .md)
+            awk -v op="$op" '
+              /^#### / { v=$2; sub(/ on .*/, "", v); tgt="unknown" }
+              /^- \*\*IP\*\*:/ { tgt=$3 }
+              /^- \*\*Status\*\*: EXPLOITED/ { print op","v","tgt }
+            ' "$md" >> "$out"
+          done
+        }
+
+        WORK=$(mktemp -d)
+        trap 'rm -rf "$WORK"' EXIT
+        extract "{{.BEFORE}}" "$WORK/before.csv"
+        extract "{{.AFTER}}"  "$WORK/after.csv"
+
+        if [ ! -s "$WORK/before.csv" ] || [ ! -s "$WORK/after.csv" ]; then
+          echo -e "{{.ERROR}} one side extracted 0 rows — check the input dirs contain coverage.csv or *.md reports"
+          echo "    BEFORE rows: $(wc -l < $WORK/before.csv)"
+          echo "    AFTER rows:  $(wc -l < $WORK/after.csv)"
+          exit 1
+        fi
+
+        # Op counts
+        B_OPS=$(cut -d, -f1 "$WORK/before.csv" | sort -u | wc -l | tr -d ' ')
+        A_OPS=$(cut -d, -f1 "$WORK/after.csv"  | sort -u | wc -l | tr -d ' ')
+
+        # Technique sets
+        cut -d, -f2 "$WORK/before.csv" | sort -u > "$WORK/before.tech"
+        cut -d, -f2 "$WORK/after.csv"  | sort -u > "$WORK/after.tech"
+
+        # (technique,target) coverage pairs
+        awk -F, '{print $2":"$3}' "$WORK/before.csv" | sort -u > "$WORK/before.pairs"
+        awk -F, '{print $2":"$3}' "$WORK/after.csv"  | sort -u > "$WORK/after.pairs"
+
+        # Steps per op — path length distribution (CSV side only; markdown has no
+        # step order, so we count distinct techniques per op as a proxy).
+        awk -F, '{c[$1]++} END {for (o in c) print c[o]}' "$WORK/before.csv" | sort -n > "$WORK/before.lens"
+        awk -F, '{c[$1]++} END {for (o in c) print c[o]}' "$WORK/after.csv"  | sort -n > "$WORK/after.lens"
+        stat() {
+          awk 'BEGIN{n=0} {a[n++]=$1; s+=$1} END{
+            if (n==0){print "0/0/0"; exit}
+            med = (n%2 ? a[int(n/2)] : (a[n/2-1]+a[n/2])/2);
+            printf "%d/%.1f/%d", med, s/n, a[n-1];
+          }' "$1"
+        }
+
+        BOTH=$(comm -12 "$WORK/before.tech" "$WORK/after.tech")
+        BONLY=$(comm -23 "$WORK/before.tech" "$WORK/after.tech")
+        AONLY=$(comm -13 "$WORK/before.tech" "$WORK/after.tech")
+        PAIRS_BOTH=$(comm -12 "$WORK/before.pairs" "$WORK/after.pairs" | wc -l | tr -d ' ')
+        PAIRS_BONLY=$(comm -23 "$WORK/before.pairs" "$WORK/after.pairs" | wc -l | tr -d ' ')
+        PAIRS_AONLY=$(comm -13 "$WORK/before.pairs" "$WORK/after.pairs" | wc -l | tr -d ' ')
+
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "  BEFORE: {{.BEFORE}}  (${B_OPS} ops)"
+        echo "  AFTER:  {{.AFTER}}   (${A_OPS} ops)"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+        echo "─── Technique classes ────────────────────────────────────────"
+        printf "  In both:      "; echo "$BOTH"  | tr '\n' ' ' | fmt -w 60 | sed 's/^/                /' | sed 's/^ *$//'
+        [ -n "$BONLY" ] && { printf "  BEFORE only:  "; echo "$BONLY" | tr '\n' ' ' | fmt -w 60 | sed 's/^/                /' | sed 's/^ *$//'; }
+        if [ -n "$AONLY" ]; then
+          echo ""
+          echo -e "  {{.SUCCESS}} AFTER only (NEW coverage from diversity):"
+          echo "$AONLY" | sed 's/^/    + /'
+        else
+          echo ""
+          echo -e "  {{.WARN}} AFTER unlocked nothing new — diversity knobs are not producing novel techniques"
+        fi
+        echo ""
+        echo "─── (technique, target) pair coverage ────────────────────────"
+        printf "  BEFORE unique pairs:      %d\n" "$(wc -l < $WORK/before.pairs | tr -d ' ')"
+        printf "  AFTER unique pairs:       %d\n" "$(wc -l < $WORK/after.pairs  | tr -d ' ')"
+        printf "  Overlap:                  %d\n" "$PAIRS_BOTH"
+        printf "  BEFORE-only pairs:        %d\n" "$PAIRS_BONLY"
+        printf "  AFTER-only pairs (novel): %d\n" "$PAIRS_AONLY"
+        echo ""
+        echo "─── Techniques per op (median/mean/max) ──────────────────────"
+        printf "  BEFORE: %s\n" "$(stat $WORK/before.lens)"
+        printf "  AFTER:  %s\n" "$(stat $WORK/after.lens)"
+        echo ""
+        echo "─── Top techniques (op count) ────────────────────────────────"
+        printf "  %-30s  %8s  %8s\n" "technique" "BEFORE" "AFTER"
+        (cut -d, -f2 "$WORK/before.csv"; cut -d, -f2 "$WORK/after.csv") | sort -u | while read -r t; do
+          b=$(awk -F, -v t="$t" '$2==t {print $1}' "$WORK/before.csv" | sort -u | wc -l | tr -d ' ')
+          a=$(awk -F, -v t="$t" '$2==t {print $1}' "$WORK/after.csv"  | sort -u | wc -l | tr -d ' ')
+          printf "  %-30s  %8d  %8d\n" "$t" "$b" "$a"
+        done | sort -k3 -rn | head -20
+        echo ""
