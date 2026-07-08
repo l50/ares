@@ -119,10 +119,10 @@ task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID"
 ```
 
 `benchmark:replay:run` forwards `SNAPSHOT_DIR`, `MODEL`, `MAX_STEPS`,
-`OUTPUT_DIR`, `QUIET_PERIOD`, `CLOCK`, `REPLAY_MODE`, and `TRIGGER_MODE` to
-`ares benchmark run`. For flags the Taskfile does not forward
-(`--seed`, `--temperature`, `--replicates`), call `ares benchmark run`
-directly against the same `--stack-ip`.
+`OUTPUT_DIR`, `QUIET_PERIOD`, `CLOCK`, `REPLAY_MODE`, `TRIGGER_MODE`, plus
+the noise-control knobs `SEED`, `TEMPERATURE`, and `REPLICATES` to
+`ares benchmark run`. `benchmark:replay:loop` forwards the same set to each
+iteration.
 
 ### Tuning loop (warm stack across N iterations)
 
@@ -169,6 +169,14 @@ per-run JSON — no summary — so existing callers see identical output.
 ```bash
 # 5 replicates, seeded so temperature is forced to 0 and each replicate
 # samples the same way at each turn
+task benchmark:replay:run \
+  STACK_IP="$STACK_IP" \
+  OP_ID=op-20260706-123045 \
+  REPLICATES=5 \
+  SEED=42 \
+  OUTPUT_DIR=./reports
+
+# Or drive the CLI directly if you're not using the Taskfile surface
 ares benchmark run op-20260706-123045 \
   --stack-ip "$STACK_IP" \
   --replicates 5 \

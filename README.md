@@ -459,8 +459,8 @@ task benchmark:replay:loop OP_ID=op-20260706-123045 ITERATIONS=8 \
 
 # K-of-N averaging: 5 replicates against a warm stack, seeded for determinism
 # Mean/stddev/min/max land in <output-dir>/<session>-summary.json
-ares benchmark run op-20260706-123045 \
-  --stack-ip "$STACK_IP" --replicates 5 --seed 42 --output-dir ./reports
+task benchmark:replay:run STACK_IP="$STACK_IP" OP_ID=op-20260706-123045 \
+  REPLICATES=5 SEED=42 OUTPUT_DIR=./reports
 
 # Generalization sweep against the held-out set
 task benchmark:generalize FAIL_UNDER=0.6

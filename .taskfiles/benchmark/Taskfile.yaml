@@ -32,11 +32,15 @@
 #     Use this when a tuning driver (e.g. Vibe Gepa) wants to keep the stack
 #     warm across many `ares benchmark run` invocations.
 #
+#     For noise control, pass SEED=<u64>, TEMPERATURE=<f32>, REPLICATES=<K>;
+#     they forward to `ares benchmark run --seed / --temperature / --replicates`.
+#
 #   task benchmark:replay:loop OP_ID=op-20260706-1200 ITERATIONS=10
 #     provision → N x (run [→ HOOK]) → teardown. The optional HOOK= command
 #     runs between iterations with STACK_IP, OP_ID, and ITERATION exported,
 #     so a tuning driver can rewrite prompts / config in place. Omit HOOK to
 #     just repeat the same investigation N times (useful for K-of-N averaging).
+#     SEED / TEMPERATURE / REPLICATES forward through to each iteration's run.
 #
 #     Example (Vibe Gepa driver):
 #       task benchmark:replay:loop OP_ID=op-... ITERATIONS=8 \
@@ -99,6 +103,9 @@ tasks:
       CLOCK: '{{.CLOCK | default "step"}}'
       REPLAY_MODE: '{{.REPLAY_MODE | default "timeline"}}'
       TRIGGER_MODE: '{{.TRIGGER_MODE | default "alert-replay"}}'
+      SEED: '{{.SEED | default ""}}'
+      TEMPERATURE: '{{.TEMPERATURE | default ""}}'
+      REPLICATES: '{{.REPLICATES | default ""}}'
     cmds:
       - |
         echo -e "{{.INFO}} provisioning replay stack for {{.OP_ID}}..."
@@ -128,7 +135,10 @@ tasks:
           CLOCK="{{.CLOCK}}" \
           SNAPSHOT_DIR="{{.SNAPSHOT_DIR}}" \
           MODEL="{{.MODEL}}" \
-          QUIET_PERIOD="{{.QUIET_PERIOD}}"
+          QUIET_PERIOD="{{.QUIET_PERIOD}}" \
+          SEED="{{.SEED}}" \
+          TEMPERATURE="{{.TEMPERATURE}}" \
+          REPLICATES="{{.REPLICATES}}"
 
   replay:run:
     desc: Run one benchmark investigation against an already-provisioned stack (no teardown).
@@ -143,6 +153,10 @@ tasks:
       CLOCK: '{{.CLOCK | default "step"}}'
       REPLAY_MODE: '{{.REPLAY_MODE | default "timeline"}}'
       TRIGGER_MODE: '{{.TRIGGER_MODE | default "alert-replay"}}'
+      # LLM sampling knobs — noise control for tuning loops. Empty ⇒ CLI defaults.
+      SEED: '{{.SEED | default ""}}'
+      TEMPERATURE: '{{.TEMPERATURE | default ""}}'
+      REPLICATES: '{{.REPLICATES | default ""}}'
     cmds:
       - |
         echo -e "{{.INFO}} running investigation against {{.STACK_IP}} for {{.OP_ID}}..."
@@ -155,7 +169,10 @@ tasks:
           --clock "{{.CLOCK}}" \
           {{if .SNAPSHOT_DIR}}--snapshot-dir "{{.SNAPSHOT_DIR}}"{{end}} \
           {{if .MODEL}}--model "{{.MODEL}}"{{end}} \
-          {{if .QUIET_PERIOD}}--quiet-period "{{.QUIET_PERIOD}}"{{end}}
+          {{if .QUIET_PERIOD}}--quiet-period "{{.QUIET_PERIOD}}"{{end}} \
+          {{if .SEED}}--seed "{{.SEED}}"{{end}} \
+          {{if .TEMPERATURE}}--temperature "{{.TEMPERATURE}}"{{end}} \
+          {{if .REPLICATES}}--replicates "{{.REPLICATES}}"{{end}}
 
   replay:loop:
     desc: Provision once, run N investigations reusing the stack, tear down. For tuning loops (Vibe Gepa) and K-of-N averaging.
@@ -172,6 +189,9 @@ tasks:
       CLOCK: '{{.CLOCK | default "step"}}'
       REPLAY_MODE: '{{.REPLAY_MODE | default "timeline"}}'
       TRIGGER_MODE: '{{.TRIGGER_MODE | default "alert-replay"}}'
+      SEED: '{{.SEED | default ""}}'
+      TEMPERATURE: '{{.TEMPERATURE | default ""}}'
+      REPLICATES: '{{.REPLICATES | default ""}}'
     cmds:
       - |
         echo -e "{{.INFO}} provisioning replay stack for {{.OP_ID}} (loop x{{.ITERATIONS}})..."
@@ -204,7 +224,10 @@ tasks:
               CLOCK="{{.CLOCK}}" \
               SNAPSHOT_DIR="{{.SNAPSHOT_DIR}}" \
               MODEL="{{.MODEL}}" \
-              QUIET_PERIOD="{{.QUIET_PERIOD}}"; then
+              QUIET_PERIOD="{{.QUIET_PERIOD}}" \
+              SEED="{{.SEED}}" \
+              TEMPERATURE="{{.TEMPERATURE}}" \
+              REPLICATES="{{.REPLICATES}}"; then
             FAILURES=$((FAILURES + 1))
             echo -e "{{.WARN}} iteration $i failed — continuing loop"
           fi
