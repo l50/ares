@@ -215,23 +215,35 @@ pub(crate) enum CompletionDecision {
 /// Decide whether the completion loop should stop, begin the post-DA grace
 /// period, or continue waiting. Pure — no Redis, no tokio sleeps.
 ///
-/// Decision priority (matches the inline logic this replaces):
+/// Runtime is bounded by a **soft** and a **hard** cap. The soft cap is the
+/// normal budget; the hard cap is a strict ceiling that always terminates.
+/// The soft cap yields to `Continue` only when the op has achieved DA on at
+/// least one domain *and* still has an undominated forest — i.e. the run is
+/// visibly progressing on multi-forest work but ran out of the primary
+/// budget. Without DA there's no evidence the op is close enough to warrant
+/// more time; with DA but all forests done, the op is just idling.
+///
+/// Decision priority:
 /// 1. `completed` flag set externally → Stop("operation marked completed")
-/// 2. `elapsed >= max_runtime` → Stop("max runtime exceeded")
-/// 3. `has_domain_admin && stop_on_da` → Stop on DA
-/// 4. `has_domain_admin && stop_on_gt`:
+/// 2. `elapsed >= hard_max_runtime` → Stop("hard max runtime exceeded")
+/// 3. `elapsed >= soft_max_runtime`:
+///     - DA achieved AND undominated forests remain → fall through (extend)
+///     - otherwise → Stop("max runtime exceeded")
+/// 4. `has_domain_admin && stop_on_da` → Stop on DA
+/// 5. `has_domain_admin && stop_on_gt`:
 ///     - `has_golden_ticket` → Stop on GT
 ///     - otherwise → Continue (still waiting for GT)
-/// 5. `has_domain_admin` (default mode):
+/// 6. `has_domain_admin` (default mode):
 ///     - undominated forests remain → Continue
 ///     - all dominated, grace timer set, `elapsed_since >= grace_period` → Stop
 ///     - all dominated, grace timer set, still inside grace → Continue
 ///     - all dominated, grace timer unset → BeginGracePeriod
-/// 6. otherwise → Continue
+/// 7. otherwise → Continue
 pub(crate) fn evaluate_completion(
     snapshot: &CompletionSnapshot,
     elapsed: Duration,
-    max_runtime: Duration,
+    soft_max_runtime: Duration,
+    hard_max_runtime: Duration,
     stop_on_da: bool,
     stop_on_gt: bool,
     grace_period: Duration,
@@ -239,7 +251,12 @@ pub(crate) fn evaluate_completion(
     if snapshot.completed {
         return CompletionDecision::Stop("operation marked completed");
     }
-    if elapsed >= max_runtime {
+    if elapsed >= hard_max_runtime {
+        return CompletionDecision::Stop("hard max runtime exceeded");
+    }
+    if elapsed >= soft_max_runtime
+        && (!snapshot.has_domain_admin || snapshot.undominated_forests_empty)
+    {
         return CompletionDecision::Stop("max runtime exceeded");
     }
     if !snapshot.has_domain_admin {
@@ -288,8 +305,14 @@ pub async fn wait_for_completion(
         })
         .unwrap_or((false, false));
 
+    // Hard cap = 2× the configured budget. The soft cap (max_runtime) is the
+    // normal ceiling; the hard cap is the strict upper bound that fires even
+    // when the op is still visibly progressing on an undominated forest.
+    let hard_max_runtime = max_runtime.saturating_mul(2);
+
     info!(
         max_runtime_secs = max_runtime.as_secs(),
+        hard_max_runtime_secs = hard_max_runtime.as_secs(),
         stop_on_domain_admin = stop_on_da,
         stop_on_golden_ticket = stop_on_gt,
         "Completion monitor started"
@@ -341,6 +364,7 @@ pub async fn wait_for_completion(
             &snapshot,
             elapsed,
             max_runtime,
+            hard_max_runtime,
             stop_on_da,
             stop_on_gt,
             grace_period,
@@ -1242,6 +1266,9 @@ mod tests {
     fn ten_min() -> Duration {
         Duration::from_secs(600)
     }
+    fn twenty_min() -> Duration {
+        Duration::from_secs(1200)
+    }
     fn three_min() -> Duration {
         Duration::from_secs(180)
     }
@@ -1251,7 +1278,15 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.completed = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("operation marked completed")
         );
     }
@@ -1264,6 +1299,7 @@ mod tests {
                 &snap,
                 Duration::from_secs(601),
                 ten_min(),
+                twenty_min(),
                 false,
                 false,
                 three_min()
@@ -1276,7 +1312,15 @@ mod tests {
     fn completion_no_da_continues() {
         let snap = empty_snapshot();
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
     }
@@ -1286,7 +1330,15 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), true, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                true,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("domain admin achieved (stop_on_domain_admin)")
         );
     }
@@ -1296,12 +1348,28 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, true, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                true,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
         snap.has_golden_ticket = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, true, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                true,
+                three_min()
+            ),
             CompletionDecision::Stop("golden ticket forged (stop_on_golden_ticket)")
         );
     }
@@ -1312,7 +1380,15 @@ mod tests {
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = false;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
     }
@@ -1322,9 +1398,16 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = true;
-        // Grace timer not set yet → BeginGracePeriod.
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::BeginGracePeriod
         );
     }
@@ -1335,9 +1418,16 @@ mod tests {
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = true;
         snap.all_dominated_for = Some(Duration::from_secs(60));
-        // 60s elapsed, grace is 180s → still continuing.
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
     }
@@ -1349,26 +1439,42 @@ mod tests {
         snap.undominated_forests_empty = true;
         snap.all_dominated_for = Some(Duration::from_secs(181));
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("all forests dominated (post-exploitation complete)")
         );
     }
 
     #[test]
     fn completion_stop_on_da_beats_completed_priority() {
-        // `completed` runs first; even with stop_on_da configured, the
-        // external completed flag wins because it's priority 1.
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         snap.completed = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), true, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                true,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("operation marked completed")
         );
     }
 
     #[test]
-    fn completion_max_runtime_beats_da_grace() {
+    fn completion_soft_cap_stops_when_all_forests_done() {
+        // DA achieved and all forests dominated → the soft cap fires; no
+        // reason to extend beyond it once there's nothing left to compromise.
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = true;
@@ -1377,11 +1483,56 @@ mod tests {
                 &snap,
                 Duration::from_secs(601),
                 ten_min(),
+                twenty_min(),
                 false,
                 false,
                 three_min(),
             ),
             CompletionDecision::Stop("max runtime exceeded")
+        );
+    }
+
+    #[test]
+    fn completion_soft_cap_extends_when_forest_still_owed() {
+        // DA on one domain but a trusted forest is still uncompromised — this
+        // is the case that used to lose the second forest to the guillotine.
+        // The soft cap must yield to Continue so the op keeps working the
+        // remaining forest until it lands DA or hits the hard cap.
+        let mut snap = empty_snapshot();
+        snap.has_domain_admin = true;
+        snap.undominated_forests_empty = false;
+        assert_eq!(
+            evaluate_completion(
+                &snap,
+                Duration::from_secs(601),
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min(),
+            ),
+            CompletionDecision::Continue
+        );
+    }
+
+    #[test]
+    fn completion_hard_cap_stops_even_with_forest_owed() {
+        // The hard cap is the strict upper bound — even if a forest is still
+        // uncompromised, the op must terminate rather than run forever.
+        let mut snap = empty_snapshot();
+        snap.has_domain_admin = true;
+        snap.undominated_forests_empty = false;
+        assert_eq!(
+            evaluate_completion(
+                &snap,
+                Duration::from_secs(1201),
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min(),
+            ),
+            CompletionDecision::Stop("hard max runtime exceeded")
         );
     }
 
@@ -1392,7 +1543,15 @@ mod tests {
         snap.undominated_forests_empty = true;
         snap.all_dominated_for = Some(three_min());
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("all forests dominated (post-exploitation complete)")
         );
     }
