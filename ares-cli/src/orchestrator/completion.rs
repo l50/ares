@@ -568,6 +568,18 @@ async fn mark_red_completion_for_loot(
         .expire(&key, 86400)
         .query_async::<()>(&mut conn)
         .await?;
+
+    // Eagerly render + cache the red report from live state so the Taskfile
+    // watch loop's `ops report` fetch (which fires as soon as `ops status`
+    // reports completed) hits the cached copy instead of racing on partial
+    // Redis reads. Best-effort: a render failure must not fail red completion.
+    if let Err(e) =
+        crate::ops::report::generate_and_cache_report(&mut conn, &dispatcher.config.operation_id)
+            .await
+    {
+        warn!(err = %e, "Failed to eagerly cache red report on completion");
+    }
+
     Ok(())
 }
 
