@@ -17,6 +17,21 @@
 #   task benchmark:replay:provision OP_ID=op-20260706-1200
 #     just provisions and prints the stack IP + instance ID (for manual use)
 #
+#   task benchmark:replay:run STACK_IP=192.168.58.5 OP_ID=op-20260706-1200
+#     runs one investigation against an already-provisioned stack — no teardown.
+#     Use this when a tuning driver (e.g. Vibe Gepa) wants to keep the stack
+#     warm across many `ares benchmark run` invocations.
+#
+#   task benchmark:replay:loop OP_ID=op-20260706-1200 ITERATIONS=10
+#     provision → N x (run [→ HOOK]) → teardown. The optional HOOK= command
+#     runs between iterations with STACK_IP, OP_ID, and ITERATION exported,
+#     so a tuning driver can rewrite prompts / config in place. Omit HOOK to
+#     just repeat the same investigation N times (useful for K-of-N averaging).
+#
+#     Example (Vibe Gepa driver):
+#       task benchmark:replay:loop OP_ID=op-... ITERATIONS=8 \
+#         HOOK='python -m vibe_gepa.update --op-id "$OP_ID" --iter "$ITERATION"'
+#
 #   task benchmark:replay:teardown INSTANCE_ID=i-abc123
 #     terminates a provisioned stack
 version: "3"
@@ -75,9 +90,36 @@ tasks:
         }
         trap cleanup EXIT
 
-        echo -e "{{.INFO}} running investigation against $STACK_IP..."
+        task benchmark:replay:run \
+          STACK_IP="$STACK_IP" \
+          OP_ID="{{.OP_ID}}" \
+          REPLAY_MODE="{{.REPLAY_MODE}}" \
+          TRIGGER_MODE="{{.TRIGGER_MODE}}" \
+          OUTPUT_DIR="{{.OUTPUT_DIR}}" \
+          MAX_STEPS="{{.MAX_STEPS}}" \
+          CLOCK="{{.CLOCK}}" \
+          SNAPSHOT_DIR="{{.SNAPSHOT_DIR}}" \
+          MODEL="{{.MODEL}}" \
+          QUIET_PERIOD="{{.QUIET_PERIOD}}"
+
+  replay:run:
+    desc: Run one benchmark investigation against an already-provisioned stack (no teardown).
+    requires:
+      vars: [STACK_IP, OP_ID]
+    vars:
+      SNAPSHOT_DIR: '{{.SNAPSHOT_DIR | default ""}}'
+      MODEL: '{{.MODEL | default ""}}'
+      MAX_STEPS: '{{.MAX_STEPS | default "50"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+      QUIET_PERIOD: '{{.QUIET_PERIOD | default ""}}'
+      CLOCK: '{{.CLOCK | default "step"}}'
+      REPLAY_MODE: '{{.REPLAY_MODE | default "timeline"}}'
+      TRIGGER_MODE: '{{.TRIGGER_MODE | default "alert-replay"}}'
+    cmds:
+      - |
+        echo -e "{{.INFO}} running investigation against {{.STACK_IP}} for {{.OP_ID}}..."
         {{.ARES_CLI}} benchmark run "{{.OP_ID}}" \
-          --stack-ip "$STACK_IP" \
+          --stack-ip "{{.STACK_IP}}" \
           --replay-mode "{{.REPLAY_MODE}}" \
           --trigger-mode "{{.TRIGGER_MODE}}" \
           --output-dir "{{.OUTPUT_DIR}}" \
@@ -86,6 +128,72 @@ tasks:
           {{if .SNAPSHOT_DIR}}--snapshot-dir "{{.SNAPSHOT_DIR}}"{{end}} \
           {{if .MODEL}}--model "{{.MODEL}}"{{end}} \
           {{if .QUIET_PERIOD}}--quiet-period "{{.QUIET_PERIOD}}"{{end}}
+
+  replay:loop:
+    desc: Provision once, run N investigations reusing the stack, tear down. For tuning loops (Vibe Gepa) and K-of-N averaging.
+    requires:
+      vars: [OP_ID]
+    vars:
+      ITERATIONS: '{{.ITERATIONS | default "1"}}'
+      HOOK: '{{.HOOK | default ""}}'
+      SNAPSHOT_DIR: '{{.SNAPSHOT_DIR | default ""}}'
+      MODEL: '{{.MODEL | default ""}}'
+      MAX_STEPS: '{{.MAX_STEPS | default "50"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+      QUIET_PERIOD: '{{.QUIET_PERIOD | default ""}}'
+      CLOCK: '{{.CLOCK | default "step"}}'
+      REPLAY_MODE: '{{.REPLAY_MODE | default "timeline"}}'
+      TRIGGER_MODE: '{{.TRIGGER_MODE | default "alert-replay"}}'
+    cmds:
+      - |
+        echo -e "{{.INFO}} provisioning replay stack for {{.OP_ID}} (loop x{{.ITERATIONS}})..."
+        PROV_OUT=$(task benchmark:replay:provision OP_ID={{.OP_ID}})
+        STACK_IP=$(echo "$PROV_OUT" | awk -F= '/^STACK_IP=/{print $2}')
+        INSTANCE_ID=$(echo "$PROV_OUT" | awk -F= '/^INSTANCE_ID=/{print $2}')
+        if [ -z "$STACK_IP" ] || [ -z "$INSTANCE_ID" ]; then
+          echo -e "{{.ERROR}} provision did not produce STACK_IP/INSTANCE_ID"
+          exit 1
+        fi
+        echo -e "{{.SUCCESS}} stack up at $STACK_IP (instance $INSTANCE_ID)"
+
+        cleanup() {
+          echo -e "{{.INFO}} tearing down $INSTANCE_ID..."
+          task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID" || \
+            echo -e "{{.WARN}} teardown failed for $INSTANCE_ID — sweep for ares:component=benchmark-replay"
+        }
+        trap cleanup EXIT
+
+        FAILURES=0
+        for i in $(seq 1 {{.ITERATIONS}}); do
+          echo -e "{{.INFO}} iteration $i/{{.ITERATIONS}} against $STACK_IP..."
+          if ! task benchmark:replay:run \
+              STACK_IP="$STACK_IP" \
+              OP_ID="{{.OP_ID}}" \
+              REPLAY_MODE="{{.REPLAY_MODE}}" \
+              TRIGGER_MODE="{{.TRIGGER_MODE}}" \
+              OUTPUT_DIR="{{.OUTPUT_DIR}}" \
+              MAX_STEPS="{{.MAX_STEPS}}" \
+              CLOCK="{{.CLOCK}}" \
+              SNAPSHOT_DIR="{{.SNAPSHOT_DIR}}" \
+              MODEL="{{.MODEL}}" \
+              QUIET_PERIOD="{{.QUIET_PERIOD}}"; then
+            FAILURES=$((FAILURES + 1))
+            echo -e "{{.WARN}} iteration $i failed — continuing loop"
+          fi
+          if [ -n "{{.HOOK}}" ] && [ "$i" -lt "{{.ITERATIONS}}" ]; then
+            echo -e "{{.INFO}} running HOOK between iteration $i and $((i + 1))..."
+            STACK_IP="$STACK_IP" OP_ID="{{.OP_ID}}" ITERATION="$i" bash -c '{{.HOOK}}' || {
+              echo -e "{{.ERROR}} HOOK failed after iteration $i — aborting loop"
+              exit 1
+            }
+          fi
+        done
+
+        if [ "$FAILURES" -gt 0 ]; then
+          echo -e "{{.WARN}} {{.ITERATIONS}} iteration(s) complete — $FAILURES failed"
+        else
+          echo -e "{{.SUCCESS}} {{.ITERATIONS}} iteration(s) complete for {{.OP_ID}}"
+        fi
 
   replay:provision:
     desc: Launch and set up a replay stack EC2 — prints STACK_IP=<ip> INSTANCE_ID=<id>.
