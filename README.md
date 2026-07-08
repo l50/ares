@@ -422,9 +422,21 @@ workflow splits by concern:
 - `task benchmark:replay:provision` / `:teardown` — EC2 lifecycle for the
   replay-stack box (all AWS-CLI orchestration in Taskfile, not Rust).
 - `ares benchmark run --stack-ip <ip>` — submits the investigation, polls
-  Redis, computes the score.
+  Redis, computes the score. `--seed` / `--temperature` / `--replicates` cut
+  LLM sampling noise so a real score change is distinguishable from variance.
+- `task benchmark:replay:run STACK_IP=<ip> OP_ID=<op>` — runs one investigation
+  against an already-provisioned stack, no teardown. Reuses the stack across
+  many runs.
 - `task benchmark:replay OP_ID=<op>` — end-to-end wrapper: provision → run →
   teardown (deferred via shell `trap`, fires on failure too).
+- `task benchmark:replay:loop OP_ID=<op> ITERATIONS=<n>` — provision once,
+  iterate N times, teardown. Optional `HOOK=<cmd>` runs between iterations
+  with `STACK_IP` / `OP_ID` / `ITERATION` exported — for a tuning driver
+  (e.g. Vibe Gepa) to rewrite prompts in place without reprovisioning.
+- `task benchmark:generalize` — sweeps the held-out attack set from
+  `benchmarks/holdout.yaml` and reports per-op + aggregate score. The
+  held-out corpus is off-limits to any tuning process; it's the only
+  measure of generalization.
 
 ```bash
 # Capture from a completed op
@@ -436,10 +448,22 @@ ares benchmark list
 # End-to-end replay
 task benchmark:replay OP_ID=op-20260706-123045
 
-# Or split provision/run/teardown when iterating
+# Or split provision/run/teardown when iterating against one stack
 eval "$(task benchmark:replay:provision OP_ID=op-20260706-123045 | grep -E '^(STACK_IP|INSTANCE_ID)=')"
-ares benchmark run op-20260706-123045 --stack-ip "$STACK_IP" --max-steps 75
+task benchmark:replay:run STACK_IP="$STACK_IP" OP_ID=op-20260706-123045
 task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID"
+
+# Tuning loop: 8 iterations against a warm stack, prompt update between each
+task benchmark:replay:loop OP_ID=op-20260706-123045 ITERATIONS=8 \
+  HOOK='python -m vibe_gepa.update --op-id "$OP_ID" --iter "$ITERATION"'
+
+# K-of-N averaging: 5 replicates against a warm stack, seeded for determinism
+# Mean/stddev/min/max land in <output-dir>/<session>-summary.json
+ares benchmark run op-20260706-123045 \
+  --stack-ip "$STACK_IP" --replicates 5 --seed 42 --output-dir ./reports
+
+# Generalization sweep against the held-out set
+task benchmark:generalize FAIL_UNDER=0.6
 ```
 
 Provisioning prefers a pre-baked `ares-replay-stack` AMI

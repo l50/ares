@@ -14,8 +14,15 @@ The workflow has three concerns, split cleanly across three surfaces:
 | Blue investigation + scoring    | `ares benchmark run` (Rust) against a pre-provisioned `--stack-ip`                     |
 
 `ares benchmark run` no longer provisions EC2 — provisioning is Taskfile-driven.
-Call `task benchmark:replay` for the end-to-end flow, or drive
-`replay:provision` / `run` / `replay:teardown` individually.
+Call `task benchmark:replay` for the end-to-end flow, `task benchmark:replay:run`
+against a stack you provisioned yourself, or `task benchmark:replay:loop` for
+tuning workflows that reuse one warm stack across many iterations.
+
+The tuning corpus (what a prompt-search or Vibe Gepa driver iterates on) is
+whatever the driver picks; the held-out corpus for generalization scoring
+lives at `benchmarks/holdout.yaml` and is swept by `task benchmark:generalize`.
+Keep the two lists physically separate so no tuning loop can silently train
+on the eval set.
 
 ## Prerequisites
 
@@ -101,15 +108,77 @@ from S3 into a temp dir.
 eval "$(task benchmark:replay:provision OP_ID=op-20260706-123045 | grep -E '^(STACK_IP|INSTANCE_ID)=')"
 
 # Run — as many times as you want against the same stack
-ares benchmark run op-20260706-123045 \
-  --stack-ip "$STACK_IP" \
-  --replay-mode timeline \
-  --max-steps 75 \
-  --output-dir ./reports
+task benchmark:replay:run \
+  STACK_IP="$STACK_IP" \
+  OP_ID=op-20260706-123045 \
+  MAX_STEPS=75 \
+  OUTPUT_DIR=./reports
 
 # Teardown when done
 task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID"
 ```
+
+`benchmark:replay:run` forwards `SNAPSHOT_DIR`, `MODEL`, `MAX_STEPS`,
+`OUTPUT_DIR`, `QUIET_PERIOD`, `CLOCK`, `REPLAY_MODE`, and `TRIGGER_MODE` to
+`ares benchmark run`. For flags the Taskfile does not forward
+(`--seed`, `--temperature`, `--replicates`), call `ares benchmark run`
+directly against the same `--stack-ip`.
+
+### Tuning loop (warm stack across N iterations)
+
+For a prompt-search / Vibe Gepa driver iterating on the same op: provision
+once, run N times, tear down once. `HOOK` runs between iterations (not after
+the last) with `STACK_IP`, `OP_ID`, and `ITERATION` exported so the driver
+can rewrite prompts or config in place.
+
+```bash
+task benchmark:replay:loop \
+  OP_ID=op-20260706-123045 \
+  ITERATIONS=8 \
+  HOOK='python -m vibe_gepa.update --op-id "$OP_ID" --iter "$ITERATION"'
+```
+
+Failure semantics:
+
+- A single `replay:run` failure counts against a warning tally but does NOT
+  abort the loop — K-of-N averaging still works if one iteration flakes.
+- A `HOOK` failure IS fatal — subsequent iterations against a broken tuning
+  update would be meaningless.
+
+Omit `HOOK` to just repeat the same investigation N times — the built-in
+form of K-of-N averaging.
+
+### Deterministic scoring and replicates (`ares benchmark run`)
+
+LLM sampling adds run-to-run variance. Two knobs on `ares benchmark run`
+help distinguish a real score change from noise:
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--seed <u64>` | Best-effort deterministic sampling. Passed to providers that honour it (OpenAI); providers that ignore it (Anthropic, Ollama) log a warning and continue with default sampling. When set without `--temperature`, temperature is forced to `0.0`. |
+| `--temperature <f32>` | Override the provider default. `0.0` = greedy decoding. Unset ⇒ provider default (typically `1.0`). |
+| `--replicates <K>` | K independent investigations against the same stack. The stack is NOT reprovisioned per replicate; each replicate gets its own `run_id`. |
+
+With `--replicates > 1`, in addition to the per-run JSON at
+`<output-dir>/<run_id>.json`, a session summary lands at
+`<output-dir>/<session_stem>-summary.json` with `replicate_count`, `mean`,
+`stddev` (n-1 denominator), `min`, `max`, the raw `scores` array, and a
+`replicates` array with per-run metadata. `K=1` writes only the single
+per-run JSON — no summary — so existing callers see identical output.
+
+```bash
+# 5 replicates, seeded so temperature is forced to 0 and each replicate
+# samples the same way at each turn
+ares benchmark run op-20260706-123045 \
+  --stack-ip "$STACK_IP" \
+  --replicates 5 \
+  --seed 42 \
+  --output-dir ./reports
+```
+
+Replicates run sequentially, not in parallel — running them in parallel
+would multiply in-process evidence-store state and interfere with the
+shared tool dispatcher.
 
 ### Replay modes
 
@@ -118,6 +187,35 @@ task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID"
   unfolding attack. This is the realistic mode.
 - `static` — all data pre-loaded, agent knows the full attack window upfront.
   Convenient but less realistic.
+
+## Generalization sweep
+
+Any tuning process (prompt search, config iteration, Vibe Gepa, RL rollouts)
+will fit to whatever corpus it sees. To measure whether an improvement
+generalizes, sweep a held-out set the tuning process never touched.
+
+`benchmarks/holdout.yaml` is that set. It's hand-curated and physically
+separate from the tuning corpus so nothing auto-populates it from recent ops.
+
+```bash
+task benchmark:generalize                                # sweep with defaults
+task benchmark:generalize OUTPUT_DIR=./reports/gen       # custom output dir
+task benchmark:generalize HOLDOUT=benchmarks/other.yaml  # alternate corpus
+task benchmark:generalize FAIL_UNDER=0.6                 # fail if mean < 0.6
+```
+
+The task iterates each entry via `task benchmark:replay`, collects the
+`evaluation.overall_score` from each investigation report, prints a summary
+table, and writes `$OUTPUT_DIR/generalize-summary.json` with per-op scores
+plus mean and median. Per-op failures are non-fatal so one broken snapshot
+doesn't sink the whole sweep; failures are recorded in the summary. Set
+`FAIL_UNDER=<float>` to gate CI on the aggregate mean.
+
+Curate `benchmarks/holdout.yaml` manually: pick 3–5 ops covering distinct
+attack classes (ADCS ESC1, kerberoast, MSSQL linked servers, constrained
+delegation, NTLM relay, etc.). Do not populate it from your most recent ops
+— tuning drivers routinely see the latest ops and would silently retrain on
+the eval set. The file's top-of-file comment restates this contract.
 
 ## The replay-stack AMI
 
