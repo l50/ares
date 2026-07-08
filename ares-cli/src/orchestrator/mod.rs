@@ -736,7 +736,6 @@ async fn run_inner() -> Result<()> {
             ),
             blue::spawn_blue_auto_submit(
                 queue.clone(),
-                shared_state.clone(),
                 config.clone(),
                 blue_model_spec,
                 shutdown_rx.clone(),

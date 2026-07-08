@@ -87,7 +87,15 @@ impl BlueCallbackHandler {
     }
 
     /// Run a sub-agent loop for a blue team role and return the result text.
-    async fn run_sub_agent(&self, role: BlueAgentRole, task_prompt: &str) -> Result<String> {
+    ///
+    /// `pub(crate)` so the investigation lifecycle can drive auto-chained
+    /// follow-up hunts inline after the orchestrator loop finishes (there is no
+    /// blue-task worker fleet to consume an enqueued chained task).
+    pub(crate) async fn run_sub_agent(
+        &self,
+        role: BlueAgentRole,
+        task_prompt: &str,
+    ) -> Result<String> {
         let tools = blue::blue_tools_for_role(role);
         let capabilities: Vec<String> = tools
             .iter()
