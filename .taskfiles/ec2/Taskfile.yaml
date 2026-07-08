@@ -1005,6 +1005,12 @@ tasks:
       RDS_DB: '{{.RDS_DB | default "ares_history"}}'
       LLM_MODEL: '{{.LLM_MODEL | default ""}}'
       FLUSH_REDIS: '{{.FLUSH_REDIS | default "true"}}'
+      # Observability endpoint overrides — take precedence over Secrets Manager
+      # values so laptop-shape URLs in ares/api-keys (e.g. http://localhost:3000
+      # from the obs:forward pattern) don't wedge on the EC2 box, which reaches
+      # observability via VPC peering to the plundr ingress instead.
+      EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL | default "https://grafana.dev.plundr.ai"}}'
+      EC2_LOKI_URL: '{{.EC2_LOKI_URL | default "https://loki.dev.plundr.ai"}}'
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
       WAIT: '{{.WAIT | default "true"}}'
       POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
@@ -1066,6 +1072,19 @@ tasks:
           LOKI_URL_VAL="{{.LOKI_URL}}"
         fi
         LOKI_AUTH_TOKEN_VAL=$(echo "$SECRETS" | jq -r '.LOKI_AUTH_TOKEN // empty')
+
+        # EC2 override: the secret's GRAFANA_URL/LOKI_URL are laptop-shape
+        # (localhost:PORT from `task obs:forward`) and never pass the reachability
+        # probe below. On EC2 we always want the plundr ingress URL, which is
+        # reachable via VPC peering. Override iff the task var is set (default:
+        # the plundr ingress). Set EC2_GRAFANA_URL="" / EC2_LOKI_URL="" to keep
+        # the secret's value verbatim.
+        if [ -n "{{.EC2_GRAFANA_URL}}" ]; then
+          GRAFANA_URL_VAL="{{.EC2_GRAFANA_URL}}"
+        fi
+        if [ -n "{{.EC2_LOKI_URL}}" ]; then
+          LOKI_URL_VAL="{{.EC2_LOKI_URL}}"
+        fi
         DREADNODE_API_KEY=$(echo "$SECRETS" | jq -r '.DREADNODE_API_KEY // empty')
 
         # Build ARES_DATABASE_URL for the ares-history Postgres so the
