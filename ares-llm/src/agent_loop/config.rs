@@ -11,6 +11,9 @@ pub struct AgentLoopConfig {
     pub max_tokens: u32,
     /// Optional temperature override.
     pub temperature: Option<f32>,
+    /// Optional sampling seed. Threaded into `LlmRequest.seed`; providers
+    /// that don't support seeded sampling silently drop it.
+    pub seed: Option<u64>,
     /// Retry configuration for transient LLM errors (rate limits, network).
     pub retry: RetryConfig,
     /// Context window management configuration.
@@ -37,6 +40,7 @@ impl Default for AgentLoopConfig {
             max_steps: 75,
             max_tokens: 4096,
             temperature: None,
+            seed: None,
             retry: RetryConfig::default(),
             context: ContextConfig::default(),
             budget: BudgetConfig::default(),
@@ -56,6 +60,8 @@ impl AgentLoopConfig {
     /// - `ARES_AGENT_MAX_TOKENS`
     /// - `ARES_AGENT_MAX_TOOL_CALLS_PER_NAME`
     /// - `ARES_AGENT_ENABLE_PROMPT_CACHE` (`true`/`false`/`1`/`0`)
+    /// - `ARES_LLM_SEED` — sampling seed passed to providers that honour it
+    ///   (OpenAI). Undefined → no seed (provider default).
     /// - everything from `ContextConfig::from_env`, `BudgetConfig::from_env`,
     ///   `SessionLogConfig::from_env`
     pub fn from_env(model: String, temperature: Option<f32>) -> Self {
@@ -63,6 +69,7 @@ impl AgentLoopConfig {
         Self {
             model,
             temperature,
+            seed: parse_env_u64_opt("ARES_LLM_SEED"),
             max_steps: parse_env_u32("ARES_AGENT_MAX_STEPS", defaults.max_steps),
             max_tokens: parse_env_u32("ARES_AGENT_MAX_TOKENS", defaults.max_tokens),
             max_tool_calls_per_name: parse_env_u32(
@@ -326,6 +333,15 @@ fn parse_env_u32(key: &str, default: u32) -> u32 {
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(default)
+}
+
+/// Parse an optional u64 env var, returning `None` if unset or unparsable.
+/// Used for opt-in knobs like sampling seeds where "absent" and "explicit
+/// zero" carry different meanings.
+fn parse_env_u64_opt(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
 fn parse_env_usize(key: &str, default: usize) -> usize {

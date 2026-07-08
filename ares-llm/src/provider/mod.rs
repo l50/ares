@@ -213,6 +213,10 @@ pub struct LlmRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// Optional sampling seed. Providers that support seeded sampling
+    /// (currently OpenAI) forward it; others ignore it. Set alongside a
+    /// `temperature` of 0.0 for the tightest determinism the provider offers.
+    pub seed: Option<u64>,
     /// Hint to providers that support prompt caching (Anthropic) to attach
     /// a cache breakpoint to the stable prefix (system + tools). Other
     /// providers ignore this flag.
@@ -228,6 +232,7 @@ impl LlmRequest {
             tools: Vec::new(),
             max_tokens: 4096,
             temperature: None,
+            seed: None,
             enable_prompt_cache: false,
         }
     }

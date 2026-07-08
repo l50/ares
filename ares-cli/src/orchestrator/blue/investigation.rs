@@ -22,6 +22,27 @@ use ares_llm::{
 use super::callbacks::BlueCallbackHandler;
 use super::chaining;
 
+/// Read the optional LLM sampling temperature override from `ARES_LLM_TEMPERATURE`.
+///
+/// The blue investigation isn't driven by the red-team `Strategy` layer (which
+/// already reads this env var), so we read it here to give `benchmark run
+/// --temperature` a path through to the actual LLM call.
+pub(crate) fn parse_env_temperature() -> Option<f32> {
+    std::env::var("ARES_LLM_TEMPERATURE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+}
+
+/// Read the optional LLM sampling seed from `ARES_LLM_SEED`.
+///
+/// Providers that don't support seeded sampling (Anthropic, Ollama today) drop
+/// this silently at request time. See `LlmRequest.seed`.
+pub(crate) fn parse_env_seed() -> Option<u64> {
+    std::env::var("ARES_LLM_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 /// Represents a running investigation.
 pub struct Investigation {
     pub investigation_id: String,
@@ -155,6 +176,12 @@ pub async fn run_investigation(
         // ARES_SESSION_LOG_DIR — the same introspection red gets. Plain
         // `..default()` ships a disabled SessionLogConfig, so opt in here.
         session_log: ares_llm::SessionLogConfig::from_env(),
+        // `benchmark run --temperature/--seed` sets ARES_LLM_TEMPERATURE /
+        // ARES_LLM_SEED so the blue investigation samples deterministically
+        // enough for replicate averaging. Unset ⇒ provider defaults, i.e.
+        // no behaviour change for non-benchmark callers.
+        temperature: parse_env_temperature(),
+        seed: parse_env_seed(),
         ..AgentLoopConfig::default()
     };
 

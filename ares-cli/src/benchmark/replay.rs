@@ -45,6 +45,14 @@ pub(crate) struct ReplayParams {
     /// up by `task benchmark:replay:provision`; `benchmark run` only runs the
     /// investigation against it.
     pub stack_ip: String,
+    /// Optional LLM sampling seed (OpenAI-only; other providers log-and-continue).
+    pub seed: Option<u64>,
+    /// Optional LLM sampling temperature override (0.0 = greedy).
+    pub temperature: Option<f32>,
+    /// Replicate count. K > 1 reruns the same investigation K times against the
+    /// same stack and reports mean/stddev/min/max so a tuning loop can
+    /// distinguish real deltas from LLM sampling noise.
+    pub replicates: u32,
 }
 
 /// Import a snapshot's Loki data into a target Loki instance.
@@ -101,9 +109,10 @@ pub(crate) async fn run_load(
 /// - `timeline`: quiet period before first alert, alert-replay trigger (no end window),
 ///   simulating an unfolding attack
 pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
-    let run_started_at = Utc::now();
-    let run_id = format!("inv-{}", run_started_at.format("%Y%m%d-%H%M%S"));
+    let session_started_at = Utc::now();
+    let session_stem = format!("inv-{}", session_started_at.format("%Y%m%d-%H%M%S"));
     let is_timeline = p.replay_mode == "timeline";
+    let replicates = p.replicates.max(1);
 
     if !matches!(p.replay_mode.as_str(), "static" | "timeline") {
         bail!(
@@ -111,6 +120,8 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
             p.replay_mode
         );
     }
+
+    apply_sampling_env(p.seed, p.temperature, p.model.as_deref());
 
     // Point the blue agent's observability surface at the caller-supplied
     // stack and pull LLM keys from Secrets Manager if they're missing (e.g.
@@ -140,7 +151,9 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         // ARES_SESSION_OP_ID (= the replayed op) is set in run_replay_inner where
         // the manifest is in scope, before the blue config is built.
     }
-    info!("blue investigation transcript → {session_dir}/<op>/{run_id}.jsonl (team=blue → SQL)");
+    info!(
+        "blue investigation transcripts → {session_dir}/<op>/{session_stem}[-r*].jsonl (team=blue → SQL)"
+    );
     ensure_llm_secrets();
 
     let snapshot_config = SnapshotConfig::from_env();
@@ -150,13 +163,14 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
     let manifest = load_manifest(snapshot_path.to_str().unwrap())?;
 
     info!(
-        "benchmark run {run_id} [mode={}, trigger={}] for operation {} against stack {}",
+        "benchmark run {session_stem} [mode={}, trigger={}, replicates={}] for operation {} against stack {}",
         p.replay_mode,
         if is_timeline {
             "alert-replay"
         } else {
             &p.trigger_mode
         },
+        replicates,
         manifest.operation_id,
         p.stack_ip,
     );
@@ -166,11 +180,65 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         &manifest,
         &loki_url,
         &snapshot_path,
-        &run_id,
+        &session_stem,
         is_timeline,
-        run_started_at,
+        session_started_at,
+        replicates,
     )
     .await
+}
+
+/// Apply the `--seed` / `--temperature` knobs by setting the env vars the
+/// agent loop reads at request-build time (`ARES_LLM_SEED`, `ARES_LLM_TEMPERATURE`).
+///
+/// When `--seed` is set without `--temperature`, temperature is forced to
+/// `0.0` because seeded sampling only meaningfully constrains variance at
+/// low temperature. Explicit `--temperature` always wins.
+///
+/// Providers that don't honour `seed` (Anthropic, Ollama today) log a
+/// warning and continue — the request-level field is silently dropped.
+///
+/// SAFETY: called from `run_replay` before any worker tasks are spawned;
+/// no other thread can be reading these env vars concurrently.
+fn apply_sampling_env(seed: Option<u64>, temperature: Option<f32>, model: Option<&str>) {
+    if seed.is_none() && temperature.is_none() {
+        return;
+    }
+    if let Some(t) = temperature {
+        unsafe { std::env::set_var("ARES_LLM_TEMPERATURE", format!("{t}")) };
+        info!("blue sampling: ARES_LLM_TEMPERATURE={t}");
+    } else if seed.is_some() {
+        unsafe { std::env::set_var("ARES_LLM_TEMPERATURE", "0") };
+        info!("blue sampling: ARES_LLM_TEMPERATURE=0 (implied by --seed)");
+    }
+    if let Some(s) = seed {
+        unsafe { std::env::set_var("ARES_LLM_SEED", s.to_string()) };
+        info!("blue sampling: ARES_LLM_SEED={s}");
+        if !provider_supports_seed(model) {
+            warn!(
+                "provider derived from model={:?} does not support LLM seed; \
+                 request-level seed will be dropped and outputs will still vary \
+                 across replicates",
+                model.unwrap_or("<default>"),
+            );
+        }
+    }
+}
+
+/// Return true when the resolved model routes to a provider that honours
+/// `LlmRequest.seed`. Today that's OpenAI only. Unknown / unset models
+/// (falling back to the config-YAML default) are treated as supporting seed
+/// — the default blue model is OpenAI, and being wrong here just means an
+/// occasional false-negative warning.
+fn provider_supports_seed(model: Option<&str>) -> bool {
+    let Some(m) = model else { return true };
+    if m.starts_with("openai/") {
+        return true;
+    }
+    // Bare model names without a provider prefix follow ares_llm::create_provider's
+    // resolution rules; we can't tell without invoking it. Warn only for the
+    // prefixes we know skip seed (anthropic, claude-cli, ollama).
+    !(m.starts_with("anthropic/") || m.starts_with("claude-cli/") || m.starts_with("ollama/"))
 }
 
 /// Ensure LLM API keys are in the environment. Delegates to the shared
@@ -192,14 +260,16 @@ fn ensure_llm_secrets() {
 }
 
 /// Inner replay logic, separated so teardown always runs.
+#[allow(clippy::too_many_arguments)]
 async fn run_replay_inner(
     p: &ReplayParams,
     manifest: &SnapshotManifest,
     loki_url: &str,
     snapshot_path: &Path,
-    run_id: &str,
+    session_stem: &str,
     is_timeline: bool,
-    run_started_at: chrono::DateTime<Utc>,
+    session_started_at: chrono::DateTime<Utc>,
+    replicates: u32,
 ) -> Result<()> {
     // SAFETY: this is the documented mechanism for pointing the blue agent
     // at a specific Loki. The env var is read by loki_config() in loki.rs.
@@ -282,37 +352,16 @@ async fn run_replay_inner(
     // Ensure LOKI_URL points to the replay EC2
     env_vars.insert("LOKI_URL".to_string(), loki_url.to_string());
 
-    let mut conn = connect_redis(p.redis_url.clone()).await?;
-
-    let request = serde_json::json!({
-        "investigation_id": run_id,
-        "alert": alert_json,
-        "correlation_context": null,
-        "model": effective_model,
-        "max_steps": p.max_steps,
-        "multi_agent": true,
-        "auto_route": false,
-        "report_dir": null,
-        "submitted_at": Utc::now().to_rfc3339(),
-    });
-
-    // Store env vars (includes LOKI_URL override for per-investigation routing)
-    if !env_vars.is_empty() {
-        let env_key = format!("ares:blue:inv:{run_id}:env_vars");
-        let env_json = serde_json::to_string(&env_vars)?;
-        let _: () = conn.set(&env_key, &env_json).await?;
-        let _: () = conn.expire(&env_key, 3600).await?;
-    }
-
     let nats = NatsBroker::connect_from_env()
         .await
         .context("connect to NATS for investigation submission")?;
     nats.ensure_streams().await?;
 
-    // Spawn an ephemeral in-process blue consumer so the investigation we submit
-    // actually runs — this makes `benchmark run` self-contained (no separately
-    // running blue orchestrator required). It dies with the process and uses the
-    // isolated ARES_BLUE_TASKS stream, so it never interferes with a red fleet.
+    // Spawn an ephemeral in-process blue consumer ONCE for the entire session —
+    // even when K > 1, all replicates share the same consumer since NATS
+    // multiplexes their investigation-submissions across a single subscriber.
+    // It dies with the process and uses the isolated ARES_BLUE_TASKS stream,
+    // so it never interferes with a red fleet.
     let redis_url_str = p.redis_url.clone().unwrap_or_else(|| {
         std::env::var("ARES_REDIS_URL")
             .or_else(|_| std::env::var("REDIS_URL"))
@@ -332,14 +381,156 @@ async fn run_replay_inner(
     .await
     .context("spawn in-process blue consumer")?;
 
-    BlueTaskQueue::submit_investigation_request(&nats, &request)
+    fs::create_dir_all(&p.output_dir)
+        .with_context(|| format!("create output dir: {}", p.output_dir))?;
+
+    let ctx = ReplicateContext {
+        p,
+        manifest,
+        snapshot_path,
+        effective_trigger_mode,
+        effective_model: effective_model.as_deref(),
+        alert_json: &alert_json,
+        env_vars: &env_vars,
+        nats: &nats,
+        session_started_at,
+        quiet_period_secs,
+    };
+
+    let mut replicate_scores: Vec<f64> = Vec::with_capacity(replicates as usize);
+    let mut replicate_summaries: Vec<ReplicateSummary> = Vec::with_capacity(replicates as usize);
+    let run_result: Result<()> = async {
+        for i in 0..replicates {
+            let run_id = if replicates == 1 {
+                session_stem.to_string()
+            } else {
+                format!("{session_stem}-r{i}")
+            };
+            info!("replicate {}/{} → run_id={run_id}", i + 1, replicates);
+            let outcome = run_single_replicate(&ctx, &run_id).await?;
+            replicate_scores.push(outcome.overall_score);
+            replicate_summaries.push(ReplicateSummary {
+                run_id: run_id.clone(),
+                overall_score: outcome.overall_score,
+                technique_coverage: outcome.technique_coverage,
+                ioc_detection_rate: outcome.ioc_detection_rate,
+                grade: outcome.grade,
+                passed: outcome.passed,
+                investigation_duration_secs: outcome.investigation_duration_secs,
+                result_path: outcome.result_path,
+            });
+        }
+        Ok(())
+    }
+    .await;
+
+    // Always tear down the in-process blue consumer — bail path or clean finish.
+    let _ = blue_shutdown.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), blue_handle).await;
+
+    run_result?;
+
+    // Guard: `operation` trigger hands the agent the ground-truth techniques and
+    // IOCs it is graded on (see build_operation_trigger). It's an oracle/debug
+    // mode, never a valid score — flag it loudly so nobody reports it.
+    if effective_trigger_mode == "operation" {
+        eprintln!(
+            "\n⚠️  trigger-mode=operation hands the agent the ground-truth techniques and \
+             IOCs it is graded on — this score is CONTAMINATED and must NOT be used for \
+             comparison. Use the default (alert-replay) for real scoring.\n"
+        );
+    }
+
+    if replicates > 1 {
+        write_and_print_replicate_summary(
+            &p.output_dir,
+            session_stem,
+            &manifest.operation_id,
+            &effective_model,
+            session_started_at,
+            &replicate_summaries,
+            &replicate_scores,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Immutable state shared across every replicate in one `benchmark run`.
+struct ReplicateContext<'a> {
+    p: &'a ReplayParams,
+    manifest: &'a SnapshotManifest,
+    snapshot_path: &'a Path,
+    effective_trigger_mode: &'a str,
+    effective_model: Option<&'a str>,
+    alert_json: &'a serde_json::Value,
+    env_vars: &'a std::collections::HashMap<String, String>,
+    nats: &'a NatsBroker,
+    session_started_at: chrono::DateTime<Utc>,
+    quiet_period_secs: Option<f64>,
+}
+
+/// Summary of one replicate used to build the K-replicate aggregate report.
+struct ReplicateOutcome {
+    overall_score: f64,
+    technique_coverage: f64,
+    ioc_detection_rate: f64,
+    grade: String,
+    passed: bool,
+    investigation_duration_secs: f64,
+    result_path: PathBuf,
+}
+
+/// Per-replicate line written into the aggregate summary JSON.
+#[derive(serde::Serialize)]
+struct ReplicateSummary {
+    run_id: String,
+    overall_score: f64,
+    technique_coverage: f64,
+    ioc_detection_rate: f64,
+    grade: String,
+    passed: bool,
+    investigation_duration_secs: f64,
+    result_path: PathBuf,
+}
+
+/// Submit one investigation, poll for completion, score it, write the
+/// per-run JSON, and print the standard summary block. Returns the numeric
+/// scores + path used to build the aggregate report.
+async fn run_single_replicate(
+    ctx: &ReplicateContext<'_>,
+    run_id: &str,
+) -> Result<ReplicateOutcome> {
+    let started_at = Utc::now();
+    let mut conn = connect_redis(ctx.p.redis_url.clone()).await?;
+
+    let request = serde_json::json!({
+        "investigation_id": run_id,
+        "alert": ctx.alert_json,
+        "correlation_context": null,
+        "model": ctx.effective_model,
+        "max_steps": ctx.p.max_steps,
+        "multi_agent": true,
+        "auto_route": false,
+        "report_dir": null,
+        "submitted_at": Utc::now().to_rfc3339(),
+    });
+
+    if !ctx.env_vars.is_empty() {
+        let env_key = format!("ares:blue:inv:{run_id}:env_vars");
+        let env_json = serde_json::to_string(ctx.env_vars)?;
+        let _: () = conn.set(&env_key, &env_json).await?;
+        let _: () = conn.expire(&env_key, 3600).await?;
+    }
+
+    BlueTaskQueue::submit_investigation_request(ctx.nats, &request)
         .await
         .context("submit investigation request to NATS")?;
 
     info!("investigation {run_id} submitted");
 
     let investigation_start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(45 * 60); // 45 minutes
+    let timeout = std::time::Duration::from_secs(45 * 60);
     let poll_interval = std::time::Duration::from_secs(10);
 
     loop {
@@ -369,9 +560,7 @@ async fn run_replay_inner(
                             .unwrap_or("unknown error");
                         bail!("investigation {run_id} failed: {err}");
                     }
-                    _ => {
-                        // still running
-                    }
+                    _ => {}
                 }
             }
         }
@@ -379,19 +568,15 @@ async fn run_replay_inner(
         tokio::time::sleep(poll_interval).await;
     }
 
-    // Investigation finished — stop the in-process blue consumer cleanly.
-    let _ = blue_shutdown.send(true);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), blue_handle).await;
-
     let investigation_duration = investigation_start.elapsed().as_secs_f64();
 
-    let red_state_path = snapshot_path.join("red-state.json");
+    let red_state_path = ctx.snapshot_path.join("red-state.json");
     let (red_state, techniques) = load_red_state_from_file(&red_state_path)?;
     // Prefer the ENRICHED ground-truth.json written at capture time (attack
     // timeline + attacker-source IPs); the scorer used to regenerate a stripped
     // GT from red-state and ignore this file (#89 gap). Fall back to regeneration
     // only for older snapshots that predate the enrichment.
-    let ground_truth = load_enriched_ground_truth(snapshot_path)
+    let ground_truth = load_enriched_ground_truth(ctx.snapshot_path)
         .unwrap_or_else(|| create_ground_truth_from_red_state(&red_state, &techniques));
 
     let blue_reader = BlueStateReader::new(run_id.to_string());
@@ -401,7 +586,7 @@ async fn run_replay_inner(
         .with_context(|| format!("no blue team state found for {run_id}"))?;
 
     let snap = InvestigationSnapshot::from_blue_state(&blue_state);
-    let model_name = effective_model.as_deref().unwrap_or("default");
+    let model_name = ctx.effective_model.unwrap_or("default");
 
     let eval_result = scorers::evaluate(
         &format!("bench-{run_id}"),
@@ -413,8 +598,9 @@ async fn run_replay_inner(
     );
     let gap_analysis = analyze_detection_gaps(&eval_result);
 
-    let trigger_alert = match effective_trigger_mode {
-        "alert-replay" => alert_json
+    let trigger_alert = match ctx.effective_trigger_mode {
+        "alert-replay" => ctx
+            .alert_json
             .get("labels")
             .and_then(|l| l.get("alertname"))
             .and_then(|n| n.as_str())
@@ -423,55 +609,47 @@ async fn run_replay_inner(
     };
 
     let result = BenchmarkResult {
-        snapshot_id: manifest.operation_id.clone(),
-        operation_id: manifest.operation_id.clone(),
+        snapshot_id: ctx.manifest.operation_id.clone(),
+        operation_id: ctx.manifest.operation_id.clone(),
         run_id: run_id.to_string(),
-        replay_mode: p.replay_mode.clone(),
-        trigger_mode: effective_trigger_mode.to_string(),
+        replay_mode: ctx.p.replay_mode.clone(),
+        trigger_mode: ctx.effective_trigger_mode.to_string(),
         trigger_alert,
         loki_mode: "ec2".to_string(),
         model: model_name.to_string(),
-        started_at: run_started_at,
+        started_at,
         completed_at: Utc::now(),
-        quiet_period_secs,
+        quiet_period_secs: if ctx.session_started_at == started_at {
+            ctx.quiet_period_secs
+        } else {
+            // Subsequent replicates skipped the quiet-period sleep — record
+            // that explicitly rather than lying about the wait time.
+            None
+        },
         time_compression: None,
         investigation_duration_secs: investigation_duration,
         evaluation: eval_result.to_value(),
         gap_analysis: gap_analysis.to_markdown(),
     };
 
-    fs::create_dir_all(&p.output_dir)
-        .with_context(|| format!("create output dir: {}", p.output_dir))?;
-    let result_path = Path::new(&p.output_dir).join(format!("{run_id}.json"));
+    let result_path = Path::new(&ctx.p.output_dir).join(format!("{run_id}.json"));
     fs::write(&result_path, serde_json::to_string_pretty(&result)?)
         .with_context(|| format!("write result: {}", result_path.display()))?;
 
-    // Guard: `operation` trigger hands the agent the ground-truth techniques and
-    // IOCs it is graded on (see build_operation_trigger). It's an oracle/debug
-    // mode, never a valid score — flag it loudly so nobody reports it.
-    let contaminated = effective_trigger_mode == "operation";
-    if contaminated {
-        eprintln!(
-            "\n⚠️  trigger-mode=operation hands the agent the ground-truth techniques and \
-             IOCs it is graded on — this score is CONTAMINATED and must NOT be used for \
-             comparison. Use the default (alert-replay) for real scoring.\n"
-        );
-    }
-
     println!("Benchmark complete: {}", result_path.display());
     println!("  Run ID:         {run_id}");
-    if contaminated {
+    if ctx.effective_trigger_mode == "operation" {
         println!("  ⚠ SCORE INVALID: trigger=operation leaked ground truth (oracle mode).");
     }
     println!(
         "  Transcript:     {}/{}/{run_id}.jsonl  (team=blue → SQL)",
         std::env::var("ARES_SESSION_LOG_DIR")
             .unwrap_or_else(|_| "/var/log/ares/session".to_string()),
-        manifest.operation_id
+        ctx.manifest.operation_id
     );
-    println!("  Mode:           {}", p.replay_mode);
-    println!("  Operation:      {}", manifest.operation_id);
-    if let Some(qp) = quiet_period_secs {
+    println!("  Mode:           {}", ctx.p.replay_mode);
+    println!("  Operation:      {}", ctx.manifest.operation_id);
+    if let Some(qp) = result.quiet_period_secs {
         println!("  Quiet period:   {qp:.0}s");
     }
     println!("  Grade:          {}", eval_result.grade());
@@ -490,7 +668,94 @@ async fn run_replay_inner(
     println!("  Investigation:  {investigation_duration:.1}s");
     println!("  Pass:           {}", eval_result.passed());
 
+    Ok(ReplicateOutcome {
+        overall_score: eval_result.overall_score,
+        technique_coverage: eval_result.technique_coverage,
+        ioc_detection_rate: eval_result.ioc_detection_rate,
+        grade: eval_result.grade().to_string(),
+        passed: eval_result.passed(),
+        investigation_duration_secs: investigation_duration,
+        result_path,
+    })
+}
+
+/// Write the K-replicate aggregate summary JSON and print the noise-floor
+/// stats to stdout.
+#[allow(clippy::too_many_arguments)]
+fn write_and_print_replicate_summary(
+    output_dir: &str,
+    session_stem: &str,
+    operation_id: &str,
+    effective_model: &Option<String>,
+    session_started_at: chrono::DateTime<Utc>,
+    replicates: &[ReplicateSummary],
+    scores: &[f64],
+) -> Result<()> {
+    let stats = ScoreStats::from(scores);
+    let summary_path = Path::new(output_dir).join(format!("{session_stem}-summary.json"));
+    let payload = serde_json::json!({
+        "session_id": session_stem,
+        "operation_id": operation_id,
+        "model": effective_model.as_deref().unwrap_or("default"),
+        "started_at": session_started_at.to_rfc3339(),
+        "completed_at": Utc::now().to_rfc3339(),
+        "replicate_count": replicates.len(),
+        "mean": stats.mean,
+        "stddev": stats.stddev,
+        "min": stats.min,
+        "max": stats.max,
+        "scores": scores,
+        "replicates": replicates,
+    });
+    fs::write(&summary_path, serde_json::to_string_pretty(&payload)?)
+        .with_context(|| format!("write summary: {}", summary_path.display()))?;
+
+    println!("\nReplicate summary: {}", summary_path.display());
+    println!("  Replicates:     {}", replicates.len());
+    println!("  Mean score:     {:.1}%", stats.mean * 100.0);
+    println!("  Stddev:         {:.1}%", stats.stddev * 100.0);
+    println!("  Min:            {:.1}%", stats.min * 100.0);
+    println!("  Max:            {:.1}%", stats.max * 100.0);
     Ok(())
+}
+
+/// Sample mean, sample stddev (n-1 denominator), min, and max of a slice
+/// of scores. Empty input → all zeros; a single sample has undefined
+/// stddev under the n-1 rule, so we report 0.0 there.
+struct ScoreStats {
+    mean: f64,
+    stddev: f64,
+    min: f64,
+    max: f64,
+}
+
+impl ScoreStats {
+    fn from(scores: &[f64]) -> Self {
+        if scores.is_empty() {
+            return Self {
+                mean: 0.0,
+                stddev: 0.0,
+                min: 0.0,
+                max: 0.0,
+            };
+        }
+        let n = scores.len() as f64;
+        let mean = scores.iter().sum::<f64>() / n;
+        let stddev = if scores.len() < 2 {
+            0.0
+        } else {
+            let var = scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (n - 1.0);
+            var.sqrt()
+        };
+        let min = scores.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        Self {
+            mean,
+            stddev,
+            min,
+            max,
+        }
+    }
 }
 
 /// Load the enriched ground truth (attack timeline + attacker-source IPs) written
@@ -718,4 +983,58 @@ fn build_operation_trigger(
         "target_ips": target_ips,
         "target_users": target_users,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_stats_empty_input_is_zero() {
+        let s = ScoreStats::from(&[]);
+        assert_eq!(s.mean, 0.0);
+        assert_eq!(s.stddev, 0.0);
+        assert_eq!(s.min, 0.0);
+        assert_eq!(s.max, 0.0);
+    }
+
+    #[test]
+    fn score_stats_single_sample_stddev_is_zero() {
+        let s = ScoreStats::from(&[0.72]);
+        assert!((s.mean - 0.72).abs() < 1e-9);
+        assert_eq!(s.stddev, 0.0);
+        assert!((s.min - 0.72).abs() < 1e-9);
+        assert!((s.max - 0.72).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_stats_matches_sample_stddev() {
+        // Sample stddev of [0.60, 0.70, 0.80] uses n-1 = 2 in the denominator:
+        // variance = ((-.1)² + 0 + .1²) / 2 = 0.01 → stddev = 0.1.
+        let s = ScoreStats::from(&[0.60, 0.70, 0.80]);
+        assert!((s.mean - 0.70).abs() < 1e-9);
+        assert!((s.stddev - 0.1).abs() < 1e-9);
+        assert!((s.min - 0.60).abs() < 1e-9);
+        assert!((s.max - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provider_supports_seed_recognizes_openai_prefix() {
+        assert!(provider_supports_seed(Some("openai/gpt-5.2")));
+    }
+
+    #[test]
+    fn provider_supports_seed_warns_for_anthropic() {
+        assert!(!provider_supports_seed(Some("anthropic/claude-opus-4-8")));
+        assert!(!provider_supports_seed(Some("claude-cli/sonnet")));
+        assert!(!provider_supports_seed(Some("ollama/llama3")));
+    }
+
+    #[test]
+    fn provider_supports_seed_no_model_defaults_to_supported() {
+        // Unknown model resolution → assume supported to avoid crying wolf on
+        // the default blue model (OpenAI). Occasional false-negative warning
+        // is preferable to a false-positive "your seed will be dropped".
+        assert!(provider_supports_seed(None));
+    }
 }

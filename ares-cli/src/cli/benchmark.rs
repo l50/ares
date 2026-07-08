@@ -133,6 +133,25 @@ pub(crate) enum BenchmarkCommands {
         /// teardown flow).
         #[arg(long, required = true)]
         stack_ip: String,
+
+        /// LLM sampling seed for best-effort deterministic runs. Passed to
+        /// providers that honour it (OpenAI); providers that don't (Anthropic,
+        /// Ollama) log a warning and continue with default sampling. When set
+        /// without `--temperature`, temperature is forced to 0.0.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// LLM sampling temperature override for the blue investigation.
+        /// Lower values reduce run-to-run variance; 0.0 is greedy decoding.
+        /// Unset ⇒ provider default (typical: 1.0).
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Number of independent replicates to run against the same stack.
+        /// K > 1 reports mean/stddev/min/max across replicates so callers can
+        /// distinguish a real score change from LLM sampling noise. The stack
+        /// is NOT reprovisioned between replicates; each replicate gets its
+        /// own investigation `run_id`.
+        #[arg(long, default_value_t = 1)]
+        replicates: u32,
     },
 
     /// List available benchmark snapshots from S3.

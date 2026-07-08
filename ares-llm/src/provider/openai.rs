@@ -45,6 +45,10 @@ struct ApiRequest {
     tools: Vec<ApiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// OpenAI's seed parameter for best-effort deterministic sampling.
+    /// See <https://platform.openai.com/docs/api-reference/chat/create#chat-create-seed>.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -286,6 +290,7 @@ impl LlmProvider for OpenAiProvider {
             max_completion_tokens: use_max_completion_tokens.then_some(request.max_tokens),
             tools: convert_tools(&request.tools),
             temperature: request.temperature,
+            seed: request.seed,
         };
 
         info!(

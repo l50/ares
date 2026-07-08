@@ -331,6 +331,7 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
         request.tools = active_tools.clone();
         request.max_tokens = config.max_tokens;
         request.temperature = config.temperature;
+        request.seed = config.seed;
         request.enable_prompt_cache = config.enable_prompt_cache;
 
         debug!(

@@ -60,6 +60,9 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
             quiet_period,
             clock,
             stack_ip,
+            seed,
+            temperature,
+            replicates,
         } => {
             replay::run_replay(replay::ReplayParams {
                 redis_url,
@@ -73,6 +76,9 @@ pub(crate) async fn run_benchmark(cmd: BenchmarkCommands, redis_url: Option<Stri
                 quiet_period,
                 clock_mode: clock,
                 stack_ip,
+                seed,
+                temperature,
+                replicates,
             })
             .await
         }

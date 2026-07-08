@@ -108,6 +108,11 @@ impl BlueCallbackHandler {
             // Capture the blue transcript when ARES_SESSION_LOG_DIR is set;
             // `..default()` disables session logging otherwise.
             session_log: ares_llm::SessionLogConfig::from_env(),
+            // Sub-agents inherit the same deterministic-sampling knobs so all
+            // three layers (root investigation, sub-agent, tool loop) sample
+            // identically under `benchmark run --seed/--temperature`.
+            temperature: super::investigation::parse_env_temperature(),
+            seed: super::investigation::parse_env_seed(),
             ..AgentLoopConfig::default()
         };
 
