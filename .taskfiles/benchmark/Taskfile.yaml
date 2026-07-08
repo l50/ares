@@ -10,6 +10,16 @@
 # (warpgate-templates/templates/ares-replay-stack/). It comes pre-loaded with
 # Docker, all 6 replay-stack images, and the stack config at /opt/replay-stack/.
 #
+# Tuning vs. generalization split:
+#   The corpus of ops used for tuning (prompt search, config iteration, Vibe
+#   Gepa, RL rollouts) is whatever the tuning driver picks — this Taskfile does
+#   not enumerate it. `benchmark:generalize` reads a separate, hand-curated
+#   held-out set from `benchmarks/holdout.yaml` that no tuning process is
+#   allowed to touch. Overall generalization score comes from that held-out
+#   sweep only; the tuning sweep is for gradient signal, not for reporting.
+#   Keep the two lists physically separate so nobody accidentally trains on
+#   the eval corpus.
+#
 # Usage:
 #   task benchmark:replay OP_ID=op-20260706-1200 SNAPSHOT_DIR=./snapshots
 #     provision → ares benchmark run --stack-ip <ip> → teardown (deferred)
@@ -34,6 +44,10 @@
 #
 #   task benchmark:replay:teardown INSTANCE_ID=i-abc123
 #     terminates a provisioned stack
+#
+#   task benchmark:generalize [HOLDOUT=benchmarks/holdout.yaml] [OUTPUT_DIR=./reports/generalize] [FAIL_UNDER=0.0]
+#     replays every op in the held-out set, aggregates scores, writes a
+#     generalize-summary.json — continues past per-op failures
 version: "3"
 
 set: [errexit, pipefail]
@@ -366,3 +380,156 @@ tasks:
           --filters "Name=tag:ares:component,Values=benchmark-replay-stack" "Name=state,Values=available" \
           --query 'sort_by(Images, &CreationDate)[-1].[ImageId,Name,CreationDate]' \
           --output table
+
+  generalize:
+    desc: "Replay every op in the held-out set and report per-op + aggregate score (usage: task benchmark:generalize [HOLDOUT=path] [OUTPUT_DIR=./reports/generalize] [FAIL_UNDER=0.0])."
+    vars:
+      HOLDOUT: '{{.HOLDOUT | default "benchmarks/holdout.yaml"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports/generalize"}}'
+      FAIL_UNDER: '{{.FAIL_UNDER | default "0.0"}}'
+      SNAPSHOT_DIR: '{{.SNAPSHOT_DIR | default ""}}'
+      MODEL: '{{.MODEL | default ""}}'
+      MAX_STEPS: '{{.MAX_STEPS | default "50"}}'
+      CLOCK: '{{.CLOCK | default "step"}}'
+      REPLAY_MODE: '{{.REPLAY_MODE | default "timeline"}}'
+      TRIGGER_MODE: '{{.TRIGGER_MODE | default "alert-replay"}}'
+      QUIET_PERIOD: '{{.QUIET_PERIOD | default ""}}'
+    preconditions:
+      - sh: 'test -f "{{.HOLDOUT}}"'
+        msg: "held-out set not found at {{.HOLDOUT}} — see benchmarks/holdout.yaml"
+      - sh: 'command -v yq >/dev/null 2>&1'
+        msg: "yq is required to parse the held-out YAML (brew install yq)"
+      - sh: 'command -v jq >/dev/null 2>&1'
+        msg: "jq is required to read per-op benchmark result JSONs"
+    cmds:
+      - |
+        set -euo pipefail
+        mkdir -p "{{.OUTPUT_DIR}}"
+        SUMMARY="{{.OUTPUT_DIR}}/generalize-summary.json"
+
+        # Parse held-out set. Each row is <op_id>\t<attack_class>\t<description>.
+        # tsv handles descriptions with spaces cleanly; op_id and attack_class
+        # never contain whitespace so this parses without quoting hell.
+        MAPFILE=$(yq -r '.holdout[] | [.op_id, .attack_class, .description] | @tsv' "{{.HOLDOUT}}")
+        if [ -z "$MAPFILE" ]; then
+          echo -e "{{.ERROR}} {{.HOLDOUT}} has no .holdout entries" >&2
+          exit 1
+        fi
+
+        # Header. Note: tuning code MUST NOT read {{.HOLDOUT}} — see Taskfile
+        # header for the split rationale.
+        echo -e "{{.INFO}} held-out sweep: $(echo "$MAPFILE" | wc -l | tr -d ' ') op(s) from {{.HOLDOUT}}"
+
+        RESULTS_JSON="[]"
+        while IFS=$'\t' read -r OP_ID ATTACK_CLASS DESCRIPTION; do
+          [ -z "$OP_ID" ] && continue
+          OP_OUT_DIR="{{.OUTPUT_DIR}}/${OP_ID}"
+          mkdir -p "$OP_OUT_DIR"
+          echo -e "{{.INFO}} replaying $OP_ID (class=$ATTACK_CLASS) → $OP_OUT_DIR"
+
+          STATUS="ok"
+          SCORE="null"
+          ERROR=""
+
+          if task benchmark:replay \
+              OP_ID="$OP_ID" \
+              OUTPUT_DIR="$OP_OUT_DIR" \
+              {{if .SNAPSHOT_DIR}}SNAPSHOT_DIR="{{.SNAPSHOT_DIR}}"{{end}} \
+              {{if .MODEL}}MODEL="{{.MODEL}}"{{end}} \
+              MAX_STEPS="{{.MAX_STEPS}}" \
+              CLOCK="{{.CLOCK}}" \
+              REPLAY_MODE="{{.REPLAY_MODE}}" \
+              TRIGGER_MODE="{{.TRIGGER_MODE}}" \
+              {{if .QUIET_PERIOD}}QUIET_PERIOD="{{.QUIET_PERIOD}}"{{end}} \
+              > "$OP_OUT_DIR/replay.log" 2>&1; then
+            RESULT_FILE=$(ls -1t "$OP_OUT_DIR"/inv-*.json 2>/dev/null | head -1 || true)
+            if [ -n "$RESULT_FILE" ]; then
+              SCORE=$(jq -r '.evaluation.overall_score // empty' "$RESULT_FILE" 2>/dev/null || true)
+              if [ -z "$SCORE" ] || [ "$SCORE" = "null" ]; then
+                STATUS="no-score"
+                SCORE="null"
+                ERROR="benchmark result has no evaluation.overall_score"
+              fi
+            else
+              STATUS="no-result"
+              ERROR="no inv-*.json produced in $OP_OUT_DIR"
+            fi
+          else
+            STATUS="failed"
+            ERROR="task benchmark:replay exited non-zero — see $OP_OUT_DIR/replay.log"
+            echo -e "{{.WARN}} $OP_ID failed; continuing"
+          fi
+
+          RESULTS_JSON=$(jq \
+            --arg op_id "$OP_ID" \
+            --arg attack_class "$ATTACK_CLASS" \
+            --arg description "$DESCRIPTION" \
+            --arg status "$STATUS" \
+            --arg error "$ERROR" \
+            --argjson score "${SCORE:-null}" \
+            '. + [{op_id: $op_id, attack_class: $attack_class, description: $description,
+                   status: $status, score: $score,
+                   error: (if $error == "" then null else $error end)}]' \
+            <<< "$RESULTS_JSON")
+        done <<< "$MAPFILE"
+
+        # Aggregate: mean/median over successful scored ops only.
+        MEAN=$(jq -r '
+          [.[] | select(.score != null) | .score] as $s
+          | if ($s | length) == 0 then null else ($s | add) / ($s | length) end
+        ' <<< "$RESULTS_JSON")
+        MEDIAN=$(jq -r '
+          [.[] | select(.score != null) | .score] | sort as $s
+          | if ($s | length) == 0 then null
+            elif ($s | length) % 2 == 1 then $s[($s | length) / 2 | floor]
+            else (($s[($s | length) / 2 - 1] + $s[($s | length) / 2]) / 2)
+            end
+        ' <<< "$RESULTS_JSON")
+        SCORED=$(jq '[.[] | select(.score != null)] | length' <<< "$RESULTS_JSON")
+        TOTAL=$(jq 'length' <<< "$RESULTS_JSON")
+
+        jq -n \
+          --arg holdout_file "{{.HOLDOUT}}" \
+          --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --argjson mean "${MEAN:-null}" \
+          --argjson median "${MEDIAN:-null}" \
+          --argjson scored "$SCORED" \
+          --argjson total "$TOTAL" \
+          --argjson results "$RESULTS_JSON" \
+          '{holdout_file: $holdout_file, generated_at: $generated_at,
+            total_ops: $total, scored_ops: $scored,
+            mean_score: $mean, median_score: $median,
+            per_op: $results}' > "$SUMMARY"
+
+        # Human-readable table on stdout.
+        echo ""
+        printf "%-22s  %-24s  %-10s  %s\n" "op_id" "attack_class" "status" "score"
+        printf "%-22s  %-24s  %-10s  %s\n" "----------------------" "------------------------" "----------" "-----"
+        jq -r '.per_op[] | [.op_id, .attack_class, .status,
+                            (if .score == null then "-" else (.score * 100 | tostring + "%") end)]
+                          | @tsv' "$SUMMARY" \
+          | while IFS=$'\t' read -r OP CLS ST SC; do
+              printf "%-22s  %-24s  %-10s  %s\n" "$OP" "$CLS" "$ST" "$SC"
+            done
+        echo ""
+        echo -e "{{.INFO}} summary → $SUMMARY"
+        if [ "$MEAN" != "null" ] && [ -n "$MEAN" ]; then
+          MEAN_PCT=$(printf "%.1f" "$(echo "$MEAN * 100" | bc -l)")
+          echo -e "{{.INFO}} mean overall_score: ${MEAN_PCT}% (scored=$SCORED / total=$TOTAL)"
+        else
+          echo -e "{{.WARN}} no scored ops (scored=0 / total=$TOTAL) — nothing to aggregate"
+        fi
+
+        # Gate: FAIL_UNDER lets CI fail the sweep if the mean drops.
+        FU="{{.FAIL_UNDER}}"
+        if [ "$FU" != "0.0" ] && [ "$FU" != "0" ]; then
+          if [ "$MEAN" = "null" ] || [ -z "$MEAN" ]; then
+            echo -e "{{.ERROR}} FAIL_UNDER=$FU set but no mean score computed" >&2
+            exit 1
+          fi
+          FAIL=$(awk -v m="$MEAN" -v t="$FU" 'BEGIN{print (m < t) ? 1 : 0}')
+          if [ "$FAIL" = "1" ]; then
+            echo -e "{{.ERROR}} mean overall_score $MEAN < FAIL_UNDER $FU" >&2
+            exit 1
+          fi
+        fi

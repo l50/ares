@@ -49,6 +49,7 @@ __pycache__/
 # Benchmark snapshots (local Loki data) — ignore data, keep the replay-stack code
 benchmarks/*
 !benchmarks/replay-stack/
+!benchmarks/holdout.yaml
 benchmarks/replay-stack/data/
 /snapshots*/
 
