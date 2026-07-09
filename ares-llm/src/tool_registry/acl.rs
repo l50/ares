@@ -8,7 +8,7 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "bloodyad_add_group_member".into(),
-            description: "Add a user to a domain group via BloodyAD. Exploits write permissions (GenericAll, GenericWrite, WriteDacl) on the group object to add an attacker-controlled principal as a member.".into(),
+            description: "Add a user to a domain group via BloodyAD. Exploits write permissions (GenericAll, GenericWrite, WriteDacl) on the group object to add an attacker-controlled principal as a member. Auth: supply either `password` (NTLM bind) or `ticket_path` (Kerberos ccache). If both are set, `ticket_path` wins.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -30,19 +30,23 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for NTLM authentication (used only when `ticket_path` is absent)"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Takes precedence over `password`; required for cross-forest writes an NTLM bind would reject with 0x52e."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_user", "group", "domain", "username", "password", "dc_ip"]
+                "required": ["target_user", "group", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
             name: "bloodyad_set_password".into(),
-            description: "Force-set a user's password via BloodyAD. Exploits ForceChangePassword, GenericAll, or AllExtendedRights permissions on the target user object to reset their password without knowing the current one.".into(),
+            description: "Force-set a user's password via BloodyAD. Exploits ForceChangePassword, GenericAll, or AllExtendedRights permissions on the target user object to reset their password without knowing the current one. Auth: supply either `password` (NTLM bind) or `ticket_path` (Kerberos ccache). If both are set, `ticket_path` wins.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -64,19 +68,23 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for NTLM authentication (used only when `ticket_path` is absent)"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Takes precedence over `password`; required for cross-forest writes an NTLM bind would reject with 0x52e."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_user", "new_password", "domain", "username", "password", "dc_ip"]
+                "required": ["target_user", "new_password", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
             name: "bloodyad_add_genericall".into(),
-            description: "Add a GenericAll ACE to a target object via BloodyAD. Grants full control over the target by writing a new ACE into its DACL. Requires WriteDacl permission on the target.".into(),
+            description: "Add a GenericAll ACE to a target object via BloodyAD. Grants full control over the target by writing a new ACE into its DACL. Requires WriteDacl permission on the target. Auth: supply either `password` (NTLM bind) or `ticket_path` (Kerberos ccache). If both are set, `ticket_path` wins.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -98,14 +106,18 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for NTLM authentication (used only when `ticket_path` is absent)"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Takes precedence over `password`; required for cross-forest writes an NTLM bind would reject with 0x52e."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_dn", "principal", "domain", "username", "password", "dc_ip"]
+                "required": ["target_dn", "principal", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
