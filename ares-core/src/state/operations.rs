@@ -81,19 +81,17 @@ pub async fn finalize_operation(
     let meta_key = build_key(operation_id, KEY_META);
     let now = Utc::now().to_rfc3339();
 
-    // 1. Mark completed in meta HASH
+    // 1. Mark completed in meta HASH. `red_blocked_on_blue` is written by
+    //    `mark_red_completion_for_loot` at red-completion time and must NOT be
+    //    touched here — this function runs after the blue drain, and clobbering
+    //    the field to `false` would erase the "we waited for blue" signal that
+    //    downstream consumers rely on.
     let completed_json = serde_json::to_string(&true).unwrap_or_default();
     let completed_at_json = serde_json::to_string(&now).unwrap_or_default();
     conn.hset::<_, _, _, ()>(&meta_key, "completed", &completed_json)
         .await?;
     conn.hset::<_, _, _, ()>(&meta_key, "completed_at", &completed_at_json)
         .await?;
-    conn.hset::<_, _, _, ()>(
-        &meta_key,
-        "red_blocked_on_blue",
-        serde_json::to_string(&false).unwrap_or_default(),
-    )
-    .await?;
     conn.expire::<_, ()>(&meta_key, OP_RETENTION_TTL_SECS)
         .await?;
 

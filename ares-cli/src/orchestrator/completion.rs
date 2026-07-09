@@ -399,32 +399,28 @@ pub async fn wait_for_completion(
                 warn!(err = %e, "Failed to persist red completion metadata");
             }
 
-            // When blue team is enabled, auto-submit an investigation from the
-            // operation state if none have been submitted yet, then wait for all
-            // investigations to drain before signalling stop.
-            // Cap at 45 minutes to avoid hanging forever if an investigation is stuck.
+            // When blue team is enabled, submit a final investigation reflecting
+            // the completed red state, then wait for all investigations to drain
+            // before signalling stop. Cap at 45 minutes to avoid hanging forever
+            // if an investigation is stuck.
             if blue_enabled {
                 info!("Blue team enabled — waiting for investigations to finish before shutdown");
                 let mut conn = dispatcher.queue.connection();
 
-                // Check if any blue investigations already exist for this operation.
-                // If not, auto-submit one so blue always gets at least one run.
-                let op_inv_key = format!(
-                    "ares:blue:op:{}:investigations",
-                    dispatcher.config.operation_id
-                );
-                let existing: i64 = redis::cmd("SCARD")
-                    .arg(&op_inv_key)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or(0);
-                if existing == 0 {
-                    info!("No blue investigations found — auto-submitting from operation state");
-                    if let Err(e) =
-                        auto_submit_blue_investigation(state, dispatcher, &mut conn).await
-                    {
-                        warn!(err = %e, "Failed to auto-submit blue investigation");
-                    }
+                // Always submit one final "red completed" investigation from the
+                // completion loop, regardless of whether the async auto-submit
+                // ticker has already fired for this milestone. The ticker runs
+                // on a 30s interval and can miss the red-completion window; if
+                // an earlier milestone investigation already finished, the drain
+                // loop below would otherwise see active=0/queued=0 and exit
+                // before the ticker's next milestone-3 submission lands. The
+                // auto-submit helper pre-registers the investigation in the
+                // BLUE_ACTIVE_INVESTIGATIONS set before publishing, so the
+                // drain loop is guaranteed to observe active>=1 until blue
+                // finishes processing this final snapshot.
+                info!("Forcing final blue investigation on red completion");
+                if let Err(e) = auto_submit_blue_investigation(state, dispatcher, &mut conn).await {
+                    warn!(err = %e, "Failed to force-submit final blue investigation");
                 }
                 let blue_deadline = tokio::time::Instant::now() + Duration::from_secs(2700);
                 loop {
