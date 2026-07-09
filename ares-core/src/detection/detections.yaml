@@ -463,6 +463,38 @@ templates:
       - 'lsadump'
       - 'reg.query.*security'
 
+  detect_sysvol_gpp_credentials:
+    description: "Group Policy Preferences credential hunt in SYSVOL (T1552.006)"
+    aliases: [detect_gpp_password, detect_sysvol_cred_hunt]
+    mitre_id: "T1552.006"
+    tactic: credential_access
+    severity: high
+    connection_types: [smb]
+    red_team_tool: "get-gpppassword"
+    filter_stages:
+      - ['5145', '5140', '4663']
+      - ['sysvol', 'policies', 'preferences']
+      - ['groups\.xml', 'services\.xml', 'scheduledtasks\.xml', 'printers\.xml', 'drives\.xml', 'datasources\.xml', 'cpassword']
+
+  detect_pass_the_ticket:
+    description: "Pass-the-Ticket Detection (T1550.003) — forged/stolen Kerberos ticket use"
+    aliases: [detect_ptt, detect_ticket_injection]
+    mitre_id: "T1550.003"
+    tactic: lateral_movement
+    severity: critical
+    red_team_tool: "rubeus_ptt"
+    event_ids: ["4624", "4769", "4688"]
+    patterns:
+      - 'rubeus'
+      - 'ticketer'
+      - 'kerberos::ptt'
+      - 'sekurlsa::tickets'
+      - '\.kirbi'
+      - '\.ccache'
+      - 'asktgs'
+      - 'klist\.exe'
+      - 'ticketoptions.*(0x40810010|0x50800000)'
+
   detect_ntlm_relay:
     description: "NTLM Relay Attack Detection"
     mitre_id: "T1557"

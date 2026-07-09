@@ -261,7 +261,7 @@ impl RedTeamReportGenerator {
             let key = h.hash_value.trim().to_lowercase();
             symmetric_groups.entry(key).or_default().push(i);
         }
-        for (_hv, idxs) in symmetric_groups.iter() {
+        for idxs in symmetric_groups.values() {
             if idxs.len() < 2 {
                 continue;
             }
@@ -406,10 +406,6 @@ impl Default for RedTeamReportGenerator {
         Self::new().expect("Failed to initialize red team report templates")
     }
 }
-
-// ============================================================================
-// Executive summary generation
-// ============================================================================
 
 pub(crate) fn generate_executive_summary(
     state: &SharedRedTeamState,
