@@ -290,6 +290,7 @@ pub async fn wait_for_completion(
     mut shutdown_rx: watch::Receiver<bool>,
     max_runtime: Duration,
     interval: Duration,
+    blue_enabled: bool,
 ) {
     let start = tokio::time::Instant::now();
 
@@ -394,7 +395,6 @@ pub async fn wait_for_completion(
                 "Completion condition met"
             );
 
-            let blue_enabled = std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1");
             if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, blue_enabled).await {
                 warn!(err = %e, "Failed to persist red completion metadata");
             }

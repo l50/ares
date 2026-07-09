@@ -699,8 +699,19 @@ async fn run_inner() -> Result<()> {
             }
         }
     }
+    // Resolve blue-team enablement ONCE per operation so the spawner and the
+    // completion loop can't diverge. Two independent env reads at different
+    // points in the orchestrator lifetime have gone out of sync in the past —
+    // blue would spawn from mod.rs but the completion loop's own read of
+    // ARES_BLUE_ENABLED would come back empty, so it never waited for
+    // investigations to drain and blue got shot dead mid-lateral-analyst.
     #[cfg(feature = "blue")]
-    let blue_handle = if std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1") {
+    let blue_enabled = std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1");
+    #[cfg(not(feature = "blue"))]
+    let blue_enabled = false;
+
+    #[cfg(feature = "blue")]
+    let blue_handle = if blue_enabled {
         // Create a separate LLM provider for the blue team
         let blue_model_spec = std::env::var("ARES_BLUE_LLM_MODEL")
             .ok()
@@ -825,6 +836,7 @@ async fn run_inner() -> Result<()> {
                     .unwrap_or(7200),
             ),
             std::time::Duration::from_secs(10),
+            blue_enabled,
         )
         .await;
         info!("Completion monitor finished — operation complete");
