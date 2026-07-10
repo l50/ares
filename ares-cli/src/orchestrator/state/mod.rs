@@ -101,6 +101,13 @@ pub const DEDUP_MSSQL_LINK_PIVOT: &str = "mssql_link_pivot";
 /// so the next tick re-attempts up to MAX_IMPERSONATION_ATTEMPTS.
 pub const DEDUP_MSSQL_IMPERSONATION: &str = "mssql_impersonation_auto";
 
+/// Dedup for the far-host OS-cred harvest that fires after
+/// `auto_mssql_link_pivot` confirms sysadmin on a linked SQL host. Keyed
+/// per far-host IP so a single hive-dump attempt covers all the pivot
+/// probes that resolved to the same physical host (multiple source
+/// principals often all confirm sysadmin against the same linked server).
+pub const DEDUP_MSSQL_FAR_HOST_DUMP: &str = "mssql_far_host_dump";
+
 // Assist-abandoned tracking moved off the generic dedup set into a
 // timestamped HashMap on `StateInner` (`assist_abandoned_at`) so the
 // abandonment can expire. See `ASSIST_ABANDONED_TTL_SECS` in
@@ -180,6 +187,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_MSSQL_RETRY,
     DEDUP_MSSQL_LINK_PIVOT,
     DEDUP_MSSQL_IMPERSONATION,
+    DEDUP_MSSQL_FAR_HOST_DUMP,
     DEDUP_SID_HISTORY,
     DEDUP_STALL_COLD_START,
 ];

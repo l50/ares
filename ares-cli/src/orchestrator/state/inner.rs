@@ -1108,6 +1108,7 @@ mod tests {
             DEDUP_MSSQL_RETRY,
             DEDUP_MSSQL_LINK_PIVOT,
             DEDUP_MSSQL_IMPERSONATION,
+            DEDUP_MSSQL_FAR_HOST_DUMP,
             DEDUP_SID_HISTORY,
             DEDUP_STALL_COLD_START,
         ];

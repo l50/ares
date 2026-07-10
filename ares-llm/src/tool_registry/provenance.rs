@@ -223,6 +223,10 @@ mod tests {
             "smb_login_check",
             "password_spray",
             "username_as_password",
+            // The far-host hive dump internally hardcodes `reg save` +
+            // `impacket-secretsdump LOCAL` — the LLM never chooses the
+            // command, so the resulting hash rows are trusted.
+            "mssql_far_host_secretsdump",
         ] {
             assert_eq!(
                 stdout_provenance(name),

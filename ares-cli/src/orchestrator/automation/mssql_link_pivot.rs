@@ -512,6 +512,159 @@ fn resolve_linked_server_host_ip(state: &StateInner, linked_server: &str) -> Opt
         .map(|h| h.ip.clone())
 }
 
+/// Recover a host's domain from its hostname (`hostname.domain.tld` →
+/// `domain.tld`). Returns `None` if the hostname carries no dotted
+/// suffix — the caller then skips the "domain already has cred" gate.
+fn resolve_host_domain(state: &StateInner, ip: &str) -> Option<String> {
+    let ip_lc = ip.to_lowercase();
+    state
+        .hosts
+        .iter()
+        .find(|h| h.ip.to_lowercase() == ip_lc && !h.hostname.is_empty())
+        .and_then(|h| {
+            h.hostname
+                .find('.')
+                .map(|i| h.hostname[i + 1..].to_lowercase())
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// True when state already carries a plausible admin credential (password
+/// or NTLM hash) for `domain`, meaning a fresh far-host hive dump is
+/// redundant. Accepts either a stored `is_admin` credential OR an
+/// Administrator/DA-shaped NTLM hash — the same shapes
+/// `auto_local_admin_secretsdump` treats as usable.
+fn has_far_forest_admin_credential(state: &StateInner, domain: &str) -> bool {
+    let dom = domain.to_lowercase();
+    if dom.is_empty() {
+        return false;
+    }
+    let has_admin_cred = state
+        .credentials
+        .iter()
+        .any(|c| c.is_admin && !c.password.is_empty() && c.domain.to_lowercase() == dom);
+    if has_admin_cred {
+        return true;
+    }
+    state.hashes.iter().any(|h| {
+        h.hash_type.eq_ignore_ascii_case("NTLM")
+            && !h.hash_value.is_empty()
+            && h.domain.to_lowercase() == dom
+            && matches!(
+                h.username.to_lowercase().as_str(),
+                "administrator" | "krbtgt"
+            )
+    })
+}
+
+/// Dispatch `mssql_far_host_secretsdump` against the confirmed-sysadmin
+/// linked host, using the same source-side credential and impersonation
+/// context that landed the pivot probe. Deduped per `(far-host-ip)` so
+/// multiple pivot probes that all resolve to the same physical host don't
+/// each re-run the hive dump.
+///
+/// This is the primitive that converts a sysadmin foothold on a linked
+/// (typically cross-forest) SQL host into far-forest OS credentials —
+/// before this fired, `mark_host_owned` handed off to SMB-based dump
+/// automations that need an admin cred for the far domain, which by
+/// definition we don't have when the pivot lands. The hive dump rides
+/// the same xp_cmdshell-over-link path the pivot proved workable, so it
+/// doesn't need a separate SMB authentication.
+async fn dispatch_far_host_secretsdump(
+    dispatcher: &Dispatcher,
+    item: &PivotWork,
+    far_host_ip: &str,
+    far_domain: &str,
+) {
+    let dedup_key = format!("mssql_far_host_dump:{far_host_ip}");
+    {
+        let state = dispatcher.state.read().await;
+        if state.is_processed(DEDUP_MSSQL_FAR_HOST_DUMP, &dedup_key) {
+            return;
+        }
+    }
+    {
+        let mut state = dispatcher.state.write().await;
+        state.mark_processed(DEDUP_MSSQL_FAR_HOST_DUMP, dedup_key.clone());
+    }
+    let _ = dispatcher
+        .state
+        .persist_dedup(&dispatcher.queue, DEDUP_MSSQL_FAR_HOST_DUMP, &dedup_key)
+        .await;
+
+    let mut tool_args = serde_json::json!({
+        "target": item.target_ip,
+        "username": item.cred_username,
+        "linked_server": item.linked_server,
+    });
+    if !item.cred_domain.is_empty() {
+        tool_args["domain"] = serde_json::json!(item.cred_domain);
+        tool_args["windows_auth"] = serde_json::json!(true);
+    }
+    if let Some(ref impersonate_user) = item.impersonate_user {
+        tool_args["impersonate_user"] = serde_json::json!(impersonate_user);
+    }
+
+    let task_id = format!(
+        "mssql_far_host_dump_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let call = ToolCall {
+        id: format!(
+            "mssql_far_host_secretsdump_{}",
+            uuid::Uuid::new_v4().simple()
+        ),
+        name: "mssql_far_host_secretsdump".to_string(),
+        arguments: tool_args,
+    };
+
+    info!(
+        task_id = %task_id,
+        vuln_id = %item.vuln_id,
+        source = %item.target_ip,
+        linked_server = %item.linked_server,
+        far_host_ip = %far_host_ip,
+        far_domain = %far_domain,
+        "MSSQL far-host hive dump dispatched — converting SQL-sysadmin foothold into OS credentials"
+    );
+
+    match dispatcher
+        .llm_runner
+        .tool_dispatcher()
+        .dispatch_tool("credential_access", &task_id, &call)
+        .await
+    {
+        Ok(exec) => {
+            if let Some(err) = exec.error.as_deref() {
+                warn!(
+                    task_id = %task_id,
+                    far_host_ip = %far_host_ip,
+                    far_domain = %far_domain,
+                    err = %err,
+                    "MSSQL far-host hive dump returned a tool error — discoveries (if any) still processed"
+                );
+            } else {
+                info!(
+                    task_id = %task_id,
+                    far_host_ip = %far_host_ip,
+                    far_domain = %far_domain,
+                    output_len = exec.output.len(),
+                    "MSSQL far-host hive dump completed"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                err = %e,
+                task_id = %task_id,
+                far_host_ip = %far_host_ip,
+                far_domain = %far_domain,
+                "Failed to dispatch mssql_far_host_secretsdump"
+            );
+        }
+    }
+}
+
 /// Credit the scoreboard primitive for a confirmed link pivot. The
 /// deterministic probe dispatches via `dispatch_tool` (task_id
 /// `mssql_link_pivot_*`), bypassing the `exploit_*` gate in
@@ -571,9 +724,16 @@ async fn handle_probe_outcome(dispatcher: &Dispatcher, item: &PivotWork, outcome
             // subsequent SAM/LSA dump surfaces cached domain credentials that
             // `auto_credential_reuse` then uses to DCSync the foreign DC.
             if is_sa {
-                let host_ip = {
+                let (host_ip, far_domain, has_far_cred) = {
                     let state = dispatcher.state.read().await;
-                    resolve_linked_server_host_ip(&state, &item.linked_server)
+                    let ip = resolve_linked_server_host_ip(&state, &item.linked_server);
+                    let domain = ip
+                        .as_deref()
+                        .and_then(|ip| resolve_host_domain(&state, ip))
+                        .unwrap_or_default();
+                    let has_cred =
+                        !domain.is_empty() && has_far_forest_admin_credential(&state, &domain);
+                    (ip, domain, has_cred)
                 };
                 if let Some(ip) = host_ip {
                     match dispatcher
@@ -593,6 +753,24 @@ async fn handle_probe_outcome(dispatcher: &Dispatcher, item: &PivotWork, outcome
                             host_ip = %ip,
                             "Failed to mark linked-server host owned after sysadmin pivot"
                         ),
+                    }
+                    // SMB-based dump chains (lsassy / local_admin_secretsdump)
+                    // need an admin credential for the far host's domain. When
+                    // the linked host is in a foreign forest we don't have one
+                    // yet — that's the whole point of the pivot. Convert the
+                    // SQL-sysadmin foothold directly into OS credentials by
+                    // hive-dumping the linked host over xp_cmdshell. Fire once
+                    // per (op, far-host-ip); skip when we already hold an
+                    // admin cred for the far domain (dump would be redundant).
+                    if !has_far_cred {
+                        dispatch_far_host_secretsdump(dispatcher, item, &ip, &far_domain).await;
+                    } else {
+                        info!(
+                            linked_server = %item.linked_server,
+                            host_ip = %ip,
+                            far_domain = %far_domain,
+                            "Skipping far-host hive dump — admin credential for far domain already in state"
+                        );
                     }
                 } else {
                     warn!(
@@ -1241,5 +1419,179 @@ mod tests {
             classify_probe_result(&result),
             ProbeOutcome::NoEvidence(_)
         ));
+    }
+
+    // ── resolve_host_domain / has_far_forest_admin_credential ──────────
+
+    fn make_host(ip: &str, hostname: &str) -> ares_core::models::Host {
+        ares_core::models::Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        }
+    }
+
+    fn make_admin_cred(user: &str, domain: &str, password: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{user}-{domain}"),
+            username: user.into(),
+            password: password.into(),
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: true,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_ntlm_hash(user: &str, domain: &str, value: &str) -> ares_core::models::Hash {
+        ares_core::models::Hash {
+            id: format!("h-{user}-{domain}"),
+            username: user.into(),
+            hash_value: value.into(),
+            hash_type: "NTLM".into(),
+            domain: domain.into(),
+            cracked_password: None,
+            source: String::new(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        }
+    }
+
+    #[test]
+    fn resolve_host_domain_extracts_suffix_from_fqdn() {
+        let mut state = StateInner::new("op-t".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.60", "sql02.fabrikam.local"));
+        assert_eq!(
+            resolve_host_domain(&state, "192.168.58.60").as_deref(),
+            Some("fabrikam.local")
+        );
+    }
+
+    #[test]
+    fn resolve_host_domain_is_case_insensitive_on_ip() {
+        let mut state = StateInner::new("op-t".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.60", "SQL02.FABRIKAM.LOCAL"));
+        assert_eq!(
+            resolve_host_domain(&state, "192.168.58.60").as_deref(),
+            Some("fabrikam.local")
+        );
+    }
+
+    #[test]
+    fn resolve_host_domain_returns_none_when_hostname_bare_or_missing() {
+        let mut state = StateInner::new("op-t".into());
+        state.hosts.push(make_host("192.168.58.60", "sql02"));
+        state.hosts.push(make_host("192.168.58.61", ""));
+        assert_eq!(resolve_host_domain(&state, "192.168.58.60"), None);
+        assert_eq!(resolve_host_domain(&state, "192.168.58.61"), None);
+        // Unknown IP → None.
+        assert_eq!(resolve_host_domain(&state, "192.168.58.99"), None);
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_matches_plaintext_admin_cred() {
+        let mut state = StateInner::new("op-t".into());
+        state
+            .credentials
+            .push(make_admin_cred("alice", "fabrikam.local", "P@ssw0rd!"));
+        assert!(has_far_forest_admin_credential(&state, "fabrikam.local"));
+        assert!(has_far_forest_admin_credential(&state, "FABRIKAM.LOCAL"));
+        assert!(!has_far_forest_admin_credential(&state, "contoso.local"));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_matches_administrator_ntlm_hash() {
+        let mut state = StateInner::new("op-t".into());
+        state.hashes.push(make_ntlm_hash(
+            "Administrator",
+            "fabrikam.local",
+            "deadbeef",
+        ));
+        assert!(has_far_forest_admin_credential(&state, "fabrikam.local"));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_matches_krbtgt_hash() {
+        // krbtgt hash → we already own the domain (golden ticket capable),
+        // hive dump on a member server would be pure churn.
+        let mut state = StateInner::new("op-t".into());
+        state
+            .hashes
+            .push(make_ntlm_hash("krbtgt", "fabrikam.local", "deadbeef"));
+        assert!(has_far_forest_admin_credential(&state, "fabrikam.local"));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_ignores_non_admin_cred() {
+        let mut state = StateInner::new("op-t".into());
+        let mut c = make_admin_cred("alice", "fabrikam.local", "P@ssw0rd!");
+        c.is_admin = false;
+        state.credentials.push(c);
+        assert!(!has_far_forest_admin_credential(&state, "fabrikam.local"));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_ignores_empty_password_and_hash() {
+        let mut state = StateInner::new("op-t".into());
+        state
+            .credentials
+            .push(make_admin_cred("alice", "fabrikam.local", ""));
+        state
+            .hashes
+            .push(make_ntlm_hash("Administrator", "fabrikam.local", ""));
+        assert!(!has_far_forest_admin_credential(&state, "fabrikam.local"));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_ignores_non_admin_username_hash() {
+        // Non-Administrator/non-krbtgt hash isn't the "domain already
+        // owned" signal we're gating on — a random user NTLM hash
+        // typically can't DCSync the far DC.
+        let mut state = StateInner::new("op-t".into());
+        state
+            .hashes
+            .push(make_ntlm_hash("alice", "fabrikam.local", "deadbeef"));
+        assert!(!has_far_forest_admin_credential(&state, "fabrikam.local"));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_empty_domain_never_matches() {
+        let mut state = StateInner::new("op-t".into());
+        state.hashes.push(make_ntlm_hash(
+            "Administrator",
+            "fabrikam.local",
+            "deadbeef",
+        ));
+        // Empty domain arg is the "unknown-domain" signal — treat as no
+        // match so the caller falls through to dispatching the dump.
+        assert!(!has_far_forest_admin_credential(&state, ""));
+    }
+
+    #[test]
+    fn has_far_forest_admin_credential_wrong_hash_type_ignored() {
+        // AES256 kerberos key alone doesn't unlock the SMB-based
+        // secretsdump path — it needs the NT hash. Guard mirrors what
+        // `auto_local_admin_secretsdump` actually consumes.
+        let mut state = StateInner::new("op-t".into());
+        let mut h = make_ntlm_hash("Administrator", "fabrikam.local", "deadbeef");
+        h.hash_type = "AES256".into();
+        state.hashes.push(h);
+        assert!(!has_far_forest_admin_credential(&state, "fabrikam.local"));
     }
 }

