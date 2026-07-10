@@ -34,6 +34,33 @@ else
 fi
 echo ""
 
+# Duplicated in `.taskfiles/ec2/scripts/hashcat-status.sh` (used by `task
+# ec2:hashcat`). Both scripts are uploaded to SSM as inline text so they can't
+# source each other — keep the two in sync when editing.
+echo "=== Hashcat ==="
+HC_PIDS=$(pgrep -x hashcat 2>/dev/null || true)
+if [ -n "$HC_PIDS" ]; then
+	HC_COUNT=$(echo "$HC_PIDS" | wc -l | tr -d ' ')
+	echo "  Running: $HC_COUNT job(s)"
+	for pid in $HC_PIDS; do
+		LINE=$(ps -p "$pid" -o etime=,args= 2>/dev/null | head -1 | sed 's/^ *//')
+		[ -z "$LINE" ] && continue
+		ETIME=$(echo "$LINE" | awk '{print $1}')
+		ARGS=$(echo "$LINE" | cut -d' ' -f2-)
+		MODE=$(echo "$ARGS" | grep -oE -- '-m *[0-9]+' | head -1 | tr -d ' ' | sed 's/^-m//')
+		SESSION=$(echo "$ARGS" | grep -oE -- '--session[ =][^ ]+' | head -1 | sed 's/^--session[ =]//')
+		printf '    PID=%s etime=%s mode=%s session=%s\n' \
+			"$pid" "$ETIME" "${MODE:-?}" "${SESSION:-?}"
+	done
+	CRACKER_STATE=$(systemctl is-active ares@cracker.service 2>/dev/null || echo unknown)
+	echo "  ares@cracker: $CRACKER_STATE"
+else
+	echo "  idle (no hashcat processes)"
+	CRACKER_STATE=$(systemctl is-active ares@cracker.service 2>/dev/null || echo unknown)
+	echo "  ares@cracker: $CRACKER_STATE"
+fi
+echo ""
+
 echo "=== Disk ==="
 df -h / | tail -1
 echo ""

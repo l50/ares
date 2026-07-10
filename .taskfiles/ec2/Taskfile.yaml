@@ -573,6 +573,56 @@ tasks:
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
 
+  hashcat:
+    desc: "Show hashcat jobs currently running on EC2 (usage: task ec2:hashcat [EC2_NAME=ares-tools])"
+    silent: true
+    cmds:
+      - |
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" \
+          --output text | head -1)
+
+        if [ -z "$INSTANCE_ID" ]; then
+          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
+          exit 1
+        fi
+
+        PARAMS_FILE=$(mktemp)
+        trap "rm -f $PARAMS_FILE" EXIT
+        jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/hashcat-status.sh > "$PARAMS_FILE"
+
+        CMD_ID=$(aws ssm send-command \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --instance-ids "$INSTANCE_ID" \
+          --document-name "AWS-RunShellScript" \
+          --parameters "file://$PARAMS_FILE" \
+          --query "Command.CommandId" --output text)
+
+        for i in $(seq 1 15); do
+          RESULT=$(aws ssm get-command-invocation \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "Status" --output text 2>/dev/null) || true
+          case "$RESULT" in
+            Success|Failed|Cancelled|TimedOut) break ;;
+          esac
+          sleep 1
+        done
+
+        aws ssm get-command-invocation \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --command-id "$CMD_ID" \
+          --instance-id "$INSTANCE_ID" \
+          --query "StandardOutputContent" --output text
+
   logs:
     desc: "Tail ares logs on EC2 via SSM session (usage: task ec2:logs [EC2_NAME=ares-tools] [ROLE=orchestrator] [LINES=50])"
     silent: true
