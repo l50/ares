@@ -581,14 +581,14 @@ export S3_BUCKET=your-deploy-bucket
 
 EC2_NAME=kali-ares
 TARGET=dreadgoad
-BLUE_ENABLED=1
+BLUE_MODE=replay  # off | replay | live — default is replay
 
 task ec2:stop       EC2_NAME=$EC2_NAME                                 # stop workers
 task ec2:stop-op    EC2_NAME=$EC2_NAME LATEST=true                     # stop running op
 task -y ec2:deploy  EC2_NAME=$EC2_NAME                                 # cross-compile + ship binary
 task ec2:exec       EC2_NAME=$EC2_NAME CMD="redis-cli FLUSHALL"        # wipe Redis
 task ec2:start      EC2_NAME=$EC2_NAME                                 # start workers
-task -y red:ec2:multi TARGET=$TARGET EC2_NAME=$EC2_NAME BLUE_ENABLED=$BLUE_ENABLED
+task -y red:ec2:multi TARGET=$TARGET EC2_NAME=$EC2_NAME BLUE_MODE=$BLUE_MODE
 ```
 
 If the host shell raises `nofile` above ~65k (some tuned shells go to
@@ -652,7 +652,8 @@ Precedence (highest first):
 
 | Variable                        | Default                 | Description                            |
 | ------------------------------- | ----------------------- | -------------------------------------- |
-| `ARES_BLUE_ENABLED`             |                         | Set to `1` to activate blue team       |
+| `ARES_BLUE_MODE`                | `replay`                | `off` (no blue), `replay` (capture snapshot after red for offline scoring), `live` (blue investigates alongside red and red waits for the drain) |
+| `ARES_BLUE_ENABLED`             |                         | **Deprecated** — `0` maps to `off`, `1` to `replay`; emits a warning and will be removed next release |
 | `ARES_BLUE_MAX_STEPS`           | `75`                    | Max agent loop steps per investigation |
 | `ARES_REPORT_DIR`               | `$HOME/ares_reports`    | Report output directory                |
 | `GRAFANA_URL`                   | `http://localhost:3000` | Grafana instance URL                   |

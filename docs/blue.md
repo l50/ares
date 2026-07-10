@@ -806,12 +806,25 @@ ARES_REDIS_URL=redis://localhost:16379 ares blue from-operation --latest
 
 ### Running Blue Alongside Red
 
-Set `BLUE_ENABLED=1` to start blue team investigations automatically when
-a red team operation runs:
+Blue-team behaviour is controlled by `BLUE_MODE` (env var `ARES_BLUE_MODE`).
+The three modes:
+
+| Mode     | Behaviour                                                                                                              |
+| -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `off`    | No blue at all.                                                                                                        |
+| `replay` | **Default.** Red completes solo; an auto-capture backgrounder waits for Loki to flush and snapshots the op for offline blue investigation via `ares benchmark run`. Best for benchmarking blue changes without perturbing red wall-clock. |
+| `live`   | Blue orchestrator runs in-process alongside red and red's completion loop waits (up to 45 min) for blue investigations to drain. Use when you want red↔blue interaction in the same op.                                                    |
 
 ```bash
-task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local BLUE_ENABLED=1
+# Default replay mode (auto-capture after Loki flush) — no env flag needed
+task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local
+
+# In-process live blue alongside red
+task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local BLUE_MODE=live
 ```
+
+The old `BLUE_ENABLED={0,1}` flag still works (`0 → off`, `1 → replay`)
+with a deprecation warning; it will be removed next release.
 
 ### Taskfile Variables
 

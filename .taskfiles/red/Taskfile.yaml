@@ -783,7 +783,16 @@ tasks:
       EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
       AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
       AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
-      BLUE_ENABLED: '{{.BLUE_ENABLED | default "1"}}'
+      # Blue-team mode: off | replay | live. See root Taskfile.yaml comment.
+      # Default replay: red completes solo, snapshot captured after Loki flush.
+      BLUE_MODE: '{{.BLUE_MODE | default "replay"}}'
+      # Back-compat shim for BLUE_ENABLED. Empty means unset; a value overrides
+      # BLUE_MODE with a deprecation warning emitted below. Delete both this
+      # line and BLUE_MODE_EFFECTIVE next release.
+      BLUE_ENABLED: '{{.BLUE_ENABLED | default ""}}'
+      # Effective mode after applying the BLUE_ENABLED shim. Prefer BLUE_MODE;
+      # if only BLUE_ENABLED is set, translate 0 → off and 1 → replay.
+      BLUE_MODE_EFFECTIVE: '{{if eq .BLUE_ENABLED "0"}}off{{else if eq .BLUE_ENABLED "1"}}replay{{else}}{{.BLUE_MODE}}{{end}}'
       BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
       # Box-context obs endpoints — plundr defaults are reachable from
       # kali-ares (verified TCP:443 + /api/v1/labels 200). Distinct from
@@ -822,6 +831,15 @@ tasks:
       - sh: test -f .env
         msg: ".env file required for API keys"
     cmds:
+      # BLUE_ENABLED → BLUE_MODE deprecation warning. Fires only when the
+      # caller sets BLUE_ENABLED explicitly. Delete alongside BLUE_MODE_EFFECTIVE
+      # next release.
+      - cmd: |
+          if [ -n "{{.BLUE_ENABLED}}" ]; then
+            echo "WARN: BLUE_ENABLED is deprecated; use BLUE_MODE={off,replay,live}. Mapping BLUE_ENABLED={{.BLUE_ENABLED}} → BLUE_MODE={{.BLUE_MODE_EFFECTIVE}}."
+          fi
+        silent: false
+
       # Show operation details
       - cmd: |
           TARGET="{{.TARGET}}"
@@ -938,7 +956,7 @@ tasks:
               -e "s|__GRAFANA_URL__|{{.EC2_GRAFANA_URL}}|" \
               -e "s|__LOKI_URL__|{{.EC2_LOKI_URL}}|" \
               -e "s|__ARES_LLM_MODEL__|{{.MODEL}}|" \
-              -e "s|__ARES_BLUE_ENABLED__|{{.BLUE_ENABLED}}|" \
+              -e "s|__ARES_BLUE_MODE__|{{.BLUE_MODE_EFFECTIVE}}|" \
               -e "s|__ARES_BLUE_LLM_MODEL__|{{.BLUE_LLM_MODEL}}|" \
               -e "s|__ARES_DEPLOYMENT__|{{.EC2_DEPLOYMENT}}|" \
               -e "s|__OTEL_TRACES_ENDPOINT__|{{.OTEL_TRACES_ENDPOINT}}|" \
@@ -1003,6 +1021,50 @@ tasks:
           echo "  task ec2:logs EC2_NAME={{.EC2_NAME}} ROLE=orchestrator"
           echo "  task ec2:redis:forward EC2_NAME={{.EC2_NAME}}  # then:"
           echo "  ARES_REDIS_URL=redis://localhost:16379 ares ops loot --latest"
+        silent: false
+        ignore_error: true
+
+      # Auto-capture on red completion. Fires when BLUE_MODE=replay (the
+      # default) so a completed red op automatically produces a benchmark
+      # snapshot after Loki flushes to S3. Runs as a detached background
+      # bash process — the task returns immediately, capture polls for op
+      # completion and then waits ~30-60m for the Loki flush before writing.
+      # Silence with CAPTURE=false, or force on for other modes with
+      # CAPTURE=true.
+      - cmd: |
+          MODE="{{.BLUE_MODE_EFFECTIVE}}"
+          FORCE_CAPTURE="{{.CAPTURE}}"
+          case "$FORCE_CAPTURE" in
+            true|1|yes) SHOULD_CAPTURE=1 ;;
+            false|0|no) SHOULD_CAPTURE=0 ;;
+            *)
+              case "$MODE" in
+                replay) SHOULD_CAPTURE=1 ;;
+                *)      SHOULD_CAPTURE=0 ;;
+              esac ;;
+          esac
+          if [ "$SHOULD_CAPTURE" != "1" ]; then
+            exit 0
+          fi
+
+          OP_ID="{{.OPERATION_ID_COMPUTED}}"
+          CAP_LOG="{{.LOG_DIR}}/red-ec2-${OP_ID}-capture.log"
+          echo ""
+          echo "Auto-capture scheduled (mode=$MODE, force=$FORCE_CAPTURE): $CAP_LOG"
+          echo ""
+
+          # Detach the backgrounder via `bash -c '…nohup script &'`. go-task's
+          # default shell interpreter (mvdan.cc/sh) does not preserve `&`
+          # background jobs across the cmd boundary; wrapping in real bash
+          # does. The script itself lives in .taskfiles/red/scripts/ so we
+          # avoid quoting a 30-line block inline.
+          bash -c "nohup .taskfiles/red/scripts/auto-capture.sh \
+              '$OP_ID' \
+              '{{.EC2_NAME}}' \
+              '{{.AWS_PROFILE}}' \
+              '{{.AWS_REGION}}' \
+              '{{.ARES_CLI}}' \
+              </dev/null >'$CAP_LOG' 2>&1 &"
         silent: false
         ignore_error: true
 

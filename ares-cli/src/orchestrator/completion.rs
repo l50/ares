@@ -290,8 +290,12 @@ pub async fn wait_for_completion(
     mut shutdown_rx: watch::Receiver<bool>,
     max_runtime: Duration,
     interval: Duration,
-    blue_enabled: bool,
+    blue_mode: ares_core::blue_mode::BlueMode,
 ) {
+    // Only Live mode makes red wait for blue. Replay/Off skip the drain and
+    // let red release as soon as its own tasks finish, so the wall-clock
+    // budget belongs to red alone.
+    let wait_for_blue = blue_mode.is_live();
     let start = tokio::time::Instant::now();
 
     // Read stop-condition flags from config (default: both false)
@@ -395,16 +399,16 @@ pub async fn wait_for_completion(
                 "Completion condition met"
             );
 
-            if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, blue_enabled).await {
+            if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, wait_for_blue).await {
                 warn!(err = %e, "Failed to persist red completion metadata");
             }
 
-            // When blue team is enabled, submit a final investigation reflecting
-            // the completed red state, then wait for all investigations to drain
-            // before signalling stop. Cap at 45 minutes to avoid hanging forever
-            // if an investigation is stuck.
-            if blue_enabled {
-                info!("Blue team enabled — waiting for investigations to finish before shutdown");
+            // Only Live mode force-submits a final blue investigation and
+            // waits for it to drain (up to 45 min). Replay and Off skip
+            // straight to the red drain — blue either runs later against a
+            // captured snapshot or not at all.
+            if wait_for_blue {
+                info!("Blue team live — waiting for investigations to finish before shutdown");
                 let mut conn = dispatcher.queue.connection();
 
                 // Always submit one final "red completed" investigation from the

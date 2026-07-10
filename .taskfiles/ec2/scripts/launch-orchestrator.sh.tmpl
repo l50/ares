@@ -32,7 +32,7 @@ if [ -n "$_llm_model" ] && [ "$_llm_model" = "${_llm_model#__}" ]; then
 fi
 # ARES_TOOL_DISPATCH intentionally unset: tools route via NATS to ares@<role>.service
 # so hashcat/netexec spawn under the worker's 3G cgroup, not the orchestrator's.
-export ARES_BLUE_ENABLED='__ARES_BLUE_ENABLED__'
+export ARES_BLUE_MODE='__ARES_BLUE_MODE__'
 _blue_model='__ARES_BLUE_LLM_MODEL__'
 if [ -n "$_blue_model" ] && [ "$_blue_model" = "${_blue_model#__}" ]; then
   export ARES_BLUE_LLM_MODEL="$_blue_model"
@@ -78,7 +78,7 @@ exec systemd-run \
   --setenv=GRAFANA_URL \
   --setenv=LOKI_URL \
   --setenv=ARES_LLM_MODEL \
-  --setenv=ARES_BLUE_ENABLED \
+  --setenv=ARES_BLUE_MODE \
   --setenv=ARES_BLUE_LLM_MODEL \
   --setenv=ARES_DEPLOYMENT \
   --setenv=ARES_CONFIG \
