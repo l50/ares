@@ -109,6 +109,30 @@
   when: redis_install_ares_worker_unit
   become: true
 
+# ── Ares Blue team worker units ─────────────────────────────────────
+# Installed independently of the red worker fleet. A blue-only node
+# sets redis_install_ares_worker_unit=false + redis_install_ares_blue_worker_unit=true
+# to avoid dragging in the red role set.
+
+- name: Install Ares Blue worker systemd template unit
+  ansible.builtin.template:
+    src: ares-blue-worker@.service.j2
+    dest: /etc/systemd/system/ares-blue-worker@.service
+    mode: '0644'
+  become: true
+  when: redis_install_ares_blue_worker_unit
+  notify: Reload systemd
+
+- name: Enable and start Ares Blue worker instances
+  ansible.builtin.systemd:
+    name: "ares-blue-worker@{{ item }}.service"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ redis_ares_blue_worker_roles }}"
+  when: redis_install_ares_blue_worker_unit
+  become: true
+
 - name: Verify Redis is responding
   ansible.builtin.command:
     cmd: redis-cli ping

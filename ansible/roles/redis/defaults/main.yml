@@ -44,5 +44,25 @@ redis_ares_worker_roles:
   - lateral
   - coercion
 
+# Blue team worker configuration. When true, installs the
+# ares-blue-worker@.service template and enables one instance per role
+# in redis_ares_blue_worker_roles. Independent of the red worker
+# toggle so a blue-only node can run without the red role fleet.
+redis_install_ares_blue_worker_unit: false
+redis_ares_blue_worker_binary: "/usr/local/bin/ares-blue"
+
+# OTEL attrs for blue units — distinguishes them from red workers in
+# any observability that groups by attack.team.
+redis_ares_blue_otel_resource_attributes: "deployment.environment=staging,attack.team=blue"
+
+# ares-blue-worker@<role>.service instances to enable. Each blue role
+# handles a distinct investigation task class (triage, hunt, lateral
+# analysis). See ares-cli/src/worker/blue_task_loop.rs::parse_blue_role
+# for the recognised names.
+redis_ares_blue_worker_roles:
+  - triage
+  - threat_hunter
+  - lateral_analyst
+
 # Verification
 redis_verify_install: false

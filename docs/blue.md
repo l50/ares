@@ -839,6 +839,46 @@ with a deprecation warning; it will be removed next release.
 | `REPORT_DIR` | `./reports` | Report output directory |
 | `LOG_DIR` | `./logs` | Log output directory |
 
+### Blue-only deployments
+
+For nodes that only run blue investigation (the replay / scoring stack,
+a dedicated SOC-analysis box), install the `ares-blue` binary instead
+of `ares`. It exposes the same `blue`, `benchmark`, and `worker`
+subcommands but refuses every red-team subcommand and refuses to start
+a worker unless `ARES_WORKER_MODE=blue_task` is set, so a misfired
+systemd unit or an operator typo can't accidentally launch a red op
+through a blue node.
+
+Build with the default features:
+
+```bash
+cargo build --release --bin ares-blue
+```
+
+Ansible installs the blue systemd unit template
+(`ares-blue-worker@<role>.service`) via the `redis` role. Two
+variables toggle the blue fleet independently of the red one:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `redis_install_ares_blue_worker_unit` | `false` | Install and enable `ares-blue-worker@.service` |
+| `redis_ares_blue_worker_binary` | `/usr/local/bin/ares-blue` | Path to the `ares-blue` binary |
+| `redis_ares_blue_worker_roles` | `[triage, threat_hunter, lateral_analyst]` | Instance roles to enable |
+| `redis_ares_blue_otel_resource_attributes` | `attack.team=blue` | OTEL resource attrs for blue units |
+
+On a blue-only host, set
+`redis_install_ares_worker_unit: false` and
+`redis_install_ares_blue_worker_unit: true`; the red worker fleet is
+skipped entirely and only the blue units are installed. A dual-purpose
+host leaves both flags at their default settings so it runs the full
+red fleet plus a blue investigator when the operator opts in.
+
+The `worker` subcommand on `ares-blue` gates itself on
+`ARES_WORKER_MODE=blue_task` and exits with a diagnostic error if the
+mode is unset or set to a red value — the systemd unit hardcodes the
+right value so unit-file drift surfaces immediately as a start
+failure.
+
 ## Summary
 
 The **Ares Blue Agent** handles autonomous SOC investigation:

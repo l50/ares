@@ -32,13 +32,22 @@ LLM-coordinated autonomous security operations platform with two modes:
 
 ## Architecture
 
-Ares is a Rust workspace that compiles to a single `ares` binary with
-subcommands (`ares ops`, `ares orchestrator`, `ares worker`, `ares blue`,
-`ares history`, `ares config`):
+Ares is a Rust workspace that compiles to two binaries:
+
+- **`ares`** — the full red + blue + orchestrator + worker surface. All
+  subcommands (`ops`, `orchestrator`, `worker`, `blue`, `benchmark`,
+  `history`, `config`) are dispatchable through this binary.
+- **`ares-blue`** — a blue-team-only entrypoint that exposes just the
+  `blue`, `benchmark`, and `worker` (in `ARES_WORKER_MODE=blue_task`)
+  subcommands and refuses the red-team surface. Same source tree,
+  different entrypoint. Use it on blue-only deployments (the replay /
+  scoring stack, dedicated SOC-analysis nodes) where you want a
+  systemd unit and PATH surface that can't accidentally launch a red
+  op.
 
 | Crate        | Purpose                                                   |
 | ------------ | --------------------------------------------------------- |
-| `ares-cli`   | Unified binary - CLI, orchestrator, and worker            |
+| `ares-cli`   | Unified binary crate (produces `ares` and `ares-blue`)    |
 | `ares-core`  | Shared models, state management, Redis schema, telemetry  |
 | `ares-llm`   | LLM providers (Anthropic, OpenAI, Ollama) + tool registry |
 | `ares-tools` | Tool dispatch and execution framework                     |
@@ -74,7 +83,7 @@ results back. The orchestrator never executes exploitation tools directly.
 Local (this machine)              Remote (K8s or EC2)
 ────────────────────              ───────────────────
 ares --k8s / --ec2        →      ares orchestrator (investigation coordination)
-  or `task` commands              ares worker x4 (triage, threat_hunter,
+  or `task` commands              ares[-blue] worker x4 (triage, threat_hunter,
                                     lateral_analyst, escalation_triage)
                                   Redis (state store + message broker)
                                   Grafana (Loki logs + Prometheus metrics)
@@ -84,6 +93,12 @@ The blue orchestrator dispatches investigation tasks to specialized agents
 via Redis queues. Agents query Loki/Prometheus for evidence and report
 findings back. The orchestrator chains follow-up investigations based on
 discovered evidence types.
+
+Blue workers are packaged behind their own systemd template unit
+(`ares-blue-worker@<role>.service`) that runs the `ares-blue` binary
+with `ARES_WORKER_MODE=blue_task` hardcoded. See
+[Blue-only deployments](docs/blue.md#blue-only-deployments) for the
+ansible variables that install just the blue units on a node.
 
 **Agent Roles:**
 

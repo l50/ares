@@ -39,6 +39,13 @@ Redis server for Ares worker message broker
 | `redis_ares_worker_roles.4` | str | <code>privesc</code> | No description |
 | `redis_ares_worker_roles.5` | str | <code>lateral</code> | No description |
 | `redis_ares_worker_roles.6` | str | <code>coercion</code> | No description |
+| `redis_install_ares_blue_worker_unit` | bool | <code>False</code> | No description |
+| `redis_ares_blue_worker_binary` | str | <code>/usr/local/bin/ares-blue</code> | No description |
+| `redis_ares_blue_otel_resource_attributes` | str | <code>deployment.environment=staging,attack.team=blue</code> | No description |
+| `redis_ares_blue_worker_roles` | list | <code>&#91;&#93;</code> | No description |
+| `redis_ares_blue_worker_roles.0` | str | <code>triage</code> | No description |
+| `redis_ares_blue_worker_roles.1` | str | <code>threat_hunter</code> | No description |
+| `redis_ares_blue_worker_roles.2` | str | <code>lateral_analyst</code> | No description |
 | `redis_verify_install` | bool | <code>False</code> | No description |
 
 ## Tasks
@@ -59,6 +66,8 @@ Redis server for Ares worker message broker
 - **Install Ares system slice (global fleet cgroup cap)** (ansible.builtin.template) - Conditional
 - **Install Ares worker systemd template unit** (ansible.builtin.template) - Conditional
 - **Enable and start Ares worker instances** (ansible.builtin.systemd) - Conditional
+- **Install Ares Blue worker systemd template unit** (ansible.builtin.template) - Conditional
+- **Enable and start Ares Blue worker instances** (ansible.builtin.systemd) - Conditional
 - **Verify Redis is responding** (ansible.builtin.command) - Conditional
 - **Display Redis verification** (ansible.builtin.debug) - Conditional
 

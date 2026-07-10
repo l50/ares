@@ -894,6 +894,17 @@ mod tests {
 
     #[tokio::test]
     async fn try_acquire_lock_is_contested_by_different_holder() {
+        // Serialize with `try_acquire_lock_honours_takeover_env`: that
+        // test sets ARES_LOCK_TAKEOVER=1 on the process-global env,
+        // and cargo runs both in parallel by default — a leaked var
+        // flips this test into TakenOver and the assert fails. See
+        // ENV_MUTEX below. `tokio::sync::Mutex` (not `std::sync`) so
+        // clippy is happy holding the guard across an `.await`.
+        let _guard = ENV_MUTEX.lock().await;
+        // Defensively clear the env var in case a prior panic in the
+        // takeover test left it set (env manipulation is not
+        // panic-safe).
+        std::env::remove_var(LOCK_TAKEOVER_ENV);
         let q = mock_queue();
         // Plant a lock owned by a different holder.
         let mut conn = q.conn.clone();
@@ -911,12 +922,21 @@ mod tests {
         assert!(matches!(outcome, LockAcquire::Contested { .. }));
     }
 
+    /// Serialises tests that manipulate `ARES_LOCK_TAKEOVER`. cargo
+    /// runs tests concurrently within one process, and env vars are
+    /// process-global, so tests that set/unset the takeover var can
+    /// leak into tests that read it. Tokio's mutex (not `std::sync`)
+    /// so clippy is happy holding the guard across `.await` inside
+    /// `try_acquire_lock`.
+    static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn try_acquire_lock_honours_takeover_env() {
-        // NOTE: this test manipulates a process-global env var. It shares a
-        // parent block with `try_acquire_lock_reclaims_own_stale_key` in
-        // spirit but the ops are distinct so a stray leak doesn't affect
-        // the reclaim test's key.
+        // Serialize with `try_acquire_lock_is_contested_by_different_holder`
+        // — see ENV_MUTEX comment above. Without the lock, cargo's
+        // parallel test runner would let the contested test observe
+        // ARES_LOCK_TAKEOVER=1 mid-run.
+        let _guard = ENV_MUTEX.lock().await;
         let q = mock_queue();
         let mut conn = q.conn.clone();
         let key = format!("{LOCK_PREFIX}:op-takeover");
