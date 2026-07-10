@@ -69,6 +69,21 @@ impl Dispatcher {
         priority: i32,
         span: tracing::Span,
     ) -> Result<SubmissionOutcome> {
+        // Post-completion refill guard: once `wait_for_completion` decides to
+        // stop the op, drop every new automation submission. Without this,
+        // ~50 automation dispatchers keep enqueueing (post-exploit loot,
+        // additional kerberoast, cred expansion) faster than the 5-min
+        // red-drain wait can empty the queue, so drain hits its deadline
+        // still holding 60+ deferred tasks that get force-killed anyway.
+        if self.is_stop_dispatching() {
+            span.record("automation.decision", "drop_stop_requested");
+            debug!(
+                task_type,
+                target_role, "Refusing dispatch — operation stop signalled"
+            );
+            return Ok(SubmissionOutcome::Dropped);
+        }
+
         // Rate cap: if this (task_type, target, principal) pattern ended
         // with `RequestAssistance` inside the assist-abandoned TTL, refuse
         // to redispatch. The pattern is usually doomed — missing tool

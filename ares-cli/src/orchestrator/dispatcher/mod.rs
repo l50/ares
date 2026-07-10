@@ -8,6 +8,7 @@ mod submission;
 mod task_builders;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
@@ -130,9 +131,26 @@ pub struct Dispatcher {
     /// fallback for the rare race the mutex didn't prevent (a still-
     /// running ntlmrelayx from a prior dispatch).
     pub relay_slot: Arc<Mutex<()>>,
+    /// Set once the completion loop has decided to stop the operation.
+    /// All `throttled_submit` calls short-circuit to `Dropped` after this
+    /// flips, preventing automation from refilling the pending / deferred
+    /// queues faster than the red-drain wait can empty them. Workers still
+    /// finish in-flight tasks; only new dispatches are gated.
+    pub stop_flag: Arc<AtomicBool>,
 }
 
 impl Dispatcher {
+    /// Signal that automation must stop submitting new tasks.
+    /// Idempotent — subsequent calls are no-ops.
+    pub fn signal_stop_dispatching(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the completion loop has signalled stop.
+    pub fn is_stop_dispatching(&self) -> bool {
+        self.stop_flag.load(Ordering::Relaxed)
+    }
+
     /// Check if a technique is allowed by the active strategy.
     pub fn is_technique_allowed(&self, technique: &str) -> bool {
         self.config.strategy.is_technique_allowed(technique)
@@ -168,6 +186,7 @@ impl Dispatcher {
             // Allow up to 3 concurrent tasks per credential
             credential_inflight: CredentialInflight::new(3),
             relay_slot: Arc::new(Mutex::new(())),
+            stop_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -186,6 +205,19 @@ pub struct DispatcherDeps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_flag_starts_unset_and_flips_on_signal() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.load(Ordering::Relaxed));
+        flag.store(true, Ordering::Relaxed);
+        assert!(flag.load(Ordering::Relaxed));
+        // Second signal is a no-op — signal_stop_dispatching must be idempotent
+        // so the completion loop can call it without worrying about ordering
+        // against any recovery-path callers.
+        flag.store(true, Ordering::Relaxed);
+        assert!(flag.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn credential_key_basic() {

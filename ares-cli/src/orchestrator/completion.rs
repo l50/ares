@@ -399,6 +399,15 @@ pub async fn wait_for_completion(
                 "Completion condition met"
             );
 
+            // Signal automation to stop refilling the pending / deferred
+            // queues immediately, BEFORE the drain waits below. Otherwise
+            // the ~50 automation dispatchers keep enqueueing tail work
+            // (post-exploit loot, extra kerberoast, cred expansion) faster
+            // than the 300s red-drain can empty it, and the drain hits its
+            // deadline holding tasks that would have been useless anyway.
+            // In-flight work continues; only new submissions are dropped.
+            dispatcher.signal_stop_dispatching();
+
             if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, wait_for_blue).await {
                 warn!(err = %e, "Failed to persist red completion metadata");
             }
