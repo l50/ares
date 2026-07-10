@@ -146,11 +146,23 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
         "run_bloodhound" => {
             // BloodHound collection doesn't produce immediate discoveries
         }
-        "secretsdump" | "secretsdump_kerberos" | "forge_inter_realm_and_dump" => {
+        "secretsdump"
+        | "secretsdump_kerberos"
+        | "forge_inter_realm_and_dump"
+        | "mssql_far_host_secretsdump" => {
             // forge_inter_realm_and_dump runs ticketer + secretsdump in one
             // call. The orchestrator passes `target_domain` so secretsdump
             // hashes get attributed to the dumped (target/parent) realm,
             // not the forging (source/child) realm.
+            //
+            // mssql_far_host_secretsdump emits standard `impacket-secretsdump
+            // LOCAL` output (SAM/SYSTEM/SECURITY hives lifted off a linked
+            // cross-forest host over xp_cmdshell). Without this arm its
+            // harvested hashes and cached-domain creds fall through to the
+            // `_ => {}` default and never land in state — the whole point of
+            // the far-host dump. The orchestrator passes `target_domain` =
+            // far-host domain so cached/LSA domain creds attribute to the
+            // foreign realm that `auto_credential_reuse` then DCSyncs.
             let (hashes, creds) = parse_secretsdump(output, params);
             set_if_nonempty(&mut discoveries, "hashes", hashes);
             set_if_nonempty(&mut discoveries, "credentials", creds);
@@ -1014,6 +1026,25 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
         let params = json!({"domain": "contoso.local"});
         let disc = parse_tool_output("secretsdump", output, &params);
         assert!(!disc["hashes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_tool_output_mssql_far_host_secretsdump() {
+        // The far-host hive dump emits standard `impacket-secretsdump LOCAL`
+        // output. It MUST route through parse_secretsdump — otherwise every
+        // harvested hash falls through to the `_ => {}` default and the tool
+        // becomes a no-op. Local SAM rows attribute with empty domain; a
+        // cached-domain row picks up target_domain (the far realm).
+        let output = "[*] Dumping local SAM hashes (uid:rid:lmhash:nthash)\n\
+             Administrator:500:aad3b435b51404eeaad3b435b51404ee:e19ccf75ee54e06b06a5907af13cef42:::\n\
+             [*] Dumping cached domain logon information (domain/username:hash)\n\
+             FABRIKAM.LOCAL/svc_far:$DCC2$10240#svc_far#0123456789abcdef0123456789abcdef";
+        let params = json!({"target_domain": "fabrikam.local", "domain": "contoso.local"});
+        let disc = parse_tool_output("mssql_far_host_secretsdump", output, &params);
+        assert!(
+            !disc["hashes"].as_array().unwrap().is_empty(),
+            "far-host secretsdump output must yield hashes"
+        );
     }
 
     #[test]

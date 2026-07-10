@@ -604,6 +604,15 @@ async fn dispatch_far_host_secretsdump(
     if let Some(ref impersonate_user) = item.impersonate_user {
         tool_args["impersonate_user"] = serde_json::json!(impersonate_user);
     }
+    // The hives come off the FAR host, so its domain — not the source-side
+    // auth cred's domain — is the correct realm for the secretsdump parser to
+    // attribute cached-domain / LSA rows to. `parse_secretsdump` prefers
+    // `target_domain` over `domain`; without this, cached creds from the
+    // foreign forest would be tagged with the source cred's realm and
+    // `auto_credential_reuse` wouldn't line them up against the foreign DC.
+    if !far_domain.is_empty() {
+        tool_args["target_domain"] = serde_json::json!(far_domain);
+    }
 
     let task_id = format!(
         "mssql_far_host_dump_{}",
