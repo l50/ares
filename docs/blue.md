@@ -806,25 +806,12 @@ ARES_REDIS_URL=redis://localhost:16379 ares blue from-operation --latest
 
 ### Running Blue Alongside Red
 
-Blue-team behaviour is controlled by `BLUE_MODE` (env var `ARES_BLUE_MODE`).
-The three modes:
-
-| Mode     | Behaviour                                                                                                              |
-| -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `off`    | No blue at all.                                                                                                        |
-| `replay` | **Default.** Red completes solo; an auto-capture backgrounder waits for Loki to flush and snapshots the op for offline blue investigation via `ares benchmark run`. Best for benchmarking blue changes without perturbing red wall-clock. |
-| `live`   | Blue orchestrator runs in-process alongside red and red's completion loop waits (up to 45 min) for blue investigations to drain. Use when you want red↔blue interaction in the same op.                                                    |
+Set `BLUE_ENABLED=1` to start blue team investigations automatically when
+a red team operation runs:
 
 ```bash
-# Default replay mode (auto-capture after Loki flush) — no env flag needed
-task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local
-
-# In-process live blue alongside red
-task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local BLUE_MODE=live
+task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local BLUE_ENABLED=1
 ```
-
-The old `BLUE_ENABLED={0,1}` flag still works (`0 → off`, `1 → replay`)
-with a deprecation warning; it will be removed next release.
 
 ### Taskfile Variables
 
@@ -838,46 +825,6 @@ with a deprecation warning; it will be removed next release.
 | `K8S_NAMESPACE` | `attack-simulation` | K8s namespace for remote commands |
 | `REPORT_DIR` | `./reports` | Report output directory |
 | `LOG_DIR` | `./logs` | Log output directory |
-
-### Blue-only deployments
-
-For nodes that only run blue investigation (the replay / scoring stack,
-a dedicated SOC-analysis box), install the `ares-blue` binary instead
-of `ares`. It exposes the same `blue`, `benchmark`, and `worker`
-subcommands but refuses every red-team subcommand and refuses to start
-a worker unless `ARES_WORKER_MODE=blue_task` is set, so a misfired
-systemd unit or an operator typo can't accidentally launch a red op
-through a blue node.
-
-Build with the default features:
-
-```bash
-cargo build --release --bin ares-blue
-```
-
-Ansible installs the blue systemd unit template
-(`ares-blue-worker@<role>.service`) via the `redis` role. Two
-variables toggle the blue fleet independently of the red one:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `redis_install_ares_blue_worker_unit` | `false` | Install and enable `ares-blue-worker@.service` |
-| `redis_ares_blue_worker_binary` | `/usr/local/bin/ares-blue` | Path to the `ares-blue` binary |
-| `redis_ares_blue_worker_roles` | `[triage, threat_hunter, lateral_analyst]` | Instance roles to enable |
-| `redis_ares_blue_otel_resource_attributes` | `attack.team=blue` | OTEL resource attrs for blue units |
-
-On a blue-only host, set
-`redis_install_ares_worker_unit: false` and
-`redis_install_ares_blue_worker_unit: true`; the red worker fleet is
-skipped entirely and only the blue units are installed. A dual-purpose
-host leaves both flags at their default settings so it runs the full
-red fleet plus a blue investigator when the operator opts in.
-
-The `worker` subcommand on `ares-blue` gates itself on
-`ARES_WORKER_MODE=blue_task` and exits with a diagnostic error if the
-mode is unset or set to a red value — the systemd unit hardcodes the
-right value so unit-file drift surfaces immediately as a start
-failure.
 
 ## Summary
 

@@ -290,12 +290,8 @@ pub async fn wait_for_completion(
     mut shutdown_rx: watch::Receiver<bool>,
     max_runtime: Duration,
     interval: Duration,
-    blue_mode: ares_core::blue_mode::BlueMode,
+    blue_enabled: bool,
 ) {
-    // Only Live mode makes red wait for blue. Replay/Off skip the drain and
-    // let red release as soon as its own tasks finish, so the wall-clock
-    // budget belongs to red alone.
-    let wait_for_blue = blue_mode.is_live();
     let start = tokio::time::Instant::now();
 
     // Read stop-condition flags from config (default: both false)
@@ -399,41 +395,36 @@ pub async fn wait_for_completion(
                 "Completion condition met"
             );
 
-            // Signal automation to stop refilling the pending / deferred
-            // queues immediately, BEFORE the drain waits below. Otherwise
-            // the ~50 automation dispatchers keep enqueueing tail work
-            // (post-exploit loot, extra kerberoast, cred expansion) faster
-            // than the 300s red-drain can empty it, and the drain hits its
-            // deadline holding tasks that would have been useless anyway.
-            // In-flight work continues; only new submissions are dropped.
-            dispatcher.signal_stop_dispatching();
-
-            if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, wait_for_blue).await {
+            if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, blue_enabled).await {
                 warn!(err = %e, "Failed to persist red completion metadata");
             }
 
-            // Only Live mode force-submits a final blue investigation and
-            // waits for it to drain (up to 45 min). Replay and Off skip
-            // straight to the red drain — blue either runs later against a
-            // captured snapshot or not at all.
-            if wait_for_blue {
-                info!("Blue team live — waiting for investigations to finish before shutdown");
+            // When blue team is enabled, auto-submit an investigation from the
+            // operation state if none have been submitted yet, then wait for all
+            // investigations to drain before signalling stop.
+            // Cap at 45 minutes to avoid hanging forever if an investigation is stuck.
+            if blue_enabled {
+                info!("Blue team enabled — waiting for investigations to finish before shutdown");
                 let mut conn = dispatcher.queue.connection();
 
-                // Always submit one final "red completed" investigation from the
-                // completion loop, regardless of whether the async auto-submit
-                // ticker has already fired for this milestone. The ticker runs
-                // on a 30s interval and can miss the red-completion window; if
-                // an earlier milestone investigation already finished, the drain
-                // loop below would otherwise see active=0/queued=0 and exit
-                // before the ticker's next milestone-3 submission lands. The
-                // auto-submit helper pre-registers the investigation in the
-                // BLUE_ACTIVE_INVESTIGATIONS set before publishing, so the
-                // drain loop is guaranteed to observe active>=1 until blue
-                // finishes processing this final snapshot.
-                info!("Forcing final blue investigation on red completion");
-                if let Err(e) = auto_submit_blue_investigation(state, dispatcher, &mut conn).await {
-                    warn!(err = %e, "Failed to force-submit final blue investigation");
+                // Check if any blue investigations already exist for this operation.
+                // If not, auto-submit one so blue always gets at least one run.
+                let op_inv_key = format!(
+                    "ares:blue:op:{}:investigations",
+                    dispatcher.config.operation_id
+                );
+                let existing: i64 = redis::cmd("SCARD")
+                    .arg(&op_inv_key)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                if existing == 0 {
+                    info!("No blue investigations found — auto-submitting from operation state");
+                    if let Err(e) =
+                        auto_submit_blue_investigation(state, dispatcher, &mut conn).await
+                    {
+                        warn!(err = %e, "Failed to auto-submit blue investigation");
+                    }
                 }
                 let blue_deadline = tokio::time::Instant::now() + Duration::from_secs(2700);
                 loop {

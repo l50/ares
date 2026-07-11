@@ -8,17 +8,6 @@ description = "Unified binary for the Ares red team orchestration system"
 name = "ares"
 path = "src/main.rs"
 
-# Blue-only entrypoint. Same source tree as `ares` but exposes only the
-# blue-team subcommands (`blue`, `benchmark`, `worker` in blue_task
-# mode). Provides a cleaner target for the blue systemd unit and for
-# blue-only deployment images. Requires the `blue` feature — kept
-# gated so a red-only build still succeeds without opting out of the
-# default features.
-[[bin]]
-name = "ares-blue"
-path = "src/bin/ares-blue.rs"
-required-features = ["blue"]
-
 [features]
 default = ["blue"]
 blue = ["ares-core/blue", "ares-llm/blue", "ares-tools/blue"]

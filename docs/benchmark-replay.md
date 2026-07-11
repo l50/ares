@@ -58,14 +58,6 @@ ares benchmark capture op-20260706-123045 \
 task ec2:wait EC2_NAME=kali-ares OPERATION_ID=op-20260706-123045 CAPTURE=true
 ```
 
-`red:ec2:multi` now defaults to `BLUE_MODE=replay`, which spawns
-`.taskfiles/red/scripts/auto-capture.sh` as a detached backgrounder that
-polls op status, brings up an SSM Redis tunnel when the op completes,
-runs `ares benchmark capture --wait-for-flush` locally (so the operator's
-SSO credentials sign the S3 upload rather than the box's instance role),
-and tears the tunnel back down. No extra flags needed for this path;
-pass `CAPTURE=false` to opt out.
-
 Capture writes to `benchmarks/<op-id>/` by default and uploads to
 `s3://<bucket>/snapshots/<op-id>/` unless `--no-upload` is set. It also
 pre-builds Prometheus TSDB blocks at capture time so replay avoids the

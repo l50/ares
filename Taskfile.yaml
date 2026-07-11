@@ -57,7 +57,6 @@ includes:
       EC2_NAME: '{{.EC2_NAME}}'
       AWS_PROFILE: '{{.AWS_PROFILE}}'
       AWS_REGION: '{{.AWS_REGION}}'
-      BLUE_MODE: '{{.BLUE_MODE}}'
       BLUE_ENABLED: '{{.BLUE_ENABLED}}'
       BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL}}'
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
@@ -136,22 +135,10 @@ vars:
   # AWS profile/region: honor standard AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION env vars.
   AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
   AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
-  # Blue team mode: off | replay | live.
-  #   off    — no blue at all; red completes solo, no capture.
-  #   replay — red completes solo, snapshot captured after Loki flush,
-  #            blue runs later against the snapshot via `benchmark:replay:{run,loop}`.
-  #   live   — legacy joint-run; blue orchestrator spawns in-process and the
-  #            red completion loop waits up to 45m for blue to drain before
-  #            releasing. Sets `red_blocked_on_blue` if it triggers.
-  # Default replay: red gets its own budget, blue no longer regresses red
-  # wall-clock, and blue-team code changes can't break red auth paths (see
-  # dbe1a54 for the case that motivated this).
-  BLUE_MODE: '{{.BLUE_MODE | default "replay"}}'
-  # BLUE_ENABLED is deprecated; kept for one release. If BLUE_MODE is not set
-  # but BLUE_ENABLED is, red:ec2:multi maps 0 → off and 1 → replay (with a
-  # WARN in stdout). Delete both this line and the shim in .taskfiles/red/
-  # next release.
-  BLUE_ENABLED: '{{.BLUE_ENABLED | default ""}}'
+  # Blue team on by default (BLUE_ENABLED=0 to skip). The default deployment
+  # target is kali-ares on EC2, where the box can reach plundr obs directly;
+  # running with blue off there just wastes a launch.
+  BLUE_ENABLED: '{{.BLUE_ENABLED | default "1"}}'
   BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
   # Box-context observability endpoints — used when the orchestrator/workers
   # run on EC2 and need to reach Loki/Grafana themselves. GRAFANA_URL/LOKI_URL

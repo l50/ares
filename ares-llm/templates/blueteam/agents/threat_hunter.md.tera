@@ -125,29 +125,6 @@ paths blue has historically missed:
 | Kerberoasting (T1558.003) | `detect_kerberoasting` |
 | DCSync (T1003.006) | `detect_dcsync`, `detect_dcsync_replication` |
 | Golden Ticket (T1558.001) | `detect_golden_ticket` |
-| SYSVOL / GPP cred hunt (T1552.006) | `detect_sysvol_gpp_credentials` |
-| Pass-the-Ticket / forged TGT use (T1550.003) | `detect_pass_the_ticket` |
-| Pass-the-Hash (T1550.002) | `detect_pass_the_hash` |
-
-### Front-of-chain + credential-material must-runs
-
-The alert seed will usually list what red used. When it does — or when triage
-confirms a DCSync/Golden Ticket outcome — you MUST close the loop back to
-**how the attacker got in** and **how the attacker used the stolen
-credentials**. Blue historically nails the terminal state (krbtgt dump,
-inter-realm forge) and skips these two categories entirely.
-
-- **T1552 family (entry / credential exposure)** — attackers commonly bootstrap
-  from a `cpassword` value in a GPP XML file readable via `\\domain\SYSVOL`.
-  Whenever the alert lists T1552 (any subtechnique) OR the initial credential
-  is a low-privilege domain user whose provenance is unexplained, run
-  `detect_sysvol_gpp_credentials`. Also run it any time you see 5145 events
-  hitting `\SYSVOL\*\Policies\*\Preferences\*.xml`.
-- **T1550.002 / T1550.003 (credential material reuse)** — once a hash or ticket
-  is stolen, it gets reused. When the alert lists T1550.* OR a DCSync/kerberoast
-  has been confirmed, run `detect_pass_the_hash` AND `detect_pass_the_ticket`
-  as a pair. Don't stop at "krbtgt was dumped" — trace the tickets that were
-  forged with it.
 
 **If DCSync or Kerberoasting is confirmed, ALSO run the ADCS templates** — cert theft
 (ESC1 → Administrator cert → DCSync) is a common upstream path in the same window.

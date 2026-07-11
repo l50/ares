@@ -148,7 +148,6 @@ tasks:
           trap "rm -f $SRC_TAR" EXIT
           SRC_PATHS="Cargo.toml Cargo.lock Cross.toml tools.yaml ares-core/ ares-cli/ ares-llm/ ares-tools/"
           [ -d .cargo ] && SRC_PATHS="$SRC_PATHS .cargo/"
-          [ -d benchmarks/replay-stack ] && SRC_PATHS="$SRC_PATHS benchmarks/replay-stack/"
           COPYFILE_DISABLE=1 tar -czf "$SRC_TAR" \
             --exclude='target' --exclude='.git' --exclude='*.o' --exclude='*.d' --exclude='._*' \
             -C "$(pwd)" $SRC_PATHS
@@ -1069,10 +1068,6 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
       # Opt-in: auto-capture a benchmark snapshot once the op completes (WAIT=true).
       CAPTURE: '{{.CAPTURE | default "false"}}'
-      # Blue-team mode {off, replay, live}. This task is a direct-launch escape
-      # hatch (not the normal launcher), so default off. red:ec2:multi is the
-      # user-facing task and it defaults to replay.
-      BLUE_MODE: '{{.BLUE_MODE | default "off"}}'
     cmds:
       - |
         export AWS_PROFILE="{{.AWS_PROFILE}}"
@@ -1233,7 +1228,7 @@ tasks:
         {{- end}}
         export RUST_LOG=info
         export ARES_CONFIG={{.ARES_REMOTE_CONFIG}}
-        export ARES_BLUE_MODE='{{.BLUE_MODE}}'
+        export ARES_BLUE_ENABLED=1
         export ARES_DEPLOYMENT='{{.EC2_DEPLOYMENT}}'
         export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT='${OTEL_TRACES_ENDPOINT}'
         export OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'

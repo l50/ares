@@ -8,7 +8,6 @@
 //! - [`models`] — Data model structs.
 //! - [`state`] — Redis state backend with key patterns and read/write operations.
 
-pub mod blue_mode;
 pub mod config;
 #[cfg(feature = "blue")]
 pub mod correlation;

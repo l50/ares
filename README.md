@@ -32,22 +32,13 @@ LLM-coordinated autonomous security operations platform with two modes:
 
 ## Architecture
 
-Ares is a Rust workspace that compiles to two binaries:
-
-- **`ares`** — the full red + blue + orchestrator + worker surface. All
-  subcommands (`ops`, `orchestrator`, `worker`, `blue`, `benchmark`,
-  `history`, `config`) are dispatchable through this binary.
-- **`ares-blue`** — a blue-team-only entrypoint that exposes just the
-  `blue`, `benchmark`, and `worker` (in `ARES_WORKER_MODE=blue_task`)
-  subcommands and refuses the red-team surface. Same source tree,
-  different entrypoint. Use it on blue-only deployments (the replay /
-  scoring stack, dedicated SOC-analysis nodes) where you want a
-  systemd unit and PATH surface that can't accidentally launch a red
-  op.
+Ares is a Rust workspace that compiles to a single `ares` binary with
+subcommands (`ares ops`, `ares orchestrator`, `ares worker`, `ares blue`,
+`ares history`, `ares config`):
 
 | Crate        | Purpose                                                   |
 | ------------ | --------------------------------------------------------- |
-| `ares-cli`   | Unified binary crate (produces `ares` and `ares-blue`)    |
+| `ares-cli`   | Unified binary - CLI, orchestrator, and worker            |
 | `ares-core`  | Shared models, state management, Redis schema, telemetry  |
 | `ares-llm`   | LLM providers (Anthropic, OpenAI, Ollama) + tool registry |
 | `ares-tools` | Tool dispatch and execution framework                     |
@@ -83,7 +74,7 @@ results back. The orchestrator never executes exploitation tools directly.
 Local (this machine)              Remote (K8s or EC2)
 ────────────────────              ───────────────────
 ares --k8s / --ec2        →      ares orchestrator (investigation coordination)
-  or `task` commands              ares[-blue] worker x4 (triage, threat_hunter,
+  or `task` commands              ares worker x4 (triage, threat_hunter,
                                     lateral_analyst, escalation_triage)
                                   Redis (state store + message broker)
                                   Grafana (Loki logs + Prometheus metrics)
@@ -93,12 +84,6 @@ The blue orchestrator dispatches investigation tasks to specialized agents
 via Redis queues. Agents query Loki/Prometheus for evidence and report
 findings back. The orchestrator chains follow-up investigations based on
 discovered evidence types.
-
-Blue workers are packaged behind their own systemd template unit
-(`ares-blue-worker@<role>.service`) that runs the `ares-blue` binary
-with `ARES_WORKER_MODE=blue_task` hardcoded. See
-[Blue-only deployments](docs/blue.md#blue-only-deployments) for the
-ansible variables that install just the blue units on a node.
 
 **Agent Roles:**
 
@@ -596,14 +581,14 @@ export S3_BUCKET=your-deploy-bucket
 
 EC2_NAME=kali-ares
 TARGET=dreadgoad
-BLUE_MODE=replay  # off | replay | live — default is replay
+BLUE_ENABLED=1
 
 task ec2:stop       EC2_NAME=$EC2_NAME                                 # stop workers
 task ec2:stop-op    EC2_NAME=$EC2_NAME LATEST=true                     # stop running op
 task -y ec2:deploy  EC2_NAME=$EC2_NAME                                 # cross-compile + ship binary
 task ec2:exec       EC2_NAME=$EC2_NAME CMD="redis-cli FLUSHALL"        # wipe Redis
 task ec2:start      EC2_NAME=$EC2_NAME                                 # start workers
-task -y red:ec2:multi TARGET=$TARGET EC2_NAME=$EC2_NAME BLUE_MODE=$BLUE_MODE
+task -y red:ec2:multi TARGET=$TARGET EC2_NAME=$EC2_NAME BLUE_ENABLED=$BLUE_ENABLED
 ```
 
 If the host shell raises `nofile` above ~65k (some tuned shells go to
@@ -667,8 +652,7 @@ Precedence (highest first):
 
 | Variable                        | Default                 | Description                            |
 | ------------------------------- | ----------------------- | -------------------------------------- |
-| `ARES_BLUE_MODE`                | `replay`                | `off` (no blue), `replay` (capture snapshot after red for offline scoring), `live` (blue investigates alongside red and red waits for the drain) |
-| `ARES_BLUE_ENABLED`             |                         | **Deprecated** — `0` maps to `off`, `1` to `replay`; emits a warning and will be removed next release |
+| `ARES_BLUE_ENABLED`             |                         | Set to `1` to activate blue team       |
 | `ARES_BLUE_MAX_STEPS`           | `75`                    | Max agent loop steps per investigation |
 | `ARES_REPORT_DIR`               | `$HOME/ares_reports`    | Report output directory                |
 | `GRAFANA_URL`                   | `http://localhost:3000` | Grafana instance URL                   |

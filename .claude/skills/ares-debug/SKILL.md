@@ -47,8 +47,6 @@ Run Step 0, then **before drawing any conclusion** grep the tail of `orchestrato
 
 If you don't see these but the op is slow vs. baseline, escalate to Loki / Tempo for cross-tick LLM latency or tool-call stalls.
 
-**Blue-drain wait (`BLUE_MODE=live` only).** When the launcher was invoked with `BLUE_MODE=live` (opt-in — default is `replay`), the completion loop waits up to 45m for blue investigations to drain before red releases. That looks like `Waiting for blue team to finish... active_investigations=N` on repeat in the orchestrator tail, ending with either `All blue investigations finished` or `Blue team wait deadline reached (45m)`, and `red_blocked_on_blue: true` in `ares:op:<opid>:meta`. Under `BLUE_MODE=replay` or `off` (default paths) these lines and the flag never appear — if you see them, someone explicitly opted into live mode.
-
 ## What goes where
 
 | Source            | Latency  | Coverage                                        | How to query                                             |
