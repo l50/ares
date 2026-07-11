@@ -1068,6 +1068,15 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
       # Opt-in: auto-capture a benchmark snapshot once the op completes (WAIT=true).
       CAPTURE: '{{.CAPTURE | default "false"}}'
+      # Blue-team mode {off, replay, live}. This task is a direct-launch escape
+      # hatch (not the normal launcher), so default off. red:ec2:multi is the
+      # user-facing task and it defaults to replay.
+      BLUE_MODE: '{{.BLUE_MODE | default "off"}}'
+      # Per-op strategy knobs plumbed into the ARES_OPERATION_ID JSON payload.
+      # Empty means "don't override" — Strategy::resolve falls through to YAML.
+      STRATEGY: '{{.STRATEGY | default ""}}'
+      EXCLUDE_TECHNIQUES: '{{.EXCLUDE_TECHNIQUES | default ""}}'
+      CONTINUE_AFTER_DA: '{{.CONTINUE_AFTER_DA | default ""}}'
     cmds:
       - |
         export AWS_PROFILE="{{.AWS_PROFILE}}"
@@ -1086,6 +1095,28 @@ tasks:
         # Build target IPs JSON array
         TARGET_ARRAY=$(echo '{{.TARGETS}}' | tr ',' '\n' | jq -R . | jq -sc .)
 
+        # Optional per-op strategy overrides. Empty vars are omitted so the
+        # orchestrator's Strategy::resolve falls through to YAML/preset defaults.
+        EXTRA_JQ=""
+        EXTRA_ARGS=()
+        if [ -n "{{.STRATEGY}}" ]; then
+          EXTRA_JQ="$EXTRA_JQ | .strategy = \$strategy"
+          EXTRA_ARGS+=(--arg strategy "{{.STRATEGY}}")
+        fi
+        if [ -n "{{.EXCLUDE_TECHNIQUES}}" ]; then
+          EXCLUDE_ARRAY=$(echo '{{.EXCLUDE_TECHNIQUES}}' | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -sc .)
+          EXTRA_JQ="$EXTRA_JQ | .exclude_techniques = \$exclude"
+          EXTRA_ARGS+=(--argjson exclude "$EXCLUDE_ARRAY")
+        fi
+        if [ -n "{{.CONTINUE_AFTER_DA}}" ]; then
+          case "{{.CONTINUE_AFTER_DA}}" in
+            true|1|yes) CAD_BOOL=true ;;
+            *) CAD_BOOL=false ;;
+          esac
+          EXTRA_JQ="$EXTRA_JQ | .continue_after_da = \$cad"
+          EXTRA_ARGS+=(--argjson cad "$CAD_BOOL")
+        fi
+
         PAYLOAD=$(jq -c -n \
           --arg op_id "$OP_ID" \
           --arg domain "{{.DOMAIN}}" \
@@ -1093,12 +1124,13 @@ tasks:
           --arg user "{{.CRED_USER}}" \
           --arg pass "{{.CRED_PASS}}" \
           --arg cred_domain "{{.CRED_DOMAIN}}" \
-          '{
-            "operation_id": $op_id,
-            "target_domain": $domain,
-            "target_ips": $targets,
-            "initial_credential": { "username": $user, "password": $pass, "domain": $cred_domain }
-          }')
+          "${EXTRA_ARGS[@]}" \
+          "{
+            \"operation_id\": \$op_id,
+            \"target_domain\": \$domain,
+            \"target_ips\": \$targets,
+            \"initial_credential\": { \"username\": \$user, \"password\": \$pass, \"domain\": \$cred_domain }
+          } $EXTRA_JQ")
 
         # Fetch API keys from Secrets Manager
         SECRETS=$(aws secretsmanager get-secret-value \
@@ -1174,40 +1206,44 @@ tasks:
           FLUSH_CMD="redis-cli FLUSHDB; echo Redis flushed;"
         fi
 
-        # Write shared env vars for workers (EnvironmentFile in systemd template)
-        ENV_FILE_CMD="mkdir -p /etc/ares"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OPENAI_API_KEY=${OPENAI_KEY}' > /etc/ares/env"
+        # Write shared env vars for workers (EnvironmentFile in systemd template).
+        # Values are printf %q-escaped so shell metachars in secrets
+        # (parens/semicolons/dollars in RDS passwords) survive `. /etc/ares/env`.
+        # Writes go through a tmp file + mv so concurrent launches don't
+        # interleave partial content into /etc/ares/env.
+        ENV_FILE_CMD="mkdir -p /etc/ares; ENV_TMP=\$(mktemp /etc/ares/.env.XXXXXX)"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OPENAI_API_KEY=%q\n' '${OPENAI_KEY}' > \$ENV_TMP"
         if [ -n "$GRAFANA_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${GRAFANA_HOST}/${GRAFANA_PORT}' 2>/dev/null; then echo 'GRAFANA_URL=${GRAFANA_URL_VAL}' >> /etc/ares/env"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${GRAFANA_HOST}/${GRAFANA_PORT}' 2>/dev/null; then printf 'GRAFANA_URL=%q\n' '${GRAFANA_URL_VAL}' >> \$ENV_TMP"
           if [ -n "$GRAFANA_TOKEN_VAL" ]; then
-            ENV_FILE_CMD="$ENV_FILE_CMD; echo 'GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_TOKEN_VAL}' >> /etc/ares/env"
+            ENV_FILE_CMD="$ENV_FILE_CMD; printf 'GRAFANA_SERVICE_ACCOUNT_TOKEN=%q\n' '${GRAFANA_TOKEN_VAL}' >> \$ENV_TMP"
           fi
           ENV_FILE_CMD="$ENV_FILE_CMD; else echo 'SKIP: GRAFANA_URL ${GRAFANA_URL_VAL} unreachable from box' >&2; fi"
         fi
         if [ -n "$LOKI_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${LOKI_HOST}/${LOKI_PORT}' 2>/dev/null; then echo 'LOKI_URL=${LOKI_URL_VAL}' >> /etc/ares/env"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${LOKI_HOST}/${LOKI_PORT}' 2>/dev/null; then printf 'LOKI_URL=%q\n' '${LOKI_URL_VAL}' >> \$ENV_TMP"
           if [ -n "$LOKI_AUTH_TOKEN_VAL" ]; then
-            ENV_FILE_CMD="$ENV_FILE_CMD; echo 'LOKI_AUTH_TOKEN=${LOKI_AUTH_TOKEN_VAL}' >> /etc/ares/env"
+            ENV_FILE_CMD="$ENV_FILE_CMD; printf 'LOKI_AUTH_TOKEN=%q\n' '${LOKI_AUTH_TOKEN_VAL}' >> \$ENV_TMP"
           fi
           ENV_FILE_CMD="$ENV_FILE_CMD; else echo 'SKIP: LOKI_URL ${LOKI_URL_VAL} unreachable from box' >&2; fi"
         fi
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_DEPLOYMENT={{.EC2_DEPLOYMENT}}' >> /etc/ares/env"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'NATS_URL=nats://127.0.0.1:4222' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_DEPLOYMENT=%q\n' '{{.EC2_DEPLOYMENT}}' >> \$ENV_TMP"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'NATS_URL=%q\n' 'nats://127.0.0.1:4222' >> \$ENV_TMP"
         # OTEL: send traces to Alloy OTLP gateway → Tempo via HTTP/protobuf
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_TRACES_ENDPOINT}' >> /etc/ares/env"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' >> /etc/ares/env"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_RESOURCE_ATTRIBUTES=deployment.environment=staging,attack.team=red' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=%q\n' '${OTEL_TRACES_ENDPOINT}' >> \$ENV_TMP"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_EXPORTER_OTLP_PROTOCOL=%q\n' 'http/protobuf' >> \$ENV_TMP"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_RESOURCE_ATTRIBUTES=%q\n' 'deployment.environment=staging,attack.team=red' >> \$ENV_TMP"
         # JSONL session log capture (ingested into Postgres llm_messages / tool_calls).
         # Env var name per ares-llm/src/agent_loop/config.rs.
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_SESSION_LOG_DIR=/var/log/ares/session' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_SESSION_LOG_DIR=%q\n' '/var/log/ares/session' >> \$ENV_TMP"
         ENV_FILE_CMD="$ENV_FILE_CMD; mkdir -p /var/log/ares/session && chmod 0755 /var/log/ares/session"
         # ares-history Postgres — gated on box→RDS reachability (5432) so an
         # unreachable DB never wedges orchestrator startup; the projector +
         # finalizer both no-op cleanly when ARES_DATABASE_URL is absent.
         if [ -n "$ARES_DATABASE_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/{{.RDS_ENDPOINT}}/5432' 2>/dev/null; then echo 'ARES_DATABASE_URL=${ARES_DATABASE_URL_VAL}' >> /etc/ares/env; else echo 'SKIP: ARES_DATABASE_URL {{.RDS_ENDPOINT}}:5432 unreachable from box' >&2; fi"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/{{.RDS_ENDPOINT}}/5432' 2>/dev/null; then printf 'ARES_DATABASE_URL=%q\n' '${ARES_DATABASE_URL_VAL}' >> \$ENV_TMP; else echo 'SKIP: ARES_DATABASE_URL {{.RDS_ENDPOINT}}:5432 unreachable from box' >&2; fi"
         fi
-        ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 /etc/ares/env; echo Wrote /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 \$ENV_TMP; mv \$ENV_TMP /etc/ares/env; echo Wrote /etc/ares/env"
 
         LAUNCH_SCRIPT="#!/bin/bash
         set -e
