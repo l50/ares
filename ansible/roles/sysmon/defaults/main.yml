@@ -1,0 +1,16 @@
+---
+sysmon_service_name: "Sysmon64"
+sysmon_install_dir: "C:\\Windows"
+sysmon_binary_path: "C:\\Windows\\Sysmon64.exe"
+sysmon_config_path: "C:\\ProgramData\\Sysmon\\sysmonconfig.xml"
+
+sysmon_windows_temp_dir: "C:\\Windows\\Temp"
+sysmon_installer_url: "https://download.sysinternals.com/files/Sysmon.zip"
+
+# SwiftOnSecurity sysmon-config — pinned to a specific commit for reproducibility.
+# Update the SHA to roll forward.
+sysmon_config_url: "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
+
+# When true, re-apply the config on every run (Sysmon64.exe -c <config>).
+# Cheap, idempotent, and ensures drift is corrected.
+sysmon_enforce_config: true
