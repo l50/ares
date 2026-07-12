@@ -50,6 +50,10 @@ ansible-galaxy collection install git+https://github.com/dreadnode/ansible-colle
 
 ## Roles
 
+Cloud and host-monitoring roles (`aws_ssm_agent`, `aws_cloudwatch_agent`,
+`sysmon`, `alloy`) are sourced from the [`l50.bulwark`](https://github.com/l50/ansible-collection-bulwark)
+collection — see [`requirements.yml`](requirements.yml).
+
 ### Fluent Bit Setup
 
 Installs and configures **Fluent Bit** for log collection, enrichment, and
