@@ -1,8 +1,8 @@
 # Benchmark Replay — Timeline / Unfolding Spec (committed)
 
-This is the **implementation contract** for the unfolding replay. It resolves the
-open choices in `benchmark-replay-v2-plan.md` §4.4 and supersedes the "v1 frozen
-anchor" behavior. Nothing here is optional or "phase 2" — it is the target.
+This is the **implementation contract** for the unfolding replay. It supersedes
+the "v1 frozen anchor" behavior. Nothing here is optional or "phase 2" — it is
+the target.
 
 ## Intent (unchanged since 2026-07-01)
 

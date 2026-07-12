@@ -95,23 +95,19 @@ hash forges golden tickets for the entire essos forest indefinitely.
   issuance. Skip the hash retrieval, use the TGT directly via `KRB5CCNAME`.
 - **One-shot foothold** — khal.drogo's NTLM is the only credential the rest
   of the chain depends on. If `auto_shadow_credentials` produces it but the
-  orchestrator's result extractor doesn't persist it (see
-  `plan-essos-da-real-root-causes.md` Bug G), the chain has no starting
-  credential on the next tick.
+  orchestrator's result extractor doesn't persist it, the chain has no
+  starting credential on the next tick.
 
 ## Autonomous execution
 
-For the orchestrator to walk this chain unattended, the following must hold
-(tracked in `plan-essos-da-real-root-causes.md`):
+For the orchestrator to walk this chain unattended, the following must hold:
 
-- **Bug G** — `certipy shadow auto` stdout extractor wired to publish the
-  retrieved NTLM into Redis as a `Hash` row.
-- **Bug D** — `auto_golden_cert` routed to a role whose toolset contains
-  `certipy_ca`, `certipy_req`, `certipy_forge`, `certipy_auth`, and
-  `impacket-secretsdump`. The pipeline must dispatch all five steps in
-  sequence, not just forge → auth.
-- **Bug I** — producer-side dedup on the cred-gated task queue. The certipy
-  RPC calls each take 30-60s; under queue saturation they get dropped before
-  reaching a worker.
-
-Bugs A, B, C, E, F do not gate this chain.
+- `certipy shadow auto` stdout extractor wired to publish the retrieved NTLM
+  into Redis as a `Hash` row.
+- `auto_golden_cert` routed to a role whose toolset contains `certipy_ca`,
+  `certipy_req`, `certipy_forge`, `certipy_auth`, and `impacket-secretsdump`.
+  The pipeline must dispatch all five steps in sequence, not just
+  forge → auth.
+- Producer-side dedup on the cred-gated task queue. The certipy RPC calls
+  each take 30-60s; under queue saturation they get dropped before reaching
+  a worker.
