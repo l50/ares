@@ -129,6 +129,7 @@ Base requirements for Ares AI agents
 ### linux.yml
 
 
+- **Check if sudoers.d is present (sudo installed)** (ansible.builtin.stat) - Conditional
 - **Ensure sudo secure_path includes /usr/local** (ansible.builtin.copy) - Conditional
 - **Set DEBIAN_FRONTEND to noninteractive** (ansible.builtin.lineinfile) - Conditional
 - **Update apt cache** (ansible.builtin.apt) - Conditional
