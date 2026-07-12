@@ -29,12 +29,12 @@
     - role: l50.bulwark.aws_cloudwatch_agent
 
     # Ares pentesting tools
-    - role: dreadnode.nimbus_range.recon_tools
-    - role: dreadnode.nimbus_range.credential_access_tools
-    - role: dreadnode.nimbus_range.coercion_tools
-    - role: dreadnode.nimbus_range.lateral_movement_tools
-    - role: dreadnode.nimbus_range.acl_tools
-    - role: dreadnode.nimbus_range.cracking_tools
+    - role: l50.arsenal.recon_tools
+    - role: l50.arsenal.credential_access_tools
+    - role: l50.arsenal.coercion_tools
+    - role: l50.arsenal.lateral_movement_tools
+    - role: l50.arsenal.acl_tools
+    - role: l50.arsenal.cracking_tools
 
     # Install and configure Grafana Alloy for log shipping
     - name: Install and configure Grafana Alloy

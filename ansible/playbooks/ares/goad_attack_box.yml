@@ -145,37 +145,37 @@
         base_oom_tuning: true
 
     # Network reconnaissance tools (nmap, netexec, impacket, bloodhound, certipy, etc.)
-    - role: dreadnode.nimbus_range.recon_tools
+    - role: l50.arsenal.recon_tools
       vars:
         recon_tools_verify_install: true
 
     # Credential access tools (GetNPUsers, secretsdump, lsassy, sprayhound)
-    - role: dreadnode.nimbus_range.credential_access_tools
+    - role: l50.arsenal.credential_access_tools
       vars:
         credential_access_tools_verify_install: true
 
     # Network poisoning and relay tools (Responder, mitm6, Coercer, PetitPotam)
-    - role: dreadnode.nimbus_range.coercion_tools
+    - role: l50.arsenal.coercion_tools
       vars:
         coercion_tools_verify_install: true
 
     # Lateral movement tools (evil-winrm, xfreerdp, smbclient, impacket)
-    - role: dreadnode.nimbus_range.lateral_movement_tools
+    - role: l50.arsenal.lateral_movement_tools
       vars:
         lateral_movement_tools_verify_install: true
 
     # ACL exploitation tools (bloodyAD, pywhisker)
-    - role: dreadnode.nimbus_range.acl_tools
+    - role: l50.arsenal.acl_tools
       vars:
         acl_tools_verify_install: true
 
     # Password cracking tools (hashcat, john, wordlists)
-    - role: dreadnode.nimbus_range.cracking_tools
+    - role: l50.arsenal.cracking_tools
       vars:
         cracking_tools_verify_install: true
 
     # Privilege escalation tools (PrintSpoofer, noPac, PrintNightmare, etc.)
-    - role: dreadnode.nimbus_range.privesc_tools
+    - role: l50.arsenal.privesc_tools
       vars:
         privesc_tools_verify_install: true
 
