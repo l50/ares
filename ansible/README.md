@@ -18,23 +18,18 @@ graph TD
     Plugins --> P2[vnc_pw]
     Collection --> Roles[Roles]
     Roles --> R0[acl_tools *]
-    Roles --> R1[alloy]
-    Roles --> R2[aws_cloudwatch_agent]
-    Roles --> R3[aws_ssm_agent]
-    Roles --> R4[base *]
-    Roles --> R5[coercion_tools *]
-    Roles --> R6[cracking_tools *]
-    Roles --> R7[credential_access_tools *]
-    Roles --> R8[dc_audit_sacl]
-    Roles --> R9[fluent_bit]
-    Roles --> R10[lateral_movement_tools *]
-    Roles --> R11[mythic *]
-    Roles --> R12[nats]
-    Roles --> R13[privesc_tools *]
-    Roles --> R14[recon_tools *]
-    Roles --> R15[redis]
-    Roles --> R16[sysmon]
-    Roles --> R17[vector]
+    Roles --> R1[base *]
+    Roles --> R2[coercion_tools *]
+    Roles --> R3[cracking_tools *]
+    Roles --> R4[credential_access_tools *]
+    Roles --> R5[fluent_bit]
+    Roles --> R6[lateral_movement_tools *]
+    Roles --> R7[mythic *]
+    Roles --> R8[nats]
+    Roles --> R9[privesc_tools *]
+    Roles --> R10[recon_tools *]
+    Roles --> R11[redis]
+    Roles --> R12[vector]
     Collection --> Playbooks[Playbooks]
     Playbooks --> PB0[ares]
     Playbooks --> PB1[linux]
@@ -55,27 +50,9 @@ ansible-galaxy collection install git+https://github.com/dreadnode/ansible-colle
 
 ## Roles
 
-### AWS CloudWatch Agent Setup
-
-Installs and configures the **AWS CloudWatch Agent** for metrics and log
-collection on Unix-like and Windows systems.
-
-- Role docs: [`roles/aws_cloudwatch_agent/README.md`](roles/aws_cloudwatch_agent/README.md)
-
-- Collects system metrics such as CPU, disk, memory, and network.
-- Enriches metrics with AWS EC2 metadata.
-- Automatically installs, configures, and ensures the CloudWatch Agent is running.
-
-### AWS SSM Agent Setup
-
-Installs and configures the **AWS Systems Manager (SSM) Agent** for secure
-remote management and automation.
-
-- Role docs: [`roles/aws_ssm_agent/README.md`](roles/aws_ssm_agent/README.md)
-
-- Installs SSM Agent on Linux and Windows systems.
-- Configures services to automatically restart and provides monitoring scripts.
-- Ensures the SSM Agent is enabled and healthy after deployment.
+Cloud and host-monitoring roles (`aws_ssm_agent`, `aws_cloudwatch_agent`,
+`sysmon`, `alloy`) are sourced from the [`l50.bulwark`](https://github.com/l50/ansible-collection-bulwark)
+collection — see [`requirements.yml`](requirements.yml).
 
 ### Fluent Bit Setup
 
@@ -140,12 +117,6 @@ Installs and configures **privilege escalation tooling** for Ares agents.
 
 - Role docs: [`roles/privesc_tools/README.md`](roles/privesc_tools/README.md)
 
-### Grafana Alloy Setup
-
-Installs and configures **Grafana Alloy** on Windows hosts for log shipping.
-
-- Role docs: [`roles/alloy/README.md`](roles/alloy/README.md)
-
 ### Mythic Setup
 
 Installs and configures the **Mythic C2 framework** and optional agent packages.
@@ -171,8 +142,8 @@ Installs and configures the **Mythic C2 framework** and optional agent packages.
 
   roles:
     # Nimbus Range roles for Ansible system configuration and monitoring
-    - role: dreadnode.nimbus_range.aws_ssm_agent
-    - role: dreadnode.nimbus_range.aws_cloudwatch_agent
+    - role: l50.bulwark.aws_ssm_agent
+    - role: l50.bulwark.aws_cloudwatch_agent
     - role: dreadnode.nimbus_range.fluent_bit
 ```
 
@@ -192,8 +163,8 @@ Installs and configures the **Mythic C2 framework** and optional agent packages.
 
   roles:
     # Nimbus Range roles for Ansible system configuration and monitoring
-    - role: dreadnode.nimbus_range.aws_ssm_agent
-    - role: dreadnode.nimbus_range.aws_cloudwatch_agent
+    - role: l50.bulwark.aws_ssm_agent
+    - role: l50.bulwark.aws_cloudwatch_agent
     - role: dreadnode.nimbus_range.fluent_bit
 ```
 

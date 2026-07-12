@@ -11,8 +11,8 @@
     sliver_setup_systemd: true
 
   roles:
-    # Nimbus Range roles for Ansible system configuration and monitoring
-    - role: dreadnode.nimbus_range.aws_cloudwatch_agent
+    # Bulwark roles for Ansible system configuration and monitoring
+    - role: l50.bulwark.aws_cloudwatch_agent
 
     # Install and configure Grafana Alloy for log shipping
     - name: Install and configure Grafana Alloy

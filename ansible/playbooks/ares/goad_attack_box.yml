@@ -123,7 +123,7 @@
     # require the EC2 instance metadata service (cloudwatch-agent's
     # `fetch-config -m ec2` hits 169.254.169.254 and aborts the build
     # on Azure).
-    - role: dreadnode.nimbus_range.aws_ssm_agent
+    - role: l50.bulwark.aws_ssm_agent
       when: cloud_provider | default('aws') == 'aws'
       vars:
         # This is a GPU cracking box and hashcat is driven via SSM, so its
@@ -132,7 +132,7 @@
         # looks like a "GPU hang" after "Generated bitmap tables"). Uncap the
         # agent cgroup on the attack box so SSM-launched hashcat can use GPU/RAM.
         aws_ssm_agent_memory_max: "infinity"
-    - role: dreadnode.nimbus_range.aws_cloudwatch_agent
+    - role: l50.bulwark.aws_cloudwatch_agent
       when: cloud_provider | default('aws') == 'aws'
 
     # Base Ares requirements
