@@ -70,17 +70,21 @@ impl SharedState {
         // (which keep the badPwdCount climbing on shared lockout policies).
         // The state's own resolvers already filter is_principal_quarantined
         // for automation paths; this filter does the same for the LLM-facing
-        // snapshot.
+        // snapshot. Blue-revoked principals are hidden by the same channel —
+        // even more so, since a revocation is (from red's POV) permanent for
+        // the op.
         let credentials: Vec<_> = s
             .credentials
             .iter()
             .filter(|c| !s.is_principal_quarantined(&c.username, &c.domain))
+            .filter(|c| !s.is_credential_revoked(&c.username, &c.domain))
             .cloned()
             .collect();
         let hashes: Vec<_> = s
             .hashes
             .iter()
             .filter(|h| !s.is_principal_quarantined(&h.username, &h.domain))
+            .filter(|h| !s.is_credential_revoked(&h.username, &h.domain))
             .cloned()
             .collect();
 
@@ -387,6 +391,48 @@ mod tests {
         assert_eq!(snap.credentials[0].username, "live_user");
         assert_eq!(snap.hashes.len(), 1, "quarantined hash must be hidden");
         assert_eq!(snap.hashes[0].username, "live_user");
+    }
+
+    #[tokio::test]
+    async fn snapshot_hides_blue_revoked_principals() {
+        // Blue-revoked credentials must disappear from the LLM prompt on
+        // the very next task assembly — otherwise the LLM keeps trying to
+        // authenticate as a principal blue has already disabled, wasting
+        // both LLM budget and tripping the AD lockout policy on the
+        // (now-inactive) principal.
+        let state = SharedState::new("op-2".into());
+        {
+            let mut inner = state.write().await;
+            inner.credentials.push(Credential {
+                id: "c1".into(),
+                username: "svc_mssql".into(),
+                password: "p1".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.credentials.push(Credential {
+                id: "c2".into(),
+                username: "alice".into(),
+                password: "p2".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            });
+        }
+        state
+            .publish_credential_revoked("svc_mssql", "contoso.local", "STATUS_LOGON_FAILURE")
+            .await;
+
+        let snap = state.snapshot().await;
+        assert_eq!(snap.credentials.len(), 1);
+        assert_eq!(snap.credentials[0].username, "alice");
     }
 
     #[tokio::test]
