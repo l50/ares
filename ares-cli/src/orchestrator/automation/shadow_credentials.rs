@@ -45,15 +45,7 @@ pub(crate) fn select_shadow_credentials_work(state: &StateInner) -> Vec<ShadowCr
         .discovered_vulnerabilities
         .values()
         .filter_map(|vuln| {
-            // A type-level candidate, OR a `writeproperty` edge whose details
-            // prove it covers msDS-KeyCredentialLink. Bare `writeproperty` /
-            // `allextendedrights` without that proof are excluded — routing them
-            // to certipy_shadow just burns slots on INSUFF_ACCESS_RIGHTS.
-            let vt = vuln.vuln_type.to_lowercase();
-            let vt = vt.strip_prefix("acl_").unwrap_or(&vt);
-            let eligible = is_shadow_cred_candidate(&vuln.vuln_type)
-                || (vt == "writeproperty" && writeproperty_covers_keycredlink(&vuln.details));
-            if !eligible {
+            if !is_shadow_cred_candidate(&vuln.vuln_type) {
                 return None;
             }
             if let Some(tt) = vuln.details.get("target_type").and_then(|v| v.as_str()) {
@@ -235,35 +227,32 @@ fn extract_target_user(
         .map(|s| s.to_string())
 }
 
-/// msDS-KeyCredentialLink schemaIDGUID — the attribute Shadow Credentials
-/// writes. A bare `writeproperty` edge only enables shadow creds when it
-/// actually covers this attribute.
-const KEY_CREDENTIAL_LINK_GUID: &str = "5b47d60f-6090-40b2-9f37-2a4de88f3063";
-
-/// Returns `true` if `vuln_type` alone qualifies a target for shadow-credentials
-/// exploitation — i.e. it grants (or can grant itself) the msDS-KeyCredentialLink
-/// property write that certipy_shadow/pywhisker need.
+/// Returns `true` if the given vulnerability type is a candidate for shadow
+/// credentials exploitation (ACL-based write access on a user/computer that
+/// can be abused to add a msDS-KeyCredentialLink and obtain that target's
+/// NT hash via certipy auth).
 ///
-/// Eligible:
-/// - `genericall` / `genericwrite` — full control / write-all-properties; both
-///   subsume the KeyCredentialLink write.
-/// - `writedacl` / `writeowner` — let the attacker rewrite the DACL/owner to
-///   grant themselves that write.
-/// - `addkeycredentiallink` — the exact primitive: a WriteProperty scoped to
-///   msDS-KeyCredentialLink, surfaced distinctly by the ntsd parser.
-/// - `shadow_credentials` — already classified.
+/// Includes the obvious primitives (GenericAll, GenericWrite, WriteDacl,
+/// WriteOwner) plus `writeproperty` (BloodHound's targetedwrite analogue
+/// for a specific attribute write, which — when it covers all properties
+/// or msDS-KeyCredentialLink specifically — is a valid shadow-cred primitive).
 ///
-/// Deliberately NOT eligible here (this was the bug that flooded the exploit
-/// queue with INSUFF_ACCESS_RIGHTS dead-ends):
-/// - `allextendedrights` — grants control-access (extended) rights only, NOT
-///   the WriteProperty that msDS-KeyCredentialLink requires. Shadow creds via
-///   this edge deterministically fail; real abuse goes via RBCD / dacl_abuse.
-/// - `writeproperty` — ambiguous alone; only eligible when its details prove it
-///   covers msDS-KeyCredentialLink. `select_shadow_credentials_work` admits it
-///   via [`writeproperty_covers_keycredlink`].
-/// - `forcechangepassword` — password reset only; routed to bloodyad_set_password.
+/// `AllExtendedRights` is deliberately excluded. The extended-rights ACE
+/// covers *control access rights* (User-Force-Change-Password, DS-Replication-
+/// Get-Changes, etc.) but does NOT grant `WriteProperty` on any attribute —
+/// including `msDS-KeyCredentialLink`. Historically the matcher accepted it,
+/// which caused every `AllExtendedRights` edge from BloodHound to burn a
+/// shadow-cred dispatch that came back `INSUFF_ACCESS_RIGHTS 00002098` on
+/// `msDS-KeyCredentialLink`. See WAYSFUCKED op-20260624 for the trail.
+/// Those vulns are routed to `auto_dacl_abuse` instead.
 ///
-/// Accepts both bare and `acl_`-prefixed shapes.
+/// `forcechangepassword` is likewise excluded: the User-Force-Change-Password
+/// extended right grants password reset only, not the property write required
+/// for msDS-KeyCredentialLink. Those vulns are routed to `auto_dacl_abuse` →
+/// `bloodyad_set_password`.
+///
+/// All forms accept both the bare and `acl_`-prefixed shapes emitted by
+/// ldap_acl_enumeration's parser.
 pub(crate) fn is_shadow_cred_candidate(vuln_type: &str) -> bool {
     matches!(
         vuln_type.to_lowercase().as_str(),
@@ -272,36 +261,13 @@ pub(crate) fn is_shadow_cred_candidate(vuln_type: &str) -> bool {
             | "writedacl"
             | "writeowner"
             | "shadow_credentials"
-            | "addkeycredentiallink"
+            | "writeproperty"
             | "acl_genericall"
             | "acl_genericwrite"
             | "acl_writedacl"
             | "acl_writeowner"
-            | "acl_addkeycredentiallink"
+            | "acl_writeproperty"
     )
-}
-
-/// Returns `true` if a `writeproperty` edge's details prove it covers the
-/// msDS-KeyCredentialLink attribute: either an explicit `key_credential_link`
-/// marker, or an `object_type_guid` that is the KeyCredentialLink attribute or
-/// the all-properties (empty / all-zero) GUID. A bare `writeproperty` carrying
-/// no such marker is NOT a KeyCredentialLink write and must not be routed to
-/// certipy_shadow — it deterministically fails INSUFF_ACCESS_RIGHTS.
-pub(crate) fn writeproperty_covers_keycredlink(
-    details: &std::collections::HashMap<String, serde_json::Value>,
-) -> bool {
-    if details.get("key_credential_link").and_then(|v| v.as_bool()) == Some(true) {
-        return true;
-    }
-    match details.get("object_type_guid").and_then(|v| v.as_str()) {
-        Some(g) => {
-            let g = g.trim().to_lowercase();
-            g.is_empty()
-                || g == "00000000-0000-0000-0000-000000000000"
-                || g == KEY_CREDENTIAL_LINK_GUID
-        }
-        None => false,
-    }
 }
 
 #[cfg(test)]
@@ -322,52 +288,18 @@ mod tests {
         assert!(is_shadow_cred_candidate("acl_genericall"));
         assert!(is_shadow_cred_candidate("acl_genericwrite"));
         assert!(is_shadow_cred_candidate("acl_writedacl"));
-        // The distinct KeyCredentialLink-write edge is the exact primitive.
-        assert!(is_shadow_cred_candidate("addkeycredentiallink"));
-        assert!(is_shadow_cred_candidate("acl_addkeycredentiallink"));
     }
 
     #[test]
-    fn is_shadow_cred_candidate_rejects_allextendedrights_and_bare_writeproperty() {
-        // AllExtendedRights grants control-access (extended) rights only — NOT
-        // the WriteProperty msDS-KeyCredentialLink needs. Bare writeproperty is
-        // ambiguous and only admitted by select_shadow_credentials_work when its
-        // details prove KeyCredentialLink coverage. Both deterministically
-        // failed INSUFF_ACCESS_RIGHTS when (incorrectly) routed to certipy_shadow.
-        assert!(!is_shadow_cred_candidate("allextendedrights"));
-        assert!(!is_shadow_cred_candidate("AllExtendedRights"));
-        assert!(!is_shadow_cred_candidate("writeproperty"));
-        assert!(!is_shadow_cred_candidate("acl_allextendedrights"));
-        assert!(!is_shadow_cred_candidate("acl_writeproperty"));
-    }
-
-    #[test]
-    fn writeproperty_covers_keycredlink_gate() {
-        use serde_json::json;
-        // Explicit marker.
-        let mut d = HashMap::new();
-        d.insert("key_credential_link".to_string(), json!(true));
-        assert!(writeproperty_covers_keycredlink(&d));
-        // KeyCredentialLink attribute GUID.
-        let mut d = HashMap::new();
-        d.insert(
-            "object_type_guid".to_string(),
-            json!("5b47d60f-6090-40b2-9f37-2a4de88f3063"),
-        );
-        assert!(writeproperty_covers_keycredlink(&d));
-        // All-properties write (empty / all-zero GUID) covers it too.
-        let mut d = HashMap::new();
-        d.insert("object_type_guid".to_string(), json!(""));
-        assert!(writeproperty_covers_keycredlink(&d));
-        // Some other attribute GUID — NOT covered.
-        let mut d = HashMap::new();
-        d.insert(
-            "object_type_guid".to_string(),
-            json!("bf9679a8-0de6-11d0-a285-00aa003049e2"),
-        );
-        assert!(!writeproperty_covers_keycredlink(&d));
-        // No marker at all — conservative reject (the LLM-emitted-flood case).
-        assert!(!writeproperty_covers_keycredlink(&HashMap::new()));
+    fn is_shadow_cred_candidate_accepts_writeproperty() {
+        // WriteProperty (unrestricted) covers all properties including
+        // msDS-KeyCredentialLink, so it remains a valid shadow-cred
+        // primitive. When BloodHound reports a *property-scoped* WriteProperty
+        // that doesn't touch KeyCredentialLink, the pre-flight result-inspection
+        // path in result_processing bumps it to abandoned after one failure.
+        assert!(is_shadow_cred_candidate("writeproperty"));
+        assert!(is_shadow_cred_candidate("acl_writeproperty"));
+        assert!(is_shadow_cred_candidate("acl_writeowner"));
     }
 
     #[test]
@@ -384,6 +316,13 @@ mod tests {
         assert!(!is_shadow_cred_candidate("forcechangepassword"));
         assert!(!is_shadow_cred_candidate("ForceChangePassword"));
         assert!(!is_shadow_cred_candidate("acl_forcechangepassword"));
+        // AllExtendedRights grants extended (control-access) rights, NOT
+        // property writes on msDS-KeyCredentialLink. See WAYSFUCKED
+        // op-20260624 for the trail of INSUFF_ACCESS_RIGHTS failures this
+        // used to produce. Routed to auto_dacl_abuse instead.
+        assert!(!is_shadow_cred_candidate("allextendedrights"));
+        assert!(!is_shadow_cred_candidate("AllExtendedRights"));
+        assert!(!is_shadow_cred_candidate("acl_allextendedrights"));
     }
 
     #[test]

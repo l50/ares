@@ -8,7 +8,7 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "bloodyad_add_group_member".into(),
-            description: "Add a user to a domain group via BloodyAD. Exploits write permissions (GenericAll, GenericWrite, WriteDacl) on the group object to add an attacker-controlled principal as a member.".into(),
+            description: "Add a user to a domain group via BloodyAD. Exploits write permissions (GenericAll, GenericWrite, WriteDacl) on the group object to add an attacker-controlled principal as a member. Auth: supply either `password` (NTLM bind) or `ticket_path` (Kerberos ccache). If both are set, `ticket_path` wins.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -30,19 +30,23 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for NTLM authentication (used only when `ticket_path` is absent)"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Takes precedence over `password`; required for cross-forest writes an NTLM bind would reject with 0x52e."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_user", "group", "domain", "username", "password", "dc_ip"]
+                "required": ["target_user", "group", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
             name: "bloodyad_set_password".into(),
-            description: "Force-set a user's password via BloodyAD. Exploits ForceChangePassword, GenericAll, or AllExtendedRights permissions on the target user object to reset their password without knowing the current one.".into(),
+            description: "Force-set a user's password via BloodyAD. Exploits ForceChangePassword, GenericAll, or AllExtendedRights permissions on the target user object to reset their password without knowing the current one. Auth: supply either `password` (NTLM bind) or `ticket_path` (Kerberos ccache). If both are set, `ticket_path` wins.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -64,59 +68,23 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for NTLM authentication (used only when `ticket_path` is absent)"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Takes precedence over `password`; required for cross-forest writes an NTLM bind would reject with 0x52e."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_user", "new_password", "domain", "username", "password", "dc_ip"]
-            }),
-        },
-        ToolDefinition {
-            name: "samr_change_password".into(),
-            description: "Force-set a user's password via impacket changepasswd.py over SAMR/RPC (the `User-Force-Change-Password` extended right delivered through `SamrSetInformationUser2` instead of an LDAP `unicodePwd` modify). USE THIS AS A FALLBACK when `bloodyad_set_password` fails with errors like `unicodePwd modify rejected`, `LDAP server is unwilling to perform`, `confidentiality required`, or any LDAP signing / channel-binding / LDAPS-required complaint — those policies block bloodyAD's LDAP write path but do not block SAMR over RPC. Exploits the same ForceChangePassword, GenericAll, or AllExtendedRights ACE; only the wire protocol changes.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "target_user": {
-                        "type": "string",
-                        "description": "SAMAccountName of the user whose password will be reset"
-                    },
-                    "new_password": {
-                        "type": "string",
-                        "description": "New password to set on the target account"
-                    },
-                    "domain": {
-                        "type": "string",
-                        "description": "Target domain FQDN"
-                    },
-                    "username": {
-                        "type": "string",
-                        "description": "Username for authentication (principal with password reset rights — passed to changepasswd.py as `-altuser`)"
-                    },
-                    "password": {
-                        "type": "string",
-                        "description": "Password for authentication (passed as `-altpass`)"
-                    },
-                    "dc_ip": {
-                        "type": "string",
-                        "description": "Domain controller IP address"
-                    },
-                    "protocol": {
-                        "type": "string",
-                        "enum": ["rpc-samr", "smb", "kpasswd"],
-                        "description": "Wire protocol for the password change (default: rpc-samr). Use `kpasswd` only when targeting the Kerberos password-change service directly.",
-                        "default": "rpc-samr"
-                    }
-                },
-                "required": ["target_user", "new_password", "domain", "username", "password", "dc_ip"]
+                "required": ["target_user", "new_password", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
             name: "bloodyad_add_genericall".into(),
-            description: "Add a GenericAll ACE to a target object via BloodyAD. Grants full control over the target by writing a new ACE into its DACL. Requires WriteDacl permission on the target.".into(),
+            description: "Add a GenericAll ACE to a target object via BloodyAD. Grants full control over the target by writing a new ACE into its DACL. Requires WriteDacl permission on the target. Auth: supply either `password` (NTLM bind) or `ticket_path` (Kerberos ccache). If both are set, `ticket_path` wins.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -138,14 +106,18 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for NTLM authentication (used only when `ticket_path` is absent)"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Takes precedence over `password`; required for cross-forest writes an NTLM bind would reject with 0x52e."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_dn", "principal", "domain", "username", "password", "dc_ip"]
+                "required": ["target_dn", "principal", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
@@ -263,7 +235,7 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pywhisker".into(),
-            description: "Manage msDS-KeyCredentialLink attribute for Shadow Credentials attack. Adds, removes, or lists Key Credential entries on a target object. When adding, generates a PFX certificate that can be used with PKINIT to obtain a TGT for the target principal.".into(),
+            description: "Manage msDS-KeyCredentialLink attribute for Shadow Credentials attack. Adds, removes, or lists Key Credential entries on a target object. When adding, generates a PFX certificate that can be used with PKINIT to obtain a TGT for the target principal. Auth precedence: ticket_path > hash > password.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -281,7 +253,15 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for authentication (used only when no ticket_path or hash is supplied)"
+                    },
+                    "hash": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash (LM:NT or bare NT). Takes precedence over password."
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Highest auth precedence; sets KRB5CCNAME and invokes pywhisker with -k --no-pass."
                     },
                     "dc_ip": {
                         "type": "string",
@@ -294,12 +274,12 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                         "default": "add"
                     }
                 },
-                "required": ["target_samaccountname", "domain", "username", "password", "dc_ip"]
+                "required": ["target_samaccountname", "domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {
             name: "targeted_kerberoast".into(),
-            description: "Set a Service Principal Name (SPN) on a target account and then Kerberoast it. Exploits GenericAll or GenericWrite permissions to add an SPN to an account that lacks one, then requests a TGS ticket whose hash can be cracked offline to recover the account's password.".into(),
+            description: "Set a Service Principal Name (SPN) on a target account and then Kerberoast it. Exploits GenericAll or GenericWrite permissions to add an SPN to an account that lacks one, then requests a TGS ticket whose hash can be cracked offline to recover the account's password. Auth precedence: ticket_path > hash > password.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -317,14 +297,22 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for authentication (used only when no ticket_path or hash is supplied)"
+                    },
+                    "hash": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash (LM:NT or bare NT). Takes precedence over password."
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a Kerberos ccache file. Highest auth precedence; sets KRB5CCNAME and invokes the tool with -k -no-pass."
                     },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"
                     }
                 },
-                "required": ["target_user", "domain", "username", "password", "dc_ip"]
+                "required": ["target_user", "domain", "username", "dc_ip"]
             }),
         },
         // NOTE: sharpgpoabuse removed — SharpGPOAbuse.exe not in ACL container.

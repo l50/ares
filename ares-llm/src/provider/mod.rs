@@ -1,9 +1,10 @@
 //! Model-agnostic LLM provider trait and shared types.
 //!
 //! Providers implement `LlmProvider` to support different LLM backends
-//! (Anthropic, OpenAI, Ollama) through a unified interface.
+//! (Anthropic, Claude Code CLI, OpenAI, Ollama) through a unified interface.
 
 pub mod anthropic;
+pub mod claude_cli;
 pub mod ollama;
 pub mod openai;
 
@@ -212,6 +213,10 @@ pub struct LlmRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// Optional sampling seed. Providers that support seeded sampling
+    /// (currently OpenAI) forward it; others ignore it. Set alongside a
+    /// `temperature` of 0.0 for the tightest determinism the provider offers.
+    pub seed: Option<u64>,
     /// Hint to providers that support prompt caching (Anthropic) to attach
     /// a cache breakpoint to the stable prefix (system + tools). Other
     /// providers ignore this flag.
@@ -227,6 +232,7 @@ impl LlmRequest {
             tools: Vec::new(),
             max_tokens: 4096,
             temperature: None,
+            seed: None,
             enable_prompt_cache: false,
         }
     }
@@ -255,13 +261,14 @@ pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Parse a model string like "anthropic/claude-sonnet-4-20250514" and create
+/// Parse a model string like "anthropic/claude-sonnet-4-6" and create
 /// the appropriate provider + extracted model name.
 ///
 /// Supported prefixes:
 /// - `anthropic/` → AnthropicProvider (reads `ANTHROPIC_API_KEY`)
-/// - `openai/` → OpenAiProvider (reads `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`
-///   to target any OpenAI-compatible endpoint, e.g. Gemini's `/v1beta/openai` API)
+/// - `claude-cli/` → ClaudeCliProvider (shells out to local `claude -p`; draws
+///   from the operator's Claude Code subscription, no API key needed)
+/// - `openai/` → OpenAiProvider (reads `OPENAI_API_KEY`)
 /// - `ollama/` → OllamaProvider (reads `OLLAMA_BASE_URL`, default `http://localhost:11434`)
 ///
 /// If no prefix, defaults to Anthropic.
@@ -271,13 +278,13 @@ pub fn create_provider(model: &str) -> anyhow::Result<(Box<dyn LlmProvider>, Str
             .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
         let provider = anthropic::AnthropicProvider::new(api_key);
         Ok((Box::new(provider), model_name.to_string()))
+    } else if let Some(model_name) = model.strip_prefix("claude-cli/") {
+        let provider = claude_cli::ClaudeCliProvider::new();
+        Ok((Box::new(provider), model_name.to_string()))
     } else if let Some(model_name) = model.strip_prefix("openai/") {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))?;
-        // Optional override so `openai/<model>` can target any OpenAI-compatible
-        // endpoint (e.g. Gemini's `/v1beta/openai/chat/completions`).
-        let base_url = std::env::var("OPENAI_BASE_URL").ok();
-        let provider = openai::OpenAiProvider::new(api_key, base_url);
+        let provider = openai::OpenAiProvider::new(api_key, None);
         Ok((Box::new(provider), model_name.to_string()))
     } else if let Some(model_name) = model.strip_prefix("ollama/") {
         let base_url = std::env::var("OLLAMA_BASE_URL")
@@ -335,10 +342,21 @@ mod tests {
 
     #[test]
     fn llm_request_builder() {
-        let req = LlmRequest::new("claude-sonnet-4-20250514");
-        assert_eq!(req.model, "claude-sonnet-4-20250514");
+        let req = LlmRequest::new("claude-sonnet-4-6");
+        assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, 4096);
         assert!(req.tools.is_empty());
+    }
+
+    #[test]
+    fn create_provider_routes_claude_cli_prefix() {
+        // claude-cli/ never reads env vars (subprocess does); routing should
+        // succeed regardless of ANTHROPIC_API_KEY, and strip the prefix from
+        // the returned model name so it lands on the CLI as e.g. "sonnet".
+        let (provider, model) =
+            create_provider("claude-cli/sonnet").expect("claude-cli route succeeds");
+        assert_eq!(provider.name(), "claude-cli");
+        assert_eq!(model, "sonnet");
     }
 
     #[test]

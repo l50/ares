@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn operation_meta_empty_target_ips() {
         let mut data = HashMap::new();
-        data.insert("target_ips".to_string(), String::new());
+        data.insert("target_ips".to_string(), "".to_string());
         let meta = OperationMeta::from_redis_hash(&data);
         assert!(meta.target_ips.is_empty());
     }
@@ -701,7 +701,7 @@ mod tests {
             username: "user1".to_string(),
             password: "pass1".to_string(), // pragma: allowlist secret
             domain: "contoso.local".to_string(),
-            source: String::new(),
+            source: "".to_string(),
             discovered_at: None,
             is_admin: false,
             parent_id: Some("cred-2".to_string()),
@@ -712,7 +712,7 @@ mod tests {
             username: "user2".to_string(),
             password: "pass2".to_string(), // pragma: allowlist secret
             domain: "contoso.local".to_string(),
-            source: String::new(),
+            source: "".to_string(),
             discovered_at: None,
             is_admin: false,
             parent_id: Some("cred-1".to_string()),

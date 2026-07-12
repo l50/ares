@@ -231,6 +231,9 @@ async fn execute_blue_task(
         model: model_name.to_string(),
         max_steps: 50,
         max_tool_calls_per_name: 25,
+        // Capture the blue transcript when ARES_SESSION_LOG_DIR is set;
+        // `..default()` disables session logging otherwise.
+        session_log: ares_llm::SessionLogConfig::from_env(),
         ..AgentLoopConfig::default()
     };
 

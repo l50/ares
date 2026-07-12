@@ -17,8 +17,8 @@ uuid = { workspace = true }
 regex = { workspace = true }
 redis = { workspace = true }
 tempfile = "3"
+flate2 = "1"
 base64 = "0.22"
-libc = "0.2"
 
 [features]
 default = ["blue"]

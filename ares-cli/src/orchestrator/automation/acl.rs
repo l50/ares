@@ -39,7 +39,7 @@ fn extract_source_domain(step: &serde_json::Value) -> &str {
 
 /// Build ACL chain step dedup key.
 fn acl_step_dedup_key(chain_idx: usize, step_idx: usize) -> String {
-    format!("chain:{chain_idx}:step:{step_idx}")
+    format!("chain:{}:step:{}", chain_idx, step_idx)
 }
 
 /// Follows ACL chains from BloodHound results, dispatching each step when
@@ -108,19 +108,11 @@ pub async fn auto_acl_chain_follow(
                         continue;
                     }
 
-                    // Find credential for the source user. A parent-domain
-                    // account is a valid principal against a child domain in
-                    // the same forest, so a cred whose realm is a parent of the
-                    // edge's `source_domain` also matches (e.g. a stored
-                    // `contoso.local` cred for a `child.contoso.local` edge).
+                    // Find credential for the source user
                     let cred = state.credentials.iter().find(|c| {
                         c.username.to_lowercase() == source_user.to_lowercase()
                             && (source_domain.is_empty()
-                                || c.domain.to_lowercase() == source_domain.to_lowercase()
-                                || crate::worker::credential_resolver::is_parent_realm(
-                                    &c.domain,
-                                    source_domain,
-                                ))
+                                || c.domain.to_lowercase() == source_domain.to_lowercase())
                     });
 
                     if let Some(cred) = cred {

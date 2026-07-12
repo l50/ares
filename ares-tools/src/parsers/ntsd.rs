@@ -43,11 +43,6 @@ const GUID_FORCE_CHANGE_PASSWORD: &str = "00299570-246d-11d0-a768-00aa006e0529";
 const GUID_SELF_MEMBERSHIP: &str = "bf9679c0-0de6-11d0-a285-00aa003049e2";
 /// Write-Member (write to member attribute on group)
 const GUID_WRITE_MEMBER: &str = "bf9679a8-0de6-11d0-a285-00aa003049e2";
-/// msDS-KeyCredentialLink schemaIDGUID — the attribute Shadow Credentials
-/// writes. A property-write ACE scoped to this GUID is the shadow-cred
-/// primitive; surface it as a distinct edge so routing can target it precisely
-/// instead of lumping it into generic `writeproperty`.
-const GUID_KEY_CREDENTIAL_LINK: &str = "5b47d60f-6090-40b2-9f37-2a4de88f3063";
 
 // ── Binary parsing helpers ─────────────────────────────────────────────────
 
@@ -182,18 +177,10 @@ fn classify_ace(ace: &ParsedAce) -> Vec<&'static str> {
         types.push("allextendedrights");
     }
 
-    // WriteProperty. A write scoped to the msDS-KeyCredentialLink attribute is
-    // the Shadow Credentials primitive — surface it distinctly. The write-member
-    // token is already emitted as `write_membership` above. Every other
-    // specific-attribute write (and the all-properties write) stays plain
-    // `writeproperty` — which is NOT a KeyCredentialLink write and must not be
-    // routed to certipy_shadow.
+    // WriteProperty with no specific object type
     if mask & ADS_RIGHT_DS_WRITE_PROP != 0 {
         if let Some(ref guid) = ace.object_type_guid {
-            let guid_lower = guid.to_lowercase();
-            if guid_lower == GUID_KEY_CREDENTIAL_LINK {
-                types.push("addkeycredentiallink");
-            } else if guid_lower != GUID_WRITE_MEMBER {
+            if guid.to_lowercase() != GUID_WRITE_MEMBER {
                 types.push("writeproperty");
             }
         } else {
@@ -1127,21 +1114,6 @@ displayName: Test GPO
         };
         let types = classify_ace(&ace);
         assert!(types.contains(&"writeproperty"));
-    }
-
-    #[test]
-    fn classify_write_prop_keycredlink_guid_returns_addkeycredentiallink() {
-        // WriteProp scoped to msDS-KeyCredentialLink → the distinct
-        // "addkeycredentiallink" edge (shadow-cred eligible), NOT the generic
-        // "writeproperty" (which must not route to certipy_shadow).
-        let ace = ParsedAce {
-            trustee_sid: "S-1-5-21-1-2-1001".into(),
-            access_mask: ADS_RIGHT_DS_WRITE_PROP,
-            object_type_guid: Some(GUID_KEY_CREDENTIAL_LINK.into()),
-        };
-        let types = classify_ace(&ace);
-        assert!(types.contains(&"addkeycredentiallink"));
-        assert!(!types.contains(&"writeproperty"));
     }
 
     #[test]

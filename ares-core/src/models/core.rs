@@ -691,3 +691,39 @@ impl KerberosTicket {
         )
     }
 }
+
+/// Operator escape hatch: a request to force an inter-realm ticket forge,
+/// bypassing the SID-filter check and trust_follow dedup in `auto_trust_follow`.
+///
+/// The `ares ops force-inter-realm-forge` CLI runs out-of-process from the
+/// orchestrator, so it cannot call `dispatch_create_inter_realm_ticket`
+/// directly. Instead it RPUSHes one of these onto the
+/// `ares:op:{id}:force_forge_requests` LIST, which the orchestrator's trust
+/// loop drains each tick and dispatches. Every field the forge needs is carried
+/// here so the request is self-contained even if the auto path never populated
+/// the target DC into state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForceInterRealmForgeRequest {
+    /// Source forest whose `<TARGET>$` trust key is used to forge.
+    pub source_domain: String,
+    /// Foreign forest the ticket is forged for.
+    pub target_domain: String,
+    /// NT hash of the inter-realm trust account (`{source}\\{TARGET}$`).
+    pub trust_key: String,
+    /// AES256 key of the trust account, when the trust/DC has RC4 disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aes_key: Option<String>,
+    /// Source-forest domain SID embedded in the forged TGT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sid: Option<String>,
+    /// Target-forest domain SID (informational / state priming).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sid: Option<String>,
+    /// Target DC IP — primed into state so the forge can chain cifs/ + ldap/
+    /// service tickets into the ccache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dc_ip: Option<String>,
+    /// Target DC FQDN (e.g. `dc01.fabrikam.local`), primed alongside the IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dc_fqdn: Option<String>,
+}

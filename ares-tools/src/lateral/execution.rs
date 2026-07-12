@@ -225,17 +225,26 @@ pub async fn evil_winrm(args: &Value) -> Result<ToolOutput> {
     cmd.flag("-c", command).timeout_secs(120).execute().await
 }
 
-/// Test RDP authentication via xfreerdp.
+/// Build the `xfreerdp` command line for an auth-only RDP probe.
 ///
-/// Required args: `target`, `username`
-/// Optional args: `password`, `hash`, `domain`
-pub async fn xfreerdp(args: &Value) -> Result<ToolOutput> {
-    let target = required_str(args, "target")?;
-    let username = required_str(args, "username")?;
-    let password = optional_str(args, "password");
-    let hash = optional_str(args, "hash");
-    let domain = optional_str(args, "domain");
-
+/// The deployed binary is FreeRDP 3.x (`freerdp3-x11` on Kali, symlinked
+/// `xfreerdp` → `xfreerdp3`). FreeRDP 3 dropped the 2.x `/cert-ignore`
+/// spelling and folded it into the structured `/cert:` option as
+/// `/cert:ignore`. The old spelling is no longer a known keyword, so WinPR's
+/// parser aborts the whole invocation with `Unexpected keyword` *before*
+/// connecting — every RDP attempt fails identically regardless of the
+/// principal or target form. All other flags we emit (`/v:`, `/u:`, `/p:`,
+/// `/pth:`, `/d:`, `+auth-only`) are unchanged in FreeRDP 3.
+///
+/// Split out from [`xfreerdp`] so the constructed argv is unit-testable via
+/// [`CommandBuilder::args_for_test`].
+fn xfreerdp_command(
+    target: &str,
+    username: &str,
+    password: Option<&str>,
+    hash: Option<&str>,
+    domain: Option<&str>,
+) -> CommandBuilder {
     let mut cmd = CommandBuilder::new("xfreerdp")
         .arg(format!("/v:{target}"))
         .arg(format!("/u:{username}"));
@@ -252,10 +261,24 @@ pub async fn xfreerdp(args: &Value) -> Result<ToolOutput> {
         cmd = cmd.arg(format!("/d:{d}"));
     }
 
-    cmd.arg("/cert-ignore")
+    cmd.arg("/cert:ignore")
         .arg("+auth-only")
         .env("HOME", "/root")
         .timeout_secs(30)
+}
+
+/// Test RDP authentication via xfreerdp.
+///
+/// Required args: `target`, `username`
+/// Optional args: `password`, `hash`, `domain`
+pub async fn xfreerdp(args: &Value) -> Result<ToolOutput> {
+    let target = required_str(args, "target")?;
+    let username = required_str(args, "username")?;
+    let password = optional_str(args, "password");
+    let hash = optional_str(args, "hash");
+    let domain = optional_str(args, "domain");
+
+    xfreerdp_command(target, username, password, hash, domain)
         .execute()
         .await
 }
@@ -653,6 +676,51 @@ mod tests {
     fn xfreerdp_domain_format() {
         let domain = "CONTOSO";
         assert_eq!(format!("/d:{domain}"), "/d:CONTOSO");
+    }
+
+    // FreeRDP 3.x rejects the 2.x `/cert-ignore` spelling with a WinPR
+    // "Unexpected keyword" parse error, aborting before any connection. Guard
+    // the constructed argv against regressing to the old flag.
+    #[test]
+    fn xfreerdp_uses_freerdp3_cert_flag() {
+        let cmd = super::xfreerdp_command(
+            "192.168.58.10",
+            "alice",
+            Some("P@ssw0rd!"),
+            None,
+            Some("contoso.local"),
+        );
+        let args = cmd.args_for_test();
+        assert!(
+            args.iter().any(|a| a == "/cert:ignore"),
+            "expected FreeRDP 3.x /cert:ignore, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/cert-ignore"),
+            "found FreeRDP 2.x /cert-ignore which FreeRDP 3.x rejects: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "+auth-only"),
+            "auth-only probe flag missing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn xfreerdp_command_pth_and_domain() {
+        let cmd = super::xfreerdp_command(
+            "192.168.58.10",
+            "alice",
+            None,
+            Some("aabbccddeeff00112233445566778899"),
+            Some("contoso.local"),
+        );
+        let args = cmd.args_for_test();
+        assert!(args.contains(&"/v:192.168.58.10".to_string()));
+        assert!(args.contains(&"/u:alice".to_string()));
+        assert!(args.contains(&"/pth:aabbccddeeff00112233445566778899".to_string()));
+        assert!(args.contains(&"/d:contoso.local".to_string()));
+        // hash present → password form must not be emitted
+        assert!(!args.iter().any(|a| a.starts_with("/p:")), "{args:?}");
     }
 
     #[test]

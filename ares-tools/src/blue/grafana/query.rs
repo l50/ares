@@ -13,6 +13,19 @@ use super::{build_client, grafana_url, make_error, make_output};
 /// Tries multiple API endpoints for compatibility across Grafana versions.
 /// Accepts an optional `state` filter (e.g. "firing", "pending").
 pub async fn get_alerts(args: &Value) -> Result<ToolOutput> {
+    // In replay, live Alertmanager state isn't reproducible. Return the seeded
+    // firings up to the replay clock by delegating to the annotation-backed
+    // time-range tool (which is replay-aware). The caller's `state` filter is
+    // intentionally ignored here: every seeded annotation is a recorded firing,
+    // so there is no pending/normal state to filter on in replay.
+    if crate::blue::replay_clock::is_replay() {
+        let now = crate::blue::replay_clock::replay_now();
+        let from = (now - chrono::Duration::hours(24)).to_rfc3339();
+        let to = now.to_rfc3339();
+        let range_args = serde_json::json!({ "from_time": from, "to_time": to });
+        return super::rules::get_alerts_in_time_range(&range_args).await;
+    }
+
     let state = optional_str(args, "state");
     let client = build_client()?;
 
@@ -88,7 +101,11 @@ pub async fn get_annotations(args: &Value) -> Result<ToolOutput> {
     if let Some(f) = from {
         params.push(("from", f.to_string()));
     }
-    if let Some(t) = to {
+    // Replay: bound the upper time at the replay clock so firings from the
+    // agent's future don't leak (overrides any caller-supplied `to`).
+    if let Some(ceiling) = crate::blue::replay_clock::replay_clamp_end() {
+        params.push(("to", ceiling.timestamp_millis().to_string()));
+    } else if let Some(t) = to {
         params.push(("to", t.to_string()));
     }
     if let Some(t) = tags {
@@ -492,8 +509,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── format_alerts_response ────────────────────────────────────
-
     #[test]
     fn alerts_empty_array() {
         assert_eq!(format_alerts_response("[]"), "No alerts found.");
@@ -583,8 +598,6 @@ mod tests {
         assert!(out.contains("Alert: B"));
     }
 
-    // ── format_annotations_response ───────────────────────────────
-
     #[test]
     fn annotations_empty_array() {
         assert_eq!(format_annotations_response("[]"), "No annotations found.");
@@ -629,8 +642,6 @@ mod tests {
         let out = format_annotations_response(&body);
         assert!(out.contains("total"));
     }
-
-    // ── format_dashboard_search_response ──────────────────────────
 
     #[test]
     fn dashboard_search_empty() {
@@ -680,8 +691,6 @@ mod tests {
         let out = format_dashboard_search_response(&body);
         assert!(out.contains("count"));
     }
-
-    // ── format_dashboard_response ─────────────────────────────────
 
     #[test]
     fn dashboard_full() {
@@ -737,8 +746,6 @@ mod tests {
     fn dashboard_invalid_json() {
         assert_eq!(format_dashboard_response("broken"), "broken");
     }
-
-    // ── format_json_pretty ────────────────────────────────────────
 
     #[test]
     fn json_pretty_object() {

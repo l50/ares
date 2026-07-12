@@ -60,18 +60,26 @@ Each worker agent has:
 - No knowledge of other workers' activities (except via shared state)
 - Responsibility to report results back to the orchestrator
 
-### 3. Shared State via Redis, Tasks via NATS
+### 3. NATS Is the Source of Truth, Redis Is a Derived Cache
 
-Ares splits transport from state:
+Ares splits transport from state, but state itself has two tiers:
 
 - **NATS JetStream** carries task dispatch and tool RPC between orchestrator
-  and workers (durable work queues, pull consumers, explicit acks)
-- **Redis** holds durable shared state: credentials, hashes, hosts,
-  vulnerabilities, locks, heartbeats, and operation metadata
+  and workers (durable work queues, pull consumers, explicit acks), and
+  hosts the durable op-state event log (`ARES_OPSTATE`) that is the source
+  of truth for what happened during an operation.
+- **Redis** is a fast, indexed *materialized view* of op state derived from
+  the event log: credentials, hashes, hosts, vulnerabilities, locks,
+  heartbeats, and operation metadata. On orchestrator restart, `recover_operation()`
+  rehydrates Redis from the NATS event log via
+  `orchestrator/state/replay.rs`.
 - Discovered credentials are automatically broadcast via Redis state updates
-- Hashes are tracked for cracking status
-- Hosts and vulnerabilities are cataloged
-- Task status is visible to all agents
+  (fire-and-forget `ares.state.updates.{op}` core NATS notifies subscribers).
+- Task status is visible to all agents through Redis.
+
+See `ares-core/src/nats.rs` for the full subject/stream taxonomy and
+[`docs/infrastructure.md`](infrastructure.md#state--transport-layer) for
+retention tiers.
 
 ## Agent Quick Reference
 
@@ -540,27 +548,42 @@ INFO | Operation phase transition: enumeration → privilege_escalation
 
 Ares uses two backends with distinct roles:
 
-- **NATS JetStream** - broker/transport for queues and RPC. Carries task
-  dispatch (`ares.red.tasks.{role}`, `ares.blue.tasks.{role}`), tool result
-  streams (`ares.{red,blue}.tasks.results.{task_id}`), and investigation
-  requests. Work-queue retention auto-deletes acked messages.
-- **Redis** - durable, queryable state. Holds operation state, credentials,
-  hosts, hashes, vulnerabilities, heartbeats, locks, task status, and the
-  per-orchestrator deferred priority queue.
+- **NATS JetStream** - broker/transport *and* the durable event log.
+  Carries task dispatch (`ares.tasks.{role}`, `ares.blue.tasks.{role}`),
+  tool RPC (`ares.tools.exec.{role}`, request/reply inbox per call), task
+  result streams (`ares.tasks.results.{task_id}`), deferred re-dispatch
+  (`ares.deferred.{op}.{type}`), state-change notifications
+  (`ares.state.updates.{op}`, core fire-and-forget), and the op-state event
+  log (`ares.ops.{op_id}.{entity}.{action}` on `ARES_OPSTATE`). Work-queue
+  streams auto-delete acked messages; `ARES_OPSTATE` retains ~30 days.
+- **Redis** - fast, indexed *materialized view* of op state derived from
+  the NATS event log. Holds credentials, hashes, hosts, vulnerabilities,
+  heartbeats, locks, task status, and the per-orchestrator deferred
+  priority queue under `ares:op:{op_id}:*` (see
+  `ares-core/src/state/mod.rs` for the full key layout).
 
 Workers connect to both. The orchestrator owns one shared `NatsBroker` and
 threads it through dispatcher, completion checks, and the embedded blue
 auto-submit task.
 
-### Pattern: Write-Through Cache
+For the full subject/stream taxonomy, see the module header comment in
+`ares-core/src/nats.rs`. For retention tiers across Loki, Redis, and NATS
+streams, see [`docs/infrastructure.md`](infrastructure.md#state--transport-layer).
 
-Redis is the **durable store**. In-memory dicts are **write-through caches**.
+### Pattern: Write-Through Cache Backed by an Event Log
+
+`ARES_OPSTATE` is the **source of truth**. Redis is a **derived cache**
+kept in sync by the same writes that emit op-state events. In-memory dicts
+are **write-through caches** on top of Redis.
 
 #### Pattern
 
-- **Write**: Persist to Redis (immediately or via background task), update memory
-- **Read**: Read from memory (assumes write-through keeps it in sync)
-- **Recovery**: Hydrate all state from Redis before any decisions
+- **Write**: Emit op-state event to NATS, persist to Redis (immediately or
+  via background task), update memory.
+- **Read**: Read from memory (assumes write-through keeps it in sync).
+- **Recovery**: `recover_operation()` rehydrates Redis by replaying
+  `ARES_OPSTATE` for the op via `orchestrator/state/replay.rs` before any
+  decisions.
 
 #### Assumptions
 
@@ -571,7 +594,8 @@ Redis is the **durable store**. In-memory dicts are **write-through caches**.
 #### Known Gaps
 
 - `SharedRedTeamState.add_*()` methods are memory-first with async persist
-- If Redis write fails, state diverges (logged, checkpoint is safety net)
+- If Redis write fails, state diverges from the event log (logged; NATS
+  replay is the safety net)
 
 ### Shared State Objects
 

@@ -178,6 +178,18 @@ impl SharedState {
             .map(|c| *c >= MAX_EXPLOIT_FAILURES)
             .unwrap_or(false)
     }
+
+    /// Immediately bump `vuln_id`'s failure counter to
+    /// `MAX_EXPLOIT_FAILURES`, marking the vuln abandoned in a single call.
+    /// Used for deterministic dead-ends (e.g. a shadow-cred dispatch that
+    /// returned `INSUFF_ACCESS_RIGHTS` on `msDS-KeyCredentialLink` — no
+    /// amount of retry will grant the missing WriteProperty). Idempotent.
+    pub async fn mark_exploit_abandoned(&self, vuln_id: &str) {
+        let mut state = self.inner.write().await;
+        state
+            .exploit_failure_counts
+            .insert(vuln_id.to_string(), MAX_EXPLOIT_FAILURES);
+    }
 }
 
 /// Given the primary vuln being marked exploited, return additional vuln_ids
@@ -533,6 +545,33 @@ mod tests {
         // Further failures don't un-abandon.
         state.record_exploit_failure("vuln_a").await;
         assert!(state.is_exploit_abandoned("vuln_a").await);
+    }
+
+    #[tokio::test]
+    async fn mark_exploit_abandoned_one_shot_bumps_to_max() {
+        let state = SharedState::new("op-1".to_string());
+        assert!(!state.is_exploit_abandoned("vuln_kc").await);
+        state.mark_exploit_abandoned("vuln_kc").await;
+        assert!(state.is_exploit_abandoned("vuln_kc").await);
+        // Idempotent — a second mark leaves the counter at MAX.
+        state.mark_exploit_abandoned("vuln_kc").await;
+        assert!(state.is_exploit_abandoned("vuln_kc").await);
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.exploit_failure_counts.get("vuln_kc"),
+            Some(&MAX_EXPLOIT_FAILURES)
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_exploit_abandoned_overwrites_partial_failure_count() {
+        let state = SharedState::new("op-1".to_string());
+        // Two prior failures.
+        state.record_exploit_failure("vuln_kc").await;
+        state.record_exploit_failure("vuln_kc").await;
+        assert!(!state.is_exploit_abandoned("vuln_kc").await);
+        state.mark_exploit_abandoned("vuln_kc").await;
+        assert!(state.is_exploit_abandoned("vuln_kc").await);
     }
 
     #[tokio::test]

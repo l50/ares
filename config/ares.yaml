@@ -2,21 +2,6 @@
 # Ares Red Team Configuration
 # Operational parameters for red team multi-agent operations.
 
-# LLM endpoint overrides (optional, operator-side).
-# Consumed by `task proxmox:deploy:env` to populate /etc/default/ares so that
-# local / OpenAI-compatible models reach the right host. The model itself is set
-# under agents.*.model (change it with `task config:set-model-all -- <model>`).
-# Leave these commented for hosted APIs (real OpenAI / Anthropic) — deploy:env
-# then strips any stale *_BASE_URL from the env so a real provider never inherits
-# a dead LAN endpoint.
-llm:
-  # Used when the orchestrator model is `ollama/<model>`. If left unset, the
-  # provider defaults to http://localhost:11434 on the attacker itself.
-  # ollama_base_url: "http://192.168.58.25:11434"
-  # Used when the orchestrator model is `openai/<model>` against an
-  # OpenAI-compatible endpoint (llama-server, vLLM, Gemini's /v1beta/openai, ...).
-  # openai_base_url: "http://192.168.58.25:8080/v1"
-
 operation:
   name: "ares-multi-agent"
   namespace: "attack-simulation"
@@ -64,22 +49,54 @@ operation:
 
   # Per-technique priority overrides (lower = higher priority, 1-10).
   # Merged on top of the preset defaults. Overrides vulnerability_priorities below.
+  #
+  # Rebalanced for attack-path diversity (see docs/attack-path-diversity.md):
+  # acl_abuse was 1 (top priority), so the high-volume ACL graph drained first
+  # every run and crowded out the MSSQL families, which fell back to their
+  # vulnerability_priorities defaults of 10/11 and were effectively starved.
+  # ACL is de-dominated to 3 and the MSSQL impersonation/linked-server families
+  # are lifted to 3 so all three families compete on a level footing.
   technique_weights:
     esc1: 1
     esc4: 1
-    acl_abuse: 1
     constrained_delegation: 2
     unconstrained_delegation: 2
+    rbcd: 2
+    acl_abuse: 3
     mssql_access: 3
+    mssql_impersonation: 3
+    mssql_linked: 3
 
   # LLM temperature override (0.0-2.0). Higher values = more creative technique
   # selection. None/omit = provider default.
   # llm_temperature: 1.0
 
+  # --- Attack-path diversity (see docs/attack-path-diversity.md) ---
+  # All knobs below default to today's deterministic behaviour. Omit them to
+  # reproduce current runs exactly; set them to spread the fleet across more of
+  # the available attack paths.
+  #
+  # Queue selection temperature for softmax sampling in the exploitation queue.
+  # 0.0 = deterministic argmin (current behaviour). Higher = more spread across
+  # near-equal-priority work. Distinct from llm_temperature above.
+  # selection_temperature: 0.0
+  #
+  # Cross-run novelty memory: bias each run away from path prefixes prior runs
+  # already walked, so the fleet covers more unique paths.
+  # novelty:
+  #   enabled: false
+  #   scope: per-campaign   # which runs share/reset novelty memory
+  #
+  # Randomize the entry foothold per run (cheapest diversity source).
+  # randomize_entry_foothold: false
+  #
+  # Emit structured per-run path records for coverage measurement (Phase 0).
+  # emit_path_records: false
+
 # Agent configurations
 agents:
   orchestrator:
-    model: "anthropic/claude-opus-4-8"
+    model: "gpt-5.2"
     max_steps: 200
     pod_selector: "app.kubernetes.io/name=ares-orchestrator"
     # Tools: OrchestratorTools, RedTeamReportingTools
@@ -109,7 +126,9 @@ agents:
       - complete_operation
 
   recon:
-    model: "anthropic/claude-opus-4-8"
+    # Recon is enumerate-and-emit — mechanical tool dispatch over a known matrix.
+    # gpt-5-mini is ~7x cheaper than gpt-5.2 with negligible quality loss here.
+    model: "gpt-5-mini"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=recon"
     # Provisioned by: ansible/playbooks/ares/recon.yml → dreadnode.nimbus_range.recon_tools
@@ -137,7 +156,9 @@ agents:
       - impacket-GetUserSPNs
 
   credential_access:
-    model: "anthropic/claude-opus-4-8"
+    # Credential-access mostly picks a tool + target from a known matrix.
+    # gpt-5 is ~29% cheaper than gpt-5.2 and handles this shape well.
+    model: "gpt-5"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=credential_access"
     # Provisioned by: ansible/playbooks/ares/credential_access.yml → dreadnode.nimbus_range.credential_access_tools
@@ -159,7 +180,9 @@ agents:
       - impacket-secretsdump
 
   cracker:
-    model: "anthropic/claude-opus-4-8"
+    # Cracker dispatches hashcat and parses its output — fire-the-tool loop.
+    # gpt-5-mini is ~7x cheaper and sufficient for this mechanical role.
+    model: "gpt-5-mini"
     max_steps: 150
     pod_selector: "ares.dreadnode.io/role=cracker"
     # Provisioned by: ansible/playbooks/ares/cracker.yml → dreadnode.nimbus_range.cracking_tools
@@ -172,7 +195,7 @@ agents:
       - seclists
 
   acl:
-    model: "anthropic/claude-opus-4-8"
+    model: "gpt-5.2"
     max_steps: 150  # ACL analysis requires complex path finding
     pod_selector: "ares.dreadnode.io/role=acl"
     # Provisioned by: ansible/playbooks/ares/acl_abuse.yml → dreadnode.nimbus_range.acl_tools
@@ -189,7 +212,7 @@ agents:
       - impacket-dacledit
 
   privesc:
-    model: "anthropic/claude-opus-4-8"
+    model: "gpt-5.2"
     max_steps: 100
     pod_selector: "ares.dreadnode.io/role=privesc"
     # Provisioned by: ansible/playbooks/ares/privesc.yml → dreadnode.nimbus_range.privesc_tools
@@ -243,7 +266,9 @@ agents:
       - SCMUACBypass          # UAC bypass (git: /opt/privesc/SCMUACBypass)
 
   lateral:
-    model: "anthropic/claude-opus-4-8"
+    # Lateral picks a host + an execution tool from a known matrix.
+    # gpt-5 is ~29% cheaper than gpt-5.2 without sacrificing decision quality.
+    model: "gpt-5"
     max_steps: 300
     pod_selector: "ares.dreadnode.io/role=lateral"
     # Provisioned by: ansible/playbooks/ares/lateral_movement.yml → dreadnode.nimbus_range.lateral_movement_tools
@@ -273,7 +298,9 @@ agents:
       - impacket-secretsdump
 
   coercion:
-    model: "anthropic/claude-opus-4-8"
+    # Coercion is a tight fire-the-coercion-tool loop (responder + relay).
+    # gpt-5-mini is ~7x cheaper than gpt-5.2 and handles this fine.
+    model: "gpt-5-mini"
     max_steps: 30
     pod_selector: "ares.dreadnode.io/role=coercion"
     # Provisioned by: ansible/playbooks/ares/coercion.yml → dreadnode.nimbus_range.coercion_tools
@@ -300,7 +327,7 @@ agents:
 timeouts:
   agent_heartbeat: 180  # seconds - agent considered offline after this
   task_timeout: 300  # seconds - default task timeout
-  operation_timeout: 7200  # seconds - 2 hours max operation time
+  operation_timeout: 3600  # seconds - 1 hour max operation time
   lateral_movement: 180  # seconds
   hash_cracking: 600  # seconds - 10 minutes
   exploitation: 900  # seconds - ACL tasks can take 10+ minutes

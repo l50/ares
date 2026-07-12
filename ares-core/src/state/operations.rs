@@ -65,21 +65,14 @@ pub async fn set_operation_status(
     Ok(())
 }
 
-/// Retention TTL applied to all `ares:op:{id}:*` keys when an operation is
-/// finalized. The default per-write TTL is 24h, which can let credentials /
-/// hashes / etc. expire before a user pulls loot post-completion (their last
-/// write may have been hours into the op). 7 days gives users a comfortable
-/// window to query, generate reports, or re-run the loot diff.
-pub const COMPLETED_OPERATION_RETENTION_SECS: i64 = 7 * 86400;
-
 /// Finalize an operation in Redis — write completion metadata, clean up pointers.
 ///
 /// Sequence:
 /// 1. Set `completed=true` and `completed_at` in meta HASH
 /// 2. Write status key
-/// 3. Extend every `ares:op:{id}:*` key TTL to the post-completion retention
-/// 4. Delete operation lock
-/// 5. Delete `ares:op:active` if it points to this operation
+/// 3. Delete operation lock
+/// 4. Delete `ares:op:active` if it points to this operation
+/// 5. Apply a retention TTL to every remaining key for this operation
 pub async fn finalize_operation(
     conn: &mut impl AsyncCommands,
     operation_id: &str,
@@ -101,74 +94,35 @@ pub async fn finalize_operation(
         serde_json::to_string(&false).unwrap_or_default(),
     )
     .await?;
+    conn.expire::<_, ()>(&meta_key, OP_RETENTION_TTL_SECS)
+        .await?;
 
     // 2. Write status key
     set_operation_status(conn, operation_id, status).await?;
 
-    // 3. Extend post-completion retention on every op-scoped key. Without
-    //    this, only keys whose last write was near op-end keep a fresh 24h
-    //    TTL — credentials/hashes added early in the op can vanish before a
-    //    user queries loot. Done before lock deletion so a crash mid-extend
-    //    still leaves the operation looking active to recovery.
-    if let Err(e) =
-        extend_operation_retention(conn, operation_id, COMPLETED_OPERATION_RETENTION_SECS).await
-    {
-        tracing::warn!(
-            operation_id,
-            err = %e,
-            "Failed to extend post-completion retention on op keys",
-        );
-    }
-
-    // 4. Delete the operation lock
+    // 3. Delete the operation lock
     let lock_key = build_lock_key(operation_id);
     conn.del::<_, ()>(&lock_key).await?;
 
-    // 5. Clear ares:op:active if it points to this operation
+    // 4. Clear ares:op:active if it points to this operation
     let active: Option<String> = conn.get("ares:op:active").await?;
     if active.as_deref() == Some(operation_id) {
         conn.del::<_, ()>("ares:op:active").await?;
     }
 
-    Ok(())
-}
-
-/// Apply `ttl_secs` to every key under `ares:op:{operation_id}:*` via SCAN.
-///
-/// Returns the number of keys touched. Errors from individual EXPIRE calls are
-/// swallowed (logged at debug) so a single bad key does not abort retention
-/// extension across the rest of the operation's state.
-pub async fn extend_operation_retention(
-    conn: &mut impl AsyncCommands,
-    operation_id: &str,
-    ttl_secs: i64,
-) -> Result<usize, redis::RedisError> {
-    let pattern = format!("{KEY_PREFIX}:{operation_id}:*");
-    let mut cursor: u64 = 0;
-    let mut updated = 0usize;
-    loop {
-        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(200)
-            .query_async(conn)
-            .await?;
-        for key in keys {
-            match conn.expire::<_, i64>(&key, ttl_secs).await {
-                Ok(_) => updated += 1,
-                Err(e) => {
-                    tracing::debug!(key = %key, err = %e, "EXPIRE failed during retention extension")
-                }
-            }
-        }
-        cursor = next_cursor;
-        if cursor == 0 {
-            break;
+    // 5. Bound Redis growth: apply a retention TTL to every remaining key for
+    //    this operation. Most per-op keys (hosts, hashes, credentials, loot,
+    //    techniques, ...) are written without a TTL, so under `noeviction` they
+    //    would accumulate across every operation ever run. Best-effort: a scan
+    //    or expire failure must not fail finalization, which already did the
+    //    important cleanup above.
+    if let Ok(keys) = scan_keys(conn, &format!("{KEY_PREFIX}:{operation_id}:*")).await {
+        for key in &keys {
+            let _: redis::RedisResult<i64> = conn.expire(key, OP_RETENTION_TTL_SECS).await;
         }
     }
-    Ok(updated)
+
+    Ok(())
 }
 
 /// List all operation IDs by scanning `ares:op:*:meta` keys.
@@ -239,7 +193,10 @@ pub async fn list_running_operations(
     Ok(running)
 }
 
-/// Resolve the latest operation ID, preferring running operations.
+/// Resolve the latest operation ID by newest `started_at` (op_id as tiebreaker).
+///
+/// Running status is not considered — a stuck/wedged running op must not shadow
+/// a freshly-submitted newer op that has not yet been marked running.
 pub async fn resolve_latest_operation(
     conn: &mut impl AsyncCommands,
 ) -> Result<Option<String>, redis::RedisError> {
@@ -278,16 +235,6 @@ pub async fn resolve_latest_operation(
         ops.push((started_at, op_id.clone(), is_running));
     }
 
-    // Prefer running operations
-    let running: Vec<_> = ops
-        .iter()
-        .filter(|(_, _, is_running)| *is_running)
-        .collect();
-    if !running.is_empty() {
-        return Ok(Some(pick_latest(&running)));
-    }
-
-    // Fall back to latest by started_at
     let all: Vec<_> = ops.iter().collect();
     Ok(Some(pick_latest(&all)))
 }
@@ -555,65 +502,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extend_operation_retention_visits_op_scoped_keys() {
-        let mut conn = MockRedisConnection::new();
-        // Seed a handful of op-scoped keys plus an unrelated key.
-        let _: () = conn
-            .hset(build_key("op-1", KEY_META), "f", "v")
-            .await
-            .unwrap();
-        let _: () = conn
-            .hset(build_key("op-1", KEY_CREDENTIALS), "f", "v")
-            .await
-            .unwrap();
-        let _: () = conn
-            .hset(build_key("op-1", KEY_HASHES), "f", "v")
-            .await
-            .unwrap();
-        let _: () = conn
-            .hset(build_key("op-other", KEY_META), "f", "v")
-            .await
-            .unwrap();
-
-        let touched = extend_operation_retention(&mut conn, "op-1", 604800)
-            .await
-            .unwrap();
-        // The three op-1 keys should be touched; op-other must not be counted.
-        assert_eq!(touched, 3);
-    }
-
-    #[tokio::test]
-    async fn finalize_operation_extends_credential_key_ttl() {
-        // Regression: credentials/hashes/etc keys must survive past op-end
-        // long enough for users to query loot. With the old code only the
-        // meta key had its TTL extended at completion, so a credential added
-        // hours into the op could vanish ~24h later even though the meta key
-        // was still alive.
-        let mut conn = MockRedisConnection::new();
-        let _: () = conn
-            .hset(build_key("op-1", KEY_META), "started_at", "\"x\"")
-            .await
-            .unwrap();
-        let _: () = conn
-            .hset(build_key("op-1", KEY_CREDENTIALS), "cred:foo", "{}")
-            .await
-            .unwrap();
-
-        finalize_operation(&mut conn, "op-1", "completed")
-            .await
-            .unwrap();
-
-        // Mock EXPIRE always returns 1; what we care about is that the
-        // function compiled the SCAN→EXPIRE pass without erroring on the
-        // credentials key. The key must still be present after finalize.
-        let exists: bool = conn
-            .exists(build_key("op-1", KEY_CREDENTIALS))
-            .await
-            .unwrap();
-        assert!(exists);
-    }
-
-    #[tokio::test]
     async fn finalize_operation_preserves_active_when_different() {
         let mut conn = MockRedisConnection::new();
         let meta_key = build_key("op-1", KEY_META);
@@ -629,6 +517,33 @@ mod tests {
 
         let active: Option<String> = conn.get("ares:op:active").await.unwrap();
         assert_eq!(active.as_deref(), Some("op-other"));
+    }
+
+    #[tokio::test]
+    async fn finalize_operation_sweeps_op_keys_without_corrupting_state() {
+        let mut conn = MockRedisConnection::new();
+        let meta_key = build_key("op-1", KEY_META);
+        let _: () = conn
+            .hset(&meta_key, "started_at", "\"2024-06-01T00:00:00Z\"")
+            .await
+            .unwrap();
+
+        // Per-op keys that are normally written without a TTL and would leak.
+        let creds_key = build_key("op-1", KEY_CREDENTIALS);
+        let _: () = conn.hset(&creds_key, "c1", "{}").await.unwrap();
+        let hosts_key = build_key("op-1", KEY_HOSTS);
+        let _: () = conn.rpush(&hosts_key, "{}").await.unwrap();
+
+        finalize_operation(&mut conn, "op-1", "completed")
+            .await
+            .unwrap();
+
+        // The retention sweep issues a best-effort EXPIRE per key; the mock
+        // treats EXPIRE as a no-op, so the sweep must leave state readable.
+        let creds_exist: bool = conn.exists(&creds_key).await.unwrap();
+        assert!(creds_exist);
+        let hosts: Vec<String> = conn.lrange(&hosts_key, 0, -1).await.unwrap();
+        assert_eq!(hosts.len(), 1);
     }
 
     #[tokio::test]
@@ -724,10 +639,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_latest_operation_prefers_running() {
+    async fn resolve_latest_operation_picks_newest_even_when_older_is_running() {
+        // Regression: a wedged running op used to win over a freshly-submitted
+        // newer op that had not yet been marked running. Newest wins now.
         let mut conn = MockRedisConnection::new();
 
-        // op-new is newer but not running
         let _: () = conn
             .hset(
                 "ares:op:op-new:meta",
@@ -736,7 +652,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // op-old is older but running (has a lock key)
         let _: () = conn
             .hset(
                 "ares:op:op-old:meta",
@@ -748,7 +663,7 @@ mod tests {
         let _: () = conn.set("ares:lock:op-old", "1").await.unwrap();
 
         let result = resolve_latest_operation(&mut conn).await.unwrap();
-        assert_eq!(result.as_deref(), Some("op-old"));
+        assert_eq!(result.as_deref(), Some("op-new"));
     }
 
     #[tokio::test]

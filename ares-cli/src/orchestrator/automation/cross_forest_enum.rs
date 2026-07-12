@@ -14,7 +14,7 @@
 //! because initial recon only has primary-forest credentials.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -24,7 +24,12 @@ use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
 /// Check if a credential belongs to a different forest than the target domain.
-fn is_cross_forest(cred_domain: &str, target_domain: &str) -> bool {
+///
+/// Same domain or a parent/child pair (one is a DNS suffix of the other) counts
+/// as the same forest; only disjoint namespaces (e.g. `contoso.local` vs
+/// `fabrikam.local`) are cross-forest. Shared with the tool dispatcher's
+/// cross-realm auth guardrail so both use one definition of a forest boundary.
+pub(crate) fn is_cross_forest(cred_domain: &str, target_domain: &str) -> bool {
     let c = cred_domain.to_lowercase();
     let t = target_domain.to_lowercase();
     // Same domain or parent/child = same forest
@@ -138,11 +143,6 @@ pub async fn auto_cross_forest_enum(
     // Wait for initial credential discovery and cross-domain pivots.
     tokio::time::sleep(Duration::from_secs(120)).await;
 
-    // Suppress re-dispatch of items the throttler just deferred, so the tick
-    // doesn't flood the deferred queue with duplicates (dedup only commits on
-    // success). See super::DeferCooldown.
-    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
-
     loop {
         tokio::select! {
             _ = interval.tick() => {},
@@ -164,11 +164,7 @@ pub async fn auto_cross_forest_enum(
             continue;
         }
 
-        let now = Instant::now();
         for item in work {
-            if cooldown.active(&item.dedup_key, now) {
-                continue;
-            }
             // Dispatch user enumeration
             let mut user_payload = json!({
                 "technique": "ldap_user_enumeration",
@@ -198,7 +194,9 @@ pub async fn auto_cross_forest_enum(
                     "  {\"username\": \"samaccountname\", \"domain\": \"contoso.local\", ",
                     "\"source\": \"ldap_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}\n",
                     "Also report users with DoesNotRequirePreAuth as vulnerabilities with ",
-                    "vuln_type='asrep_roastable', and users with SPNs as vuln_type='kerberoastable'."
+                    "vuln_type='asrep_roastable', and users with SPNs as vuln_type='kerberoastable'. ",
+                    "For those findings set the finding `target` to the affected account's ",
+                    "sAMAccountName (not an IP or DC hostname) so the account is roasted."
                 ),
             });
             if let Some(bind_domain) =
@@ -224,7 +222,6 @@ pub async fn auto_cross_forest_enum(
                     );
                 }
                 Ok(None) => {
-                    cooldown.record(&item.dedup_key, now);
                     debug!(domain = %item.domain, "Cross-forest user enum deferred");
                     continue; // Don't mark as processed if deferred
                 }
@@ -282,7 +279,6 @@ pub async fn auto_cross_forest_enum(
             }
 
             // Mark as processed
-            cooldown.clear(&item.dedup_key);
             dispatcher
                 .state
                 .write()

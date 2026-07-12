@@ -16,40 +16,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use redis::aio::{ConnectionLike, ConnectionManager};
+use redis::aio::ConnectionManager;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
-use super::{DomainProber, ProbeOutcome, ProbedDc};
+use super::{DomainProber, ProbeOutcome};
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueueCore;
-use ares_core::models::Host;
-
-/// Register a DC discovered by a DNS SRV probe so `resolve_dc_ip` works for
-/// the realm. Routes through `register_dc` (the canonical DC path) which also
-/// derives + promotes the DC's domain. Best-effort: a failure is logged but
-/// never blocks domain promotion. Generic over the connection type so the
-/// real worker (`ConnectionManager`) and the mock-backed tests share one path.
-async fn record_probed_dc<C>(state: &SharedState, queue: &TaskQueueCore<C>, dc: &ProbedDc)
-where
-    C: ConnectionLike + Clone + Send + Sync + 'static,
-{
-    let host = Host {
-        ip: dc.ip.clone(),
-        hostname: dc.hostname.clone(),
-        os: String::new(),
-        roles: Vec::new(),
-        services: Vec::new(),
-        is_dc: true,
-        owned: false,
-    };
-    if let Err(e) = state.register_dc(queue, &host).await {
-        debug!(hostname = %dc.hostname, ip = %dc.ip, err = %e, "register_dc after SRV probe failed");
-    } else {
-        info!(hostname = %dc.hostname, ip = %dc.ip, "Recorded DC from SRV probe");
-    }
-}
 
 /// Wired-up dependencies for the probe worker.
 pub struct DomainProbeContext {
@@ -98,14 +72,11 @@ async fn drain_once(ctx: &DomainProbeContext) {
     for cand in pending {
         let outcome = ctx.prober.probe(&cand.fqdn).await;
         match outcome {
-            ProbeOutcome::Confirmed { dc } => {
+            ProbeOutcome::Confirmed => {
                 if let Err(e) = ctx.state.promote_domain(&ctx.queue, &cand.fqdn).await {
                     debug!(domain = %cand.fqdn, err = %e, "Promote after probe failed");
                 } else {
                     info!(domain = %cand.fqdn, "Promoted candidate domain after DNS SRV probe");
-                }
-                if let Some(dc) = dc {
-                    record_probed_dc(&ctx.state, &ctx.queue, &dc).await;
                 }
             }
             ProbeOutcome::Rejected(reason) => {
@@ -186,11 +157,8 @@ mod tests {
         let pending = state.pending_candidate_domains().await;
         for cand in pending {
             match prober.probe(&cand.fqdn).await {
-                ProbeOutcome::Confirmed { dc } => {
+                ProbeOutcome::Confirmed => {
                     state.promote_domain(queue, &cand.fqdn).await.unwrap();
-                    if let Some(dc) = dc {
-                        record_probed_dc(state, queue, &dc).await;
-                    }
                 }
                 ProbeOutcome::Rejected(_) => {
                     state
@@ -216,54 +184,11 @@ mod tests {
             .publish_candidate_domain(&q, "contoso.local", DomainEvidence::HostnameInference, None)
             .await
             .unwrap();
-        let prober = StubProber::new(vec![(
-            "contoso.local",
-            ProbeOutcome::Confirmed { dc: None },
-        )]);
+        let prober = StubProber::new(vec![("contoso.local", ProbeOutcome::Confirmed)]);
         drain_with_mock(&state, &q, &prober).await;
         let s = state.inner.read().await;
         assert!(s.domains.iter().any(|d| d == "contoso.local"));
         assert!(s.candidate_domains.is_empty());
-    }
-
-    #[tokio::test]
-    async fn confirmed_with_dc_records_resolvable_dc_ip() {
-        // Follow-up: a probe that resolves the SRV target to an IP must record
-        // the DC so `resolve_dc_ip` works for the realm — the gap that left a
-        // probe-confirmed foreign realm in state.domains with no DC, blocking
-        // foreign-group enum / cross-forest selectors from targeting it.
-        let state = SharedState::new("op-1".into());
-        let q = mock_queue();
-        state
-            .publish_candidate_domain(
-                &q,
-                "fabrikam.local",
-                DomainEvidence::HostnameInference,
-                None,
-            )
-            .await
-            .unwrap();
-        let prober = StubProber::new(vec![(
-            "fabrikam.local",
-            ProbeOutcome::Confirmed {
-                dc: Some(ProbedDc {
-                    hostname: "dc01.fabrikam.local".into(),
-                    ip: "192.168.58.20".into(),
-                }),
-            },
-        )]);
-        drain_with_mock(&state, &q, &prober).await;
-        let s = state.inner.read().await;
-        assert!(
-            s.domains.iter().any(|d| d == "fabrikam.local"),
-            "realm must be promoted, got {:?}",
-            s.domains
-        );
-        assert_eq!(
-            s.resolve_dc_ip("fabrikam.local").as_deref(),
-            Some("192.168.58.20"),
-            "DC IP from the SRV probe must be recorded so resolve_dc_ip succeeds"
-        );
     }
 
     #[tokio::test]
@@ -305,107 +230,6 @@ mod tests {
         assert!(s.domains.is_empty());
         let cand = s.candidate_domains.get("transient.contoso.local").unwrap();
         assert!(cand.probed);
-    }
-
-    #[tokio::test]
-    async fn dc_zone_apex_hostname_promotes_child_after_probe_confirms() {
-        // End-to-end regression for the child-domain alias bug: a
-        // child-domain DC's SMB hostname query returns the bare domain
-        // (`child.contoso.local`) instead of the proper FQDN
-        // (`dc02.child.contoso.local`). The hosts.rs publisher's parts[1..]
-        // extractor only sees the parent suffix; the child must reach
-        // state.domains via the whole-hostname candidate + DNS SRV probe.
-        use ares_core::models::Host;
-
-        let state = SharedState::new("op-1".into());
-        let q = mock_queue();
-
-        let host = Host {
-            ip: "192.168.58.11".into(),
-            hostname: "child.contoso.local".into(),
-            os: String::new(),
-            roles: vec![],
-            services: vec![],
-            is_dc: true,
-            owned: false,
-        };
-        state.publish_host(&q, host).await.unwrap();
-
-        // Parent domain promotes immediately (DcSelfReport evidence on
-        // parts[1..]). Child is held as a candidate awaiting SRV probe.
-        {
-            let s = state.inner.read().await;
-            assert!(
-                s.domains.iter().any(|d| d == "contoso.local"),
-                "parent should auto-promote, got {:?}",
-                s.domains
-            );
-            assert!(
-                s.candidate_domains.contains_key("child.contoso.local"),
-                "child must be queued for probe, got candidates {:?}",
-                s.candidate_domains.keys().collect::<Vec<_>>()
-            );
-        }
-
-        // Simulate DNS SRV probe confirming the child is a real domain.
-        let prober = StubProber::new(vec![(
-            "child.contoso.local",
-            ProbeOutcome::Confirmed { dc: None },
-        )]);
-        drain_with_mock(&state, &q, &prober).await;
-
-        let s = state.inner.read().await;
-        assert!(
-            s.domains.iter().any(|d| d == "child.contoso.local"),
-            "child should be promoted after probe confirms, got {:?}",
-            s.domains
-        );
-    }
-
-    #[tokio::test]
-    async fn dc_normal_fqdn_zone_apex_candidate_rejected_by_probe() {
-        // Negative regression: the zone-apex probe path must NOT pollute
-        // state.domains with ordinary DC host FQDNs (`dc01.contoso.local`).
-        // The candidate gets recorded but the SRV probe rejects it; the
-        // child of a known parent can't sneak in via parent_known
-        // corroboration because the new probe-only path bypasses that
-        // shortcut.
-        use ares_core::models::Host;
-
-        let state = SharedState::new("op-1".into());
-        let q = mock_queue();
-
-        let host = Host {
-            ip: "192.168.58.10".into(),
-            hostname: "dc01.contoso.local".into(),
-            os: String::new(),
-            roles: vec![],
-            services: vec![],
-            is_dc: true,
-            owned: false,
-        };
-        state.publish_host(&q, host).await.unwrap();
-
-        let prober = StubProber::new(vec![(
-            "dc01.contoso.local",
-            ProbeOutcome::Rejected("no SRV"),
-        )]);
-        drain_with_mock(&state, &q, &prober).await;
-
-        let s = state.inner.read().await;
-        assert!(
-            s.domains.contains(&"contoso.local".to_string()),
-            "parent must still be promoted"
-        );
-        assert!(
-            !s.domains.contains(&"dc01.contoso.local".to_string()),
-            "DC host FQDN must NEVER reach state.domains, got {:?}",
-            s.domains
-        );
-        assert!(
-            !s.candidate_domains.contains_key("dc01.contoso.local"),
-            "probe-rejected candidate should be dropped, not lingering"
-        );
     }
 
     #[tokio::test]

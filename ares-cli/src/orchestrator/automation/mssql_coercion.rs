@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn credential_domain_empty_no_match() {
-        let domain = String::new();
+        let domain = "".to_string();
         let cred_domain = "contoso.local";
         let matches = !domain.is_empty() && cred_domain.to_lowercase() == domain.to_lowercase();
         assert!(!matches);

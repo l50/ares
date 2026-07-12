@@ -9,18 +9,21 @@
 # doesn't rejoin -> CANCELLED), so we build on a plain instance that handles its
 # own reboot (see ares-golden-userdata.sh) and snapshot it here.
 #
-# Usage:  AWS_PROFILE=personal scripts/build-ares-golden-ami.sh
+# Usage: BUCKET=<your-staging-bucket> SUBNET=subnet-... SG=sg-... \
+#        PROFILE_NAME=<your-instance-profile> \
+#        AWS_PROFILE=<your-aws-profile> \
+#        scripts/build-ares-golden-ami.sh
 set -euo pipefail
-: "${AWS_PROFILE:=personal}"
+: "${AWS_PROFILE:?set AWS_PROFILE (e.g. personal)}"
 export AWS_PROFILE
-export AWS_REGION=us-east-1
+export AWS_REGION="${AWS_REGION:-us-east-1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-BUCKET=warpgate-staging-898493401173-use1
+: "${BUCKET:?set BUCKET to an S3 bucket you can write to in $AWS_REGION}"
 PFX="s3://$BUCKET/ares-golden-build"
-SUBNET=subnet-08f1b1e87a7adb568 # prod us-east-1 public subnet
-SG=sg-06a8a3b45fe6b094b         # egress-only SG
-PROFILE_NAME=dreadgoad-runner   # instance profile: SSM + S3 + EC2RO
+: "${SUBNET:?set SUBNET to a public subnet-id in $AWS_REGION}"
+: "${SG:?set SG to a security-group-id with egress in $AWS_REGION}"
+: "${PROFILE_NAME:?set PROFILE_NAME to an instance profile granting SSM + S3 + EC2RO}"
 
 echo "[1/6] upload ares ansible collection to S3"
 tar -czf /tmp/ares-ansible.tar.gz -C "$HERE/../ansible" .

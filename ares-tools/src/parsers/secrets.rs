@@ -124,8 +124,9 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                     let prefix = &raw_user[..idx];
                     let user = &raw_user[idx + 1..];
                     // Resolve NetBIOS prefix to FQDN using target_domain.
-                    // raiseChild emits FQDN/user (slash separator),
-                    // standard secretsdump emits DOMAIN\user (backslash + NetBIOS).
+                    // Impacket emits FQDN/user (slash) when invoked with a
+                    // domain target; standard secretsdump on Windows output
+                    // is DOMAIN\user (backslash + NetBIOS).
                     let resolved = resolve_netbios_to_fqdn(prefix, domain);
                     (resolved, user.to_string())
                 } else if is_local_sam_account(raw_user, rid, section) {
@@ -140,7 +141,7 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                 if nt_hash.len() == 32 && nt_hash != "31d6cfe0d16ae931b73c59d7e0c089c0" {
                     // Skip empty/disabled hashes
                     let lm_hash = parts[2];
-                    let hash_value = format!("{lm_hash}:{nt_hash}");
+                    let hash_value = format!("{}:{}", lm_hash, nt_hash);
 
                     // NTDS exposes rotated-out credentials as
                     // `<name>_history0`, `<name>_history1`, ... and some
@@ -443,6 +444,155 @@ pub fn parse_asrep_roast(output: &str, params: &Value) -> Vec<Value> {
     }
 
     hashes
+}
+
+/// Extract NetNTLMv2 hashes from coercion / Responder / relay tool output.
+///
+/// The canonical hashcat-5600 format is `USER::DOMAIN:CHALLENGE:NT_PROOF:BLOB`,
+/// which `split(':')` decomposes into exactly 6 parts (the empty string between
+/// the `::` after the username is one of them). Responder, ntlmrelayx, and
+/// impacket-smbserver all print the hash in this layout; Responder additionally
+/// wraps it with a `[SMB] NTLMv2-SSP Hash : ` / `[HTTP] NTLMv2 Hash : ` prefix
+/// and may colorize the line with ANSI SGR codes.
+///
+/// Without this parser, a `coercer` / `petitpotam` / `start_responder` tool
+/// call against a vulnerable DC produces output that the LLM sees as text
+/// (and may even quote in its summary), but the captured machine-account hash
+/// never lands in the orchestrator's `Hash` state — so `auto_crack_dispatch`
+/// never enqueues it, hashcat / the ouroboros backend never get a shot, and a
+/// primary path to DC compromise stays closed.
+///
+/// `source_tag` lets the caller mark the discovery (e.g. `"start_responder"`,
+/// `"petitpotam"`, `"coercer"`) so blue/red post-op queries can correlate the
+/// hash with the capture surface.
+pub fn parse_netntlmv2(output: &str, params: &Value, source_tag: &str) -> Vec<Value> {
+    let target_domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+
+    let mut hashes = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for raw_line in output.lines() {
+        // Strip ANSI (Responder colorizes [SMB]/[HTTP] tags) and trim.
+        let line = strip_ansi(raw_line).trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Strip Responder's wrappers:
+        //   [SMB]  NTLMv2-SSP Hash     : USER::DOMAIN:...
+        //   [HTTP] NTLMv2 Hash         : USER::DOMAIN:...
+        //   [MSSQL] NTLMv2 Client Hash : USER::DOMAIN:...
+        // Locate the `Hash` token (case-insensitive), then advance past the
+        // first single `:` (the label terminator) to the hash payload.
+        let lc = line.to_ascii_lowercase();
+        let payload: &str = if let Some(idx) = lc.find("ntlmv2") {
+            // The substring starts at "ntlmv2-ssp hash" or "ntlmv2 hash" etc.
+            // Find the first colon AFTER the word "hash". split_once(':') may
+            // catch the `[SMB]` bracket's `:` (none) or the label colon. To
+            // be robust, find the first colon at-or-after the word `hash`.
+            let after = &line[idx..];
+            // Locate `hash` (case-insensitive); fall back to position 0.
+            let after_lc = lc[idx..].to_string();
+            let hash_off = after_lc.find("hash").map(|p| p + 4).unwrap_or(0);
+            let tail = &after[hash_off..];
+            // Skip leading spaces / colons until we hit the username's first char.
+            let tail = tail.trim_start_matches(|c: char| c.is_whitespace() || c == ':');
+            tail
+        } else {
+            line.as_str()
+        };
+
+        if let Some(hash_value) = extract_netntlmv2_value(payload) {
+            // Dedup: Responder prints the same hash multiple times (e.g. once
+            // per protocol when the client tried both SMB and HTTP). Same
+            // physical capture, same crack work — emit it once.
+            if !seen.insert(hash_value.clone()) {
+                continue;
+            }
+
+            let parts: Vec<&str> = hash_value.split(':').collect();
+            let username = parts[0].to_string();
+            let captured_domain = parts.get(2).copied().unwrap_or("").to_string();
+
+            // Domain attribution: prefer the realm Responder logged inside the
+            // hash itself; fall back to the operation `domain` param. The
+            // Responder-captured domain may be a NetBIOS name (e.g. `CONTOSO`),
+            // which downstream cracking + state normalization tolerate.
+            let domain = if !captured_domain.is_empty() {
+                captured_domain
+            } else {
+                target_domain.to_string()
+            };
+
+            hashes.push(json!({
+                "username": username,
+                "domain": domain,
+                "hash_value": hash_value,
+                "hash_type": "netntlmv2",
+                "source": source_tag,
+            }));
+        }
+    }
+
+    hashes
+}
+
+/// Verify a candidate hash string matches the NetNTLMv2 hashcat-5600 layout
+/// and return the full string if it does.
+///
+/// Layout:  `USER::DOMAIN:CHALLENGE:NT_PROOF:BLOB`
+/// split(':') yields 6 parts; the empty between `::` is parts[1].
+/// CHALLENGE = 16 hex (8-byte server challenge)
+/// NT_PROOF  = 32 hex (16-byte NTProofStr)
+/// BLOB      = >= 16 hex (variable, ends with AV_PAIR list)
+fn extract_netntlmv2_value(s: &str) -> Option<String> {
+    let s = s.trim_end_matches(|c: char| c.is_whitespace() || c == '\r' || c == '\0');
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let user = parts[0];
+    if user.is_empty() {
+        return None;
+    }
+    // parts[1] MUST be the empty between `::`.
+    if !parts[1].is_empty() {
+        return None;
+    }
+    let challenge = parts[3];
+    let nt_proof = parts[4];
+    let blob = parts[5];
+    if challenge.len() != 16 || !challenge.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if nt_proof.len() != 32 || !nt_proof.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if blob.len() < 16 || !blob.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Strip ANSI CSI escapes Responder embeds around protocol tags / hash lines.
+/// Not a general decoder — just enough to keep the layout intact: walk past
+/// `\x1b[ ... <letter>` runs and drop them.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && matches!(chars.peek(), Some('[')) {
+            chars.next();
+            for inner in chars.by_ref() {
+                if inner.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -789,7 +939,8 @@ CONTOSO\\FABRIKAM$_history0:1107:aad3b435b51404eeaad3b435b51404ee:44444444444444
 
     #[test]
     fn parse_secretsdump_slash_separator() {
-        // raiseChild.py emits FQDN/user with a slash; parser must accept both.
+        // Impacket emits FQDN/user (slash) for domain-scoped dumps; parser
+        // must accept both slash and backslash NetBIOS forms.
         let output = "\
 contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::
 contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:22222222222222222222222222222222:::";
@@ -1015,5 +1166,121 @@ SMB         192.168.58.20   445    DC02             FABRIKAM\\CONTOSO$:aes256-ct
             hashes[0]["aes_key"],
             "4444444444444444444444444444444444444444444444444444444444444444"
         );
+    }
+
+    #[test]
+    fn parse_netntlmv2_responder_smb() {
+        // Canonical Responder SMB capture: a CONTOSO dc01$ machine-account
+        // round-tripped through coercion. CHALLENGE=16 hex, NT_PROOF=32 hex,
+        // BLOB long-form. The leading `[SMB]` prefix and `NTLMv2-SSP Hash`
+        // label must be stripped without consuming the `::` inside the hash.
+        let output = "\
+[+] Listening for events...
+[SMB] NTLMv2-SSP Client   : 192.168.58.20
+[SMB] NTLMv2-SSP Username : CONTOSO\\dc01$
+[SMB] NTLMv2-SSP Hash     : dc01$::CONTOSO:1122334455667788:9c8e64ac5db4e4a72b1cd2e1cd2e1cd2:0101000000000000c0653150de09d201aabbccddeeff00112233";
+        let params = json!({"domain": "contoso.local"});
+        let hashes = parse_netntlmv2(output, &params, "start_responder");
+        assert_eq!(hashes.len(), 1, "expected exactly one captured hash");
+        assert_eq!(hashes[0]["username"], "dc01$");
+        assert_eq!(hashes[0]["domain"], "CONTOSO");
+        assert_eq!(hashes[0]["hash_type"], "netntlmv2");
+        assert_eq!(hashes[0]["source"], "start_responder");
+        let hv = hashes[0]["hash_value"].as_str().unwrap();
+        assert!(hv.starts_with("dc01$::CONTOSO:"));
+        assert!(hv.ends_with("aabbccddeeff00112233"));
+    }
+
+    #[test]
+    fn parse_netntlmv2_http_label() {
+        // Responder HTTP capture (e.g. WebDAV coerce -> /printers/) uses a
+        // slightly different label. The parser must not require the dash form.
+        let output = "[HTTP] NTLMv2 Hash : alice::CONTOSO:aaaaaaaaaaaaaaaa:11111111111111111111111111111111:0202020202020202";
+        let params = json!({"domain": "contoso.local"});
+        let hashes = parse_netntlmv2(output, &params, "petitpotam");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "alice");
+        assert_eq!(hashes[0]["domain"], "CONTOSO");
+        assert_eq!(hashes[0]["source"], "petitpotam");
+    }
+
+    #[test]
+    fn parse_netntlmv2_raw_line_no_label() {
+        // Some Responder builds dump the bare hash line into the log (and
+        // tools like impacket-smbserver emit it raw). The parser should
+        // accept a bare 6-field line without the [SMB]/[HTTP] wrapper.
+        let output =
+            "svc_sql::CONTOSO:1122334455667788:aabbccddeeff00112233445566778899:9988776655443322";
+        let params = json!({});
+        let hashes = parse_netntlmv2(output, &params, "coercer");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "svc_sql");
+        assert_eq!(hashes[0]["domain"], "CONTOSO");
+        // No `domain` param → falls back to captured realm.
+        assert_eq!(hashes[0]["source"], "coercer");
+    }
+
+    #[test]
+    fn parse_netntlmv2_dedup_repeated_captures() {
+        // Responder commonly prints the same hash twice when the client
+        // negotiates both SMB and HTTP. Same physical credential, single
+        // crack-worth — emit once.
+        let line = "dc01$::CONTOSO:1122334455667788:9c8e64ac5db4e4a72b1cd2e1cd2e1cd2:0101000000000000aabbccdd";
+        let output = format!("[SMB] NTLMv2-SSP Hash : {line}\n[HTTP] NTLMv2 Hash : {line}\n",);
+        let params = json!({"domain": "contoso.local"});
+        let hashes = parse_netntlmv2(&output, &params, "start_responder");
+        assert_eq!(hashes.len(), 1);
+    }
+
+    #[test]
+    fn parse_netntlmv2_rejects_non_hex_fields() {
+        // A line that *looks* like the hash format but has non-hex content
+        // in CHALLENGE / NT_PROOF / BLOB must not be silently coerced.
+        let output =
+            "alice::CONTOSO:notahexstring1234:00000000000000000000000000000000:0101000000000000";
+        let hashes = parse_netntlmv2(output, &json!({}), "test");
+        assert!(hashes.is_empty(), "non-hex challenge must be rejected");
+    }
+
+    #[test]
+    fn parse_netntlmv2_rejects_wrong_field_count() {
+        // Adjacent system noise that happens to contain `::` and `:` should
+        // not be misclassified. Three checks: too few fields, too many fields,
+        // and a kerberoast-style hash (which has its own dedicated parser).
+        for noise in [
+            "user::DOMAIN:short",
+            "user::DOMAIN:1122334455667788:00000000000000000000000000000000:0101:trailing_field",
+            "$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$contoso/svc_sql*$abcd1234",
+        ] {
+            let hashes = parse_netntlmv2(noise, &json!({}), "test");
+            assert!(
+                hashes.is_empty(),
+                "should not match malformed line: {noise:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_netntlmv2_falls_back_to_param_domain_when_realm_empty() {
+        // Captured realm is empty (`USER:::CHALL:PROOF:BLOB` — three colons
+        // after the username because parts[1] AND parts[2] are empty).
+        // The 6-field structure requires parts[1] is empty (the `::`) AND
+        // exactly 6 parts; an empty domain field is still 6 parts overall.
+        let output = "alice:::1122334455667788:11111111111111111111111111111111:0202020202020202";
+        let hashes = parse_netntlmv2(output, &json!({"domain": "fallback.local"}), "test");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["domain"], "fallback.local");
+    }
+
+    #[test]
+    fn parse_netntlmv2_strips_ansi_color() {
+        // Responder colorizes the protocol tag and hash with SGR sequences.
+        // The parser must drop them before pattern-matching, or the line
+        // simply won't match the 6-field shape.
+        let output =
+            "\x1b[1;33m[SMB]\x1b[0m NTLMv2-SSP Hash : dc01$::CONTOSO:1122334455667788:11111111111111111111111111111111:0101000000000000aabbcc";
+        let hashes = parse_netntlmv2(output, &json!({}), "start_responder");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "dc01$");
     }
 }

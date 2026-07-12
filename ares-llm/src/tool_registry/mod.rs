@@ -13,6 +13,7 @@ mod credential_access;
 mod lateral;
 mod orchestrator_tools;
 mod privesc;
+pub mod provenance;
 mod recon;
 mod reporting;
 
@@ -577,20 +578,24 @@ mod tests {
             // record_compromised_host is the remaining reporting tool (log-only, no state write)
             assert!(
                 names.contains(&"record_compromised_host"),
-                "Role {role:?} missing record_compromised_host"
+                "Role {:?} missing record_compromised_host",
+                role
             );
             // Removed reporting tools must NOT be present
             assert!(
                 !names.contains(&"record_weakness"),
-                "Role {role:?} has removed tool record_weakness"
+                "Role {:?} has removed tool record_weakness",
+                role
             );
             assert!(
                 !names.contains(&"list_weaknesses"),
-                "Role {role:?} has removed tool list_weaknesses"
+                "Role {:?} has removed tool list_weaknesses",
+                role
             );
             assert!(
                 !names.contains(&"record_timeline_event"),
-                "Role {role:?} has removed tool record_timeline_event"
+                "Role {:?} has removed tool record_timeline_event",
+                role
             );
         }
     }
@@ -653,6 +658,21 @@ mod tests {
         // Posture validation tools
         assert!(names.contains(&"check_credman_entries"));
         assert!(names.contains(&"check_autologon_registry"));
+    }
+
+    #[test]
+    fn rpcclient_command_schema_exposes_null_session() {
+        let tools = tools_for_role(AgentRole::Recon);
+        let rpcclient = tools
+            .iter()
+            .find(|t| t.name == "rpcclient_command")
+            .expect("recon should expose rpcclient_command");
+        assert!(
+            rpcclient.input_schema["properties"]
+                .as_object()
+                .is_some_and(|props| props.contains_key("null_session")),
+            "rpcclient_command schema must advertise null_session fallback"
+        );
     }
 
     #[test]
@@ -746,7 +766,8 @@ mod tests {
             assert_eq!(
                 AgentRole::parse(role.as_str()),
                 Some(role),
-                "Roundtrip failed for {role:?}"
+                "Roundtrip failed for {:?}",
+                role
             );
         }
     }
@@ -945,7 +966,8 @@ mod tests {
                 let tools = blue_tools_for_role(role);
                 assert!(
                     !tools.iter().any(|t| t.name == "add_lateral_connection"),
-                    "{role:?} should NOT have add_lateral_connection"
+                    "{:?} should NOT have add_lateral_connection",
+                    role
                 );
             }
         }
@@ -1020,15 +1042,18 @@ mod tests {
                 let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
                 assert!(
                     names.contains(&"add_evidence"),
-                    "{role:?} missing add_evidence"
+                    "{:?} missing add_evidence",
+                    role
                 );
                 assert!(
                     names.contains(&"get_investigation_summary"),
-                    "{role:?} missing get_investigation_summary"
+                    "{:?} missing get_investigation_summary",
+                    role
                 );
                 assert!(
                     names.contains(&"add_technique"),
-                    "{role:?} missing add_technique"
+                    "{:?} missing add_technique",
+                    role
                 );
             }
         }

@@ -5,16 +5,32 @@ version: "3"
 dotenv: ['.env']
 
 includes:
-  aws: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/aws/Taskfile.yaml"
-  github: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/github/Taskfile.yaml"
-  pre-commit: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/pre-commit/Taskfile.yaml"
-  renovate: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/renovate/Taskfile.yaml"
-  secrets: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/secrets/Taskfile.yaml"  # pragma: allowlist secret
+  aws:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/aws/Taskfile.yaml"
+    optional: true
+  github:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/github/Taskfile.yaml"
+    optional: true
+  pre-commit:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/pre-commit/Taskfile.yaml"
+    optional: true
+  renovate:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/renovate/Taskfile.yaml"
+    optional: true
+  secrets:
+    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/secrets/Taskfile.yaml"  # pragma: allowlist secret
+    optional: true
   remote:
     taskfile: .taskfiles/remote/Taskfile.yaml
     optional: true
     vars:
       K8S_NAMESPACE: '{{.K8S_NAMESPACE}}'
+  benchmark:
+    taskfile: .taskfiles/benchmark/Taskfile.yaml
+    optional: true
+    vars:
+      ARES_CLI: '{{.ARES_CLI}}'
+      AWS_PROFILE: '{{.AWS_PROFILE}}'
   red:
     taskfile: .taskfiles/red/Taskfile.yaml
     optional: true
@@ -27,6 +43,8 @@ includes:
       REPORT_DIR: '{{.REPORT_DIR}}'
       GRAFANA_URL: '{{.GRAFANA_URL}}'
       LOKI_URL: '{{.LOKI_URL}}'
+      EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL}}'
+      EC2_LOKI_URL: '{{.EC2_LOKI_URL}}'
       DREADNODE_SERVER_URL: '{{.DREADNODE_SERVER_URL}}'
       DREADNODE_ORGANIZATION: '{{.DREADNODE_ORGANIZATION}}'
       DREADNODE_WORKSPACE: '{{.DREADNODE_WORKSPACE}}'
@@ -37,8 +55,8 @@ includes:
       TARGET: '{{.TARGET}}'
       DOMAIN: '{{.DOMAIN}}'
       EC2_NAME: '{{.EC2_NAME}}'
-      EC2_PROFILE: '{{.EC2_PROFILE}}'
-      EC2_REGION: '{{.EC2_REGION}}'
+      AWS_PROFILE: '{{.AWS_PROFILE}}'
+      AWS_REGION: '{{.AWS_REGION}}'
       BLUE_ENABLED: '{{.BLUE_ENABLED}}'
       BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL}}'
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
@@ -47,15 +65,18 @@ includes:
     optional: true
     vars:
       EC2_NAME: '{{.EC2_NAME}}'
-      EC2_PROFILE: '{{.EC2_PROFILE}}'
-      EC2_REGION: '{{.EC2_REGION}}'
+      ARES_CLI: '{{.ARES_CLI}}'
+      AWS_PROFILE: '{{.AWS_PROFILE}}'
+      AWS_REGION: '{{.AWS_REGION}}'
       ARES_CONFIG: '{{.ARES_CONFIG}}'
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
       ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
       LOKI_URL: '{{.LOKI_URL}}'
-  proxmox:
-    taskfile: .taskfiles/proxmox/Taskfile.yaml
+  k8s:
+    taskfile: .taskfiles/k8s/Taskfile.yaml
     optional: true
+    vars:
+      K8S_NAMESPACE: '{{.K8S_NAMESPACE}}'
   blue:
     taskfile: .taskfiles/blue/Taskfile.yaml
     optional: true
@@ -74,16 +95,15 @@ includes:
       DREADNODE_WORKSPACE: '{{.DREADNODE_WORKSPACE}}'
       DREADNODE_PROJECT: '{{.DREADNODE_PROJECT}}'
       K8S_NAMESPACE: '{{.K8S_NAMESPACE}}'
+  obs:
+    taskfile: .taskfiles/obs/Taskfile.yaml
+    optional: true
 
 vars:
   API_DIR: "."
   # Ares configuration
-  # Model: single source of truth is config/ares.yaml (agents.orchestrator.model).
-  # The default tracks the config file so changing the model is a one-liner
-  # (`task config:set-model-all -- <model>`); `MODEL=` still overrides per call.
-  CONFIG_MODEL:
-    sh: awk '/^  orchestrator:/{f=1} f&&/^[[:space:]]*model:/{gsub(/[",]/,"",$2); print $2; exit}' config/ares.yaml 2>/dev/null || echo "openai/gpt-5"
-  MODEL: '{{.MODEL | default .CONFIG_MODEL}}'
+  # MODEL: '{{.MODEL | default "claude-sonnet-4-5-20250929"}}'
+  MODEL: '{{.MODEL | default "gpt-5.2"}}'
   GRAFANA_URL: '{{.GRAFANA_URL}}'
   LOKI_URL: '{{.LOKI_URL}}'
   POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
@@ -112,11 +132,22 @@ vars:
   ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
   # EC2 deployment (alternative to K8s)
   EC2_NAME: '{{.EC2_NAME | default "ares-tools"}}'
-  EC2_PROFILE: '{{.EC2_PROFILE | default "lab"}}'
-  EC2_REGION: '{{.EC2_REGION | default "us-west-1"}}'
-  # Blue team (set BLUE_ENABLED=1 to run blue alongside red)
-  BLUE_ENABLED: '{{.BLUE_ENABLED | default "0"}}'
+  # AWS profile/region: honor standard AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION env vars.
+  AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+  AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
+  # Blue team on by default (BLUE_ENABLED=0 to skip). The default deployment
+  # target is kali-ares on EC2, where the box can reach plundr obs directly;
+  # running with blue off there just wastes a launch.
+  BLUE_ENABLED: '{{.BLUE_ENABLED | default "1"}}'
   BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
+  # Box-context observability endpoints — used when the orchestrator/workers
+  # run on EC2 and need to reach Loki/Grafana themselves. GRAFANA_URL/LOKI_URL
+  # in .env stay as the laptop's obs:forward localhost URLs; these are the
+  # values baked into the launch script that ships to the box. Direct Loki
+  # (not the Grafana datasource proxy) — proxy IDs get renumbered when
+  # datasources are recreated, direct DNS is stable.
+  EC2_LOKI_URL: '{{.EC2_LOKI_URL | default "https://loki.dev.plundr.ai"}}'
+  EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL | default "https://grafana.dev.plundr.ai"}}'
 
 tasks:
   default:
@@ -124,6 +155,58 @@ tasks:
     silent: true
     cmds:
       - task --list --sort none
+
+  run:
+    desc: "One-shot: stop, launch red+blue op, optionally wait + capture snapshot + print benchmark:replay command (usage: task run [WAIT=true] [CAPTURE=true] [TARGET=dreadgoad] [EC2_NAME=kali-ares])"
+    silent: true
+    vars:
+      WAIT: '{{.WAIT | default "false"}}'
+      CAPTURE: '{{.CAPTURE | default "false"}}'
+    cmds:
+      - task: ec2:stop
+      - task: red:ec2:multi
+      - |
+        if [ "{{.WAIT}}" != "true" ] && [ "{{.CAPTURE}}" != "true" ]; then
+          exit 0
+        fi
+        # CAPTURE implies WAIT — capture must run against a completed op.
+        task ec2:watch EC2_NAME="{{.EC2_NAME}}" LATEST=true
+      - |
+        if [ "{{.CAPTURE}}" != "true" ]; then exit 0; fi
+
+        # Resolve op id + attacker private IP for the capture.
+        OP_ID=$({{.ARES_CLI}} --ec2 "{{.EC2_NAME}}" --ec2-profile "{{.AWS_PROFILE}}" --ec2-region "{{.AWS_REGION}}" \
+          ops list --latest 2>/dev/null | grep -oE 'op-[0-9]+-[0-9]+' | head -1)
+        if [ -z "$OP_ID" ]; then
+          echo "capture: could not resolve latest op id — run 'ares benchmark capture --latest --wait-for-flush' manually"
+          exit 1
+        fi
+        INSTANCE_ID=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" --output text | head -1)
+        ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+          --instance-ids "$INSTANCE_ID" \
+          --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true
+
+        # SSM-forward the box's Redis so `ares benchmark capture` can read op state.
+        lsof -ti:16379 | xargs kill 2>/dev/null || true
+        aws ssm start-session --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" --target "$INSTANCE_ID" \
+          --document-name AWS-StartPortForwardingSession \
+          --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}' >/tmp/ares-run-capture-fwd.log 2>&1 &
+        PF_PID=$!
+        trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+        for _ in $(seq 1 20); do nc -z localhost 16379 2>/dev/null && break; sleep 2; done
+
+        echo "▶ capturing snapshot for $OP_ID (waits for Loki flush — up to ~60 min)..."
+        {{.ARES_CLI}} benchmark capture "$OP_ID" \
+          --redis-url redis://localhost:16379 \
+          --wait-for-flush \
+          ${ATTACKER_IP:+--attacker-ips "$ATTACKER_IP"} \
+          || { echo "capture failed — run 'ares benchmark capture $OP_ID --wait-for-flush' later"; exit 1; }
+
+        echo ""
+        echo "▶ Snapshot captured. To evaluate blue against it:"
+        echo "    task benchmark:replay OP_ID=$OP_ID"
 
   # Setup and initialization tasks
   check-command:
@@ -371,8 +454,8 @@ tasks:
     internal: true
     silent: true
     vars:
-      PROFILE: '{{.PROFILE | default "lab"}}'
-      REGION: '{{.REGION | default "us-west-1"}}'
+      PROFILE: '{{.PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+      REGION: '{{.REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
     cmds:
       - |
         # Check if AWS CLI is installed

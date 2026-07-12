@@ -67,14 +67,28 @@ impl PersistentStore {
         Ok(Self { pool })
     }
 
-    /// Run the schema migration (create tables if they don't exist).
+    /// Apply pending sqlx migrations from `ares-core/migrations/`.
+    ///
+    /// Migrations are embedded at compile time via `sqlx::migrate!`. The
+    /// `_sqlx_migrations` table tracks which have been applied; reruns are
+    /// no-ops. Existing tables created by the legacy `schema.sql` path are
+    /// re-asserted idempotently by `20260615120000_init.sql`.
     pub async fn migrate(&self) -> Result<()> {
-        let schema = include_str!("schema.sql");
-        sqlx::raw_sql(schema)
-            .execute(&self.pool)
+        // Acquire an explicit connection from the pool first so the migrator's
+        // `Acquire<'a>` bound resolves to a single concrete impl (&mut PgConnection)
+        // — both rustc 1.92 (on EC2) and 1.96 (laptop) infer this form
+        // unambiguously, where chaining `.run(&pool)` confuses the older toolchain.
+        let migrator: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+        let mut conn = self
+            .pool
+            .acquire()
             .await
-            .context("Failed to run schema migration")?;
-        info!("Persistent store schema migrated");
+            .context("Failed to acquire migration connection")?;
+        migrator
+            .run(&mut *conn)
+            .await
+            .context("Failed to apply sqlx migrations")?;
+        info!("Persistent store migrations applied");
         Ok(())
     }
 

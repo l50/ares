@@ -44,6 +44,14 @@ pub struct OrchestratorConfig {
     /// How long before an in-progress task with no activity is considered stale.
     pub stale_task_timeout: Duration,
 
+    /// Stale timeout for non-LLM tasks (`crack`, `command`). Hashcat cracks can
+    /// run for a long AES Kerberoast budget and may wait behind the
+    /// AES-exclusive permit, so reaping these on the LLM `stale_task_timeout`
+    /// throws away in-flight cracks the tool would have completed. Kept above
+    /// the dispatch ceiling and never halved under LLM hard-cap pressure so the
+    /// reaper is a true backstop, not a premature killer.
+    pub non_llm_task_timeout: Duration,
+
     /// Maximum age for deferred tasks before eviction (seconds).
     pub deferred_task_max_age: Duration,
 
@@ -176,25 +184,12 @@ impl OrchestratorConfig {
         // Resolve strategy from env vars + JSON payload + YAML config
         let strategy = Strategy::resolve(json_value.as_ref(), yaml);
 
-        // Listener IP: ONLY honored from an explicit env var. Auto-detecting
-        // from the orchestrator's egress was wrong — the orchestrator and the
-        // coercion worker run on different pods with different IPs, so the
-        // auto-detected value was never bindable on the worker and forced
-        // resolve_listener_ip in ares-tools::coercion to substitute on every
-        // call. Workers now derive their own egress IP at tool-execution time
-        // when no explicit override is set.
-        let listener_ip = env::var("ARES_LISTENER_IP").ok();
-
-        // Source of truth is config/ares.yaml `operation.max_concurrent_tasks`.
-        // The `ARES_MAX_CONCURRENT_TASKS` env var overrides it for per-deployment
-        // tuning (e.g. a local 2-slot llama-server needs a far lower fan-out than
-        // the 8-worker-pod cloud deployment). Falls back to 12 only when neither
-        // the env var nor a yaml config is present.
-        let max_concurrent_tasks = env::var("ARES_MAX_CONCURRENT_TASKS")
+        // Listener IP: explicit env var, or auto-detect from first target IP.
+        let listener_ip = env::var("ARES_LISTENER_IP")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| yaml.map(|c| c.operation.max_concurrent_tasks as usize))
-            .unwrap_or(12);
+            .or_else(|| detect_local_ip(target_ips.first().map(|s| s.as_str())));
+
+        let max_concurrent_tasks = parse_env("ARES_MAX_CONCURRENT_TASKS", 12);
         let heartbeat_interval_secs = parse_env("ARES_HEARTBEAT_INTERVAL_SECS", 30);
         let heartbeat_timeout_secs = parse_env("ARES_HEARTBEAT_TIMEOUT_SECS", 120);
         let result_poll_interval_ms = parse_env("ARES_RESULT_POLL_INTERVAL_MS", 500);
@@ -202,26 +197,13 @@ impl OrchestratorConfig {
         let deferred_poll_interval_secs = parse_env("ARES_DEFERRED_POLL_INTERVAL_SECS", 10);
         let max_tasks_per_role = parse_env("ARES_MAX_TASKS_PER_ROLE", 3);
         let dispatch_delay_ms = parse_env("ARES_DISPATCH_DELAY_MS", 200);
-        // 900s (15min) — gpt-5.2 reasoning agent loops with batches of parallel
-        // tool calls (LDAP, nmap, certipy) routinely span several minutes
-        // without an LLM response in between. With activity-based eviction
-        // already touching on each LLM response AND tool dispatch boundary
-        // (see ActiveTaskTracker::touch), a longer window covers the
-        // long-single-tool-batch case until heartbeat-during-dispatch lands.
-        // Worker death is detected separately via the ares:heartbeat:* keys.
-        let stale_task_timeout_secs = parse_env("ARES_STALE_TASK_TIMEOUT_SECS", 900);
+        let stale_task_timeout_secs = parse_env("ARES_STALE_TASK_TIMEOUT_SECS", 300);
+        // Above DEFAULT_TOOL_TIMEOUT_SECS (5700) so the dispatcher's own result
+        // — success or timeout-failure — always lands before this backstop fires.
+        let non_llm_task_timeout_secs = parse_env("ARES_NON_LLM_TASK_TIMEOUT_SECS", 6000);
         let deferred_task_max_age_secs = parse_env("ARES_DEFERRED_TASK_MAX_AGE_SECS", 300);
-        // Bumped from 50/200 — three automations
-        // (auto_local_admin_secretsdump, auto_credential_expansion,
-        // auto_credential_access) cross-fire on the same (cred,target) and
-        // saturate the per-type cap in ~60s. Tasks above the cap were
-        // permanently dropped ("Deferred queue full, task dropped") despite
-        // the misleading "will retry next tick" log — the automation only
-        // re-dispatches on its own interval, so a saturated queue meant the
-        // first successful win silently stalled the whole credential pivot.
-        // 500/2000 absorbs the cross-fire and is still trivial RAM in Redis.
-        let max_deferred_per_type = parse_env("ARES_MAX_DEFERRED_PER_TYPE", 500);
-        let max_deferred_total = parse_env("ARES_MAX_DEFERRED_TOTAL", 2000);
+        let max_deferred_per_type = parse_env("ARES_MAX_DEFERRED_PER_TYPE", 50);
+        let max_deferred_total = parse_env("ARES_MAX_DEFERRED_TOTAL", 200);
 
         Ok(Self {
             redis_url,
@@ -236,6 +218,7 @@ impl OrchestratorConfig {
             max_tasks_per_role,
             dispatch_delay: Duration::from_millis(dispatch_delay_ms),
             stale_task_timeout: Duration::from_secs(stale_task_timeout_secs),
+            non_llm_task_timeout: Duration::from_secs(non_llm_task_timeout_secs),
             deferred_task_max_age: Duration::from_secs(deferred_task_max_age_secs),
             max_deferred_per_type,
             max_deferred_total,
@@ -245,6 +228,58 @@ impl OrchestratorConfig {
             strategy,
             listener_ip,
         })
+    }
+
+    /// Expand `target_ips` to cover the entire /24 around any cluster of
+    /// 2+ existing target IPs. Returns the count of IPs added.
+    ///
+    /// Bootstrap launches in CTF / lab scenarios typically pass just the
+    /// known DC IPs (`192.168.58.10,11,12,22,23`). The interesting attack
+    /// surface lives elsewhere in the same /24 — SQL server, web server,
+    /// CA web enrollment, workstation. With `target_ips` limited to the
+    /// 5 DCs, [`crate::orchestrator::dispatcher::Dispatcher::request_recon`]
+    /// only probes those five and [`ares_tools::scope::OperationScope`]
+    /// rejects single-target attacks against anything else, leaving the
+    /// agent loop unable to pivot onto discovered hosts.
+    ///
+    /// Gated on `ARES_SCOPE_EXPAND_SUBNETS=1` so production engagements
+    /// keep the strict "only authorized IPs" guarantee. When enabled, we
+    /// add every host in each clustered /24 (`a.b.c.1` through `a.b.c.254`,
+    /// skipping the network and broadcast addresses) to `target_ips`.
+    pub fn expand_scope_to_subnets(&mut self) -> usize {
+        if std::env::var("ARES_SCOPE_EXPAND_SUBNETS").ok().as_deref() != Some("1") {
+            return 0;
+        }
+        use std::collections::BTreeSet;
+        use std::net::Ipv4Addr;
+        let mut prefixes: std::collections::BTreeMap<[u8; 3], usize> =
+            std::collections::BTreeMap::new();
+        for s in &self.target_ips {
+            if let Ok(ip) = s.parse::<Ipv4Addr>() {
+                let oc = ip.octets();
+                *prefixes.entry([oc[0], oc[1], oc[2]]).or_insert(0) += 1;
+            }
+        }
+        let cluster_prefixes: Vec<[u8; 3]> = prefixes
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(p, _)| p)
+            .collect();
+        if cluster_prefixes.is_empty() {
+            return 0;
+        }
+        let mut existing: BTreeSet<String> = self.target_ips.iter().cloned().collect();
+        let mut added = 0;
+        for p in cluster_prefixes {
+            for host in 1u8..=254 {
+                let ip = format!("{}.{}.{}.{}", p[0], p[1], p[2], host);
+                if existing.insert(ip.clone()) {
+                    self.target_ips.push(ip);
+                    added += 1;
+                }
+            }
+        }
+        added
     }
 
     /// Hard cap = 1.5x the soft concurrency limit. Tasks above this are deferred.
@@ -287,6 +322,22 @@ fn parse_credential_spec(spec: &str, default_domain: &str) -> Option<InitialCred
     })
 }
 
+/// Auto-detect the local IP by opening a UDP socket aimed at the first target.
+/// This never sends traffic — the OS resolves which interface would route to the
+/// target and we read the bound local address.
+fn detect_local_ip(target: Option<&str>) -> Option<String> {
+    let dest = target.unwrap_or("8.8.8.8");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect(format!("{dest}:53")).ok()?;
+    let addr = socket.local_addr().ok()?;
+    let ip = addr.ip().to_string();
+    // Reject loopback — not useful as a relay listener
+    if ip.starts_with("127.") {
+        return None;
+    }
+    Some(ip)
+}
+
 /// Parse an environment variable into a numeric type, falling back to `default`.
 fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
@@ -322,6 +373,7 @@ mod tests {
             max_tasks_per_role: 3,
             dispatch_delay: Duration::from_millis(0),
             stale_task_timeout: Duration::from_secs(900),
+            non_llm_task_timeout: Duration::from_secs(6000),
             deferred_task_max_age: Duration::from_secs(300),
             max_deferred_per_type: 50,
             max_deferred_total: 200,
@@ -331,28 +383,6 @@ mod tests {
             strategy: Strategy::default(),
             listener_ip: None,
         }
-    }
-
-    /// Build a minimal AresConfig with a chosen operation.max_concurrent_tasks.
-    fn ares_config_with_concurrency(max_concurrent_tasks: u32) -> ares_core::config::AresConfig {
-        let yaml_str = serde_yaml::to_string(&serde_json::json!({
-            "operation": {
-                "name": "test",
-                "namespace": "ns",
-                "max_concurrent_tasks": max_concurrent_tasks,
-            },
-            "agents": {},
-            "timeouts": {},
-            "recovery": {},
-            "phase_detection": {},
-            "context_management": {},
-            "vulnerability_priorities": {},
-            "logging": {},
-            "resources": {},
-            "security": {},
-        }))
-        .unwrap();
-        serde_yaml::from_str(&yaml_str).unwrap()
     }
 
     #[test]
@@ -438,24 +468,6 @@ mod tests {
         assert!(c.strategy.should_continue_after_da());
         assert!(c.strategy.is_comprehensive());
 
-        // max_concurrent_tasks: yaml `operation.max_concurrent_tasks` is the
-        // source of truth when the env var is unset.
-        std::env::remove_var("ARES_MAX_CONCURRENT_TASKS");
-        std::env::set_var("ARES_OPERATION_ID", "test-yaml-concurrency");
-        let yaml_cfg = ares_config_with_concurrency(7);
-        let c = OrchestratorConfig::from_env_with_yaml(Some(&yaml_cfg)).unwrap();
-        assert_eq!(c.max_concurrent_tasks, 7, "yaml value wins when env unset");
-
-        // The env var overrides the yaml value (per-deployment tuning).
-        std::env::set_var("ARES_MAX_CONCURRENT_TASKS", "3");
-        let c = OrchestratorConfig::from_env_with_yaml(Some(&yaml_cfg)).unwrap();
-        assert_eq!(c.max_concurrent_tasks, 3, "env overrides yaml");
-        std::env::remove_var("ARES_MAX_CONCURRENT_TASKS");
-
-        // No env var and no yaml → falls back to the hardcoded default.
-        let c = OrchestratorConfig::from_env_with_yaml(None).unwrap();
-        assert_eq!(c.max_concurrent_tasks, 12, "fallback when neither present");
-
         std::env::remove_var("ARES_OPERATION_ID");
         std::env::remove_var("ARES_INITIAL_CREDENTIAL");
     }
@@ -495,6 +507,62 @@ mod tests {
         assert!(parse_credential_spec("admin:@contoso.local", "").is_none());
         // Empty password without domain
         assert!(parse_credential_spec("admin:", "").is_none());
+    }
+
+    #[test]
+    fn expand_scope_to_subnets_combined() {
+        // Single test to avoid env-var races between parallel tests. Mirrors
+        // the from_env_plain_and_json_and_missing test pattern.
+        std::env::remove_var("ARES_SCOPE_EXPAND_SUBNETS");
+
+        // Env unset → no expansion even when targets are clustered.
+        {
+            let mut cfg = make_config(8);
+            cfg.target_ips = vec!["192.168.58.10".into(), "192.168.58.11".into()];
+            assert_eq!(cfg.expand_scope_to_subnets(), 0);
+            assert_eq!(cfg.target_ips.len(), 2);
+        }
+
+        // Env set, but no /24 has 2+ targets → no expansion.
+        std::env::set_var("ARES_SCOPE_EXPAND_SUBNETS", "1");
+        {
+            let mut cfg = make_config(8);
+            cfg.target_ips = vec!["192.168.58.10".into(), "192.168.59.10".into()];
+            assert_eq!(cfg.expand_scope_to_subnets(), 0);
+        }
+
+        // Env set + clustered targets → fans out to full /24 (skipping .0/.255).
+        {
+            let mut cfg = make_config(8);
+            cfg.target_ips = vec![
+                "192.168.58.10".into(),
+                "192.168.58.11".into(),
+                "192.168.58.12".into(),
+            ];
+            assert_eq!(cfg.expand_scope_to_subnets(), 251);
+            assert_eq!(cfg.target_ips.len(), 254);
+            assert!(cfg.target_ips.contains(&"192.168.58.50".to_string()));
+            assert!(cfg.target_ips.contains(&"192.168.58.254".to_string()));
+            assert!(!cfg.target_ips.contains(&"192.168.58.0".to_string()));
+            assert!(!cfg.target_ips.contains(&"192.168.58.255".to_string()));
+        }
+
+        std::env::remove_var("ARES_SCOPE_EXPAND_SUBNETS");
+    }
+
+    #[test]
+    fn detect_local_ip_returns_some() {
+        // Uses 8.8.8.8 as default destination — should resolve to a local interface
+        // unless we're running in a network-less sandbox.
+        let ip = detect_local_ip(None);
+        if let Some(ref addr) = ip {
+            assert!(!addr.starts_with("127."), "Should reject loopback: {addr}");
+        }
+        // Also test with an explicit target
+        let ip2 = detect_local_ip(Some("192.168.58.10"));
+        if let Some(ref addr) = ip2 {
+            assert!(!addr.starts_with("127."));
+        }
     }
 
     #[test]

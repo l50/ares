@@ -14,6 +14,9 @@ use super::dedup_keys::{build_credential_dedup_key, build_hash_dedup_key, parse_
 use super::keys::*;
 use super::try_deserialize;
 
+/// TTL applied to operation state keys in Redis (24 hours).
+const OP_TTL_SECS: i64 = 86_400;
+
 /// Read-only Redis state backend for CLI operations.
 pub struct RedisStateReader {
     operation_id: String,
@@ -258,7 +261,7 @@ impl RedisStateReader {
 
         let added: bool = conn.hset_nx(&key, &dedup_field, &data).await?;
         if added {
-            let _: () = conn.expire(&key, 86400).await?; // 24h TTL
+            let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         }
         Ok(added)
     }
@@ -274,7 +277,7 @@ impl RedisStateReader {
 
         let added: bool = conn.hset_nx(&key, &vuln.vuln_id, &data).await?;
         if added {
-            let _: () = conn.expire(&key, 86400).await?;
+            let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         }
         Ok(added)
     }
@@ -286,9 +289,27 @@ impl RedisStateReader {
         host: &Host,
     ) -> Result<(), redis::RedisError> {
         let key = self.key(KEY_HOSTS);
+        // Dedup by IP (fall back to hostname), like `add_user`. This used to be
+        // a blind RPUSH, so a re-discovery of an already-listed host appended a
+        // duplicate row — including phantom empty-IP rows when the hostname was
+        // known but the IP wasn't. Duplicate rows let a stale `owned:false`
+        // shadow a later `owned:true` (`mark_host_owned` could only rewrite so
+        // many of them), which starved the ownership-gated SAM-dump chain.
+        let existing: Vec<String> = conn.lrange(&key, 0, -1).await?;
+        for item in &existing {
+            if let Ok(h) = serde_json::from_str::<Host>(item) {
+                let ip_dup = !host.ip.is_empty() && h.ip == host.ip;
+                let host_dup =
+                    !host.hostname.is_empty() && h.hostname.eq_ignore_ascii_case(&host.hostname);
+                if ip_dup || host_dup {
+                    let _: () = conn.expire(&key, OP_TTL_SECS).await?;
+                    return Ok(());
+                }
+            }
+        }
         let data = serde_json::to_string(host).unwrap_or_default();
         let _: () = conn.rpush(&key, &data).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(())
     }
 
@@ -316,7 +337,7 @@ impl RedisStateReader {
         }
         let data = serde_json::to_string(user).unwrap_or_default();
         let _: () = conn.rpush(&key, &data).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(true)
     }
 
@@ -328,7 +349,7 @@ impl RedisStateReader {
     ) -> Result<bool, redis::RedisError> {
         let key = self.key(KEY_DOMAINS);
         let added: i64 = conn.sadd(&key, domain.to_lowercase()).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(added > 0)
     }
 
@@ -381,7 +402,7 @@ impl RedisStateReader {
 
         let added: bool = conn.hset_nx(&key, &dedup_field, &data).await?;
         if added {
-            let _: () = conn.expire(&key, 86400).await?;
+            let _: () = conn.expire(&key, OP_TTL_SECS).await?;
             return Ok(true);
         }
 
@@ -398,7 +419,7 @@ impl RedisStateReader {
                 .is_some();
             if !existing_has_aes {
                 let _: () = conn.hset(&key, &dedup_field, &data).await?;
-                let _: () = conn.expire(&key, 86400).await?;
+                let _: () = conn.expire(&key, OP_TTL_SECS).await?;
             }
         }
         Ok(false)
@@ -416,7 +437,7 @@ impl RedisStateReader {
         let key = self.key(KEY_META);
         let serialized = serde_json::to_string(value).unwrap_or_default();
         let _: () = conn.hset(&key, field, &serialized).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(())
     }
 
@@ -429,7 +450,7 @@ impl RedisStateReader {
     ) -> Result<(), redis::RedisError> {
         let key = self.key(KEY_DOMAIN_SIDS);
         let _: () = conn.hset(&key, domain, sid).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(())
     }
 
@@ -463,7 +484,7 @@ impl RedisStateReader {
     ) -> Result<(), redis::RedisError> {
         let key = self.key(KEY_ADMIN_NAMES);
         let _: () = conn.hset(&key, domain, name).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(())
     }
 
@@ -491,7 +512,7 @@ impl RedisStateReader {
         let field = ticket.dedup_key();
         let data = serde_json::to_string(ticket).unwrap_or_default();
         let _: () = conn.hset(&key, &field, &data).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(())
     }
 
@@ -525,7 +546,7 @@ impl RedisStateReader {
 
         let added: bool = conn.hset_nx(&key, &dedup_field, &data).await?;
         if added {
-            let _: () = conn.expire(&key, 86400).await?;
+            let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         }
         Ok(added)
     }
@@ -539,7 +560,7 @@ impl RedisStateReader {
         let key = self.key(KEY_TIMELINE);
         let data = serde_json::to_string(event).unwrap_or_default();
         let _: () = conn.rpush(&key, &data).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(())
     }
 
@@ -551,7 +572,7 @@ impl RedisStateReader {
     ) -> Result<bool, redis::RedisError> {
         let key = self.key(KEY_TECHNIQUES);
         let added: i64 = conn.sadd(&key, technique_id).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(added > 0)
     }
 
@@ -603,7 +624,7 @@ impl RedisStateReader {
     ) -> Result<i64, redis::RedisError> {
         let key = self.key(KEY_VULN_TYPE_FAILURES);
         let count: i64 = conn.hincr(&key, vuln_type, 1i64).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         Ok(count)
     }
 
@@ -658,7 +679,7 @@ impl RedisStateReader {
         let data = serde_json::to_string(trust).unwrap_or_default();
         let added: bool = conn.hset_nx(&key, &domain_key, &data).await?;
         if added {
-            let _: () = conn.expire(&key, 86400).await?;
+            let _: () = conn.expire(&key, OP_TTL_SECS).await?;
         }
         Ok(added)
     }
@@ -994,6 +1015,38 @@ mod tests {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].ip, "192.168.58.5");
         assert_eq!(hosts[0].hostname, "dc01.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn add_host_dedups_by_ip_and_hostname() {
+        let mut conn = MockRedisConnection::new();
+        let reader = make_reader();
+
+        // First insert lands.
+        reader
+            .add_host(&mut conn, &make_host("192.168.58.5", "dc01.contoso.local"))
+            .await
+            .unwrap();
+        // Same IP (hostname differs) — deduped.
+        reader
+            .add_host(&mut conn, &make_host("192.168.58.5", "other.contoso.local"))
+            .await
+            .unwrap();
+        // Same hostname, empty IP (the phantom-row shape) — deduped.
+        reader
+            .add_host(&mut conn, &make_host("", "dc01.contoso.local"))
+            .await
+            .unwrap();
+        // A genuinely different host still lands.
+        reader
+            .add_host(&mut conn, &make_host("192.168.58.6", "sql01.contoso.local"))
+            .await
+            .unwrap();
+
+        let hosts = reader.get_hosts(&mut conn).await.unwrap();
+        assert_eq!(hosts.len(), 2, "duplicates should collapse: {hosts:?}");
+        assert!(hosts.iter().any(|h| h.ip == "192.168.58.5"));
+        assert!(hosts.iter().any(|h| h.ip == "192.168.58.6"));
     }
 
     // -- get_users / add_user ------------------------------------------------

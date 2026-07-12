@@ -18,7 +18,6 @@ use ares_core::state::RedisStateReader;
 use ares_llm::{ToolCall, ToolExecResult};
 
 use crate::orchestrator::task_queue::TaskQueue;
-use crate::worker::credential_resolver::requires_exact_realm;
 
 /// Inspect a tool call's `domain` argument; return a synthetic error result
 /// if it looks like a hallucinated FQDN. Returns `None` to allow the call.
@@ -118,124 +117,193 @@ pub(super) async fn check_domain_arg(
     })
 }
 
-/// Reject authenticated exact-realm tool calls aimed at a domain we have no
-/// way to authenticate to. The LDAP simple-bind enumeration/modify and
-/// kerberoast tools in [`requires_exact_realm`] need a principal *in the
-/// target realm* — the credential resolver deliberately refuses cross-realm
-/// fallback for them (realm-strict), so when the only owned creds belong to an
-/// unrelated forest (e.g. `alice`@child.contoso.local fired at the
-/// fabrikam.local DC) the tool runs unauthenticated, returns LDAP `0x52e`,
-/// and the task gets requeued — a pure cycle-waster that recurs every round.
+/// Intercept native-credential auth aimed across a *forest* trust boundary.
 ///
-/// Fires only when ALL hold, to avoid false positives:
-/// - the tool is in the exact-realm set, minus `enumerate_domain_trusts`
-///   (the trust *discovery* escape hatch is never blocked),
-/// - we already own at least one credential/hash (past initial foothold; an
-///   empty-state op may still want unauthenticated/null-session attempts),
-/// - no owned principal's realm is in the same forest tree as the target
-///   (shared DNS suffix ≥ 2 labels), and
-/// - the target realm is not a known trusted domain (no cross-realm Kerberos
-///   path the resolver could forge a ticket for).
+/// Native NTLM/Kerberos auth cannot cross a forest boundary: a home-realm
+/// ticket presented to a foreign forest's KDC fails with `KDC_ERR_WRONG_REALM`,
+/// and cross-realm NTLM pass-through is rejected. The only working path is an
+/// inter-realm TGT forged with the trust key, which `auto_trust_follow`
+/// produces automatically and publishes as a ccache;
+/// `credential_resolver::resolve_cross_forest_ticket` then flips these tools
+/// into Kerberos mode. Left unguarded, the LLM re-issues `secretsdump` against
+/// a foreign-forest DC with home-realm creds every turn — eating
+/// `KDC_ERR_WRONG_REALM` and burning tokens while objective state stays flat
+/// (the op-20260703-141802 wedge).
 ///
-/// Returns a synthetic error with remediation so the LLM stops re-dispatching
-/// the doomed bind and instead pivots (foothold in the realm, or trust enum).
-pub(super) async fn check_unauthable_realm(
+/// Returns a synthetic error (steering the agent off the doomed mechanic) when
+/// ALL hold:
+/// - the tool has a native auth mode with a Kerberos alternative
+///   (`KerberosCoercion::InPlace` / `Redirect` — `*_kerberos` variants and
+///   non-auth tools are never blocked),
+/// - no `ticket_path` is already supplied (a supplied ticket is the legit path),
+/// - the credential realm (`domain` arg) and the resolved target-host realm are
+///   in different forests, and
+/// - no forged inter-realm ccache for the target realm exists yet.
+///
+/// Any unknown — no `domain` arg, unresolvable target realm, same forest, or a
+/// forge already landed — returns `None` (allow), so the guard never blocks a
+/// legitimate or same-realm call.
+pub(super) async fn check_cross_realm_auth(
     queue: &TaskQueue,
     operation_id: &str,
     call: &ToolCall,
 ) -> Option<ToolExecResult> {
-    if call.name == "enumerate_domain_trusts" || !requires_exact_realm(&call.name) {
+    // Only native-cred impacket auth tools that have a Kerberos alternative.
+    if !blocks_native_cross_realm_auth(&call.name) {
         return None;
     }
 
-    let target = call
+    // A supplied ticket means the caller is already on the Kerberos path.
+    if call
         .arguments
-        .get("target_domain")
-        .or_else(|| call.arguments.get("domain"))
+        .get("ticket_path")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && s.contains('.'))?;
-    let target_lc = target.to_lowercase();
-
-    let mut conn = queue.connection();
-    let reader = RedisStateReader::new(operation_id.to_string());
-
-    let creds = reader.get_credentials(&mut conn).await.unwrap_or_default();
-    let hashes = reader.get_hashes(&mut conn).await.unwrap_or_default();
-
-    // No foothold yet — let unauthenticated/null-session attempts proceed.
-    let owned_realms: Vec<String> = creds
-        .iter()
-        .filter(|c| !c.password.is_empty())
-        .map(|c| c.domain.clone())
-        .chain(
-            hashes
-                .iter()
-                .filter(|h| !h.hash_value.is_empty())
-                .map(|h| h.domain.clone()),
-        )
-        .filter(|d| !d.is_empty())
-        .collect();
-    if owned_realms.is_empty() {
-        return None;
-    }
-
-    // Any owned principal in the same forest tree as the target can bind
-    // (intra-forest trust is transitive). Only unrelated forests are doomed.
-    if owned_realms
-        .iter()
-        .any(|d| realms_related(&target_lc, &d.to_lowercase()))
+        .is_some_and(|s| !s.trim().is_empty())
     {
         return None;
     }
 
-    // A discovered trust to the target realm means a cross-realm Kerberos path
-    // (forged inter-realm ticket) may exist — don't block those.
-    let trusted = reader
-        .get_trusted_domains(&mut conn)
+    // Credential realm the LLM is authenticating as. Needs a dot to be a realm;
+    // a bare workgroup label carries no forest, so leave it alone.
+    let cred_realm = call
+        .arguments
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.contains('.'))?
+        .to_lowercase();
+
+    let mut conn = queue.connection();
+    let reader = RedisStateReader::new(operation_id.to_string());
+
+    // Resolve the target host's realm. Unknown target → don't over-block.
+    let dc_map = reader.get_dc_map(&mut conn).await.unwrap_or_default();
+    let target_realm = infer_target_realm_from_args(&call.arguments, &dc_map)?;
+
+    // If a forged inter-realm ccache for the target realm already exists, the
+    // worker's resolve_cross_forest_ticket will inject it and flip to Kerberos.
+    let has_forged_ticket = reader
+        .get_kerberos_tickets(&mut conn)
         .await
-        .unwrap_or_default();
-    if trusted.keys().any(|d| d.eq_ignore_ascii_case(target)) {
+        .unwrap_or_default()
+        .iter()
+        .any(|t| {
+            t.target_domain.eq_ignore_ascii_case(&target_realm) && !t.ticket_path.trim().is_empty()
+        });
+
+    // Only block a genuine forest boundary (disjoint namespaces) with no forge
+    // yet; same-domain, parent/child, and post-forge calls take the normal path.
+    if !cross_realm_auth_is_doomed(&cred_realm, &target_realm, has_forged_ticket) {
         return None;
     }
 
     warn!(
         tool = %call.name,
-        target = %target,
-        owned = ?owned_realms,
-        "Rejecting tool call: no owned principal can authenticate to target realm"
+        cred_realm = %cred_realm,
+        target_realm = %target_realm,
+        "Rejecting native-credential auth across a forest boundary — no forged inter-realm ticket yet"
+    );
+
+    let message = format!(
+        "Cross-forest authentication blocked: '{tool}' is targeting a domain controller in forest \
+         '{target}' using '{cred}' credentials. Native NTLM/Kerberos auth cannot cross a forest \
+         trust boundary — a home-realm ticket presented to the foreign KDC fails with \
+         KDC_ERR_WRONG_REALM, and cross-realm NTLM pass-through is rejected. The cross-forest dump \
+         requires an inter-realm TGT forged with the trust key; the orchestrator does this \
+         automatically once the target domain SID, trust key, and AES key are in state, then \
+         publishes a forged ccache that flips secretsdump/psexec/wmiexec/smbexec into Kerberos \
+         mode. No forged ticket for '{target}' exists yet. Do NOT retry native-credential auth \
+         against this DC — it will keep failing the same way. Pursue other objectives (ACL or \
+         certificate escalation, or enumeration that captures the trust key and target SID) while \
+         the inter-realm forge completes.",
+        tool = call.name,
+        target = target_realm,
+        cred = cred_realm,
     );
 
     Some(ToolExecResult {
         output: String::new(),
-        error: Some(format!(
-            "No owned credential or hash for domain '{target}', and no trust to it is known. \
-             An authenticated bind to this domain will fail with LDAP 0x52e. Capture a foothold \
-             in '{target}' first (a credential or hash for one of its principals), or — if a \
-             domain/forest trust exists — discover it with enumerate_domain_trusts and pivot via \
-             a cross-realm Kerberos ticket. Do not retry this tool against '{target}' until then."
-        )),
+        error: Some(message),
         discoveries: None,
     })
 }
 
-/// True when realms `a` and `b` sit in the same forest tree and so trust each
-/// other transitively: equal, or sharing a DNS suffix of ≥ 2 labels (e.g.
-/// `child.contoso.local` and `contoso.local` share
-/// `contoso.local`). Unrelated forests share only the TLD-style tail
-/// (`child.contoso.local` vs `fabrikam.local` share just `local`, 1 label)
-/// and are NOT related — cross-forest auth needs an explicit trust.
-fn realms_related(a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case(b) {
-        return true;
+/// True when the tool authenticates with a native credential and has a Kerberos
+/// alternative — exactly the set that fails across a forest boundary but works
+/// once a forged inter-realm ccache flips it into Kerberos mode. Derived from
+/// `kerberos_coercion` so the guard stays in lock-step with the resolver's
+/// notion of a Kerberos-capable tool; `*_kerberos` variants (`AlreadyKerberos`,
+/// the correct mechanic) and non-auth tools are excluded.
+fn blocks_native_cross_realm_auth(tool_name: &str) -> bool {
+    use crate::worker::credential_resolver::{kerberos_coercion, KerberosCoercion};
+    matches!(
+        kerberos_coercion(tool_name),
+        KerberosCoercion::InPlace | KerberosCoercion::Redirect(_)
+    )
+}
+
+/// A native cross-realm auth call is doomed when the credential realm and target
+/// realm are in different forests and no forged inter-realm ticket exists yet.
+/// Same-domain and parent/child (same-forest) pairs auth normally, and a landed
+/// forge flips the tool into Kerberos mode — neither is blocked.
+fn cross_realm_auth_is_doomed(
+    cred_realm: &str,
+    target_realm: &str,
+    has_forged_ticket: bool,
+) -> bool {
+    use crate::orchestrator::automation::is_cross_forest;
+    is_cross_forest(cred_realm, target_realm) && !has_forged_ticket
+}
+
+/// Best-effort target-realm inference for [`check_cross_realm_auth`]. Mirrors
+/// `credential_resolver::infer_domain_from_target`: an IP target is matched
+/// against the DC map (`domain → dc_ip`); an FQDN target yields its suffix.
+/// Returns `None` for bare hostnames or IPs absent from the DC map — the guard
+/// treats "unknown target realm" as allow, never block.
+fn infer_target_realm_from_args(
+    arguments: &serde_json::Value,
+    dc_map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    const TARGET_KEYS: &[&str] = &[
+        "target",
+        "target_ip",
+        "dc_ip",
+        "target_host",
+        "target_hostname",
+        "hostname",
+        "host",
+    ];
+
+    for key in TARGET_KEYS {
+        let Some(value) = arguments.get(*key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if looks_like_ip(value) {
+            for (domain, ip) in dc_map {
+                if ip.trim() == value {
+                    let d = domain.trim().to_lowercase();
+                    if !d.is_empty() {
+                        return Some(d);
+                    }
+                }
+            }
+        } else if let Some((_, suffix)) = value.split_once('.') {
+            let s = suffix.trim().to_lowercase();
+            if !s.is_empty() && s.contains('.') {
+                return Some(s);
+            }
+        }
     }
-    let a_labels = a.rsplit('.');
-    let b_labels = b.rsplit('.');
-    let shared = a_labels
-        .zip(b_labels)
-        .take_while(|(x, y)| x.eq_ignore_ascii_case(y))
-        .count();
-    shared >= 2
+    None
+}
+
+fn looks_like_ip(s: &str) -> bool {
+    let octets: Vec<&str> = s.trim().split('.').collect();
+    octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok())
 }
 
 /// Return the known domain with the smallest edit distance to `supplied`,
@@ -264,7 +332,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     for i in 1..=n {
         curr[0] = i;
         for j in 1..=m {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
@@ -307,29 +375,92 @@ mod tests {
         assert!(closest_match("totally.unrelated.domain", &known).is_none());
     }
 
+    // ── cross-realm auth guardrail ──────────────────────────────────────────
+
     #[test]
-    fn realms_related_exact_and_case_insensitive() {
-        assert!(realms_related("contoso.local", "contoso.local"));
-        assert!(realms_related("Contoso.Local", "contoso.local"));
+    fn native_auth_tools_are_guarded() {
+        // Native impacket auth tools with a Kerberos alternative → guarded.
+        assert!(blocks_native_cross_realm_auth("secretsdump"));
+        assert!(blocks_native_cross_realm_auth("psexec"));
+        assert!(blocks_native_cross_realm_auth("wmiexec"));
+        assert!(blocks_native_cross_realm_auth("smbexec"));
     }
 
     #[test]
-    fn realms_related_parent_and_child_same_forest() {
-        // child ↔ parent: shared suffix `contoso.local` (2 labels).
-        assert!(realms_related("child.contoso.local", "contoso.local"));
-        assert!(realms_related("contoso.local", "child.contoso.local"));
+    fn kerberos_and_nonauth_tools_are_not_guarded() {
+        // *_kerberos variants are the correct cross-forest mechanic — never block.
+        assert!(!blocks_native_cross_realm_auth("secretsdump_kerberos"));
+        assert!(!blocks_native_cross_realm_auth("psexec_kerberos"));
+        // Recon / non-auth tools have no native cross-realm auth to block.
+        assert!(!blocks_native_cross_realm_auth("ldap_search"));
+        assert!(!blocks_native_cross_realm_auth("nmap_scan"));
     }
 
     #[test]
-    fn realms_related_siblings_same_forest() {
-        // two children of the same parent share `contoso.local`.
-        assert!(realms_related("a.contoso.local", "b.contoso.local"));
+    fn doomed_only_for_cross_forest_without_ticket() {
+        // Cross-forest, no forged ticket → doomed (block).
+        assert!(cross_realm_auth_is_doomed(
+            "contoso.local",
+            "fabrikam.local",
+            false
+        ));
+        // Cross-forest but a forge already landed → allow (worker flips to Kerberos).
+        assert!(!cross_realm_auth_is_doomed(
+            "contoso.local",
+            "fabrikam.local",
+            true
+        ));
+        // Same forest (parent/child) → allow, regardless of ticket state.
+        assert!(!cross_realm_auth_is_doomed(
+            "child.contoso.local",
+            "contoso.local",
+            false
+        ));
+        // Same domain → allow.
+        assert!(!cross_realm_auth_is_doomed(
+            "contoso.local",
+            "contoso.local",
+            false
+        ));
     }
 
     #[test]
-    fn realms_related_separate_forests_share_only_tld() {
-        // The bug case: north child vs a foreign forest root share only `local`.
-        assert!(!realms_related("north.contoso.local", "fabrikam.local"));
-        assert!(!realms_related("contoso.local", "fabrikam.local"));
+    fn infer_target_realm_from_fqdn_suffix() {
+        let dc_map = std::collections::HashMap::new();
+        let args = serde_json::json!({ "target": "dc01.fabrikam.local" });
+        assert_eq!(
+            infer_target_realm_from_args(&args, &dc_map).as_deref(),
+            Some("fabrikam.local")
+        );
+    }
+
+    #[test]
+    fn infer_target_realm_from_ip_via_dc_map() {
+        let mut dc_map = std::collections::HashMap::new();
+        dc_map.insert("fabrikam.local".to_string(), "192.168.58.20".to_string());
+        let args = serde_json::json!({ "target_ip": "192.168.58.20" });
+        assert_eq!(
+            infer_target_realm_from_args(&args, &dc_map).as_deref(),
+            Some("fabrikam.local")
+        );
+    }
+
+    #[test]
+    fn infer_target_realm_none_for_unknown_ip_or_bare_host() {
+        let dc_map = std::collections::HashMap::new();
+        // IP not in the DC map → unknown realm.
+        let ip_args = serde_json::json!({ "target": "192.168.58.99" });
+        assert!(infer_target_realm_from_args(&ip_args, &dc_map).is_none());
+        // Bare hostname (no dotted suffix) → unknown realm.
+        let host_args = serde_json::json!({ "target": "dc01" });
+        assert!(infer_target_realm_from_args(&host_args, &dc_map).is_none());
+    }
+
+    #[test]
+    fn looks_like_ip_distinguishes_ip_from_fqdn() {
+        assert!(looks_like_ip("192.168.58.20"));
+        assert!(!looks_like_ip("dc01.fabrikam.local"));
+        assert!(!looks_like_ip("999.1.1.1"));
+        assert!(!looks_like_ip("192.168.58"));
     }
 }

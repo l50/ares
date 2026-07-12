@@ -37,6 +37,26 @@ impl SharedState {
         if host.hostname.contains('.') && !looks_like_real_domain(&host.hostname) {
             host.hostname = String::new();
         }
+        // Zone-apex guard: a DC's real FQDN is always `<machine>.<domain>`
+        // (minimum 3 labels — AD domains are ≥2 labels and machines carry a
+        // short-name prefix). Some recon paths land the bare domain apex
+        // (e.g. `contoso.local`) as a DC's hostname when DNS returns the zone
+        // apex A record for the DC IP or the machine short name is dropped
+        // upstream. That apex value then poisons SPN construction — every
+        // `cifs/<bare-domain>` TGS returns KDC_ERR_S_PRINCIPAL_UNKNOWN and
+        // the trust-follow wrapper hot-loops. Clear it so a later real FQDN
+        // can take its place.
+        if (host.is_dc || host.detect_dc())
+            && host.hostname.contains('.')
+            && host.hostname.matches('.').count() < 2
+        {
+            tracing::debug!(
+                ip = %host.ip,
+                dropped_hostname = %host.hostname,
+                "publish_host: dropping zone-apex hostname on DC (needs >=3 labels)"
+            );
+            host.hostname = String::new();
+        }
         // Some upstream parsers emit literal placeholder strings as the
         // hostname (e.g., `"None"` stringified). These are never a real
         // machine name — clear them so the display falls back to IP-only
@@ -280,10 +300,7 @@ impl SharedState {
         }
 
         // New host — add to Redis and state
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
         reader.add_host(&mut conn, &host).await?;
@@ -326,11 +343,24 @@ impl SharedState {
         // passes, also require ≥3 dot-separated parts so 2-label names like
         // `DC01.local` don't yield `local` as the AD domain.
         let derived = if looks_like_real_domain(&host.hostname) {
-            let parts: Vec<&str> = host.hostname.split('.').collect();
-            if parts.len() >= 3 {
-                parts[1..].join(".").to_lowercase()
+            let hostname_lower = host.hostname.trim_end_matches('.').to_lowercase();
+            let whole_is_known_domain = {
+                let state = self.inner.read().await;
+                state
+                    .domains
+                    .iter()
+                    .chain(state.trusted_domains.keys())
+                    .any(|d| d.eq_ignore_ascii_case(&hostname_lower))
+            };
+            if whole_is_known_domain {
+                hostname_lower
             } else {
-                String::new()
+                let parts: Vec<&str> = hostname_lower.split('.').collect();
+                if parts.len() >= 3 {
+                    parts[1..].join(".")
+                } else {
+                    String::new()
+                }
             }
         } else {
             String::new()
@@ -443,11 +473,17 @@ impl SharedState {
             let mut state = self.inner.write().await;
             let host = state.hosts.iter_mut().find(|h| h.ip == ip);
             if let Some(h) = host {
-                if h.owned {
-                    return Ok(()); // already owned
+                // Log only the genuine false→true flip, but ALWAYS fall through
+                // to the Redis persist below. The old early-return on an
+                // already-owned in-memory record skipped the write entirely, so
+                // an in-memory/Redis disagreement (owned in state, `owned:false`
+                // in the list — the shape that gated the MSSQL-link foothold out
+                // of the SAM-dump chain) never reconciled. Re-persisting is
+                // cheap and idempotent.
+                if !h.owned {
+                    h.owned = true;
+                    tracing::info!(ip = %ip, hostname = %h.hostname, "Host marked as owned");
                 }
-                h.owned = true;
-                tracing::info!(ip = %ip, hostname = %h.hostname, "Host marked as owned");
                 let json = serde_json::to_string(h).unwrap_or_default();
                 (json, state.operation_id.clone())
             } else {
@@ -471,7 +507,10 @@ impl SharedState {
             }
         };
 
-        // Persist to Redis
+        // Persist to Redis. `add_host` is a blind RPUSH with no dedup, so the
+        // list can hold several rows for one IP; update EVERY matching row (not
+        // just the first) so a stale duplicate can't keep shadowing the owned
+        // flag for `auto_lsassy_dump` / loot readers.
         let host_key = format!("{}:{}:{}", state::KEY_PREFIX, op_id, state::KEY_HOSTS);
         let mut conn = queue.connection();
         let entries: Vec<String> = redis::AsyncCommands::lrange(&mut conn, &host_key, 0, -1)
@@ -485,7 +524,6 @@ impl SharedState {
                         redis::AsyncCommands::lset(&mut conn, &host_key, idx as isize, &host_json)
                             .await;
                     found = true;
-                    break;
                 }
             }
         }
@@ -534,6 +572,36 @@ mod tests {
         assert_eq!(s.hosts.len(), 1);
         assert_eq!(s.hosts[0].ip, "192.168.58.5");
         assert_eq!(s.hosts[0].hostname, "srv01.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn mark_host_owned_sets_flag_and_is_idempotent() {
+        let state = SharedState::new("op-mho".to_string());
+        let q = mock_queue();
+        state
+            .publish_host(&q, make_host("192.168.58.51", "sql01.contoso.local", false))
+            .await
+            .unwrap();
+
+        async fn owned(state: &SharedState, ip: &str) -> bool {
+            state
+                .inner
+                .read()
+                .await
+                .hosts
+                .iter()
+                .any(|h| h.ip == ip && h.owned)
+        }
+        assert!(!owned(&state, "192.168.58.51").await);
+
+        state.mark_host_owned(&q, "192.168.58.51").await.unwrap();
+        assert!(owned(&state, "192.168.58.51").await);
+
+        // Second call on an already-owned host must still succeed (the persist
+        // path now runs unconditionally instead of early-returning) and leave
+        // the flag set.
+        state.mark_host_owned(&q, "192.168.58.51").await.unwrap();
+        assert!(owned(&state, "192.168.58.51").await);
     }
 
     #[tokio::test]
@@ -590,6 +658,47 @@ mod tests {
 
         let s = state.inner.read().await;
         assert!(s.domains.contains(&"contoso.local".to_string()));
+    }
+
+    #[tokio::test]
+    async fn publish_host_drops_bare_domain_apex_as_dc_hostname() {
+        // Regression: some recon paths (DNS PTR against the zone apex A
+        // record, SMB banners that report only the domain name for the DC)
+        // set a DC's hostname to the bare domain (e.g. `contoso.local`, 2
+        // labels). That apex value then poisons SPN construction — every
+        // `cifs/<bare-domain>` TGS returns KDC_ERR_S_PRINCIPAL_UNKNOWN and
+        // the trust-follow wrapper hot-loops. The publish path must reject
+        // it so a later real FQDN (`dc01.contoso.local`) can take its place.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("192.168.58.10", "contoso.local", true);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(s.hosts.len(), 1);
+        assert_eq!(s.hosts[0].ip, "192.168.58.10");
+        assert!(
+            s.hosts[0].hostname.is_empty(),
+            "bare-domain-apex DC hostname must be cleared, got {:?}",
+            s.hosts[0].hostname
+        );
+        assert!(s.hosts[0].is_dc, "DC flag must be preserved");
+    }
+
+    #[tokio::test]
+    async fn publish_host_keeps_multi_label_dc_fqdn() {
+        // Negative-case guard for `publish_host_drops_bare_domain_apex_as_dc_hostname`:
+        // a well-formed 3-label DC FQDN (`dc01.contoso.local`) must survive
+        // the apex filter unmodified.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("192.168.58.10", "dc01.contoso.local", true);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(s.hosts[0].hostname, "dc01.contoso.local");
     }
 
     #[tokio::test]
@@ -892,6 +1001,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_dc_zone_apex_child_maps_to_child_not_parent() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("north.contoso.local".to_string());
+        }
+
+        let host = make_host("192.168.58.240", "north.contoso.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("north.contoso.local"),
+            Some(&"192.168.58.240".to_string()),
+            "child DC must register under the child domain"
+        );
+        assert!(
+            !s.domain_controllers.contains_key("contoso.local"),
+            "child DC must NOT be registered under the parent domain, got {:?}",
+            s.domain_controllers
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_zone_apex_two_label_parent() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("north.contoso.local".to_string());
+        }
+
+        let host = make_host("192.168.58.243", "contoso.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("contoso.local"),
+            Some(&"192.168.58.243".to_string()),
+            "parent DC with bare-apex hostname must register under its domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_zone_apex_corrects_stale_parent_mapping() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("north.contoso.local".to_string());
+            s.domain_controllers
+                .insert("contoso.local".to_string(), "192.168.58.240".to_string());
+        }
+
+        let host = make_host("192.168.58.240", "north.contoso.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("north.contoso.local"),
+            Some(&"192.168.58.240".to_string())
+        );
+        assert!(
+            !s.domain_controllers.contains_key("contoso.local"),
+            "stale parent -> child-IP mapping must be corrected, got {:?}",
+            s.domain_controllers
+        );
+    }
+
+    #[tokio::test]
     async fn publish_host_upgrades_short_hostname_to_fqdn_and_reregisters_dc() {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
@@ -1131,7 +1314,7 @@ mod tests {
         ] {
             let host = make_host(malformed, "", false);
             let added = state.publish_host(&q, host).await.unwrap();
-            assert!(!added, "must drop malformed host.ip {malformed:?}");
+            assert!(!added, "must drop malformed host.ip {:?}", malformed);
         }
         let s = state.inner.read().await;
         assert!(

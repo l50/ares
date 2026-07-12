@@ -21,6 +21,7 @@ mod config;
 mod cost_summary;
 mod deferred;
 mod dispatcher;
+mod diversity;
 mod exploitation;
 mod llm_runner;
 mod monitoring;
@@ -67,6 +68,9 @@ async fn run_inner() -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "ares-orchestrator starting"
     );
+    // Op start time, for the Postgres finalize at op-end (ec2:launch flushes
+    // Redis and starts a fresh orchestrator per op, so this ≈ op launch).
+    let op_started_at = chrono::Utc::now();
 
     #[cfg(feature = "blue")]
     if std::env::var("ARES_BLUE_ONLY").as_deref() == Ok("1") {
@@ -91,10 +95,24 @@ async fn run_inner() -> Result<()> {
         }
     };
 
-    let config = Arc::new(
-        OrchestratorConfig::from_env_with_yaml(ares_config.as_deref())
-            .context("Failed to load config from environment")?,
-    );
+    let mut config = OrchestratorConfig::from_env_with_yaml(ares_config.as_deref())
+        .context("Failed to load config from environment")?;
+
+    // When ARES_SCOPE_EXPAND_SUBNETS=1, fan target_ips out over the /24 of
+    // any clustered targets. Lab launches (GOAD/CTF) pass just the known DC
+    // IPs, but the actual attack surface (SQL/web/CA/workstation) lives
+    // elsewhere in the same subnet. Without expansion the scope filter blocks
+    // single-target tools against any host the subnet sweep discovers.
+    let scope_expanded = config.expand_scope_to_subnets();
+    if scope_expanded > 0 {
+        info!(
+            added_ips = scope_expanded,
+            total_ips = config.target_ips.len(),
+            "Expanded operation scope to clustered /24 subnets (ARES_SCOPE_EXPAND_SUBNETS=1)"
+        );
+    }
+
+    let config = Arc::new(config);
 
     info!(
         operation_id = %config.operation_id,
@@ -111,24 +129,54 @@ async fn run_inner() -> Result<()> {
     let scope = ares_tools::scope::OperationScope::new(config.target_ips.clone());
     ares_tools::scope::init_scope(scope);
     if !config.target_ips.is_empty() {
-        info!(
-            target_ips = %config.target_ips.join(","),
-            "Installed operation scope — out-of-scope single-IP tool calls will be rejected"
-        );
+        // Log just a count once expansion is in play — 5 IPs is fine to print,
+        // 1270 IPs (5×254) is just noise.
+        if config.target_ips.len() <= 16 {
+            info!(
+                target_ips = %config.target_ips.join(","),
+                "Installed operation scope — out-of-scope single-IP tool calls will be rejected"
+            );
+        } else {
+            info!(
+                target_ip_count = config.target_ips.len(),
+                first_ip = %config.target_ips[0],
+                last_ip = %config.target_ips[config.target_ips.len() - 1],
+                "Installed operation scope (expanded subnet) — out-of-scope single-IP tool calls will be rejected"
+            );
+        }
     }
 
     let queue = TaskQueue::connect(&config.redis_url, &config.nats_url)
         .await
         .context("Failed to connect to Redis/NATS")?;
 
-    let acquired = queue
+    match queue
         .try_acquire_lock(&config.operation_id, config.lock_ttl)
-        .await?;
-    if !acquired {
-        anyhow::bail!(
-            "Operation {} is locked by another orchestrator",
-            config.operation_id
-        );
+        .await?
+    {
+        self::task_queue::LockAcquire::Acquired => {}
+        self::task_queue::LockAcquire::Reclaimed => {
+            warn!(
+                operation_id = %config.operation_id,
+                holder = self::task_queue::lock_holder_id(),
+                "Operation lock reclaimed from a prior crashed run on this host"
+            );
+        }
+        self::task_queue::LockAcquire::TakenOver { previous_holder } => {
+            warn!(
+                operation_id = %config.operation_id,
+                previous_holder = %previous_holder,
+                new_holder = self::task_queue::lock_holder_id(),
+                "Operation lock forcibly taken over (ARES_LOCK_TAKEOVER=1)"
+            );
+        }
+        self::task_queue::LockAcquire::Contested { current_holder } => {
+            anyhow::bail!(
+                "Operation {} is locked by another orchestrator (holder={}); set ARES_LOCK_TAKEOVER=1 to force takeover",
+                config.operation_id,
+                current_holder
+            );
+        }
     }
 
     let mut shared_state = SharedState::new(config.operation_id.clone());
@@ -150,9 +198,15 @@ async fn run_inner() -> Result<()> {
     // database URL are available. The projector tails ARES_OPSTATE and
     // upserts each event into PG, replacing the manual `ares ops offload`
     // path with an always-current archive.
+    // Filter empty string: systemd-run --setenv=NAME (no value) always sets
+    // NAME in the child env even when the parent has it unset, arriving as
+    // literal "". Treating "" as Some(url) would drive PersistentStore::connect
+    // into a doomed call every startup and log a misleading "PG connect failed".
     let _projector_handle: Option<tokio::task::JoinHandle<()>> = match (
         nats_broker.clone(),
-        std::env::var("ARES_DATABASE_URL").ok(),
+        std::env::var("ARES_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
     ) {
         (Some(broker), Some(database_url)) => {
             match ares_core::persistent_store::PersistentStore::connect(&database_url).await {
@@ -403,42 +457,72 @@ async fn run_inner() -> Result<()> {
         warn!(err = %e, "Deferred queue counter reconcile failed at startup");
     }
 
-    // Priority: ARES_LLM_MODEL env var > config YAML agents.orchestrator.model
-    let model_spec = std::env::var("ARES_LLM_MODEL").ok().or_else(|| {
-        let config_path = std::env::var("ARES_CONFIG")
-            .unwrap_or_else(|_| "/ares/config/ares.yaml".to_string());
+    // Build per-role provider map. The orchestrator's model is required (used
+    // as fallback for any role missing an entry). All other roles default to
+    // the orchestrator's model when their YAML block omits `model:`.
+    //
+    // Priority: ARES_LLM_MODEL env var > config YAML agents.{role}.model
+    let yaml_doc: Option<serde_yaml::Value> = {
+        let config_path =
+            std::env::var("ARES_CONFIG").unwrap_or_else(|_| "/ares/config/ares.yaml".to_string());
         std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|content| {
-                let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-                let model = yaml["agents"]["orchestrator"]["model"].as_str()?;
-                // Prefix with "openai/" if no provider prefix present
-                let spec = if model.contains('/') {
-                    model.to_string()
-                } else {
-                    format!("openai/{model}")
-                };
-                info!(config = %config_path, model = %spec, "Model loaded from config YAML");
-                Some(spec)
-            })
-    }).context("No LLM model configured — set ARES_LLM_MODEL or agents.orchestrator.model in config YAML")?;
-    let (provider, model_name) =
-        ares_llm::create_provider(&model_spec).context("Failed to create LLM provider")?;
+            .and_then(|content| serde_yaml::from_str(&content).ok())
+    };
+    let env_override = std::env::var("ARES_LLM_MODEL").ok();
+    let orch_spec = env_override
+        .clone()
+        .or_else(|| read_role_model(yaml_doc.as_ref(), "orchestrator"))
+        .context(
+            "No LLM model configured — set ARES_LLM_MODEL or agents.orchestrator.model in config YAML",
+        )?;
+    info!(model = %orch_spec, "Orchestrator model");
 
-    // Fail fast on org/auth misconfigurations before queueing any tasks. A
-    // typical pitfall: `gpt-5.2` defaults are org-allowlisted at OpenAI, so
-    // submitting a multi-host op against a non-allowlisted key would silently
-    // burn through dispatch → LLM → 403 on every single task. A single
-    // pre-flight call surfaces the error once, with a hint pointing at
-    // `OPENAI_ORG_ID` / `ARES_LLM_MODEL`.
-    if let Err(e) = preflight_llm_provider(provider.as_ref(), &model_name).await {
-        error!(
-            model = %model_name,
-            "LLM preflight failed: {e:#} — aborting startup. Set ARES_LLM_MODEL to a widely-available model (e.g. openai/gpt-4o-mini) or ensure the org tied to the API key has access to this model."
+    let mut providers: std::collections::HashMap<
+        ares_llm::tool_registry::AgentRole,
+        llm_runner::RoleProvider,
+    > = std::collections::HashMap::new();
+    let role_yaml_names: &[(ares_llm::tool_registry::AgentRole, &str)] = &[
+        (
+            ares_llm::tool_registry::AgentRole::Orchestrator,
+            "orchestrator",
+        ),
+        (ares_llm::tool_registry::AgentRole::Recon, "recon"),
+        (
+            ares_llm::tool_registry::AgentRole::CredentialAccess,
+            "credential_access",
+        ),
+        (ares_llm::tool_registry::AgentRole::Cracker, "cracker"),
+        (ares_llm::tool_registry::AgentRole::Acl, "acl"),
+        (ares_llm::tool_registry::AgentRole::Privesc, "privesc"),
+        (ares_llm::tool_registry::AgentRole::Lateral, "lateral"),
+        (ares_llm::tool_registry::AgentRole::Coercion, "coercion"),
+    ];
+    for (role, yaml_key) in role_yaml_names {
+        let spec = if *role == ares_llm::tool_registry::AgentRole::Orchestrator {
+            orch_spec.clone()
+        } else {
+            read_role_model(yaml_doc.as_ref(), yaml_key).unwrap_or_else(|| orch_spec.clone())
+        };
+        let (provider, model_name) = ares_llm::create_provider(&spec)
+            .with_context(|| format!("Failed to create LLM provider for role '{yaml_key}'"))?;
+        let cfg = ares_llm::AgentLoopConfig::from_env(model_name, config.strategy.llm_temperature);
+        if *role != ares_llm::tool_registry::AgentRole::Orchestrator {
+            info!(role = %yaml_key, model = %spec, "Per-role model");
+        }
+        providers.insert(
+            *role,
+            llm_runner::RoleProvider {
+                provider: Arc::from(provider),
+                config: cfg,
+            },
         );
-        return Err(e.context(format!("LLM preflight failed for model '{model_name}'")));
     }
-    info!(model = %model_name, "LLM preflight ok");
+    // Capture orchestrator's resolved model name for downstream logging.
+    let model_name = providers
+        .get(&ares_llm::tool_registry::AgentRole::Orchestrator)
+        .map(|rp| rp.config.model.clone())
+        .unwrap_or_default();
 
     // Credential auth throttle — prevents AD account lockout by rate-limiting
     // auth-bearing tool calls per credential. Max 3 attempts per 30s window.
@@ -481,14 +565,29 @@ async fn run_inner() -> Result<()> {
         .collect();
     technique_priorities.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
+    // Snapshot the operation's target context once at runner creation so the
+    // LLM system prompt stays byte-stable across every step (prefix caching).
+    // Current discoveries — including target_dc_ip if recon updates it later —
+    // flow through the task prompt's dynamic context block instead.
+    let init_snapshot = shared_state.snapshot().await;
+    let frozen_target_domain = if init_snapshot.target_domain.is_empty() {
+        config.target_domain.clone()
+    } else {
+        init_snapshot.target_domain.clone()
+    };
+    let frozen_target_dc_ip = init_snapshot.target_dc_ip.clone();
+    let frozen_target_dc_fqdn = init_snapshot.target_dc_fqdn.clone();
     let llm_runner = Arc::new(llm_runner::LlmTaskRunner::new(
-        provider,
-        model_name.clone(),
+        providers,
         tool_disp,
         shared_state.clone(),
-        config.strategy.llm_temperature,
         technique_priorities,
-        config.listener_ip.clone().unwrap_or_default(),
+        llm_runner::FrozenOpContext {
+            target_domain: frozen_target_domain,
+            target_dc_ip: frozen_target_dc_ip,
+            target_dc_fqdn: frozen_target_dc_fqdn,
+            listener_ip: config.listener_ip.clone().unwrap_or_default(),
+        },
     ));
     info!(
         model = %model_name,
@@ -513,9 +612,6 @@ async fn run_inner() -> Result<()> {
             .with_dispatcher(dispatcher.clone()),
     );
     llm_runner.set_callback_handler(callback_handler);
-    // Per-task activity heartbeats: each LLM response touches the running task
-    // so stale-eviction keys on inactivity, not total runtime.
-    llm_runner.set_active_task_tracker(tracker.clone());
     info!("Orchestrator callback handler wired (query + dispatch tools)");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -603,13 +699,24 @@ async fn run_inner() -> Result<()> {
             }
         }
     }
+    // Resolve blue-team enablement ONCE per operation so the spawner and the
+    // completion loop can't diverge. Two independent env reads at different
+    // points in the orchestrator lifetime have gone out of sync in the past —
+    // blue would spawn from mod.rs but the completion loop's own read of
+    // ARES_BLUE_ENABLED would come back empty, so it never waited for
+    // investigations to drain and blue got shot dead mid-lateral-analyst.
     #[cfg(feature = "blue")]
-    let blue_handle = if std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1") {
+    let blue_enabled = std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1");
+    #[cfg(not(feature = "blue"))]
+    let blue_enabled = false;
+
+    #[cfg(feature = "blue")]
+    let blue_handle = if blue_enabled {
         // Create a separate LLM provider for the blue team
         let blue_model_spec = std::env::var("ARES_BLUE_LLM_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| model_spec.clone());
+            .unwrap_or_else(|| orch_spec.clone());
         let (blue_provider, blue_model) = ares_llm::create_provider(&blue_model_spec)
             .context("Failed to create blue team LLM provider")?;
 
@@ -640,7 +747,6 @@ async fn run_inner() -> Result<()> {
             ),
             blue::spawn_blue_auto_submit(
                 queue.clone(),
-                shared_state.clone(),
                 config.clone(),
                 blue_model_spec,
                 shutdown_rx.clone(),
@@ -730,6 +836,7 @@ async fn run_inner() -> Result<()> {
                     .unwrap_or(7200),
             ),
             std::time::Duration::from_secs(10),
+            blue_enabled,
         )
         .await;
         info!("Completion monitor finished — operation complete");
@@ -762,6 +869,16 @@ async fn run_inner() -> Result<()> {
     if !config.target_ips.is_empty() {
         let recon_count = dispatch_initial_recon(&dispatcher, &config).await;
         info!(tasks = recon_count, "Initial recon dispatched");
+
+        // Subnet sweep: when target IPs are clustered in /24s (typical for
+        // lab/CTF engagements), also dispatch a sweep over each /24 to
+        // discover non-DC hosts (SQL server, web server, ADCS, workstation).
+        // Without this, the recon agent only ever probes the explicit IP
+        // list — missing the bulk of the attack surface in lab scenarios.
+        let sweep_count = bootstrap::dispatch_subnet_sweep(&dispatcher, &config).await;
+        if sweep_count > 0 {
+            info!(tasks = sweep_count, "Subnet sweep dispatched");
+        }
     } else {
         warn!("No target IPs configured — skipping initial recon dispatch");
     }
@@ -855,6 +972,25 @@ async fn run_inner() -> Result<()> {
         }
     }
 
+    // CAS release before the unconditional finalize DEL so a stray same-op
+    // holder mismatch (should be impossible, but cheap to guard) doesn't
+    // silently clobber someone else's lock.
+    match queue.release_lock(&config.operation_id).await {
+        Ok(true) => info!(
+            operation_id = %config.operation_id,
+            "Operation lock released on shutdown"
+        ),
+        Ok(false) => debug!(
+            operation_id = %config.operation_id,
+            "Operation lock already gone or held by another orchestrator at shutdown"
+        ),
+        Err(e) => warn!(
+            operation_id = %config.operation_id,
+            err = %e,
+            "release_lock failed on shutdown"
+        ),
+    }
+
     // Write completion metadata, status key, clear lock and active pointer.
     {
         let mut conn = queue.connection();
@@ -903,55 +1039,199 @@ async fn run_inner() -> Result<()> {
                 "Failed to auto-generate red team report on completion"
             ),
         }
+
+        // Finalize the operation to the ares-history Postgres so runs stay
+        // comparable (cost, domain-admin, entity counts). The live projector
+        // keeps entity tables current during the op but has no completion event,
+        // so it never stamps completed_at / DA / counts / cost — this is the
+        // op-end finalize that fills them. No-op when ARES_DATABASE_URL is unset
+        // (K8s/local); every step is fault-tolerant so a PG hiccup never fails
+        // op teardown, and it's idempotent with the projector (ON CONFLICT
+        // upserts on operations + the uq_* entity constraints).
+        if let Some(database_url) = std::env::var("ARES_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            match ares_core::persistent_store::PersistentStore::connect(&database_url).await {
+                Ok(store) => {
+                    let offload = {
+                        let st = shared_state.read().await;
+                        ares_core::persistent_store::OperationOffload {
+                            operation_id: config.operation_id.clone(),
+                            target_ip: config.target_ips.first().cloned(),
+                            target_domain: (!config.target_domain.is_empty())
+                                .then(|| config.target_domain.clone()),
+                            environment: std::env::var("ARES_DEPLOYMENT")
+                                .ok()
+                                .filter(|s| !s.is_empty()),
+                            started_at: op_started_at,
+                            completed_at: Some(chrono::Utc::now()),
+                            has_domain_admin: st.has_domain_admin,
+                            has_golden_ticket: st.has_golden_ticket,
+                            domain_admin_path: st.domain_admin_path.clone(),
+                            da_hash_id: None,
+                            credentials: st.credentials.clone(),
+                            hashes: st.hashes.clone(),
+                            hosts: st.hosts.clone(),
+                            users: st.users.clone(),
+                            vulnerabilities: st.discovered_vulnerabilities.clone(),
+                            exploited_vulnerabilities: st.exploited_vulnerabilities.clone(),
+                        }
+                    };
+                    match store.offload_operation(&offload).await {
+                        Ok(_) => info!(
+                            operation_id = %config.operation_id,
+                            "Operation finalized to Postgres (ares-history)"
+                        ),
+                        Err(e) => warn!(
+                            operation_id = %config.operation_id,
+                            err = %e,
+                            "PG finalize: offload_operation failed"
+                        ),
+                    }
+                    // Token usage + cost from Redis → operations.total_cost/tokens.
+                    match ares_core::token_usage::get_token_usage(&mut conn, &config.operation_id)
+                        .await
+                    {
+                        Ok(Some(usage)) => {
+                            let (total_cost, breakdown, _unpriced) =
+                                ares_core::token_usage::estimate_usage_cost(&usage);
+                            let model_usage = if usage.models.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                let mut m = serde_json::Map::new();
+                                for (name, mu) in &usage.models {
+                                    let cost = breakdown
+                                        .iter()
+                                        .find(|b| &b.model == name)
+                                        .map(|b| b.cost)
+                                        .unwrap_or(0.0);
+                                    m.insert(
+                                        name.clone(),
+                                        serde_json::json!({
+                                            "input_tokens": mu.input_tokens,
+                                            "output_tokens": mu.output_tokens,
+                                            "cost": cost,
+                                        }),
+                                    );
+                                }
+                                serde_json::Value::Object(m)
+                            };
+                            if let Err(e) = store
+                                .update_cost(
+                                    &config.operation_id,
+                                    usage.input_tokens as i64,
+                                    usage.output_tokens as i64,
+                                    total_cost.unwrap_or(0.0),
+                                    &model_usage,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    operation_id = %config.operation_id,
+                                    err = %e,
+                                    "PG finalize: update_cost failed"
+                                );
+                            }
+                        }
+                        Ok(None) => debug!(
+                            operation_id = %config.operation_id,
+                            "PG finalize: no token usage in Redis to record"
+                        ),
+                        Err(e) => warn!(
+                            operation_id = %config.operation_id,
+                            err = %e,
+                            "PG finalize: token usage read failed"
+                        ),
+                    }
+                }
+                Err(e) => warn!(
+                    operation_id = %config.operation_id,
+                    err = %e,
+                    "PG finalize: connect failed; operation not persisted to Postgres"
+                ),
+            }
+        }
     }
 
     info!("ares-orchestrator stopped");
     Ok(())
 }
 
-/// Issue a minimal LLM chat request to verify the API key + model + org
-/// permissions are good before queueing any tasks. The response content is
-/// discarded. A non-retryable error (auth, org-restricted model, bad model
-/// name) aborts startup; a retryable error (network, 5xx, rate limit) is
-/// treated as a transient upstream blip and only warns.
-async fn preflight_llm_provider(
-    provider: &dyn ares_llm::LlmProvider,
-    model_name: &str,
-) -> Result<()> {
-    use ares_llm::{ChatMessage, LlmError, LlmRequest, Role};
-
-    // If the operator explicitly opts out (air-gapped tests, recorded
-    // fixtures), skip the network call.
-    if std::env::var("ARES_LLM_PREFLIGHT_SKIP").as_deref() == Ok("1") {
-        info!("ARES_LLM_PREFLIGHT_SKIP=1; skipping LLM preflight ping");
-        return Ok(());
-    }
-
-    let mut req = LlmRequest::new(model_name);
-    // OpenAI reasoning models (gpt-5*, o1*, o3*, etc.) count internal
-    // reasoning tokens against the completion budget. A budget of 1 isn't
-    // enough to even emit reasoning, and the API returns a 400 "Could not
-    // finish the message because max_tokens or model output limit was
-    // reached" before we ever see a token of output — failing the preflight
-    // for a perfectly-valid model. 64 leaves headroom for reasoning while
-    // keeping the call cost negligible.
-    req.max_tokens = 64;
-    req.messages.push(ChatMessage::text(Role::User, "ping"));
-
-    match provider.chat(&req).await {
-        Ok(_) => Ok(()),
-        Err(LlmError::AuthError(msg)) => Err(anyhow::anyhow!("authentication failed: {msg}")),
-        Err(e) if !e.is_retryable() => Err(anyhow::anyhow!("LLM provider rejected preflight: {e}")),
-        Err(e) => {
-            warn!(err = %e, "LLM preflight returned a retryable error; continuing startup");
-            Ok(())
-        }
-    }
+/// Look up the model spec for a role from a parsed YAML doc.
+///
+/// Reads `agents.{role}.model`. If the value is a bare model name without a
+/// provider prefix (e.g. `gpt-5.2`), prepends `openai/` so downstream
+/// provider routing works.
+fn read_role_model(yaml: Option<&serde_yaml::Value>, role: &str) -> Option<String> {
+    let doc = yaml?;
+    let model = doc["agents"][role]["model"].as_str()?;
+    let spec = if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("openai/{model}")
+    };
+    Some(spec)
 }
 
 /// Run in blue-only mode: just the investigation poller, no red team.
 ///
 /// Requires only `ARES_REDIS_URL` and an LLM model. No operation ID needed.
+/// Spawn an ephemeral in-process blue-orchestrator consumer, returning its join
+/// handle and a shutdown sender. Lets `benchmark run` be self-contained — it
+/// consumes and runs the investigation it submits without a separately-running
+/// blue orchestrator, and the consumer dies with the process. Send `true` on the
+/// returned sender to stop it. Uses the isolated `ARES_BLUE_TASKS` stream, so it
+/// never interferes with a red fleet's `ARES_TASKS`.
+#[cfg(feature = "blue")]
+pub(crate) async fn spawn_inprocess_blue_consumer(
+    model_spec: &str,
+    redis_url: &str,
+    nats_url: &str,
+) -> Result<(tokio::task::JoinHandle<()>, watch::Sender<bool>)> {
+    let (provider, model_name) =
+        ares_llm::create_provider(model_spec).context("Failed to create LLM provider")?;
+    let queue = self::task_queue::TaskQueue::connect_state_only(redis_url, nats_url)
+        .await
+        .context("Failed to connect to Redis/NATS for blue consumer")?;
+    let auth_throttle = tool_dispatcher::AuthThrottle::new(3, std::time::Duration::from_secs(30));
+    // The benchmark consumer is self-contained (no separate worker fleet). The
+    // evidence validator's query-result store is a per-PROCESS static, so the
+    // query and its follow-up `add_evidence` MUST run in the same process — under
+    // Redis dispatch they land on different workers, the store is empty, and every
+    // add_evidence is rejected ("value not found in any recorded query result"),
+    // giving 0 evidence / 0 techniques. Default to local (in-process) dispatch,
+    // which the old working recipe forced via ARES_TOOL_DISPATCH=local. Honor an
+    // explicit ARES_TOOL_DISPATCH=redis for callers that do run a worker fleet.
+    let dispatcher: Arc<dyn ares_llm::ToolDispatcher> =
+        if std::env::var("ARES_TOOL_DISPATCH").as_deref() == Ok("redis") {
+            info!("blue consumer tool dispatch: Redis queue");
+            Arc::new(tool_dispatcher::RedisToolDispatcher::new(
+                queue,
+                "blue-orchestrator".to_string(),
+                auth_throttle,
+            ))
+        } else {
+            info!("blue consumer tool dispatch: local (in-process, shared evidence store)");
+            Arc::new(tool_dispatcher::LocalToolDispatcher::new(
+                queue,
+                "blue-orchestrator".to_string(),
+                auth_throttle,
+            ))
+        };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    info!(model = %model_name, "in-process blue consumer spawned for replay");
+    let handle = blue::spawn_blue_orchestrator(
+        provider,
+        model_name,
+        dispatcher,
+        redis_url.to_string(),
+        nats_url.to_string(),
+        shutdown_rx,
+    );
+    Ok((handle, shutdown_tx))
+}
+
 #[cfg(feature = "blue")]
 async fn run_blue_only() -> Result<()> {
     info!("Running in BLUE-ONLY mode (no red team orchestrator)");
@@ -983,8 +1263,9 @@ async fn run_blue_only() -> Result<()> {
     let (provider, model_name) =
         ares_llm::create_provider(&model_spec).context("Failed to create LLM provider")?;
 
-    // Blue uses a simple Redis-based tool dispatcher (no operation-scoped auth throttle)
-    let queue = self::task_queue::TaskQueue::connect(&redis_url, &nats_url)
+    // Blue uses a simple Redis-based tool dispatcher (no operation-scoped auth
+    // throttle) and never polls task results, so it needs no result demux.
+    let queue = self::task_queue::TaskQueue::connect_state_only(&redis_url, &nats_url)
         .await
         .context("Failed to connect to Redis/NATS")?;
     let auth_throttle = tool_dispatcher::AuthThrottle::new(3, std::time::Duration::from_secs(30));

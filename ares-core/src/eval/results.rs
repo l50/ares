@@ -21,7 +21,8 @@ pub struct EvaluationResult {
     pub completeness_score: f64,
 
     // Component scores (0.0–1.0)
-    pub stage_score: f64,
+    /// Fraction of the attack's kill-chain phases the investigation covered.
+    pub phase_coverage: f64,
     pub ioc_detection_rate: f64,
     pub technique_coverage: f64,
     pub pyramid_elevation_score: f64,
@@ -87,7 +88,7 @@ impl Default for EvaluationResult {
             detection_score: 0.0,
             quality_score: 0.0,
             completeness_score: 0.0,
-            stage_score: 0.0,
+            phase_coverage: 0.0,
             ioc_detection_rate: 0.0,
             technique_coverage: 0.0,
             pyramid_elevation_score: 0.0,
@@ -120,11 +121,17 @@ impl Default for EvaluationResult {
 }
 
 impl EvaluationResult {
-    /// Whether the evaluation passed minimum thresholds.
+    /// Whether the investigation clears the pass bar.
+    ///
+    /// Bars mirror the ground truth's defaults (`min_ioc_detection_rate` 0.5,
+    /// `min_technique_coverage` 0.6) plus a grade-D overall floor. On the
+    /// corrected, blue-observable, precision-aware metrics these are now
+    /// genuinely achievable — unlike the old bar, which the red-centric IOC
+    /// metric made unreachable.
     pub fn passed(&self) -> bool {
-        self.overall_score >= 0.5
+        self.overall_score >= 0.6
             && self.ioc_detection_rate >= 0.5
-            && self.technique_coverage >= 0.5
+            && self.technique_coverage >= 0.6
     }
 
     /// Letter grade for the evaluation.
@@ -164,7 +171,7 @@ impl EvaluationResult {
                 "detection": self.detection_score,
                 "quality": self.quality_score,
                 "completeness": self.completeness_score,
-                "stage": self.stage_score,
+                "phase_coverage": self.phase_coverage,
                 "ioc_detection_rate": self.ioc_detection_rate,
                 "technique_coverage": self.technique_coverage,
                 "pyramid_elevation": self.pyramid_elevation_score,
@@ -316,10 +323,7 @@ impl DatasetEvaluationResult {
     }
 
     pub fn pass_rate(&self) -> f64 {
-        if self.results.is_empty() {
-            return 0.0;
-        }
-        self.results.iter().filter(|r| r.passed()).count() as f64 / self.results.len() as f64
+        rate(&self.results, |r| r.passed())
     }
 
     pub fn avg_overall_score(&self) -> f64 {
@@ -335,21 +339,11 @@ impl DatasetEvaluationResult {
     }
 
     pub fn alert_fire_rate(&self) -> f64 {
-        if self.results.is_empty() {
-            return 0.0;
-        }
-        self.results.iter().filter(|r| r.alert_fired).count() as f64 / self.results.len() as f64
+        rate(&self.results, |r| r.alert_fired)
     }
 
     pub fn investigation_completion_rate(&self) -> f64 {
-        if self.results.is_empty() {
-            return 0.0;
-        }
-        self.results
-            .iter()
-            .filter(|r| r.investigation_completed)
-            .count() as f64
-            / self.results.len() as f64
+        rate(&self.results, |r| r.investigation_completed)
     }
 
     pub fn total_cost_usd(&self) -> f64 {
@@ -452,6 +446,13 @@ fn avg(results: &[EvaluationResult], f: impl Fn(&EvaluationResult) -> f64) -> f6
         return 0.0;
     }
     results.iter().map(f).sum::<f64>() / results.len() as f64
+}
+
+fn rate(results: &[EvaluationResult], pred: impl Fn(&EvaluationResult) -> bool) -> f64 {
+    if results.is_empty() {
+        return 0.0;
+    }
+    results.iter().filter(|r| pred(r)).count() as f64 / results.len() as f64
 }
 
 #[cfg(test)]
@@ -559,7 +560,7 @@ mod tests {
         assert_eq!(r.detection_score, 0.0);
         assert_eq!(r.quality_score, 0.0);
         assert_eq!(r.completeness_score, 0.0);
-        assert_eq!(r.stage_score, 0.0);
+        assert_eq!(r.phase_coverage, 0.0);
         assert_eq!(r.ioc_detection_rate, 0.0);
         assert_eq!(r.technique_coverage, 0.0);
         assert_eq!(r.pyramid_elevation_score, 0.0);
@@ -611,7 +612,7 @@ mod tests {
             detection_score: 0.88,
             quality_score: 0.75,
             completeness_score: 0.95,
-            stage_score: 0.80,
+            phase_coverage: 0.80,
             ioc_detection_rate: 0.70,
             technique_coverage: 0.85,
             pyramid_elevation_score: 0.90,
@@ -639,7 +640,7 @@ mod tests {
                 pyramid_level: crate::models::PyramidLevel::DomainNames,
                 mitre_techniques: vec![],
                 required: true,
-                source: String::new(),
+                source: "".to_string(),
             }],
             found_techniques: vec![ExpectedTechnique {
                 technique_id: "T1558.003".to_string(),
@@ -694,7 +695,7 @@ mod tests {
             "detection_score": 0.5,
             "quality_score": 0.5,
             "completeness_score": 0.5,
-            "stage_score": 0.5,
+            "phase_coverage": 0.5,
             "ioc_detection_rate": 0.5,
             "technique_coverage": 0.5,
             "pyramid_elevation_score": 0.5,
@@ -790,14 +791,25 @@ mod tests {
     }
 
     #[test]
-    fn passed_boundary_exactly_half() {
+    fn passed_at_threshold() {
         let r = EvaluationResult {
-            overall_score: 0.5,
+            overall_score: 0.6,
             ioc_detection_rate: 0.5,
-            technique_coverage: 0.5,
+            technique_coverage: 0.6,
             ..Default::default()
         };
         assert!(r.passed());
+    }
+
+    #[test]
+    fn passed_fails_technique_below_threshold() {
+        let r = EvaluationResult {
+            overall_score: 0.7,
+            ioc_detection_rate: 0.9,
+            technique_coverage: 0.5,
+            ..Default::default()
+        };
+        assert!(!r.passed());
     }
 
     #[test]
@@ -870,7 +882,6 @@ mod tests {
         };
         let val = r.to_value();
 
-        // Check nested values
         assert_eq!(val["status"]["alert_fired"], true);
         assert_eq!(val["status"]["passed"], false); // 0.7 overall but 0.0 ioc/tech
         assert_eq!(val["cost"]["total_tokens"], 1000);
@@ -888,7 +899,7 @@ mod tests {
                     pyramid_level: crate::models::PyramidLevel::IpAddresses,
                     mitre_techniques: vec![],
                     required: true,
-                    source: String::new(),
+                    source: "".to_string(),
                 },
                 ExpectedIOC {
                     ioc_type: "ip".to_string(),
@@ -896,7 +907,7 @@ mod tests {
                     pyramid_level: crate::models::PyramidLevel::IpAddresses,
                     mitre_techniques: vec![],
                     required: true,
-                    source: String::new(),
+                    source: "".to_string(),
                 },
             ],
             missed_iocs: vec![ExpectedIOC {
@@ -905,7 +916,7 @@ mod tests {
                 pyramid_level: crate::models::PyramidLevel::DomainNames,
                 mitre_techniques: vec![],
                 required: true,
-                source: String::new(),
+                source: "".to_string(),
             }],
             ..Default::default()
         };
@@ -1237,7 +1248,7 @@ mod tests {
             detection_score: 0.8,
             quality_score: 0.7,
             completeness_score: 0.65,
-            stage_score: 0.5,
+            phase_coverage: 0.5,
             ioc_detection_rate: 0.6,
             technique_coverage: 0.55,
             pyramid_elevation_score: 0.4,
@@ -1251,7 +1262,7 @@ mod tests {
         assert_eq!(scores["detection"], 0.8);
         assert_eq!(scores["quality"], 0.7);
         assert_eq!(scores["completeness"], 0.65);
-        assert_eq!(scores["stage"], 0.5);
+        assert_eq!(scores["phase_coverage"], 0.5);
         assert_eq!(scores["ioc_detection_rate"], 0.6);
         assert_eq!(scores["technique_coverage"], 0.55);
         assert_eq!(scores["pyramid_elevation"], 0.4);

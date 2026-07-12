@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
 use crate::orchestrator::dispatcher::CredentialInflight;
-use crate::orchestrator::routing::ActiveTaskTracker;
+use crate::orchestrator::routing::{is_non_llm_task, ActiveTaskTracker};
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 
@@ -117,7 +117,12 @@ pub fn spawn_lock_keeper(
         // Create a dedicated Redis connection for the lock keeper so that
         // EXPIRE commands are not queued behind heavy BRPOP/LPUSH traffic
         // on the shared connection manager.
-        let dedicated_queue = match TaskQueue::connect(&config.redis_url, &config.nats_url).await {
+        let dedicated_queue = match TaskQueue::connect_state_only(
+            &config.redis_url,
+            &config.nats_url,
+        )
+        .await
+        {
             Ok(q) => {
                 info!("Lock keeper using dedicated Redis connection");
                 q
@@ -151,22 +156,36 @@ pub fn spawn_lock_keeper(
             match result {
                 Ok(Ok(true)) => {} // Lock TTL refreshed
                 Ok(Ok(false)) => {
-                    // Lock key disappeared — re-acquire it
+                    // Lock key disappeared or drifted to another holder —
+                    // re-acquire. Same holder ID means we own it in Redis
+                    // after Reclaimed; different holder means our TTL
+                    // lapsed and someone else took over — we should stop.
                     warn!(
                         operation_id = %config.operation_id,
-                        "Lock key missing, attempting re-acquisition"
+                        "Lock extend returned false, attempting re-acquisition"
                     );
                     match dedicated_queue
                         .try_acquire_lock(&config.operation_id, config.lock_ttl)
                         .await
                     {
-                        Ok(true) => info!(
+                        Ok(crate::orchestrator::task_queue::LockAcquire::Acquired)
+                        | Ok(crate::orchestrator::task_queue::LockAcquire::Reclaimed) => info!(
                             operation_id = %config.operation_id,
                             "Operation lock re-acquired"
                         ),
-                        Ok(false) => warn!(
+                        Ok(crate::orchestrator::task_queue::LockAcquire::TakenOver {
+                            previous_holder,
+                        }) => warn!(
                             operation_id = %config.operation_id,
-                            "Lock re-acquisition failed — another holder exists"
+                            previous_holder = %previous_holder,
+                            "Operation lock forcibly re-acquired via ARES_LOCK_TAKEOVER"
+                        ),
+                        Ok(crate::orchestrator::task_queue::LockAcquire::Contested {
+                            current_holder,
+                        }) => warn!(
+                            operation_id = %config.operation_id,
+                            current_holder = %current_holder,
+                            "Lock re-acquisition failed — another orchestrator holds it"
                         ),
                         Err(e) => warn!(err = %e, "Lock re-acquisition error"),
                     }
@@ -279,6 +298,23 @@ async fn run_heartbeat_sweep(
     Ok(())
 }
 
+/// Pick the stale-reap threshold for a task by class. Non-LLM tasks (`crack`,
+/// `command`) run far longer than an LLM turn — a hashcat crack is budgeted at
+/// 20 min, serialized behind the single GPU permit, with a 25-min dispatch
+/// ceiling — so they get the longer, un-halved `non_llm_timeout`; everything
+/// else gets the (possibly hard-cap-halved) LLM timeout.
+fn stale_threshold_for(
+    task_type: &str,
+    llm_timeout: std::time::Duration,
+    non_llm_timeout: std::time::Duration,
+) -> std::time::Duration {
+    if is_non_llm_task(task_type) {
+        non_llm_timeout
+    } else {
+        llm_timeout
+    }
+}
+
 /// Remove tasks that have been active longer than the configured stale timeout.
 async fn cleanup_stale_tasks(
     tracker: &ActiveTaskTracker,
@@ -287,29 +323,35 @@ async fn cleanup_stale_tasks(
     state: &SharedState,
     config: &OrchestratorConfig,
 ) -> Result<()> {
-    let pre_llm_count = tracker.llm_task_count().await;
+    let llm_count = tracker.llm_task_count().await;
     let hard_cap = config.hard_cap();
 
-    // Use shorter timeout when at hard cap to break deadlock faster
-    let effective_timeout = if pre_llm_count >= hard_cap {
+    // LLM tasks: shorten under hard cap to break the throttle deadlock faster.
+    let llm_timeout = if llm_count >= hard_cap {
         config.stale_task_timeout / 2
     } else {
         config.stale_task_timeout
     };
+    // Non-LLM tasks (`crack`, `command`) are not part of any LLM deadlock, so
+    // the hard-cap halving must not apply to them. A hashcat crack is budgeted
+    // at 20 min, serialized behind the single GPU permit, and the dispatcher
+    // waits up to 25 min for its result — reaping at the 5-min LLM timeout
+    // throws away an in-flight crack the tool would have finished (observed: a
+    // cross-forest AS-REP crack reaped at age_secs=329, costing the second
+    // forest its only foothold credential).
+    let non_llm_timeout = config.non_llm_task_timeout;
 
-    // Atomically find and remove every stale task under a single tracker lock.
-    // The previous implementation split this into `stale_tasks` (snapshot only)
-    // followed by per-task `remove` calls inside the loop body. That left the
-    // throttler observing the tasks as in-flight between the two steps and
-    // — if any per-task removal was ever skipped — leaked the in-flight slot
-    // for both `llm_task_count` and `count_for_role`, since the throttler
-    // derives both from the tracker. Symptom: the orchestrator wedges with
-    // `llm_count` frozen and the per-role budget (`ARES_MAX_TASKS_PER_ROLE`)
-    // full of phantom slots, every new dispatch deferred, and zero outbound
-    // LLM connections. Mirror the normal-completion path (`results.rs`) by
-    // doing the decrement at the same site we declare the task evicted.
-    let stale = tracker.remove_stale_tasks(effective_timeout).await;
-    for task in &stale {
+    // Scan at the smaller horizon, then reap each task against its own
+    // threshold so a slow crack isn't collected on the LLM timeout.
+    let scan_horizon = llm_timeout.min(non_llm_timeout);
+    let candidates = tracker.stale_tasks(scan_horizon).await;
+    let mut reaped = 0usize;
+    for task in &candidates {
+        let task_timeout = stale_threshold_for(&task.task_type, llm_timeout, non_llm_timeout);
+        if task.submitted_at.elapsed() < task_timeout {
+            continue;
+        }
+        reaped += 1;
         warn!(
             task_id = %task.task_id,
             role = %task.role,
@@ -321,13 +363,14 @@ async fn cleanup_stale_tasks(
         // still be running long after the task was declared stale, and
         // every subsequent task with the same credential gets deferred
         // until the future eventually returns.
-        if let Some(ref key) = task.credential_key {
-            credential_inflight.release(key).await;
+        if let Some(removed) = tracker.remove(&task.task_id).await {
+            if let Some(ref key) = removed.credential_key {
+                credential_inflight.release(key).await;
+            }
         }
 
-        let inactive_secs = task.last_activity.elapsed().as_secs();
-        let reason =
-            format!("stale task evicted after {inactive_secs}s without progress (no LLM activity)");
+        let age_secs = task.submitted_at.elapsed().as_secs();
+        let reason = format!("stale task evicted after {age_secs}s without a result");
 
         if let Err(e) = queue.set_task_status(&task.task_id, "failed").await {
             warn!(
@@ -354,15 +397,9 @@ async fn cleanup_stale_tasks(
         }
     }
 
-    if !stale.is_empty() {
-        // Re-read llm_count AFTER the eviction so the log reflects the actual
-        // post-cleanup counter, not the snapshot captured before the loop.
-        // Operators reading "Stale task cleanup complete" need the value the
-        // throttler will use on its next `check()`, not the stale pre-cleanup
-        // value that previously appeared frozen across consecutive sweeps.
-        let llm_count = tracker.llm_task_count().await;
+    if reaped > 0 {
         info!(
-            removed = stale.len(),
+            removed = reaped,
             llm_count, hard_cap, "Stale task cleanup complete"
         );
     }
@@ -535,6 +572,40 @@ mod tests {
         r.update_heartbeat("nonexistent", "busy", Some("task-1"), Utc::now())
             .await;
         assert!(r.agent_names().await.is_empty());
+    }
+
+    #[test]
+    fn crack_tasks_get_the_long_un_halved_threshold() {
+        use std::time::Duration;
+        // Simulate the hard-cap case: LLM tasks halved to 150s, non-LLM 6000s.
+        let llm = Duration::from_secs(150);
+        let non_llm = Duration::from_secs(6000);
+
+        // A crack task must use the long threshold — this is the fix: a crack
+        // was being reaped mid-run before hashcat returned the password.
+        assert_eq!(stale_threshold_for("crack", llm, non_llm), non_llm);
+        assert_eq!(stale_threshold_for("command", llm, non_llm), non_llm);
+
+        // LLM tasks keep the short (halved) threshold so a real deadlock still
+        // clears fast.
+        assert_eq!(stale_threshold_for("recon", llm, non_llm), llm);
+        assert_eq!(stale_threshold_for("credential_access", llm, non_llm), llm);
+        assert_eq!(stale_threshold_for("lateral_movement", llm, non_llm), llm);
+    }
+
+    #[test]
+    fn a_329s_crack_survives_but_a_329s_llm_task_is_reaped() {
+        use std::time::Duration;
+        // Reproduces the observed regression: a cross-forest AS-REP crack was
+        // reaped at age_secs=329. With the fix, a crack at 329s is below its
+        // 6000s threshold (survives), while an LLM task at 329s exceeds its
+        // 300s threshold (reaped) — the two classes no longer share a fuse.
+        let llm = Duration::from_secs(300);
+        let non_llm = Duration::from_secs(6000);
+        let age = Duration::from_secs(329);
+
+        assert!(age < stale_threshold_for("crack", llm, non_llm));
+        assert!(age >= stale_threshold_for("recon", llm, non_llm));
     }
 
     #[tokio::test]

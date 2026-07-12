@@ -21,21 +21,6 @@ pub type HostnameMap = Arc<HashMap<String, String>>;
 /// the warning isn't premature.
 const WRAPUP_THRESHOLD_STEPS: u32 = 5;
 
-/// How many steps ahead of the no-progress hard cut to inject the single
-/// graceful "you're repeating yourself" nudge. Gives the agent a window to
-/// call `task_complete` or pivot before `LoopEndReason::MaxSteps` trips.
-const NO_PROGRESS_NUDGE_LEAD: u32 = 4;
-
-/// Canonical signature for a tool call used by the no-progress breaker:
-/// `name` plus the serialized arguments. Falls back to a debug rendering if
-/// the arguments can't be serialized (never expected for JSON values). Two
-/// calls with identical name + arguments collapse to the same signature, so a
-/// re-issued identical call does not count as forward progress.
-fn tool_signature(name: &str, arguments: &serde_json::Value) -> String {
-    let args = serde_json::to_string(arguments).unwrap_or_else(|_| format!("{arguments:?}"));
-    format!("{name}\u{1f}{args}")
-}
-
 use crate::provider::{
     ChatMessage, LlmProvider, LlmRequest, Role, StopReason, TokenUsage, ToolCall,
 };
@@ -231,85 +216,9 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
     // the warning.
     let mut wrapup_nudge_injected = false;
 
-    // No-progress circuit breaker state. `unproductive_streak` counts
-    // consecutive tool-dispatching steps that produced neither a new parser
-    // discovery nor a tool-call signature (name + canonical args) the agent
-    // hasn't already issued this run. A spinning agent — re-running the same
-    // handful of calls against the same target — drives this monotonically up;
-    // any genuinely new call or discovery resets it to 0. When it reaches
-    // `config.no_progress_limit` the loop exits early reusing
-    // `LoopEndReason::MaxSteps`, so the existing stall-salvage path still
-    // credits whatever evidence landed before the spin. One graceful nudge is
-    // injected a few steps ahead of the hard cut to give the agent a chance to
-    // converge or change tactics first.
-    let mut seen_tool_signatures: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut unproductive_streak: u32 = 0;
-    let mut no_progress_nudge_injected = false;
-    // Discovery-anchored stall breaker. Counts consecutive tool-dispatching
-    // steps with no NEW parser discovery. Resets only on a real discovery —
-    // never on a merely novel tool-call signature — so it catches the grind
-    // `unproductive_streak` misses: an agent issuing distinct-but-fruitless
-    // calls (varying target/user/realm/flags every step) keeps minting novel
-    // signatures, so `unproductive_streak` resets every iteration and the
-    // agent burns to `max_steps`. This counter ignores novelty entirely.
-    let mut no_discovery_streak: u32 = 0;
-
     loop {
         if steps >= config.max_steps {
             warn!(task_id = task_id, steps = steps, "Agent loop hit max steps");
-            return finish(FinishArgs {
-                session_log: &session_log,
-                steps,
-                reason: LoopEndReason::MaxSteps,
-                total_usage,
-                tool_calls_dispatched,
-                discoveries: all_discoveries,
-                llm_findings: all_llm_findings,
-                tool_outputs: all_tool_outputs,
-            });
-        }
-
-        // No-progress circuit breaker: cut a spinning agent before it burns the
-        // remaining step budget (and the wall-clock + credential inflight-slots
-        // that go with it). Evaluated at the top of the loop — after the prior
-        // iteration's callbacks (incl. task_complete) have been fully handled —
-        // so a productive final step is never preempted. Reuses MaxSteps so
-        // the downstream stall-salvage path credits any evidence already found.
-        if config.no_progress_limit > 0 && unproductive_streak >= config.no_progress_limit {
-            warn!(
-                task_id = task_id,
-                steps = steps,
-                unproductive_streak = unproductive_streak,
-                "Agent loop exiting early: no new discoveries or novel tool calls — \
-                 reclaiming step budget (treated as MaxSteps stall)"
-            );
-            return finish(FinishArgs {
-                session_log: &session_log,
-                steps,
-                reason: LoopEndReason::MaxSteps,
-                total_usage,
-                tool_calls_dispatched,
-                discoveries: all_discoveries,
-                llm_findings: all_llm_findings,
-                tool_outputs: all_tool_outputs,
-            });
-        }
-
-        // Discovery-anchored stall breaker: an agent that keeps making novel
-        // (but fruitless) tool calls slips past `unproductive_streak` because
-        // each distinct signature counts as "progress". This second breaker
-        // anchors on actual parser discoveries, so a long run of varied calls
-        // that surfaces nothing new still gets cut. Reuses MaxSteps so
-        // stall-salvage credits whatever evidence landed before the spin.
-        if config.no_discovery_limit > 0 && no_discovery_streak >= config.no_discovery_limit {
-            warn!(
-                task_id = task_id,
-                steps = steps,
-                no_discovery_streak = no_discovery_streak,
-                "Agent loop exiting early: no new discoveries despite continued tool calls — \
-                 reclaiming step budget (treated as MaxSteps stall)"
-            );
             return finish(FinishArgs {
                 session_log: &session_log,
                 steps,
@@ -348,6 +257,10 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
         }
 
         steps += 1;
+        // Advance the benchmark replay clock (step mode) so logs and alerts
+        // unfold as the investigation progresses. Monotonic + global across the
+        // multi-agent hand-offs; no-op outside a step-mode replay.
+        ares_core::replay_clock::advance_step();
 
         // Wrap-up nudge: when we're WRAPUP_THRESHOLD steps from the cap,
         // inject one user-role reminder telling the agent to call
@@ -418,6 +331,7 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
         request.tools = active_tools.clone();
         request.max_tokens = config.max_tokens;
         request.temperature = config.temperature;
+        request.seed = config.seed;
         request.enable_prompt_cache = config.enable_prompt_cache;
 
         debug!(
@@ -554,19 +468,6 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
         // Dispatch external tools to workers concurrently
         if !external.is_empty() {
             tool_calls_dispatched = tool_calls_dispatched.saturating_add(external.len() as u32);
-
-            // No-progress accounting (part 1): snapshot the discovery count and
-            // record whether this step issued any tool-call signature the agent
-            // hasn't used before. A signature is `name` + canonical-JSON args,
-            // so re-running the identical call against the identical target is
-            // "not novel". The streak is finalized after results are collected.
-            let discoveries_before = all_discoveries.len();
-            let mut step_had_novel_tool = false;
-            for call in &external {
-                if seen_tool_signatures.insert(tool_signature(&call.name, &call.arguments)) {
-                    step_had_novel_tool = true;
-                }
-            }
 
             let mut join_set = tokio::task::JoinSet::new();
             for call in &external {
@@ -720,55 +621,6 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
                     }
                     messages.push(m);
                 }
-            }
-
-            // No-progress accounting (part 2): a step is progress if it surfaced
-            // a new parser discovery OR issued a never-before-seen tool-call
-            // signature. Otherwise the agent is spinning — grow the streak; the
-            // top-of-loop breaker acts on it next iteration.
-            let made_discovery = all_discoveries.len() > discoveries_before;
-            if made_discovery || step_had_novel_tool {
-                unproductive_streak = 0;
-            } else {
-                unproductive_streak = unproductive_streak.saturating_add(1);
-            }
-
-            // Discovery-anchored streak: resets ONLY on a real discovery, so
-            // novelty alone can't keep it pinned at 0 (the gap that let the
-            // novelty escape hatch run agents to max_steps).
-            if made_discovery {
-                no_discovery_streak = 0;
-            } else {
-                no_discovery_streak = no_discovery_streak.saturating_add(1);
-            }
-
-            // Graceful nudge a few steps before the hard cut: one chance to
-            // converge (task_complete) or change tactics before MaxSteps trips.
-            if config.no_progress_limit > NO_PROGRESS_NUDGE_LEAD
-                && !no_progress_nudge_injected
-                && unproductive_streak
-                    >= config
-                        .no_progress_limit
-                        .saturating_sub(NO_PROGRESS_NUDGE_LEAD)
-            {
-                no_progress_nudge_injected = true;
-                let nudge = format!(
-                    "NO FORWARD PROGRESS — the last {unproductive_streak} steps repeated \
-                     tool calls you've already made and surfaced no new credentials, \
-                     hashes, tickets, hosts, or vulnerabilities. Either call \
-                     `task_complete` NOW with the parser-grounded evidence you already \
-                     have, or make a materially different move (a new target, a new \
-                     technique, or different arguments). Repeating the same calls will \
-                     end the task as a stall and forfeit nothing you've already found — \
-                     but it wastes the budget other tasks need.",
-                );
-                messages.push(ChatMessage::text(Role::User, nudge));
-                warn!(
-                    task_id = task_id,
-                    steps = steps,
-                    unproductive_streak = unproductive_streak,
-                    "Agent loop injected no-progress nudge"
-                );
             }
         }
 

@@ -6,6 +6,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Label keys that carry a hostname, checked when extracting/matching hosts.
+const HOST_KEYS: &[&str] = &["hostname", "host", "computer"];
+/// Label/annotation keys that carry a username, checked when extracting users.
+const USER_KEYS: &[&str] = &[
+    "user",
+    "username",
+    "account",
+    "TargetUserName",
+    "SubjectUserName",
+];
+
 /// A cluster of related alerts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertCluster {
@@ -43,7 +54,7 @@ impl AlertCluster {
 
         // Extract hosts
         if let Some(labels) = labels {
-            for key in &["hostname", "host", "computer"] {
+            for key in HOST_KEYS {
                 if let Some(val) = labels.get(*key).and_then(|v| v.as_str()) {
                     self.common_hosts.insert(val.to_lowercase());
                 }
@@ -57,13 +68,7 @@ impl AlertCluster {
             }
 
             // Extract users
-            for key in &[
-                "user",
-                "username",
-                "account",
-                "TargetUserName",
-                "SubjectUserName",
-            ] {
+            for key in USER_KEYS {
                 if let Some(val) = labels.get(*key).and_then(|v| v.as_str()) {
                     self.common_users.insert(val.to_lowercase());
                 }
@@ -98,13 +103,7 @@ impl AlertCluster {
 
         // Also extract users from annotations
         if let Some(annotations) = annotations {
-            for key in &[
-                "user",
-                "username",
-                "account",
-                "TargetUserName",
-                "SubjectUserName",
-            ] {
+            for key in USER_KEYS {
                 if let Some(val) = annotations.get(*key).and_then(|v| v.as_str()) {
                     self.common_users.insert(val.to_lowercase());
                 }
@@ -154,7 +153,7 @@ impl AlertCluster {
         if let Some(labels) = labels {
             // Host match: high weight
             let mut host_matched = false;
-            for key in &["hostname", "host", "computer"] {
+            for key in HOST_KEYS {
                 if let Some(val) = labels.get(*key).and_then(|v| v.as_str()) {
                     if self.common_hosts.contains(&val.to_lowercase()) {
                         score += 0.4;

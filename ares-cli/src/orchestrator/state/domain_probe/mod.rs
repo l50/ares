@@ -31,29 +31,11 @@ pub use worker::{spawn_domain_probe_worker, DomainProbeContext};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeOutcome {
     /// The probe positively identified an AD domain. Promote.
-    ///
-    /// `dc` optionally carries the domain controller the probe resolved from
-    /// the `_ldap._tcp.dc._msdcs.<fqdn>` SRV record (target hostname + its
-    /// resolved A record). When present, the worker registers it so
-    /// `resolve_dc_ip` works for this realm — without it a probe-confirmed
-    /// foreign realm lands in `state.domains` but has no DC IP, so the
-    /// selectors that need one (foreign-group enum, cross-forest, ADCS) can't
-    /// target it directly. `None` preserves the prior confirm-only behavior
-    /// (e.g. SRV resolved but the target A lookup failed).
-    Confirmed { dc: Option<ProbedDc> },
+    Confirmed,
     /// The probe authoritatively says this is not an AD domain. Drop.
     Rejected(&'static str),
     /// Transient error or insufficient signal. Leave the candidate to retry.
     Indeterminate,
-}
-
-/// A domain controller resolved during a DNS SRV probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProbedDc {
-    /// SRV target hostname, e.g. `dc01.contoso.local`.
-    pub hostname: String,
-    /// Resolved IPv4/IPv6 address of `hostname`.
-    pub ip: String,
 }
 
 /// Pluggable domain prober. Implementers return a `ProbeOutcome` for an FQDN.

@@ -22,6 +22,27 @@ use ares_llm::{
 use super::callbacks::BlueCallbackHandler;
 use super::chaining;
 
+/// Read the optional LLM sampling temperature override from `ARES_LLM_TEMPERATURE`.
+///
+/// The blue investigation isn't driven by the red-team `Strategy` layer (which
+/// already reads this env var), so we read it here to give `benchmark run
+/// --temperature` a path through to the actual LLM call.
+pub(crate) fn parse_env_temperature() -> Option<f32> {
+    std::env::var("ARES_LLM_TEMPERATURE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+}
+
+/// Read the optional LLM sampling seed from `ARES_LLM_SEED`.
+///
+/// Providers that don't support seeded sampling (Anthropic, Ollama today) drop
+/// this silently at request time. See `LlmRequest.seed`.
+pub(crate) fn parse_env_seed() -> Option<u64> {
+    std::env::var("ARES_LLM_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 /// Represents a running investigation.
 pub struct Investigation {
     pub investigation_id: String,
@@ -151,6 +172,16 @@ pub async fn run_investigation(
         model: investigation.model.clone(),
         max_steps: 75,
         max_tool_calls_per_name: 25,
+        // Capture the blue transcript (messages + tool calls) to
+        // ARES_SESSION_LOG_DIR — the same introspection red gets. Plain
+        // `..default()` ships a disabled SessionLogConfig, so opt in here.
+        session_log: ares_llm::SessionLogConfig::from_env(),
+        // `benchmark run --temperature/--seed` sets ARES_LLM_TEMPERATURE /
+        // ARES_LLM_SEED so the blue investigation samples deterministically
+        // enough for replicate averaging. Unset ⇒ provider defaults, i.e.
+        // no behaviour change for non-benchmark callers.
+        temperature: parse_env_temperature(),
+        seed: parse_env_seed(),
         ..AgentLoopConfig::default()
     };
 
@@ -174,17 +205,48 @@ pub async fn run_investigation(
         role: role.as_str(),
         task_id: &investigation.investigation_id,
         tools: &tools,
-        callback_handler: Some(callback_handler),
+        callback_handler: Some(callback_handler.clone()),
         hostname_map: None,
     })
     .await;
 
     let investigation_outcome = process_outcome(&outcome, &investigation.investigation_id);
 
-    // Auto-chain follow-up tasks based on discoveries from the agent loop.
+    // Auto-chain follow-up hunts.
+    //
+    // The triage / threat-hunt / lateral sub-agents ran inline and persisted
+    // their evidence to Redis, but blue tool dispatch surfaces no discoveries
+    // of its own, so `outcome.discoveries` is effectively empty. Reconstruct the
+    // chain-planner input from the blue investigation state (P7), plan the
+    // follow-ups, and run them INLINE — there is no blue-task worker fleet to
+    // consume an enqueued task, so the hunts must execute in-process. Running
+    // here, before scoring and the report below, is what finally lands chained
+    // evidence in both the eval and the report (P8).
     let mut dispatched_chains: HashSet<String> = HashSet::new();
-    let mut chained_task_ids: Vec<String> = Vec::new();
+    let mut planned_chains: Vec<chaining::PlannedChain> = Vec::new();
 
+    if let Ok(Some(blue_state)) = BlueStateReader::new(investigation.investigation_id.clone())
+        .load_state(conn)
+        .await
+    {
+        if let Some(payload) = bubble_discoveries_from_blue_state(&blue_state) {
+            let synthetic = BlueTaskResult {
+                task_id: format!("bubbled_{}", investigation.investigation_id),
+                investigation_id: investigation.investigation_id.clone(),
+                success: true,
+                result: Some(payload),
+                error: None,
+                completed_at: Utc::now().to_rfc3339(),
+                worker_agent: Some("sub_agents".into()),
+            };
+            planned_chains.extend(chaining::plan_task_result(
+                &synthetic,
+                &mut dispatched_chains,
+            ));
+        }
+    }
+
+    // Also honor any discoveries the orchestrator loop surfaced directly.
     for discovery in &outcome.discoveries {
         let synthetic_result = BlueTaskResult {
             task_id: format!("discovery_{}", investigation.investigation_id),
@@ -195,32 +257,35 @@ pub async fn run_investigation(
             completed_at: Utc::now().to_rfc3339(),
             worker_agent: Some("orchestrator".into()),
         };
-
-        match chaining::process_task_result(
+        planned_chains.extend(chaining::plan_task_result(
             &synthetic_result,
-            _task_queue,
-            &investigation.investigation_id,
             &mut dispatched_chains,
-        )
-        .await
-        {
-            Ok(new_ids) => chained_task_ids.extend(new_ids),
-            Err(e) => {
-                warn!(
-                    investigation_id = %investigation.investigation_id,
-                    error = %e,
-                    "Failed to process evidence chain"
-                );
-            }
-        }
+        ));
     }
 
-    if !chained_task_ids.is_empty() {
+    if !planned_chains.is_empty() {
         info!(
             investigation_id = %investigation.investigation_id,
-            count = chained_task_ids.len(),
-            "Evidence auto-chaining dispatched follow-up tasks"
+            count = planned_chains.len(),
+            "Evidence auto-chaining: running inline follow-up hunts"
         );
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(CHAINED_HUNTS_TIMEOUT_SECS),
+            run_inline_chained_hunts(
+                callback_handler.as_ref(),
+                &planned_chains,
+                &investigation.investigation_id,
+            ),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                investigation_id = %investigation.investigation_id,
+                timeout_secs = CHAINED_HUNTS_TIMEOUT_SECS,
+                "Inline chained hunts timed out — proceeding to report/scoring"
+            );
+        }
     }
 
     // Score investigation against red team ground truth
@@ -287,6 +352,89 @@ pub async fn run_investigation(
     .await;
 
     Ok(investigation_outcome)
+}
+
+/// Max auto-chained follow-up hunts to run inline before the report, so a chain
+/// storm can't blow the investigation's time budget.
+const MAX_INLINE_CHAINS: usize = 4;
+
+/// Overall wall-clock cap for the inline chained-hunt phase. Comfortably under
+/// the runner's 45-minute investigation timeout even stacked on the main loop.
+const CHAINED_HUNTS_TIMEOUT_SECS: u64 = 420;
+
+/// Reconstruct chain-planner input from what the inline sub-agents persisted to
+/// Redis. Blue tool dispatch returns no discoveries of its own, so the MITRE
+/// techniques recorded on evidence and timeline events are the real
+/// "discoveries" to feed the chain map. Returns `None` when there's nothing to
+/// chain on.
+fn bubble_discoveries_from_blue_state(
+    state: &ares_core::models::SharedBlueTeamState,
+) -> Option<serde_json::Value> {
+    let mut techniques = std::collections::BTreeSet::new();
+    for tech in state
+        .evidence
+        .iter()
+        .flat_map(|ev| ev.mitre_techniques.iter())
+        .chain(
+            state
+                .timeline
+                .iter()
+                .flat_map(|tl| tl.mitre_techniques.iter()),
+        )
+    {
+        let tech = tech.trim();
+        if !tech.is_empty() {
+            techniques.insert(tech.to_string());
+        }
+    }
+    if techniques.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "techniques_found": techniques.into_iter().collect::<Vec<_>>(),
+    }))
+}
+
+/// Run the planned auto-chained follow-up hunts inline (bounded by
+/// [`MAX_INLINE_CHAINS`]) so their evidence lands in Redis before the report
+/// and scoring run. Failures are logged and skipped — one bad hunt must not
+/// sink the whole investigation.
+async fn run_inline_chained_hunts(
+    handler: &BlueCallbackHandler,
+    planned: &[chaining::PlannedChain],
+    investigation_id: &str,
+) {
+    for chain in planned.iter().take(MAX_INLINE_CHAINS) {
+        let prompt = format!(
+            "AUTO-CHAINED follow-up hunt, triggered by evidence type '{}'.\n\n\
+             Focus: {}\n\n\
+             Investigate using your detection templates (run_detection_query / \
+             run_parallel_detections) and Loki queries. Record every finding with \
+             add_evidence and map it to MITRE techniques, then call hunt_complete.",
+            chain.evidence_type, chain.focus
+        );
+        match handler.run_sub_agent(chain.role, &prompt).await {
+            Ok(_) => info!(
+                investigation_id,
+                evidence_type = %chain.evidence_type,
+                task_type = chain.task_type,
+                "Inline chained hunt completed"
+            ),
+            Err(e) => warn!(
+                investigation_id,
+                evidence_type = %chain.evidence_type,
+                error = %e,
+                "Inline chained hunt failed"
+            ),
+        }
+    }
+    if planned.len() > MAX_INLINE_CHAINS {
+        info!(
+            investigation_id,
+            dropped = planned.len() - MAX_INLINE_CHAINS,
+            "Capped inline chained hunts"
+        );
+    }
 }
 
 /// Resolve the report output directory.
@@ -560,7 +708,7 @@ mod tests {
         let outcome = AgentLoopOutcome {
             reason: LoopEndReason::RequestAssistance {
                 issue: "Critical: active data exfiltration".into(),
-                context: String::new(),
+                context: "".into(),
             },
             total_usage: Default::default(),
             steps: 3,
@@ -594,7 +742,7 @@ mod tests {
         let outcome = outcome_with(
             LoopEndReason::RequestAssistance {
                 issue: "Suspicious 4625 cluster, need access to host logs".into(),
-                context: String::new(),
+                context: "".into(),
             },
             4,
         );

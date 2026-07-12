@@ -4,6 +4,8 @@
 //! subcommands: `ares ops`, `ares orchestrator`, `ares worker`, etc.
 
 #[cfg(feature = "blue")]
+mod benchmark;
+#[cfg(feature = "blue")]
 mod blue;
 mod cli;
 mod config;
@@ -58,15 +60,10 @@ async fn main() {
 
     // ── Initialize telemetry before using tracing macros ──
     // Skip for orchestrator/worker subcommands — they init their own telemetry
-    // with the correct service name. The subcommand can appear anywhere in argv
-    // because clap allows global flags (e.g. `--redis-url <url>`) to precede
-    // it, so we scan rather than checking `args().nth(1)`. If we mis-detect, the
-    // telemetry init in ares-core is idempotent (`try_init`-based) and the
-    // redundant call returns a no-op guard, but mis-detection still bakes the
-    // wrong service name into spans for the entire process lifetime.
+    // with the correct service name.
     let is_service_subcommand = std::env::args()
-        .skip(1)
-        .any(|a| a == "orchestrator" || a == "worker");
+        .nth(1)
+        .is_some_and(|a| a == "orchestrator" || a == "worker");
     let _telemetry = if !is_service_subcommand {
         Some(ares_core::telemetry::init_telemetry(
             ares_core::telemetry::TelemetryConfig::new("ares-cli")
@@ -111,6 +108,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Ops(cmd) => ops::run_ops(cmd, cli.redis_url).await,
         #[cfg(feature = "blue")]
         Commands::Blue(cmd) => blue::run_blue(cmd, cli.redis_url).await,
+        #[cfg(feature = "blue")]
+        Commands::Benchmark(cmd) => benchmark::run_benchmark(cmd, cli.redis_url).await,
         Commands::History(cmd) => history::run_history(cmd).await,
         Commands::Config(cmd) => config::run_config(cmd),
         Commands::Orchestrator => orchestrator::run().await,

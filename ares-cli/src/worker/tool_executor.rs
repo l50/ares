@@ -16,12 +16,15 @@
 //! ```
 //!
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn, Instrument};
 
 use ares_core::nats::{self, NatsBroker};
@@ -32,6 +35,7 @@ use ares_core::telemetry::spans::{
 use ares_core::telemetry::target::{extract_target_info, infer_target_type_from_info};
 
 use crate::worker::config::WorkerConfig;
+use crate::worker::credential_resolver::resolve_credentials;
 use crate::worker::heartbeat::WorkerStatus;
 
 // ─── Wire types (match orchestrator's tool_dispatcher.rs exactly) ────────────
@@ -64,10 +68,82 @@ struct ToolExecResponse {
 
 // ─── Tool executor loop ─────────────────────────────────────────────────────
 
+/// Default per-worker concurrent-tool cap. Each worker processes up to N
+/// tool requests in parallel via `tokio::spawn`; the serial `.await` on
+/// each dispatch was throttling effective fleet throughput to the number
+/// of worker roles (7) regardless of how many permits `TOOL_PERMITS`
+/// advertised. Kept conservative (3) so the fleet-wide peak stays under
+/// the observed 10 GiB cgroup ceiling: at ~250 MB per netexec × 3 per
+/// worker × 7 roles = ~5 GB peak, matching the original single-worker
+/// TOOL_PERMITS=20 memory profile. Override via `ARES_WORKER_CONCURRENCY`.
+const DEFAULT_WORKER_CONCURRENCY: usize = 3;
+
+/// Environment variable override for [`DEFAULT_WORKER_CONCURRENCY`].
+/// Values <1 are ignored (falls back to default).
+const WORKER_CONCURRENCY_ENV: &str = "ARES_WORKER_CONCURRENCY";
+
+fn worker_concurrency_from_env() -> usize {
+    std::env::var(WORKER_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_WORKER_CONCURRENCY)
+}
+
+/// Guard for the per-worker in-flight counter. Increments the counter on
+/// construction (flipping `status_tx` to "busy" on the 0→1 transition) and
+/// decrements on drop (flipping to "idle" on the 1→0 transition). Held for
+/// the lifetime of a spawned `execute_and_respond` task so panics and early
+/// returns can never leak the count.
+struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+    status_tx: tokio::sync::watch::Sender<WorkerStatus>,
+}
+
+impl InflightGuard {
+    fn enter(
+        counter: Arc<AtomicUsize>,
+        status_tx: tokio::sync::watch::Sender<WorkerStatus>,
+        tool_name: &str,
+        call_id: &str,
+    ) -> Self {
+        let prev = counter.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 {
+            let _ = status_tx.send(WorkerStatus {
+                status: "busy".to_string(),
+                current_task: Some(busy_current_task(tool_name, call_id)),
+            });
+        }
+        Self { counter, status_tx }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let after = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
+        if after == 0 {
+            let _ = self.status_tx.send(WorkerStatus {
+                status: "idle".to_string(),
+                current_task: None,
+            });
+        }
+    }
+}
+
 /// Run the tool execution loop until shutdown is signalled.
 ///
 /// Subscribes to `ares.tools.exec.{role}` as a queue group so each request
 /// goes to exactly one worker. Replies on the request's reply inbox.
+///
+/// Concurrency: each received request is dispatched into `tokio::spawn`
+/// gated by a per-worker semaphore capped at [`DEFAULT_WORKER_CONCURRENCY`]
+/// (default 3). The loop backpressures on `acquire_owned().await` when the
+/// cap is reached — a full cap holds the next `sub.next()` fetch in
+/// suspension, so NATS's queue-group rebalances to a worker with slack.
+/// Ordering is not preserved across concurrent dispatches; the LLM's tool
+/// calls are independent, so this is safe. Preserves the serial-loop's
+/// memory guardrail via the process-wide `TOOL_PERMITS` semaphore inside
+/// `CommandBuilder::execute()` plus the tighter per-worker cap here.
 pub async fn run_tool_exec_loop(
     config: &WorkerConfig,
     conn: redis::aio::ConnectionManager,
@@ -101,7 +177,32 @@ pub async fn run_tool_exec_loop(
         "Starting tool executor loop (NATS queue subscribe)"
     );
 
-    let mut unavailable_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let unavailable_tools: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let worker_permits = Arc::new(Semaphore::new(worker_concurrency_from_env()));
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let worker_role = config.worker_role.clone();
+
+    // Long-lived workers (EC2 systemd units) start with operation_id=None, so
+    // the startup `/etc/hosts` sync in `worker::run` never fires — they only
+    // learn the op from incoming requests. Bind the sync lazily off the first
+    // request that carries one; without this, FQDN/Kerberos tools fail with
+    // `getaddrinfo: Name or service not known`. Seeded with the startup op so
+    // the K8s path (op known at boot) doesn't double-spawn.
+    let mut hosts_guard = crate::worker::hosts::HostsSyncGuard::seeded(config.operation_id.clone());
+
+    // Cracker-only: wipe hashcat's persistent potfile at every op transition
+    // so plaintexts cracked in a prior op don't leak into the next as free
+    // candidates in the known-password reuse pass (which would silently
+    // inflate benchmark compromise numbers with prior ops' crack work). The
+    // guard is fresh (not seeded with `config.operation_id`) so a worker
+    // restart mid-op still wipes — a restarted worker cannot prove the
+    // potfile is uncontaminated. Set `ARES_KEEP_POTFILE=1` to disable.
+    let mut potfile_guard: Option<ares_tools::cracker::PotfileResetGuard> =
+        if worker_role == "cracker" {
+            Some(ares_tools::cracker::PotfileResetGuard::new())
+        } else {
+            None
+        };
 
     loop {
         let next = tokio::select! {
@@ -125,14 +226,33 @@ pub async fn run_tool_exec_loop(
             }
         };
 
-        let _ = status_tx.send(WorkerStatus {
-            status: "busy".to_string(),
-            current_task: Some(busy_current_task(&request.tool_name, &request.call_id)),
-        });
+        // Ensure the /etc/hosts sync is running for this request's operation so
+        // FQDN/Kerberos-based tools can resolve DC and member-server names.
+        if let Some(ref op) = request.operation_id {
+            hosts_guard.ensure(&conn, op, &config.agent_name, shutdown.clone());
+            if let Some(guard) = potfile_guard.as_mut() {
+                guard.ensure(op);
+            }
+        }
+
+        // Acquire the per-worker permit BEFORE spawning so the loop
+        // backpressures on the cap. `acquire_owned` returns a permit whose
+        // Drop releases the semaphore slot — moving it into the spawned
+        // task ties the slot's lifetime to the task's, no matter how it
+        // exits (Ok, error, panic).
+        let permit = match worker_permits.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                // Only reachable if the semaphore is explicitly closed,
+                // which we never do — treat as fatal.
+                error!(err = %e, "worker semaphore closed unexpectedly, exiting loop");
+                return Err(anyhow::anyhow!("worker semaphore closed: {e}"));
+            }
+        };
 
         let ti = extract_target_info(&request.arguments);
         let tt = infer_target_type_from_info(&ti);
-        let mut span_builder = AgentSpanBuilder::new("tool_exec", &config.worker_role, Team::Red)
+        let mut span_builder = AgentSpanBuilder::new("tool_exec", &worker_role, Team::Red)
             .tool(&request.tool_name)
             .kind(SpanKind::Consumer);
         if let Some(ref ip) = ti.target_ip {
@@ -157,21 +277,38 @@ pub async fn run_tool_exec_loop(
 
         let reply_to = msg.reply.clone();
         let client_for_reply = client.clone();
+        // Clone the resolver-side Redis connection per-request. ConnectionManager
+        // is cheap to clone (it wraps an Arc) and resolve_credentials mutates
+        // the borrow during state reads — keeping a per-request copy avoids
+        // interleaving with the next iteration's `sub.next()` await.
+        let conn_for_resolver = conn.clone();
+        let unavailable_for_task = unavailable_tools.clone();
+        let guard = InflightGuard::enter(
+            inflight.clone(),
+            status_tx.clone(),
+            &request.tool_name,
+            &request.call_id,
+        );
 
-        execute_and_respond(
-            client_for_reply,
-            reply_to,
-            &request,
-            &mut unavailable_tools,
-            conn.clone(),
-        )
-        .instrument(exec_span)
-        .await;
-
-        let _ = status_tx.send(WorkerStatus {
-            status: "idle".to_string(),
-            current_task: None,
-        });
+        tokio::spawn(
+            async move {
+                // Bind `permit` locally so its Drop releases the worker
+                // semaphore slot exactly when this task ends — including
+                // on panic, task cancellation, or early return from any
+                // branch of `execute_and_respond`.
+                let _permit = permit;
+                let _guard = guard;
+                execute_and_respond(
+                    client_for_reply,
+                    reply_to,
+                    &request,
+                    &unavailable_for_task,
+                    conn_for_resolver,
+                )
+                .await;
+            }
+            .instrument(exec_span),
+        );
     }
 }
 
@@ -269,51 +406,33 @@ fn build_error_response(call_id: &str, err_str: String) -> ToolExecResponse {
 }
 
 /// Execute a tool call and reply on the NATS inbox.
-/// Poll the parent task's status in Redis and return as soon as it leaves the
-/// alive set (`in_progress` / `running`). Companion to the `tokio::select` in
-/// [`execute_and_respond`]: when this future resolves, the dispatch arm is
-/// dropped and tokio's `kill_on_drop(true)` on any spawned tool child (e.g.
-/// `impacket-ntlmrelayx` from `ares-tools/coercion.rs`) reaps the worker-side
-/// process, freeing its listener sockets. Without this the dispatch keeps
-/// awaiting forever and the tool stays orphaned across orchestrator restarts —
-/// the long-standing `RELAY_BIND_BUSY` pattern.
 ///
-/// Polling cadence is 5s — one Redis `GET` per cycle, bounding the orphan
-/// window to ~5s after the orchestrator marks the task non-running. Transient
-/// Redis errors and missing keys are deliberately treated as "still alive" so a
-/// blip can't accidentally cancel a healthy tool mid-execution.
-async fn poll_parent_task_cancelled(mut conn: redis::aio::ConnectionManager, task_id: String) {
-    let key = format!("ares:task_status:{task_id}");
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    // Skip the immediate first tick so we don't race a fresh dispatch whose
-    // status key the orchestrator hasn't written yet.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let val: redis::RedisResult<Option<String>> =
-            redis::cmd("GET").arg(&key).query_async(&mut conn).await;
-        match val {
-            // Substring check, not full JSON parse — the status field is a
-            // short literal and this runs on every in-flight tool every 5s.
-            Ok(Some(v))
-                if !v.contains(r#""status":"in_progress""#)
-                    && !v.contains(r#""status":"running""#) =>
-            {
-                return;
-            }
-            _ => continue,
-        }
-    }
-}
-
+/// Resolves credentials and Kerberos tickets from operation state before
+/// dispatch. Pre-fix this path called `ares_tools::dispatch` directly with
+/// the orchestrator-supplied arguments, which meant the entire credential
+/// resolution layer (`worker::credential_resolver::resolve_credentials`) was
+/// bypassed in production NATS mode — every cred-injection fix the
+/// orchestrator made (Bug B's KRB5CCNAME wiring, Bug I's same-realm cred
+/// precedence, etc.) only affected the in-process `LocalToolDispatcher` and
+/// never reached real workers. The injection now mirrors
+/// `LocalToolDispatcher::dispatch_tool` so the two paths stay in lock-step.
 async fn execute_and_respond(
     client: async_nats::Client,
     reply_to: Option<async_nats::Subject>,
     request: &ToolExecRequest,
-    unavailable_tools: &mut std::collections::HashSet<String>,
-    conn: redis::aio::ConnectionManager,
+    unavailable_tools: &Arc<Mutex<HashSet<String>>>,
+    mut conn: redis::aio::ConnectionManager,
 ) {
-    if unavailable_tools.contains(&request.tool_name) {
+    // Cheap contains-check under a briefly-held std::sync::Mutex — no await
+    // point holds this lock, so it can't deadlock with concurrent spawned
+    // tasks that also read/write the same shared HashSet.
+    let is_unavailable = {
+        let g = unavailable_tools
+            .lock()
+            .expect("unavailable_tools mutex poisoned");
+        g.contains(&request.tool_name)
+    };
+    if is_unavailable {
         debug!(
             tool = %request.tool_name,
             call_id = %request.call_id,
@@ -334,67 +453,75 @@ async fn execute_and_respond(
     let di = extract_target_info(&request.arguments);
     let dt = infer_target_type_from_info(&di);
 
-    // Resolve secret material (password/hash/aes_key/ticket/SIDs) from operation
-    // state. The LLM names principals (`username`, `domain`) but never secrets;
-    // the resolver fills credential-shaped fields from Redis right before
-    // dispatch. May redirect the tool to a `*_kerberos` variant for cross-forest
-    // coercion. Without this call the NATS worker would fire `ares_tools::dispatch`
-    // with whatever the LLM sent — usually no creds, since the dispatch
-    // prompt template tells the LLM not to pass them.
-    let mut resolved_args = request.arguments.clone();
-    let mut resolver_conn = conn.clone();
-    let resolved_tool_name = match crate::worker::credential_resolver::resolve_credentials(
-        &mut resolver_conn,
+    // Resolve credentials from operation state. The LLM never passes secret
+    // material — usernames + domains only. A cross-forest Kerberos coercion
+    // may redirect to a `*_kerberos` variant (e.g. psexec → psexec_kerberos),
+    // so track the effective tool name for the dispatch + parser calls.
+    // On resolver error, fall back to the original arguments so the worker
+    // never silently drops a tool call.
+    let mut resolved_arguments = request.arguments.clone();
+    let mut effective_tool_name: Cow<'_, str> = Cow::Borrowed(request.tool_name.as_str());
+    match resolve_credentials(
+        &mut conn,
         request.operation_id.as_deref(),
         &request.tool_name,
-        &mut resolved_args,
+        &mut resolved_arguments,
     )
     .await
     {
-        Ok(Some(redirected)) => redirected,
-        Ok(None) => request.tool_name.clone(),
+        Ok(Some(renamed)) => {
+            info!(
+                from = %request.tool_name,
+                to = %renamed,
+                call_id = %request.call_id,
+                "worker tool_executor: applying Kerberos variant redirect from credential_resolver"
+            );
+            effective_tool_name = Cow::Owned(renamed);
+        }
+        Ok(None) => {}
         Err(e) => {
             warn!(
                 tool = %request.tool_name,
                 call_id = %request.call_id,
                 err = %e,
-                "credential_resolver failed — proceeding with LLM-supplied arguments"
+                "worker credential_resolver failed; continuing with original arguments"
             );
-            request.tool_name.clone()
+            resolved_arguments = request.arguments.clone();
         }
-    };
+    }
 
-    // Race the tool dispatch against the parent task's status in Redis. When the
-    // orchestrator stale-evicts (or otherwise terminates) the task, this select
-    // returns immediately, the dispatch future is dropped, and tokio's
-    // `kill_on_drop(true)` on the child process inside the tool (e.g.
-    // `impacket-ntlmrelayx` in ares-tools/coercion.rs) SIGKILLs the spawned
-    // process — closing its listener sockets. Without this race the dispatch
-    // future would keep awaiting indefinitely after the parent task is dead,
-    // and the tool would hold its sockets until the worker pod restarted —
-    // the orphan pattern in [[project_orphan_tool_processes]].
-    let dispatch_fut = ares_tools::dispatch(&resolved_tool_name, &resolved_args);
-    let cancel_fut = poll_parent_task_cancelled(conn, request.task_id.clone());
-    let response = tokio::select! {
-        biased; // poll the dispatch first when both are ready
-        res = dispatch_fut => match res {
+    let response = match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
         Ok(output) => {
             let raw = output.combined_raw();
-            let combined = output.combined();
+            let mut combined = output.combined();
             let success = output.success;
             let exit_code = output.exit_code;
 
             let discoveries = discoveries_or_none(ares_tools::parsers::parse_tool_output(
-                &resolved_tool_name,
+                &effective_tool_name,
                 &raw,
-                &resolved_args,
+                &resolved_arguments,
             ));
+
+            // A zero-yield unauthenticated harvest (spray/roast) exits 0 and
+            // masks its empty result as "success". Append an explicit advisory
+            // so the LLM enumerates real users instead of re-spraying the same
+            // canned wordlist. No-op for tools that aren't unauth harvests or
+            // that actually produced loot.
+            if success {
+                if let Some(note) = ares_tools::parsers::empty_harvest_advisory(
+                    &effective_tool_name,
+                    discoveries.as_ref(),
+                ) {
+                    combined.push_str(&note);
+                }
+            }
 
             if let Some(ref disc) = discoveries {
                 for (disc_type, _count) in count_discovery_entries(disc) {
                     let span = trace_discovery(TraceDiscoveryParams {
                         discovery_type: &disc_type,
-                        source_agent: &request.tool_name,
+                        source_agent: &effective_tool_name,
                         target_user: di.target_user.as_deref(),
                         target_domain: None,
                         target_ip: di.target_ip.as_deref(),
@@ -413,36 +540,26 @@ async fn execute_and_respond(
             let err_str = e.to_string();
             if is_tool_unavailable_error(&err_str) {
                 warn!(
-                    tool = %request.tool_name,
+                    tool = %effective_tool_name,
                     "Tool binary not found — marking as unavailable for this session"
                 );
-                unavailable_tools.insert(request.tool_name.clone());
+                unavailable_tools
+                    .lock()
+                    .expect("unavailable_tools mutex poisoned")
+                    .insert(effective_tool_name.to_string());
             }
             warn!(
-                tool = %request.tool_name,
+                tool = %effective_tool_name,
                 call_id = %request.call_id,
                 err = %e,
                 "Tool execution failed"
             );
             build_error_response(&request.call_id, err_str)
         }
-        },
-        _ = cancel_fut => {
-            warn!(
-                tool = %request.tool_name,
-                call_id = %request.call_id,
-                task_id = %request.task_id,
-                "Parent task no longer in_progress — dropping dispatch (kill_on_drop reaps any spawned child)"
-            );
-            build_error_response(
-                &request.call_id,
-                "cancelled: parent task no longer in_progress".to_string(),
-            )
-        }
     };
 
     debug!(
-        tool = %request.tool_name,
+        tool = %effective_tool_name,
         call_id = %request.call_id,
         has_error = response.error.is_some(),
         "Tool result ready"
@@ -476,6 +593,212 @@ async fn send_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Per-worker concurrency (Serial-loop wedge fix) ────────────────────
+
+    /// Env-var tests serialise on this mutex — process-wide `set_var` is
+    /// not test-isolated, and cargo runs unit tests in parallel by default.
+    /// Without the guard, the "default" test can observe the "override"
+    /// test's leaked value and fail with a bogus assertion.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drop guard that snapshots [`WORKER_CONCURRENCY_ENV`] on entry and
+    /// restores it on scope exit. Combined with `ENV_LOCK`, this keeps
+    /// each env-touching test hermetic against its sibling tests.
+    struct EnvGuard {
+        prior: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvGuard {
+        fn acquire() -> Self {
+            // If a sibling test panicked while holding the lock, PoisonError
+            // still lets us proceed — we just want serialisation, not the
+            // sibling's data.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                prior: std::env::var(WORKER_CONCURRENCY_ENV).ok(),
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(WORKER_CONCURRENCY_ENV, v),
+                None => std::env::remove_var(WORKER_CONCURRENCY_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn worker_concurrency_default_when_env_unset() {
+        let _g = EnvGuard::acquire();
+        std::env::remove_var(WORKER_CONCURRENCY_ENV);
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+    }
+
+    #[test]
+    fn worker_concurrency_ignores_zero_and_negative() {
+        // Zero and negative overrides must not silently disable the worker —
+        // fall back to the default so a fat-fingered env var can't wedge
+        // the fleet.
+        let _g = EnvGuard::acquire();
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "0");
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "-1");
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "not-a-number");
+        assert_eq!(worker_concurrency_from_env(), DEFAULT_WORKER_CONCURRENCY);
+    }
+
+    #[test]
+    fn worker_concurrency_env_override_takes_effect() {
+        let _g = EnvGuard::acquire();
+        std::env::set_var(WORKER_CONCURRENCY_ENV, "7");
+        assert_eq!(worker_concurrency_from_env(), 7);
+    }
+
+    #[tokio::test]
+    async fn inflight_guard_flips_busy_on_0_to_1_transition() {
+        // Contract: entering the FIRST inflight guard flips the watch
+        // channel to "busy". Subsequent guards (concurrent dispatches) do
+        // NOT re-broadcast — the guard checks the pre-add counter.
+        let (tx, rx) = tokio::sync::watch::channel(WorkerStatus {
+            status: "idle".to_string(),
+            current_task: None,
+        });
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let g1 = InflightGuard::enter(counter.clone(), tx.clone(), "nmap_scan", "call-1");
+        assert_eq!(rx.borrow().status, "busy");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let g2 = InflightGuard::enter(counter.clone(), tx, "secretsdump", "call-2");
+        // Still busy; counter reflects the second in-flight dispatch.
+        assert_eq!(rx.borrow().status, "busy");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        drop(g2);
+        // Dropping the second guard while the first is still held must NOT
+        // flip to idle — the 1→0 transition is the only trigger.
+        assert_eq!(rx.borrow().status, "busy");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        drop(g1);
+        // Now the counter hits zero; flip back to idle.
+        assert_eq!(rx.borrow().status, "idle");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inflight_guard_flips_idle_on_panic_via_drop() {
+        // Contract: a spawned task that panics mid-execution still releases
+        // its inflight slot because `InflightGuard: Drop` runs during
+        // unwinding. Prevents a permanent "busy" report on a wedged worker.
+        let (tx, rx) = tokio::sync::watch::channel(WorkerStatus {
+            status: "idle".to_string(),
+            current_task: None,
+        });
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let counter_for_task = counter.clone();
+        let tx_for_task = tx.clone();
+        let handle = tokio::spawn(async move {
+            let _guard =
+                InflightGuard::enter(counter_for_task, tx_for_task, "kaboom", "panic-call");
+            panic!("simulated tool executor panic");
+        });
+
+        // Await the task — panics propagate as a JoinError.
+        let result = handle.await;
+        assert!(result.is_err(), "expected the spawned task to panic");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "InflightGuard::Drop must fire during unwind to release the slot"
+        );
+        assert_eq!(rx.borrow().status, "idle");
+    }
+
+    #[tokio::test]
+    async fn worker_permits_backpressure_at_cap() {
+        // Contract: `acquire_owned().await` on a saturated semaphore
+        // suspends until a permit is dropped. Verified by
+        // 1. holding all N permits, then confirming `available_permits()`
+        //    reaches zero,
+        // 2. wrapping a fresh `acquire_owned` in `tokio::time::timeout` —
+        //    it times out while the cap is held,
+        // 3. dropping a held permit and confirming a subsequent
+        //    `acquire_owned` completes promptly.
+        // This is the same backpressure the worker loop relies on to keep
+        // fleet-wide concurrent tool count within memory budget.
+        use std::time::Duration;
+
+        let permits = Arc::new(Semaphore::new(2));
+
+        let p1 = permits.clone().acquire_owned().await.unwrap();
+        let p2 = permits.clone().acquire_owned().await.unwrap();
+        assert_eq!(permits.available_permits(), 0);
+
+        // A fresh acquire under a tight timeout must fail with Elapsed
+        // while the cap is saturated. Elapsed is the timeout arm's Err.
+        let stuck =
+            tokio::time::timeout(Duration::from_millis(25), permits.clone().acquire_owned()).await;
+        assert!(
+            stuck.is_err(),
+            "acquire_owned should not have resolved while the cap was full"
+        );
+
+        drop(p1);
+        // Slot freed — the next acquire completes well within the same
+        // timeout budget.
+        let p3 = tokio::time::timeout(Duration::from_millis(200), permits.clone().acquire_owned())
+            .await
+            .expect("acquire_owned failed to complete after a permit was dropped")
+            .expect("semaphore closed unexpectedly");
+
+        drop(p2);
+        drop(p3);
+        assert_eq!(permits.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn unavailable_tools_read_write_across_tasks_no_deadlock() {
+        // Contract: `unavailable_tools` is shared across concurrently
+        // spawned dispatch tasks. The std::sync::Mutex is held only for
+        // the duration of a HashSet contains/insert — never across an
+        // await — so many concurrent tasks can safely serialize on it
+        // without deadlocking each other or the outer loop's
+        // `sub.next().await`.
+        let set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // First writer marks "hashcat" as unavailable.
+        let writer_set = set.clone();
+        let writer = tokio::spawn(async move {
+            writer_set
+                .lock()
+                .expect("mutex poisoned")
+                .insert("hashcat".to_string());
+        });
+
+        // Concurrent readers race the writer; either observation is valid,
+        // but neither may deadlock.
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let r_set = set.clone();
+            readers.push(tokio::spawn(async move {
+                r_set.lock().expect("mutex poisoned").contains("hashcat")
+            }));
+        }
+
+        writer.await.unwrap();
+        for r in readers {
+            let _observed = r.await.unwrap();
+        }
+
+        // After all tasks settle, the writer's mutation is visible.
+        assert!(set.lock().unwrap().contains("hashcat"));
+    }
 
     #[test]
     fn tool_exec_request_deserialize() {
@@ -657,8 +980,9 @@ mod tests {
         // Verify the format used in execute_and_respond for unavailable tools
         let tool_name = "nonexistent_tool";
         let error_msg = format!(
-            "Tool '{tool_name}' is not installed on this worker. \
-             Do not call this tool again — it failed to spawn previously."
+            "Tool '{}' is not installed on this worker. \
+             Do not call this tool again — it failed to spawn previously.",
+            tool_name
         );
         assert!(error_msg.contains("nonexistent_tool"));
         assert!(error_msg.contains("not installed"));

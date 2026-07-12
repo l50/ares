@@ -174,7 +174,7 @@ mod tests {
 
     fn make_credential(username: &str, password: &str, domain: &str, is_admin: bool) -> Credential {
         Credential {
-            id: format!("c-{username}"),
+            id: format!("c-{}", username),
             username: username.into(),
             password: password.into(), // pragma: allowlist secret
             domain: domain.into(),

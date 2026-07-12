@@ -5,7 +5,7 @@
 //! to list shares on all known hosts.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -84,10 +84,6 @@ fn collect_smbclient_work(state: &crate::orchestrator::state::StateInner) -> Vec
 pub async fn auto_smbclient_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Suppress re-dispatch of items the throttler just deferred, so the tick
-    // doesn't flood the deferred queue with duplicates (dedup only commits on
-    // success). See super::DeferCooldown.
-    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -111,11 +107,7 @@ pub async fn auto_smbclient_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             items
         };
 
-        let now = Instant::now();
         for item in work {
-            if cooldown.active(&item.dedup_key, now) {
-                continue;
-            }
             let payload = json!({
                 "technique": "authenticated_share_enumeration",
                 "target_ip": item.target_ip,
@@ -139,7 +131,6 @@ pub async fn auto_smbclient_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                         host = %item.target_ip,
                         "Authenticated SMB share enumeration dispatched"
                     );
-                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -151,7 +142,6 @@ pub async fn auto_smbclient_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                         .await;
                 }
                 Ok(None) => {
-                    cooldown.record(&item.dedup_key, now);
                     debug!(host = %item.target_ip, "SMB auth enum deferred");
                 }
                 Err(e) => {
@@ -713,7 +703,7 @@ mod tests {
 
     #[test]
     fn credential_domain_matching_empty_skips() {
-        let domain = String::new();
+        let domain = "".to_string();
         let cred_domain = "contoso.local";
         let matches = !domain.is_empty() && cred_domain.to_lowercase() == domain.to_lowercase();
         assert!(!matches);

@@ -9,7 +9,7 @@
 //! ADCS web enrollment (ESC8).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -66,10 +66,6 @@ fn collect_dfs_coercion_work(state: &StateInner, listener: &str) -> Vec<DfsWork>
 pub async fn auto_dfs_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Suppress re-dispatch of items the throttler just deferred, so the tick
-    // doesn't flood the deferred queue with duplicates (dedup only commits on
-    // success). See super::DeferCooldown.
-    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -94,11 +90,7 @@ pub async fn auto_dfs_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             collect_dfs_coercion_work(&state, &listener)
         };
 
-        let now = Instant::now();
         for item in work {
-            if cooldown.active(&item.dedup_key, now) {
-                continue;
-            }
             let payload = json!({
                 "technique": "dfs_coercion",
                 "target_ip": item.dc_ip,
@@ -124,7 +116,6 @@ pub async fn auto_dfs_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         "DFSCoerce (MS-DFSNM) coercion dispatched"
                     );
 
-                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -136,7 +127,6 @@ pub async fn auto_dfs_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         .await;
                 }
                 Ok(None) => {
-                    cooldown.record(&item.dedup_key, now);
                     debug!(dc = %item.dc_ip, "DFSCoerce task deferred");
                 }
                 Err(e) => {

@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::dedup::{is_ghost_machine_account, is_low_value_acl_target};
+use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::dispatcher::{Dispatcher, SubmissionOutcome};
 use crate::orchestrator::state::*;
 
@@ -163,26 +163,11 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             .or_else(|| vuln.details.get("to"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if is_ghost_machine_account(target_name)
-            || state.is_self_created_machine_account(target_name)
-        {
+        if is_ghost_machine_account(target_name) {
             debug!(
                 vuln_id = %vuln.vuln_id,
                 target = %target_name,
-                "Skipping ACL abuse for ghost or ares-created machine account target"
-            );
-            continue;
-        }
-
-        // Drop ACL edges whose target is a well-known non-escalating built-in
-        // group (Cloneable Domain Controllers, IIS_IUSRS, …). BloodHound emits
-        // these by the dozen; each became a doomed priority-1 exploit task that
-        // flooded the queue and starved decisive escalations (e.g. seimpersonate).
-        if is_low_value_acl_target(target_name) {
-            debug!(
-                vuln_id = %vuln.vuln_id,
-                target = %target_name,
-                "Skipping ACL abuse: target is a non-escalating built-in group"
+                "Skipping ACL abuse for ghost machine account target"
             );
             continue;
         }
@@ -219,11 +204,7 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             .find(|c| {
                 c.username.to_lowercase() == source_user.to_lowercase()
                     && (source_domain.is_empty()
-                        || c.domain.to_lowercase() == source_domain.to_lowercase()
-                        || crate::worker::credential_resolver::is_parent_realm(
-                            &c.domain,
-                            source_domain,
-                        ))
+                        || c.domain.to_lowercase() == source_domain.to_lowercase())
             })
             .cloned()
             .or_else(|| resolve_sid_principal(state, source_user, source_domain));
@@ -254,11 +235,9 @@ pub(crate) fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             }
 
             // ForceChangePassword / GenericAll overwrite the target's
-            // plaintext via `bloodyad_set_password` (or `samr_change_password`
-            // as the SAMR/RPC fallback when LDAP unicodePwd writes are
-            // rejected by the DC). Skip when we already have material so the
-            // scoreboard's back-verification against the original
-            // lab-provisioned password still holds.
+            // plaintext via `bloodyad_set_password`. Skip when we already
+            // have material so the scoreboard's back-verification against
+            // the original lab-provisioned password still holds.
             let is_destructive_acl =
                 vtype.contains("forcechangepassword") || vtype.contains("genericall");
             if is_destructive_acl && !target_user.is_empty() {
@@ -344,17 +323,8 @@ fn is_privileged_well_known_rid(rid: u32) -> bool {
 ///   1. Parse `S-1-5-21-X-Y-Z-RID` and extract the domain SID prefix and RID.
 ///   2. Reverse-look up the domain via `state.domain_sids` (or fall back to
 ///      `source_domain` from the vuln details).
-///   3. For privileged well-known RIDs, return an `is_admin` credential in
-///      that domain — i.e. a credential that could plausibly act as that
-///      privileged group. If we hold no such credential, return `None`.
-///
-/// The old behavior fell back to "any credential in the domain", which
-/// fabricated a doomed exploit task for every `Enterprise Admins -> GenericAll
-/// -> X` edge BloodHound emits (abuse attempted as e.g. a low-priv user that is
-/// not a member of the group — it always fails). At hundreds of such edges this
-/// flooded the priority-1 ACL queue and starved real escalations. We only
-/// synthesize work from a privileged-group source when we actually hold an
-/// admin credential in that domain.
+///   3. For privileged well-known RIDs, return any `is_admin` credential in
+///      that domain. As a last resort, return any credential in the domain.
 fn resolve_sid_principal(
     state: &StateInner,
     source: &str,
@@ -383,13 +353,19 @@ fn resolve_sid_principal(
         return None;
     }
 
-    // Only an admin credential can plausibly exercise a privileged group's
-    // rights. No "any credential" fallback — that fabricated doomed work for
-    // every privileged-group-source edge and flooded the ACL queue.
-    state
+    let admin = state
         .credentials
         .iter()
         .find(|c| c.is_admin && c.domain.to_lowercase() == resolved_domain)
+        .cloned();
+    if admin.is_some() {
+        return admin;
+    }
+
+    state
+        .credentials
+        .iter()
+        .find(|c| c.domain.to_lowercase() == resolved_domain)
         .cloned()
 }
 
@@ -562,35 +538,6 @@ mod tests {
     #[test]
     fn ghost_machine_targets_rejected() {
         assert!(is_ghost_machine_account("WIN-DPPJMLU3XS6$"));
-    }
-
-    #[tokio::test]
-    async fn collect_skips_ares_created_machine_account_target() {
-        // A GenericAll edge whose target is a machine account ares created
-        // itself (e.g. ARESATK01$ via addcomputer) must NOT be actioned —
-        // attacking our own planted account burns cycles for nothing.
-        let shared = SharedState::new("test".into());
-        {
-            let mut state = shared.write().await;
-            state
-                .credentials
-                .push(make_credential("user1", "contoso.local"));
-            // Record the account as self-created (as result processing would
-            // from the impacket-addcomputer success line).
-            state.record_created_machine_account("ARESATK01$");
-            let details = acl_details("user1", "ARESATK01$", "contoso.local");
-            let vuln = make_vuln("vuln-decoy-001", "GenericAll", details);
-            state
-                .discovered_vulnerabilities
-                .insert(vuln.vuln_id.clone(), vuln);
-        }
-
-        let state = shared.read().await;
-        let work = collect_dacl_work(&state);
-        assert!(
-            work.is_empty(),
-            "ares-created machine account target must be skipped"
-        );
     }
 
     #[test]
@@ -786,46 +733,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_skips_low_value_builtin_group_target() {
-        // GenericAll over a non-escalating built-in group must NOT become work;
-        // an identically-shaped edge against a real target must. This is the
-        // ACL-flood guard — dozens of these built-in-group edges otherwise
-        // saturate the priority-1 exploit queue and starve real escalations.
-        let shared = SharedState::new("test".into());
-        {
-            let mut state = shared.write().await;
-            state
-                .credentials
-                .push(make_credential("alice", "contoso.local"));
-            let noise = make_vuln(
-                "vuln-noise-001",
-                "GenericAll",
-                acl_details("alice", "Cloneable Domain Controllers", "contoso.local"),
-            );
-            let real = make_vuln(
-                "vuln-real-001",
-                "GenericAll",
-                acl_details("alice", "carol", "contoso.local"),
-            );
-            state
-                .discovered_vulnerabilities
-                .insert(noise.vuln_id.clone(), noise);
-            state
-                .discovered_vulnerabilities
-                .insert(real.vuln_id.clone(), real);
-        }
-
-        let state = shared.read().await;
-        let work = collect_dacl_work(&state);
-        assert_eq!(
-            work.len(),
-            1,
-            "only the real-target edge should produce work"
-        );
-        assert_eq!(work[0].target_user, "carol");
-    }
-
-    #[tokio::test]
     async fn collect_genericwrite_produces_work() {
         let shared = SharedState::new("test".into());
         {
@@ -961,39 +868,6 @@ mod tests {
         // credential_resolver looks up password by `(username, domain)`, and
         // a SID never matches a credential record.
         assert_eq!(work[0].source_user, "admin");
-    }
-
-    #[tokio::test]
-    async fn collect_sid_source_no_admin_cred_yields_no_work() {
-        // The ACL-flood regression: a privileged-group source SID (Enterprise
-        // Admins, -519) must NOT be resolved to a non-admin credential. With no
-        // admin cred in the domain the edge is doomed (a low-priv user can't
-        // exercise EA's rights), so it must produce zero work rather than flood
-        // the priority-1 queue. Before the fix this fell back to "any cred".
-        let shared = SharedState::new("test".into());
-        {
-            let mut state = shared.write().await;
-            // only a NON-admin credential in the domain
-            state
-                .credentials
-                .push(make_credential("alice", "contoso.local"));
-            state.domain_sids.insert(
-                "contoso.local".to_string(),
-                "S-1-5-21-111-222-333".to_string(),
-            );
-            let details = acl_details("S-1-5-21-111-222-333-519", "victim", "contoso.local");
-            let vuln = make_vuln("vuln-sid-flood-001", "GenericAll", details);
-            state
-                .discovered_vulnerabilities
-                .insert(vuln.vuln_id.clone(), vuln);
-        }
-
-        let state = shared.read().await;
-        let work = collect_dacl_work(&state);
-        assert!(
-            work.is_empty(),
-            "privileged-group source SID with no admin cred must not produce ACL work"
-        );
     }
 
     #[tokio::test]
@@ -1255,62 +1129,6 @@ mod tests {
         let work = collect_dacl_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].domain, "fabrikam.local");
-    }
-
-    #[tokio::test]
-    async fn collect_matches_parent_domain_credential_for_child_source_domain() {
-        // The cross-realm killchain bug: a BloodHound ACL edge carries
-        // source_domain=child.contoso.local, but the only credential in state
-        // is for the parent (contoso.local). A parent-domain account is a valid
-        // principal against the child, so the work item must still be collected
-        // (previously the exact-domain predicate dropped it and the chain was
-        // silently skipped).
-        let shared = SharedState::new("test".into());
-        {
-            let mut state = shared.write().await;
-            state
-                .credentials
-                .push(make_credential("tony", "contoso.local"));
-            let details = acl_details("tony", "victim", "child.contoso.local");
-            let vuln = make_vuln("vuln-parent-001", "GenericAll", details);
-            state
-                .discovered_vulnerabilities
-                .insert(vuln.vuln_id.clone(), vuln);
-        }
-
-        let state = shared.read().await;
-        let work = collect_dacl_work(&state);
-        assert_eq!(
-            work.len(),
-            1,
-            "parent-domain credential must match a child-domain ACL edge"
-        );
-        assert_eq!(work[0].domain, "contoso.local");
-    }
-
-    #[tokio::test]
-    async fn collect_skips_sibling_domain_credential_for_child_source_domain() {
-        // fabrikam.local is not a parent of child.contoso.local — a sibling /
-        // foreign-forest cred must not be matched to the edge.
-        let shared = SharedState::new("test".into());
-        {
-            let mut state = shared.write().await;
-            state
-                .credentials
-                .push(make_credential("tony", "fabrikam.local"));
-            let details = acl_details("tony", "victim", "child.contoso.local");
-            let vuln = make_vuln("vuln-sibling-001", "GenericAll", details);
-            state
-                .discovered_vulnerabilities
-                .insert(vuln.vuln_id.clone(), vuln);
-        }
-
-        let state = shared.read().await;
-        let work = collect_dacl_work(&state);
-        assert!(
-            work.is_empty(),
-            "sibling-domain credential must not match a child-domain ACL edge"
-        );
     }
 
     #[tokio::test]

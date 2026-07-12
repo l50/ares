@@ -55,48 +55,11 @@ pub struct ToolExecResponse {
     pub discoveries: Option<serde_json::Value>,
 }
 
-/// Default timeout waiting for a tool result (25 minutes).
-/// Must exceed queue wait time + longest tool runtime (hashcat can queue
-/// behind another hashcat, so 2x runtime + buffer).
-pub(super) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1500;
-
-/// Tools whose worst-case runtime is materially longer than the default
-/// allowance and which must not be capped at the dispatcher's generic
-/// `DEFAULT_TOOL_TIMEOUT_SECS`. Maps a tool name to its minimum deadline (in
-/// seconds) — the effective timeout is `max(DEFAULT_TOOL_TIMEOUT_SECS, value)`
-/// so this acts as a floor, not a ceiling. Operators can still override the
-/// default via `ARES_TOOL_TIMEOUT_SECS` to lift everything at once.
-///
-/// Observed during the 2026-05-26 bring-up: full-port `nmap` service-version
-/// scans against a Windows DC routinely take 60-180s, and `smb_sweep` /
-/// `smb_signing_check` against a /24 can queue behind serialized smbclient
-/// invocations. The original 10s NATS client `request_timeout` defeated even
-/// the dispatcher's generous outer `tokio::time::timeout`; with the broker
-/// timeout raised in `ares-core`, this table gives the dispatcher a way to
-/// bump individual slow tools without touching every other code path.
-pub(super) fn per_tool_timeout_floor_secs(tool_name: &str) -> Option<u64> {
-    match tool_name {
-        // nmap full-port + service version against Windows DC: ~60-180s
-        // observed; allow 10x headroom for slow / heavily filtered hosts.
-        "nmap_scan" => Some(30 * 60),
-        // smbclient enumeration against a /24 can serialize for minutes.
-        "smb_sweep" | "smb_signing_check" | "enumerate_shares" => Some(20 * 60),
-        // netexec-driven AD checks; chained logon attempts add up.
-        "domain_admin_checker" | "password_spray" | "username_as_password" => Some(20 * 60),
-        _ => None,
-    }
-}
-
-/// Compute the dispatch deadline for a given tool.
-pub(super) fn tool_timeout_for(
-    tool_name: &str,
-    default: std::time::Duration,
-) -> std::time::Duration {
-    match per_tool_timeout_floor_secs(tool_name) {
-        Some(floor) if floor > default.as_secs() => std::time::Duration::from_secs(floor),
-        _ => default,
-    }
-}
+/// Default timeout waiting for a tool result (95 minutes).
+/// Must exceed queue wait time + longest tool runtime. AES Kerberoast defaults
+/// to a 45-minute pass and can queue behind one AES-exclusive job, so this is
+/// 2x runtime plus buffer.
+pub(super) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 95 * 60;
 
 /// Tools that require netexec/ldapsearch and must be routed to the recon
 /// worker queue regardless of the calling agent's role.

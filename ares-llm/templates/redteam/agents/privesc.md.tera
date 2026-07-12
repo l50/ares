@@ -270,10 +270,10 @@ source/target domain SIDs, and the trusted forest FQDN already populated by
 Trigger the path by ensuring the prerequisite data lands in state:
 
 - **Child-to-Parent escalation** runs when a child-domain krbtgt hash and
-  child-DA credentials are present. The dispatched task either calls
-  `raise_child` (automated path) or, when the manual ExtraSID path is taken,
-  forges a golden ticket whose `extra_sids` is the parent forest's SID with
-  `-519` appended (the Enterprise Admins RID).
+  child-DA credentials are present. The orchestrator dispatches
+  `forge_inter_realm_and_dump` automatically with
+  `extra_sid=<parent_sid>-519` (Enterprise Admins) injected so DCSync on
+  the parent DC succeeds.
 - **Cross-Forest Trust Key Extraction** runs when DA in `{{ target_domain }}`
   exists and `enumerate_domain_trusts` reports a forest trust. The chain is
   `extract_trust_key` → `create_inter_realm_ticket` → `secretsdump_kerberos`.
@@ -308,21 +308,6 @@ For local privilege escalation via RBCD (requires ability to add computer):
 2. Call `rbcd_write` with `target_computer` set to the NetBIOS name of the local host you want SYSTEM on, and `delegate_from` set to the machine account from step 1 (with `$` suffix).
 3. Call `s4u_attack` with `impersonate="Administrator"` and `target_spn="cifs/"` followed by the local host's FQDN (the same host named in step 2).
 4. Use the resulting ticket with `psexec_kerberos` against the same host → SYSTEM.
-
-### KrbRelayUp (Member Server Local Privilege Escalation)
-When the task payload names a **member server hostname** (not a DC) and the task type is `privesc` from `auto_krbrelayup`:
-
-- `payload.hostname` is the member server you want SYSTEM on (the relay target). It is in scope even if it differs from `{{ target_domain }}` / `{{ target_dc_ip }}` — the operation may have multiple member targets and the dispatcher picked one with a domain credential available.
-- `payload.domain` is the credential's domain. Use it for any auth, not `{{ target_domain }}`.
-- The DC for `payload.domain` is whichever IP `payload.dc_ip` carries; if absent, derive it from `state.domain_controllers[payload.domain]` (or fall back to `find_dc` once).
-
-KrbRelayUp chain (4-6 tool calls):
-1. `add_computer` against `payload.dc_ip` to create a new machine account (MAQ permitting). Note the SAM name returned.
-2. `rbcd_write` setting `delegate_from=<new_machine$>` and `target_computer=payload.hostname` (write RBCD on the target itself).
-3. `s4u_attack` with `impersonate="Administrator"`, `target_spn="cifs/<payload.hostname FQDN>"`, using the new machine account creds.
-4. `psexec_kerberos` against `payload.hostname` with the resulting ticket → SYSTEM on the member.
-
-Do NOT bail with "Task payload domain/host out of operation scope" — the payload IS the scope for this task type. Only fail if `add_computer` returns MachineAccountQuota=0 or the user lacks Create-Child rights, in which case `report_privesc_failed` with `technique="krbrelayup"` and the concrete reason.
 
 ## Workflow (Efficiency-Focused)
 
@@ -395,7 +380,6 @@ Do NOT bail with "Task payload domain/host out of operation scope" — the paylo
 |------|----------|
 | get_sid | Get domain SID for ticket forging |
 | generate_golden_ticket | Forge TGT with krbtgt hash |
-| raise_child | Child-to-parent domain escalation |
 | extract_trust_key | Extract inter-realm trust key |
 | create_inter_realm_ticket | Forge inter-realm TGT |
 

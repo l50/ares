@@ -47,12 +47,24 @@ pub(crate) static RE_USER_BRACKET: LazyLock<Regex> =
 pub(crate) static RE_ACCOUNT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Account:\s*([A-Za-z0-9_.\-]+)").unwrap());
 
+// Capture the trailing `$` too: a computer's sAMAccountName is `HOSTNAME$`,
+// and `is_valid_extracted_user` rejects `$`-suffixed names. Dropping the `$`
+// from the capture let machine accounts (DC01$, WIN-XXXX$) masquerade as
+// users in the `ldap_extraction` source.
 static RE_SAM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)samaccountname:\s*([A-Za-z0-9_.\-]+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)samaccountname:\s*([A-Za-z0-9_.\-]+\$?)").unwrap());
 
 static RE_SMB_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"SMB\s+\S+\s+\d+\s+\S+\s+([A-Za-z0-9_.\-]+)\s+\d{4}-\d{2}-\d{2}").unwrap()
 });
+
+// An LDIF `objectClass: group` / `objectClass: computer` line. Marks the
+// enclosing record as a non-user so its `sAMAccountName` is not mistaken for
+// a user in the `ldap_extraction` source. Matches only the exact group /
+// computer classes — `user`, `person`, and `msDS-GroupManagedServiceAccount`
+// stay users.
+static RE_OBJECTCLASS_NONUSER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*objectclass:\s*(?:group|computer)\s*$").unwrap());
 
 /// Check if a domain string looks like a machine hostname rather than an AD domain.
 ///
@@ -100,6 +112,11 @@ pub fn is_valid_extracted_user(username: &str, domain: &str) -> bool {
     if username.starts_with('_') || domain.starts_with('_') {
         return false;
     }
+    // Windows auto-generated machine NetBIOS names (WIN-XXXX, DESKTOP-XXXX)
+    // carry a `sAMAccountName` and would otherwise land in the user table.
+    if lower.starts_with("win-") || lower.starts_with("desktop-") {
+        return false;
+    }
     if !domain.contains('.') {
         if domain.len() > 15 || domain.is_empty() {
             return false;
@@ -117,13 +134,68 @@ pub fn is_valid_extracted_user(username: &str, domain: &str) -> bool {
     true
 }
 
+/// Emit buffered `sAMAccountName` finds for one completed LDIF record as
+/// `ldap_extraction` users — unless the record was flagged a group/computer,
+/// in which case they are discarded. Buffering to a record boundary makes the
+/// group/computer decision independent of whether `objectClass:` appears
+/// before or after `sAMAccountName:` in the entry.
+fn flush_ldap_record(
+    pending: &mut Vec<(String, String)>,
+    record_is_non_user: bool,
+    users: &mut Vec<User>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let drained = std::mem::take(pending);
+    if record_is_non_user {
+        return;
+    }
+    for (raw_username, raw_domain) in drained {
+        let username = raw_username.trim().trim_end_matches('.').to_string();
+        let domain = raw_domain.trim().trim_end_matches('.').to_string();
+        if !is_valid_extracted_user(&username, &domain) {
+            continue;
+        }
+        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+        if seen.insert(key) {
+            users.push(User {
+                username,
+                domain,
+                description: String::new(),
+                is_admin: false,
+                // High-confidence: sAMAccountName attribute is only
+                // emitted by an LDAP server, not by tool prose.
+                source: "ldap_extraction".to_string(),
+            });
+        }
+    }
+}
+
 pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
     let mut users = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut current_domain = default_domain.to_string();
 
+    // LDAP record buffering: `sAMAccountName` finds are held until the record
+    // ends (blank line or the next `dn:`), then emitted only if the record was
+    // not a group/computer. netexec/rpcclient output has neither `dn:` lines
+    // nor blank-line-delimited records, so its users flow straight through the
+    // final flush unaffected.
+    let mut pending_ldap: Vec<(String, String)> = Vec::new();
+    let mut record_is_non_user = false;
+
     for line in output.lines() {
         let stripped = line.trim();
+
+        // Record boundary: a new `dn:` entry or a blank separator flushes the
+        // record that just ended and resets the group/computer flag.
+        if stripped.is_empty() || stripped.len() >= 3 && stripped[..3].eq_ignore_ascii_case("dn:") {
+            flush_ldap_record(&mut pending_ldap, record_is_non_user, &mut users, &mut seen);
+            record_is_non_user = false;
+        }
+
+        if RE_OBJECTCLASS_NONUSER.is_match(stripped) {
+            record_is_non_user = true;
+        }
 
         if let Some(caps) = RE_DOMAIN_CONTEXT.captures(stripped) {
             let candidate = caps
@@ -180,11 +252,24 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
         // server-emitted, not user-generated), so RE_SAM matches survive the
         // kerbrute/asrep wordlist false-positive guard at the publishing
         // layer. Other regexes match prose like "User foo doesn't have ..."
-        // which iterates wordlist failures and must stay gated.
-        let mut found_ldap = Vec::new();
+        // which iterates wordlist failures and must stay gated. Buffered to
+        // the record boundary so group/computer entries are dropped.
         if let Some(caps) = RE_SAM.captures(stripped) {
-            let user = caps.get(1).unwrap().as_str();
-            found_ldap.push((user.to_string(), current_domain.clone()));
+            let m = caps.get(1).unwrap();
+            let user = m.as_str();
+            // Embedded-space guard. RE_SAM stops at the first space, so a
+            // multi-word sAMAccountName ("Backup Operators", "Domain Admins")
+            // is captured truncated ("Backup"). User accounts never carry a
+            // space in sAMAccountName; groups routinely do. Detecting the
+            // truncation drops group leaks even when the record has no
+            // `objectClass: group` line for flush_ldap_record to catch —
+            // e.g. an `ldap_search` that requested only sAMAccountName.
+            let value_continues = stripped[m.end()..]
+                .strip_prefix(|c: char| c == ' ' || c == '\t')
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphanumeric()));
+            if !value_continues {
+                pending_ldap.push((user.to_string(), current_domain.clone()));
+            }
         }
 
         if let Some(caps) = RE_SMB_TIMESTAMP.captures(stripped) {
@@ -209,27 +294,11 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
                 });
             }
         }
-
-        for (raw_username, raw_domain) in found_ldap {
-            let username = raw_username.trim().trim_end_matches('.').to_string();
-            let domain = raw_domain.trim().trim_end_matches('.').to_string();
-            if !is_valid_extracted_user(&username, &domain) {
-                continue;
-            }
-            let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
-            if seen.insert(key) {
-                users.push(User {
-                    username,
-                    domain,
-                    description: String::new(),
-                    is_admin: false,
-                    // High-confidence: sAMAccountName attribute is only
-                    // emitted by an LDAP server, not by tool prose.
-                    source: "ldap_extraction".to_string(),
-                });
-            }
-        }
     }
+
+    // Flush the final record (output that doesn't end on a blank line, or
+    // netexec/rpcclient output with no record delimiters at all).
+    flush_ldap_record(&mut pending_ldap, record_is_non_user, &mut users, &mut seen);
 
     users
 }
@@ -300,6 +369,14 @@ mod tests {
     }
 
     #[test]
+    fn is_valid_extracted_user_rejects_win_netbios_name() {
+        // A raw WIN-xxxx sAMAccountName (computer) must not become a user.
+        assert!(!is_valid_extracted_user("WIN-G7FPA5ZZXZV", "contoso.local"));
+        assert!(!is_valid_extracted_user("desktop-abc123", "contoso.local"));
+        assert!(is_valid_extracted_user("winston", "contoso.local"));
+    }
+
+    #[test]
     fn extract_users_empty_output() {
         assert!(extract_users("", "contoso.local").is_empty());
     }
@@ -343,6 +420,92 @@ distinguishedName: CN=alice,DC=contoso,DC=local
         let users = extract_users(output, "contoso.local");
         let alice = users.iter().find(|u| u.username == "alice").unwrap();
         assert_eq!(alice.source, "ldap_extraction");
+    }
+
+    #[test]
+    fn extract_users_ldap_skips_group_object() {
+        // A group's sAMAccountName must NOT be recorded as a user. objectClass
+        // precedes sAMAccountName in a real ldapsearch entry.
+        let output = "\
+dn: CN=Domain Admins,CN=Users,DC=contoso,DC=local
+objectClass: top
+objectClass: group
+sAMAccountName: itstaff
+
+dn: CN=alice,CN=Users,DC=contoso,DC=local
+objectClass: top
+objectClass: person
+objectClass: user
+sAMAccountName: alice
+";
+        let users = extract_users(output, "contoso.local");
+        assert!(
+            users.iter().any(|u| u.username == "alice"),
+            "real user must survive"
+        );
+        assert!(
+            !users.iter().any(|u| u.username == "itstaff"),
+            "group sAMAccountName must be dropped"
+        );
+    }
+
+    #[test]
+    fn extract_users_ldap_skips_group_when_objectclass_after_sam() {
+        // Order-independence: buffering to the record boundary means the group
+        // is dropped even when objectClass appears after sAMAccountName.
+        let output = "\
+dn: CN=Dev Team,CN=Users,DC=contoso,DC=local
+sAMAccountName: devteam
+objectClass: group
+";
+        let users = extract_users(output, "contoso.local");
+        assert!(!users.iter().any(|u| u.username == "devteam"));
+    }
+
+    #[test]
+    fn extract_users_ldap_skips_computer_object() {
+        let output = "\
+dn: CN=DC01,OU=Domain Controllers,DC=contoso,DC=local
+objectClass: computer
+sAMAccountName: DC01$
+";
+        let users = extract_users(output, "contoso.local");
+        assert!(users.is_empty(), "computer account must be dropped");
+    }
+
+    #[test]
+    fn extract_users_ldap_drops_spaced_group_without_objectclass() {
+        // Regression: an ldap_search that requested only sAMAccountName (no
+        // objectClass) dumps group names with no `objectClass: group` line for
+        // flush_ldap_record to catch. RE_SAM truncates "Backup Operators" to
+        // "Backup"; the embedded-space guard must drop it while keeping the
+        // real single-word user.
+        let output = "\
+sAMAccountName: Backup Operators
+sAMAccountName: alice
+";
+        let users = extract_users(output, "contoso.local");
+        assert!(
+            users.iter().any(|u| u.username == "alice"),
+            "single-word user must survive"
+        );
+        assert!(
+            !users.iter().any(|u| u.username == "Backup"),
+            "truncated multi-word group name must be dropped"
+        );
+    }
+
+    #[test]
+    fn extract_users_ldap_keeps_gmsa_object() {
+        // gMSA (msDS-GroupManagedServiceAccount) is a service identity, not a
+        // "group" — its "group"-containing objectClass must not gate it out.
+        let output = "\
+dn: CN=svc_gmsa,CN=Managed Service Accounts,DC=contoso,DC=local
+objectClass: msDS-GroupManagedServiceAccount
+sAMAccountName: svc_gmsa
+";
+        let users = extract_users(output, "contoso.local");
+        assert!(users.iter().any(|u| u.username == "svc_gmsa"));
     }
 
     #[test]

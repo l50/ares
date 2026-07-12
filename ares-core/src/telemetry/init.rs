@@ -49,31 +49,16 @@ impl TelemetryConfig {
 /// graceful exit to flush pending spans.
 pub struct TelemetryGuard {
     provider: Option<SdkTracerProvider>,
-    /// `true` when this guard is the no-op shim returned after a redundant
-    /// [`init_telemetry`] call. Such guards do not own a provider and must
-    /// not run shutdown.
-    already_initialized: bool,
 }
 
 impl TelemetryGuard {
     /// Flush and shut down the tracer provider. Safe to call multiple times.
     pub fn shutdown(&mut self) {
-        if self.already_initialized {
-            return;
-        }
         if let Some(provider) = self.provider.take() {
             if let Err(e) = provider.shutdown() {
                 eprintln!("telemetry shutdown error: {e}");
             }
         }
-    }
-
-    /// Returns true if this guard is a no-op shim because the tracing
-    /// subscriber had already been installed by a previous call. Exposed for
-    /// the regression test.
-    #[cfg(test)]
-    pub fn is_noop(&self) -> bool {
-        self.already_initialized
     }
 }
 
@@ -111,63 +96,28 @@ pub fn init_telemetry(config: TelemetryConfig) -> TelemetryGuard {
             let tracer = provider.tracer(config.service_name.clone());
             let otel_layer = OpenTelemetryLayer::new(tracer);
 
-            // `try_init` returns Err if a global subscriber is already set
-            // (e.g. the CLI initialized one before dispatching to a long-running
-            // subcommand that wants its own service name). Treat that as a
-            // soft success: log a notice and return a no-op guard, instead of
-            // panicking the process at startup.
-            let init_result = tracing_subscriber::registry()
+            tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer)
                 .with(otel_layer)
-                .try_init();
+                .init();
 
-            match init_result {
-                Ok(()) => {
-                    tracing::info!(
-                        service = %config.service_name,
-                        "telemetry initialized with OTLP exporter"
-                    );
-                    TelemetryGuard {
-                        provider: Some(provider),
-                        already_initialized: false,
-                    }
-                }
-                Err(_) => {
-                    // Subscriber already installed — discard the freshly built
-                    // OTel provider so we don't leak a BatchSpanProcessor that
-                    // nothing is wired into. The pre-existing subscriber stays
-                    // authoritative for this process.
-                    if let Err(e) = provider.shutdown() {
-                        eprintln!("telemetry: dropped redundant provider shutdown error: {e}");
-                    }
-                    tracing::debug!(
-                        service = %config.service_name,
-                        "telemetry already initialized by earlier call; using existing subscriber"
-                    );
-                    TelemetryGuard {
-                        provider: None,
-                        already_initialized: true,
-                    }
-                }
+            tracing::info!(
+                service = %config.service_name,
+                "telemetry initialized with OTLP exporter"
+            );
+
+            TelemetryGuard {
+                provider: Some(provider),
             }
         }
         None => {
-            let init_result = tracing_subscriber::registry()
+            tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer)
-                .try_init();
+                .init();
 
-            match init_result {
-                Ok(()) => TelemetryGuard {
-                    provider: None,
-                    already_initialized: false,
-                },
-                Err(_) => TelemetryGuard {
-                    provider: None,
-                    already_initialized: true,
-                },
-            }
+            TelemetryGuard { provider: None }
         }
     }
 }
@@ -253,38 +203,4 @@ fn try_init_otel_provider(service_name: &str) -> Option<SdkTracerProvider> {
     opentelemetry::global::set_tracer_provider(provider.clone());
 
     Some(provider)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression for the orchestrator double-init crash.
-    ///
-    /// Originally `init_telemetry` called `.init()` (which panics if a global
-    /// dispatcher is already set). Running `ares --redis-url <url> orchestrator`
-    /// would init once in `main` and again in `orchestrator::run`, panicking
-    /// with `SetGlobalDefaultError`. After the fix, the second call must
-    /// return a no-op `TelemetryGuard` instead of crashing the process.
-    #[test]
-    fn double_init_returns_noop_guard_instead_of_panicking() {
-        // First call wins and installs the subscriber.
-        let first = init_telemetry(TelemetryConfig::new("ares-test-first"));
-        // Second call must not panic; it returns a guard flagged as noop.
-        let second = init_telemetry(TelemetryConfig::new("ares-test-second"));
-
-        assert!(
-            !first.is_noop(),
-            "first init_telemetry call should own the subscriber"
-        );
-        assert!(
-            second.is_noop(),
-            "second init_telemetry call must return a no-op guard, not panic"
-        );
-
-        // Dropping the noop guard must not panic / shutdown anything; dropping
-        // the real guard runs the normal shutdown path.
-        drop(second);
-        drop(first);
-    }
 }

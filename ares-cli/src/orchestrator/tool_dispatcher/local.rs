@@ -11,7 +11,7 @@ use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 use crate::worker::credential_resolver::resolve_credentials;
 
-use super::domain_validator::{check_domain_arg, check_unauthable_realm};
+use super::domain_validator::{check_cross_realm_auth, check_domain_arg};
 use super::{
     extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
 };
@@ -58,9 +58,9 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
             return Ok(rejection);
         }
 
-        // Reject authenticated exact-realm binds against a domain we own no
-        // usable principal for — they fail 0x52e and requeue endlessly.
-        if let Some(rejection) = check_unauthable_realm(&self.queue, &self.operation_id, call).await
+        // Reject native-credential auth aimed across a forest boundary with no
+        // forged inter-realm ticket — the doomed KDC_ERR_WRONG_REALM mechanic.
+        if let Some(rejection) = check_cross_realm_auth(&self.queue, &self.operation_id, call).await
         {
             return Ok(rejection);
         }
@@ -118,7 +118,7 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
         match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
             Ok(output) => {
                 let raw = output.combined_raw();
-                let combined = output.combined();
+                let mut combined = output.combined();
                 let error = if output.success {
                     None
                 } else {
@@ -150,6 +150,17 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                         &resolved_arguments,
                     )
                     .await;
+                }
+
+                // Mirror the worker path: flag a zero-yield unauthenticated
+                // harvest so the LLM changes strategy instead of re-spraying.
+                if output.success {
+                    if let Some(note) = ares_tools::parsers::empty_harvest_advisory(
+                        &effective_tool_name,
+                        discoveries.as_ref(),
+                    ) {
+                        combined.push_str(&note);
+                    }
                 }
 
                 Ok(ToolExecResult {

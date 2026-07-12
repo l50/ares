@@ -7,6 +7,7 @@
 //! State is loaded from Redis at startup and updated incrementally as results
 //! arrive. Dedup sets are persisted to Redis so they survive orchestrator restarts.
 
+mod canonicalize;
 mod dedup;
 pub mod domain_probe;
 mod inner;
@@ -16,6 +17,9 @@ pub(crate) mod replay;
 mod shared;
 
 // Re-export everything that was publicly visible from the old single file.
+pub(crate) use canonicalize::{
+    canonicalize_domain_label, is_valid_domain_fqdn, resolve_flat_to_fqdn, resolve_fqdn_to_flat,
+};
 pub use dedup::MAX_EXPLOIT_FAILURES;
 pub use inner::StateInner;
 pub use shared::SharedState;
@@ -76,9 +80,6 @@ pub const DEDUP_DACL_ABUSE: &str = "dacl_abuse";
 pub const DEDUP_SMBCLIENT_ENUM: &str = "smbclient_enum";
 pub const DEDUP_ACL_DISCOVERY: &str = "acl_discovery";
 pub const DEDUP_CROSS_FOREST_ENUM: &str = "cross_forest_enum";
-/// Dedup for `auto_seimpersonate` — one SYSTEM-escalation follow-up per host
-/// where a `seimpersonate` primitive was credited.
-pub const DEDUP_SEIMPERSONATE: &str = "seimpersonate_escalation";
 pub const DEDUP_CROSS_REALM_LATERAL: &str = "cross_realm_lateral";
 pub const DEDUP_GOLDEN_CERT: &str = "golden_cert";
 /// Per-(vuln_id, credential) dedup for re-dispatching MSSQL exploits when
@@ -100,6 +101,13 @@ pub const DEDUP_MSSQL_LINK_PIVOT: &str = "mssql_link_pivot";
 /// so the next tick re-attempts up to MAX_IMPERSONATION_ATTEMPTS.
 pub const DEDUP_MSSQL_IMPERSONATION: &str = "mssql_impersonation_auto";
 
+/// Dedup for the far-host OS-cred harvest that fires after
+/// `auto_mssql_link_pivot` confirms sysadmin on a linked SQL host. Keyed
+/// per far-host IP so a single hive-dump attempt covers all the pivot
+/// probes that resolved to the same physical host (multiple source
+/// principals often all confirm sysadmin against the same linked server).
+pub const DEDUP_MSSQL_FAR_HOST_DUMP: &str = "mssql_far_host_dump";
+
 // Assist-abandoned tracking moved off the generic dedup set into a
 // timestamped HashMap on `StateInner` (`assist_abandoned_at`) so the
 // abandonment can expire. See `ASSIST_ABANDONED_TTL_SECS` in
@@ -110,20 +118,6 @@ pub const DEDUP_MSSQL_IMPERSONATION: &str = "mssql_impersonation_auto";
 /// immediately marks `sid_history_<user>` exploited, so re-firing is wasteful.
 pub const DEDUP_SID_HISTORY: &str = "sid_history_enum";
 pub const DEDUP_STALL_COLD_START: &str = "stall_cold_start";
-
-/// Dedup for `(credential, target_ip, technique)` tuples where a lateral
-/// movement attempt returned a terminal denial (e.g. `rpc_s_access_denied`,
-/// no admin marker, `evil-winrm NoMethodError`). Populated by result
-/// processing when a `lateral_movement` task finishes with a denied
-/// indicator in any tool output; consulted by `request_lateral` to refuse
-/// resubmits that would just repeat the same failure. Distinct from
-/// `DEDUP_CROSS_REALM_LATERAL`, which captures pre-flight realm mismatches
-/// rather than observed access-denied results.
-///
-/// Key format: `"{user}@{domain}:{target_ip}:{technique}"`. A wildcard
-/// technique `"*"` is also accepted on the lookup side so a denied result
-/// from any technique blocks all further techniques for that (cred, ip).
-pub const DEDUP_LATERAL_DENIED: &str = "lateral_denied";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -193,9 +187,9 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_MSSQL_RETRY,
     DEDUP_MSSQL_LINK_PIVOT,
     DEDUP_MSSQL_IMPERSONATION,
+    DEDUP_MSSQL_FAR_HOST_DUMP,
     DEDUP_SID_HISTORY,
     DEDUP_STALL_COLD_START,
-    DEDUP_LATERAL_DENIED,
 ];
 
 #[cfg(test)]

@@ -100,7 +100,7 @@ async fn resolve_grafana_proxy() -> Option<LokiConfig> {
 /// Shared HTTP client — reuses connection pool across all Loki calls.
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         let timeout_secs = std::env::var("LOKI_TIMEOUT_SECS")
             .ok()
@@ -144,13 +144,13 @@ fn make_error(msg: &str) -> ToolOutput {
 /// Max retry attempts for transient Loki failures.
 /// Loki queries through the Grafana proxy take 20-50s from EC2,
 /// so we allow 3 attempts to ride through transient proxy hiccups.
-const MAX_RETRIES: u32 = 3;
+pub(crate) const MAX_RETRIES: u32 = 3;
 
 /// Base backoff delay between retries.
-const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Check whether an HTTP status code is transient and worth retrying.
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
 }
 
@@ -188,10 +188,48 @@ fn cache_key(logql: &str, start: &str, end: &str) -> u64 {
 ///
 /// Retries up to 3 times on transient failures (timeouts, 429/502/503/504)
 /// with exponential backoff (1s, 2s, 4s). Respects `Retry-After` header on 429s.
+/// In the unfolding replay modes, cap a query's `end_time` at the replay clock so
+/// the blue agent can never retrieve events from its own future. Returns the
+/// input unchanged when not clamping (live, `static`, or legacy-frozen replay) or
+/// when the timestamp can't be parsed.
+pub(crate) fn clamp_end_to_replay(end: &str) -> String {
+    let Some(ceiling) = super::replay_clock::replay_clamp_end() else {
+        return end.to_string();
+    };
+    match chrono::DateTime::parse_from_rfc3339(end.trim()) {
+        Ok(dt) if dt.with_timezone(&chrono::Utc) > ceiling => ceiling.to_rfc3339(),
+        _ => end.to_string(),
+    }
+}
+
+/// True when the (clamped) query window lies entirely at/after the replay clock —
+/// the attack hasn't reached it yet, so there's nothing to return.
+pub(crate) fn replay_window_is_future(start: &str, clamped_end: &str) -> bool {
+    if super::replay_clock::replay_clamp_end().is_none() {
+        return false;
+    }
+    match (
+        chrono::DateTime::parse_from_rfc3339(start.trim()),
+        chrono::DateTime::parse_from_rfc3339(clamped_end.trim()),
+    ) {
+        (Ok(s), Ok(e)) => s >= e,
+        _ => false,
+    }
+}
+
 pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
     let logql = required_str(args, "logql")?;
     let start_time = required_str(args, "start_time")?;
-    let end_time = required_str(args, "end_time")?;
+    let end_time_arg = required_str(args, "end_time")?;
+    // Replay: cap the end at the replay clock so the agent can't see its future.
+    let end_time_clamped = clamp_end_to_replay(end_time_arg);
+    if replay_window_is_future(start_time, &end_time_clamped) {
+        return Ok(make_output(
+            "No results — that window is at or after the current replay time; \
+             the attack hasn't reached that point yet.",
+        ));
+    }
+    let end_time = end_time_clamped.as_str();
     let limit = optional_i64(args, "limit").unwrap_or(50).min(100);
 
     // Reject bare label selectors with no line filter — these scan too much data
@@ -252,11 +290,31 @@ pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
         {
             Ok(r) => r,
             Err(e) => {
-                // Connection or timeout error — retryable
-                let msg = format!("Loki request failed: {e}");
-                warn!(attempt, error = %e, "Loki request error (retryable)");
-                last_err = Some(msg);
-                continue;
+                // A builder error means the request could not even be
+                // constructed — a malformed base URL or an invalid header
+                // value (e.g. a GRAFANA_URL / auth token with a stray newline).
+                // It is deterministic, so retrying re-fails identically; fail
+                // fast and point the operator at the config instead of burning
+                // MAX_RETRIES rounds of backoff.
+                if e.is_builder() {
+                    warn!(error = %e, "Loki request construction failed (non-retryable)");
+                    return Ok(make_error(&format!(
+                        "Loki request could not be constructed \
+                         (check GRAFANA_URL / LOKI_URL and auth token for invalid \
+                         characters such as a trailing newline): {e}"
+                    )));
+                }
+                // Only genuine transport failures are worth retrying.
+                if e.is_connect() || e.is_timeout() {
+                    let msg = format!("Loki request failed: {e}");
+                    warn!(attempt, error = %e, "Loki request error (retryable)");
+                    last_err = Some(msg);
+                    continue;
+                }
+                // Anything else (redirect loops, decode, etc.) is not
+                // transient — surface it without wasting retry attempts.
+                warn!(error = %e, "Loki request error (non-retryable)");
+                return Ok(make_error(&format!("Loki request failed: {e}")));
             }
         };
 
@@ -335,17 +393,21 @@ pub(crate) fn time_window_around(
     let ts: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(timestamp)
         .or_else(|_| chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.fZ"))
         .map(|d| d.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now());
+        .unwrap_or_else(|_| super::replay_clock::replay_now());
     let start = ts - chrono::Duration::minutes(window_minutes);
     let end = ts + chrono::Duration::minutes(window_minutes);
     (start, end)
 }
 
 /// Compute a sliding `(start, end)` for "last `hours_back` hours from now".
+///
+/// "Now" is the replay clock ([`super::replay_clock::replay_now`]): wall-clock
+/// during a live investigation, or the attack-time anchor during a replay so
+/// stale-alert / "recent" queries land on the captured window.
 pub(crate) fn time_window_recent(
     hours_back: i64,
 ) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
-    let now = chrono::Utc::now();
+    let now = super::replay_clock::replay_now();
     let start = now - chrono::Duration::hours(hours_back);
     (start, now)
 }
@@ -396,7 +458,7 @@ pub async fn query_logs_progressive(args: &Value) -> Result<ToolOutput> {
     let limit = optional_i64(args, "limit").unwrap_or(100);
 
     let ts = chrono::DateTime::parse_from_rfc3339(reference_timestamp)
-        .unwrap_or_else(|_| chrono::Utc::now().into());
+        .unwrap_or_else(|_| super::replay_clock::replay_now().into());
 
     // Progressive windows: 30min, 1h, 6h (24h removed — causes Loki timeouts)
     for window_minutes in [30, 60, 360] {
@@ -640,8 +702,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── format_loki_response ────────────────────────────────────────
-
     #[test]
     fn format_loki_response_no_results() {
         let body = r#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
@@ -711,8 +771,6 @@ mod tests {
         assert_eq!(format_loki_response(&body), "No results found.");
     }
 
-    // ── is_retryable_status ─────────────────────────────────────────
-
     #[test]
     fn retryable_statuses() {
         use reqwest::StatusCode;
@@ -732,8 +790,6 @@ mod tests {
         assert!(!is_retryable_status(StatusCode::NOT_FOUND));
         assert!(!is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
     }
-
-    // ── cache_key ───────────────────────────────────────────────────
 
     #[test]
     fn cache_key_deterministic() {
@@ -764,8 +820,6 @@ mod tests {
         assert_ne!(k1, k2);
     }
 
-    // ── make_output / make_error ────────────────────────────────────
-
     #[test]
     fn make_output_success() {
         let out = make_output("hello");
@@ -783,8 +837,6 @@ mod tests {
         assert_eq!(out.stderr, "boom");
         assert_eq!(out.exit_code, Some(1));
     }
-
-    // ── combine_query_patterns ──────────────────────────────────────
 
     #[test]
     fn combine_query_patterns_single_pattern() {
@@ -836,8 +888,6 @@ mod tests {
         assert!(result.stdout.contains("foo\\.bar"));
         assert!(result.stdout.contains("baz\\(qux\\)"));
     }
-
-    // ── tests for new pure helpers ────────────────────────────────────
 
     #[test]
     fn time_window_around_rfc3339_centred_window() {

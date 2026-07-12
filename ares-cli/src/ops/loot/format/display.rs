@@ -6,6 +6,90 @@ use super::format_duration;
 use super::hosts::{clean_os_string, dedup_hosts, is_real_service};
 use crate::dedup::{dedup_credentials, dedup_hashes, dedup_users, normalize_source_label};
 
+/// Draw the DA/GT achievement banner box. Shared by `print_loot_human` and
+/// `print_runtime_summary` so both views render identically.
+fn print_achievement_banner(
+    state: &SharedRedTeamState,
+    achievements: &HashMap<String, DomainAchievement>,
+    total_domains: usize,
+) {
+    if !(state.has_domain_admin || state.has_golden_ticket) {
+        return;
+    }
+    let mut lines = Vec::new();
+    if state.has_domain_admin {
+        let da_count = achievements.values().filter(|a| a.has_da).count();
+        if total_domains > 0 {
+            lines.push(format!(
+                "\u{2605} DOMAIN ADMIN ACHIEVED ({da_count}/{total_domains} domains)"
+            ));
+        } else {
+            lines.push("\u{2605} DOMAIN ADMIN ACHIEVED".to_string());
+        }
+        if let Some(path) = &state.domain_admin_path {
+            lines.push(format!("  path: {path}"));
+        }
+    }
+    if state.has_golden_ticket {
+        let gt_count = achievements
+            .values()
+            .filter(|a| a.has_golden_ticket)
+            .count();
+        if total_domains > 0 {
+            lines.push(format!(
+                "\u{2605} GOLDEN TICKET OBTAINED ({gt_count}/{total_domains} domains)"
+            ));
+        } else {
+            lines.push("\u{2605} GOLDEN TICKET OBTAINED".to_string());
+        }
+    }
+    let inner_width = lines.iter().map(|l| l.len()).max().unwrap_or(0) + 2;
+    println!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner_width));
+    for line in &lines {
+        println!(
+            "\u{2502} {:<width$} \u{2502}",
+            line,
+            width = inner_width - 2
+        );
+    }
+    println!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_width));
+    println!();
+}
+
+/// Print the forest/child domain tree with per-domain achievement markers.
+/// Shared by `print_loot_human` and `print_runtime_summary`.
+fn print_domain_tree(
+    forest_roots: &[String],
+    child_domains: &HashMap<String, String>,
+    achievements: &HashMap<String, DomainAchievement>,
+) {
+    let mut displayed = HashSet::new();
+    for root in forest_roots {
+        print_domain_line(root, "(forest root)", "  ", achievements);
+        displayed.insert(root.clone());
+        let mut children: Vec<_> = child_domains
+            .iter()
+            .filter(|(_, parent)| *parent == root)
+            .map(|(child, _)| child.clone())
+            .collect();
+        children.sort();
+        for child in &children {
+            print_domain_line(child, "(child)", "    \u{2514}\u{2500} ", achievements);
+            displayed.insert(child.clone());
+        }
+    }
+    // Any achievement domains not in the discovered domain list.
+    let mut extra: Vec<_> = achievements
+        .keys()
+        .filter(|d| !displayed.contains(*d))
+        .cloned()
+        .collect();
+    extra.sort();
+    for domain in &extra {
+        print_domain_line(domain, "", "  ", achievements);
+    }
+}
+
 pub(super) fn print_loot_human(
     state: &SharedRedTeamState,
     credentials: &[ares_core::models::Credential],
@@ -36,47 +120,7 @@ pub(super) fn print_loot_human(
         .count();
     let compromised_forests_count = count_compromised_forests(&topology, &achievements);
 
-    if state.has_domain_admin || state.has_golden_ticket {
-        let mut lines = Vec::new();
-        let total_domains = domains.len();
-        if state.has_domain_admin {
-            let da_count = achievements.values().filter(|a| a.has_da).count();
-            if total_domains > 0 {
-                lines.push(format!(
-                    "\u{2605} DOMAIN ADMIN ACHIEVED ({da_count}/{total_domains} domains)"
-                ));
-            } else {
-                lines.push("\u{2605} DOMAIN ADMIN ACHIEVED".to_string());
-            }
-            if let Some(path) = &state.domain_admin_path {
-                lines.push(format!("  path: {path}"));
-            }
-        }
-        if state.has_golden_ticket {
-            let gt_count = achievements
-                .values()
-                .filter(|a| a.has_golden_ticket)
-                .count();
-            if total_domains > 0 {
-                lines.push(format!(
-                    "\u{2605} GOLDEN TICKET OBTAINED ({gt_count}/{total_domains} domains)"
-                ));
-            } else {
-                lines.push("\u{2605} GOLDEN TICKET OBTAINED".to_string());
-            }
-        }
-        let inner_width = lines.iter().map(|l| l.len()).max().unwrap_or(0) + 2;
-        println!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner_width));
-        for line in &lines {
-            println!(
-                "\u{2502} {:<width$} \u{2502}",
-                line,
-                width = inner_width - 2
-            );
-        }
-        println!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_width));
-        println!();
-    }
+    print_achievement_banner(state, &achievements, domains.len());
 
     if domains.is_empty() {
         println!("Domains: None");
@@ -88,31 +132,7 @@ pub(super) fn print_loot_human(
             compromised_forests_count,
             forest_roots.len()
         );
-        let mut displayed = HashSet::new();
-        for root in forest_roots {
-            print_domain_line(root, "(forest root)", "  ", &achievements);
-            displayed.insert(root.clone());
-            let mut children: Vec<_> = child_domains
-                .iter()
-                .filter(|(_, parent)| *parent == root)
-                .map(|(child, _)| child.clone())
-                .collect();
-            children.sort();
-            for child in &children {
-                print_domain_line(child, "(child)", "    \u{2514}\u{2500} ", &achievements);
-                displayed.insert(child.clone());
-            }
-        }
-        // Any achievement domains not in the discovered domain list
-        let mut extra: Vec<_> = achievements
-            .keys()
-            .filter(|d| !displayed.contains(*d))
-            .cloned()
-            .collect();
-        extra.sort();
-        for domain in &extra {
-            print_domain_line(domain, "", "  ", &achievements);
-        }
+        print_domain_tree(forest_roots, child_domains, &achievements);
     }
     println!();
 
@@ -211,11 +231,7 @@ pub(super) fn print_loot_human(
         let users = &users_by_source[src];
         println!("  [{src}] ({})", users.len());
         for user in users {
-            let prefix = if user.domain.is_empty() {
-                user.username.clone()
-            } else {
-                format!("{}\\{}", user.domain, user.username)
-            };
+            let prefix = format_principal(&user.domain, &user.username);
             let suffix = if user.is_admin { " (admin)" } else { "" };
             println!("    - {prefix}{suffix}");
         }
@@ -225,11 +241,7 @@ pub(super) fn print_loot_human(
     let unique_creds = dedup_credentials(credentials);
     println!("Credentials ({}):", unique_creds.len());
     for cred in &unique_creds {
-        let prefix = if cred.domain.is_empty() {
-            cred.username.clone()
-        } else {
-            format!("{}\\{}", cred.domain, cred.username)
-        };
+        let prefix = format_principal(&cred.domain, &cred.username);
         let suffix = if cred.is_admin { " (admin)" } else { "" };
         println!("  - {prefix}:{}{suffix}", cred.password);
     }
@@ -238,11 +250,7 @@ pub(super) fn print_loot_human(
     let unique_hashes = dedup_hashes(hashes);
     println!("Hashes ({}):", unique_hashes.len());
     for h in &unique_hashes {
-        let prefix = if h.domain.is_empty() {
-            h.username.clone()
-        } else {
-            format!("{}\\{}", h.domain, h.username)
-        };
+        let prefix = format_principal(&h.domain, &h.username);
         println!("  - {prefix}:{}:{}", h.hash_type, h.hash_value);
     }
     println!();
@@ -331,47 +339,7 @@ pub(super) fn print_runtime_summary(
         .count();
     let compromised_forests_count = count_compromised_forests(&topology, &achievements);
 
-    if state.has_domain_admin || state.has_golden_ticket {
-        let mut lines = Vec::new();
-        let total_domains = domains.len();
-        if state.has_domain_admin {
-            let da_count = achievements.values().filter(|a| a.has_da).count();
-            if total_domains > 0 {
-                lines.push(format!(
-                    "\u{2605} DOMAIN ADMIN ACHIEVED ({da_count}/{total_domains} domains)"
-                ));
-            } else {
-                lines.push("\u{2605} DOMAIN ADMIN ACHIEVED".to_string());
-            }
-            if let Some(path) = &state.domain_admin_path {
-                lines.push(format!("  path: {path}"));
-            }
-        }
-        if state.has_golden_ticket {
-            let gt_count = achievements
-                .values()
-                .filter(|a| a.has_golden_ticket)
-                .count();
-            if total_domains > 0 {
-                lines.push(format!(
-                    "\u{2605} GOLDEN TICKET OBTAINED ({gt_count}/{total_domains} domains)"
-                ));
-            } else {
-                lines.push("\u{2605} GOLDEN TICKET OBTAINED".to_string());
-            }
-        }
-        let inner_width = lines.iter().map(|l| l.len()).max().unwrap_or(0) + 2;
-        println!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner_width));
-        for line in &lines {
-            println!(
-                "\u{2502} {:<width$} \u{2502}",
-                line,
-                width = inner_width - 2
-            );
-        }
-        println!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_width));
-        println!();
-    }
+    print_achievement_banner(state, &achievements, domains.len());
 
     if !domains.is_empty() {
         println!(
@@ -381,30 +349,7 @@ pub(super) fn print_runtime_summary(
             compromised_forests_count,
             forest_roots.len()
         );
-        let mut displayed = HashSet::new();
-        for root in forest_roots {
-            print_domain_line(root, "(forest root)", "  ", &achievements);
-            displayed.insert(root.clone());
-            let mut children: Vec<_> = child_domains
-                .iter()
-                .filter(|(_, parent)| *parent == root)
-                .map(|(child, _)| child.clone())
-                .collect();
-            children.sort();
-            for child in &children {
-                print_domain_line(child, "(child)", "    \u{2514}\u{2500} ", &achievements);
-                displayed.insert(child.clone());
-            }
-        }
-        let mut extra: Vec<_> = achievements
-            .keys()
-            .filter(|d| !displayed.contains(*d))
-            .cloned()
-            .collect();
-        extra.sort();
-        for domain in &extra {
-            print_domain_line(domain, "", "  ", &achievements);
-        }
+        print_domain_tree(forest_roots, child_domains, &achievements);
     }
 
     let merged_hosts = dedup_hosts(
@@ -418,7 +363,7 @@ pub(super) fn print_runtime_summary(
 
 /// Priority threshold (inclusive) at or below which a vulnerability is treated
 /// as actively exploitable rather than an informational finding.
-pub(crate) const EXPLOITABLE_PRIORITY_MAX: i32 = 3;
+const EXPLOITABLE_PRIORITY_MAX: i32 = 3;
 
 /// Print vulnerabilities split into two tables: actively exploitable
 /// (priority <= EXPLOITABLE_PRIORITY_MAX) and informational findings (rest).
@@ -432,7 +377,7 @@ fn print_vulnerabilities(
 
     let mut exploitable: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
     let mut findings: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
-    for (id, vuln) in discovered {
+    for (id, vuln) in discovered.iter() {
         if vuln.priority <= EXPLOITABLE_PRIORITY_MAX {
             exploitable.push((id, vuln));
         } else {
@@ -761,6 +706,29 @@ pub(super) fn token_category(vuln_id: &str) -> String {
 }
 
 /// Render a single vulnerability table body (header + rows).
+/// Render a `DOMAIN\username` principal, or the bare username when the domain
+/// is empty.
+fn format_principal(domain: &str, username: &str) -> String {
+    if domain.is_empty() {
+        username.to_string()
+    } else {
+        format!("{domain}\\{username}")
+    }
+}
+
+/// Truncate `s` to at most `max` bytes on a char boundary, appending `...` when
+/// it was shortened. Returns the string unchanged when already within `max`.
+fn truncate_on_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
 fn print_vuln_table(vulns: &[(&String, &VulnerabilityInfo)], exploited: &HashSet<String>) {
     println!(
         "  {:<30} {:<20} {:>8} {:>9}  Details",
@@ -772,15 +740,7 @@ fn print_vuln_table(vulns: &[(&String, &VulnerabilityInfo)], exploited: &HashSet
         let exploited_mark = if is_exploited { "\u{2713}" } else { "\u{2717}" };
 
         let details = format_vuln_details(&vuln.details);
-        let details_display = if details.len() > 80 {
-            let mut end = 80;
-            while !details.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}...", &details[..end])
-        } else {
-            details
-        };
+        let details_display = truncate_on_boundary(&details, 80);
 
         println!(
             "  {:<30} {:<20} {:>8} {:>9}  {}",
@@ -794,6 +754,16 @@ fn format_vuln_details(details: &HashMap<String, serde_json::Value>) -> String {
     if details.is_empty() {
         return String::new();
     }
+    // Stringify a JSON value and render `Key: value`, skipping empty/null values.
+    let format_kv = |key: &str, val: &serde_json::Value| -> Option<String> {
+        let val_str = match val {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        (!val_str.is_empty() && val_str != "null")
+            .then(|| format!("{}: {}", capitalize(key), val_str))
+    };
+
     let mut parts = Vec::new();
     let priority_keys = [
         "hostname",
@@ -806,15 +776,9 @@ fn format_vuln_details(details: &HashMap<String, serde_json::Value>) -> String {
     ];
     let mut seen = HashSet::new();
     for key in &priority_keys {
-        if let Some(val) = details.get(*key) {
-            let val_str = match val {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            if !val_str.is_empty() && val_str != "null" {
-                parts.push(format!("{}: {}", capitalize(key), val_str));
-                seen.insert(*key);
-            }
+        if let Some(part) = details.get(*key).and_then(|val| format_kv(key, val)) {
+            parts.push(part);
+            seen.insert(*key);
         }
     }
     let mut remaining: Vec<_> = details
@@ -823,14 +787,8 @@ fn format_vuln_details(details: &HashMap<String, serde_json::Value>) -> String {
         .collect();
     remaining.sort();
     for key in remaining {
-        if let Some(val) = details.get(key) {
-            let val_str = match val {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            if !val_str.is_empty() && val_str != "null" {
-                parts.push(format!("{}: {}", capitalize(key), val_str));
-            }
+        if let Some(part) = details.get(key).and_then(|val| format_kv(key, val)) {
+            parts.push(part);
         }
     }
     parts.join("; ")
@@ -882,17 +840,9 @@ fn print_attack_path(timeline_events: &[serde_json::Value]) {
 
         let mitre = extract_mitre_from_event(event);
 
-        let desc_display = if description.len() > 65 {
-            let mut end = 65;
-            while !description.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{prefix}{}...", &description[..end])
-        } else {
-            format!("{prefix}{description}")
-        };
+        let desc_display = format!("{prefix}{}", truncate_on_boundary(description, 65));
 
-        println!("  {ts_display:<23} {desc_display:<70} {mitre}");
+        println!("  {:<23} {:<70} {}", ts_display, desc_display, mitre);
     }
     println!();
 }
@@ -1719,7 +1669,11 @@ mod tests {
 
     #[test]
     fn forest_structure_empty_strings_filtered() {
-        let input = vec![String::new(), "  ".to_string(), "contoso.local".to_string()];
+        let input = vec![
+            "".to_string(),
+            "  ".to_string(),
+            "contoso.local".to_string(),
+        ];
         let (domains, roots, _children) = compute_forest_structure(&input);
         assert_eq!(domains, vec!["contoso.local"]);
         assert_eq!(roots, vec!["contoso.local"]);
@@ -1884,7 +1838,7 @@ mod tests {
             "Contoso.Local".into(),
             "  contoso.local  ".into(),
             "contoso.local.".into(),
-            String::new(),
+            "".into(),
         ];
         let t = super::compute_forest_topology(&input);
         assert_eq!(t.forest_roots, vec!["contoso.local"]);
@@ -2021,7 +1975,7 @@ mod tests {
             ares_core::models::VulnerabilityInfo {
                 vuln_id: vuln_id.into(),
                 vuln_type: "test".into(),
-                target: String::new(),
+                target: "".into(),
                 discovered_by: "test".into(),
                 discovered_at: chrono::Utc::now(),
                 details: HashMap::new(),

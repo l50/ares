@@ -35,6 +35,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "NTLM hash for pass-the-hash (format: 'lmhash:nthash' or just ':nthash'). Use instead of password."
                     },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a forged inter-realm Kerberos ccache for cross-forest enumeration. Injected automatically by the credential resolver when the target forest has no reusable credential; when present, certipy authenticates via `-k -no-pass` (KRB5CCNAME) and password/hash are ignored. Auth precedence: ticket_path > hashes > password."
+                    },
                     "vulnerable": {
                         "type": "boolean",
                         "description": "Only show vulnerable templates. Defaults to true.",
@@ -97,6 +101,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "application_policies": {
                         "type": "string",
                         "description": "Application policy OID to include in the certificate request. Used for ESC15 (CVE-2024-49019) exploitation where the template uses application policy OIDs for authorization."
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a forged inter-realm Kerberos ccache for cross-forest enrollment. Injected automatically by the credential resolver when the target forest has no reusable credential; when present, certipy authenticates via `-k -no-pass` (KRB5CCNAME) and password is ignored. Auth precedence: ticket_path > password."
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "ca", "template"]
@@ -162,6 +170,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "target": {
                         "type": "string",
                         "description": "Target account to add shadow credentials to"
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a forged inter-realm Kerberos ccache for a cross-forest shadow-credentials write. Injected automatically by the credential resolver when the target forest has no reusable credential; when present, certipy authenticates via `-k -no-pass` (KRB5CCNAME) and password/hash are ignored. Auth precedence: ticket_path > hashes > password."
                     }
                 },
                 "required": ["domain", "username", "dc_ip", "target"]
@@ -198,6 +210,46 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "template"]
+            }),
+        },
+        ToolDefinition {
+            name: "certipy_account_update".into(),
+            description: "Modify a target account's userPrincipalName via certipy (account \
+                update). The primitive for ESC9 (set a GenericAll-controlled user's UPN to \
+                administrator@<domain>, request a cert with the spoofed UPN, then restore the \
+                original UPN) and ESC10 (UPN manipulation for weak implicit cert mapping). \
+                Runs on the privesc worker alongside certipy_request/certipy_auth so the whole \
+                chain completes on one host."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain of the authenticating account (e.g. contoso.local)"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Authenticating user — must have GenericAll/Write over the target account"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for the authenticating user"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Target account whose userPrincipalName is being changed"
+                    },
+                    "upn": {
+                        "type": "string",
+                        "description": "New userPrincipalName (e.g. administrator@<domain>); pass the original value to restore it afterward"
+                    },
+                    "dc_ip": {
+                        "type": "string",
+                        "description": "Domain controller IP address"
+                    }
+                },
+                "required": ["domain", "username", "password", "user", "upn", "dc_ip"]
             }),
         },
         ToolDefinition {
@@ -288,6 +340,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "backup": {
                         "type": "boolean",
                         "description": "Back up the CA private key + certificate to a PFX. Requires SYSTEM or local admin on the CA host (use the credential of an account with that access). Output PFX is the input to certipy_forge for offline Golden Certificate forgery."
+                    },
+                    "ticket_path": {
+                        "type": "string",
+                        "description": "Path to a forged inter-realm Kerberos ccache for a cross-forest CA operation. Injected automatically by the credential resolver when the target forest has no reusable credential; when present, certipy authenticates via `-k -no-pass` (KRB5CCNAME) and password is ignored. Auth precedence: ticket_path > password."
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "ca"]

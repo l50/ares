@@ -96,9 +96,51 @@ When users are compromised via credential attacks, you MUST:
 | 4698 | Scheduled task | Persistence mechanisms |
 | 4728/4732/4756 | Group membership | Users added to privileged groups |
 
+## Pre-Built Detection Templates — PREFER `run_detection_query` (CRITICAL)
+
+Before hand-writing LogQL, call the pre-built templates. They live in
+`detections.yaml`, are already tuned for the Loki pipeline, and encode the correct
+field patterns — including the ones the raw examples below get subtly wrong (e.g.
+AS-REP). Invoke one with `run_detection_query(query_name="...")`, batch several with
+`run_parallel_detections(query_names=[...])`, or list the full catalog with
+`list_detection_templates()`.
+
+These map directly to the crown-jewel techniques that are the whole point of this
+hunt — when the alert or triage mentions **cross-domain, cross-forest, certificate,
+or AS-REP** activity you MUST run the matching templates. These are exactly the
+paths blue has historically missed:
+
+| Technique | Templates to invoke |
+|-----------|---------------------|
+| ADCS ESC1 (T1649) | `detect_esc1_attack`, `detect_adcs_exploitation` |
+| ADCS ESC4 (T1649) | `detect_esc4_attack` |
+| ADCS ESC8 relay (T1649) | `detect_esc8_attack` |
+| Certificate auth / PKINIT (T1649) | `detect_certificate_authentication` |
+| Cert template recon (T1649) | `detect_certipy_enumeration` |
+| AS-REP roasting (T1558.004) | `detect_asrep_roasting`, `detect_asrep_roasting_bulk` |
+| Cross-realm / inter-realm ticket (T1134.005) | `detect_cross_realm_tgs` |
+| Child→parent krbtgt forge (T1134.005) | `detect_child_krbtgt_forge` |
+| SID history / ExtraSids (T1134.005) | `detect_sid_history_extrasid` |
+| Trust-key extraction (T1003.006) | `detect_trust_key_exfil` |
+| Kerberoasting (T1558.003) | `detect_kerberoasting` |
+| DCSync (T1003.006) | `detect_dcsync`, `detect_dcsync_replication` |
+| Golden Ticket (T1558.001) | `detect_golden_ticket` |
+
+**If DCSync or Kerberoasting is confirmed, ALSO run the ADCS templates** — cert theft
+(ESC1 → Administrator cert → DCSync) is a common upstream path in the same window.
+Example crown-jewel sweep:
+
+```
+run_parallel_detections(query_names=[
+  "detect_esc1_attack", "detect_adcs_exploitation",
+  "detect_cross_realm_tgs", "detect_child_krbtgt_forge",
+  "detect_sid_history_extrasid", "detect_asrep_roasting"
+])
+```
+
 ## Ready-to-Use Detection Queries (CRITICAL)
 
-Use these exact LogQL queries. They are optimized for the Loki pipeline and tested against live data. {% if deployment %}Replace `DEPLOYMENT` with `{{ deployment }}`.{% endif %}
+Use these exact LogQL queries for ad-hoc pivots. They are optimized for the Loki pipeline and tested against live data. {% if deployment %}Replace `DEPLOYMENT` with `{{ deployment }}`.{% endif %} **The pre-built templates above are the primary tool — reach for raw LogQL only when no template fits.**
 
 ### DCSync Detection (T1003.006) — Event 4662
 
@@ -156,11 +198,21 @@ Use these exact LogQL queries. They are optimized for the Loki pipeline and test
 - Cross-reference with the SPN being accessed
 
 ### AS-REP Roasting (T1558.004) — Event 4768
+
+**Do NOT reuse the Kerberoast `0x17` pattern here** — that flags RC4 encryption,
+which is a *secondary* signal. AS-REP roasting is defined by **pre-authentication
+being disabled** (`PreAuthType=0`). Prefer the template, which encodes the correct
+`preauthtype.*0` pattern:
 ```
-{% if deployment %}{job="windows-security", deployment="{{ deployment }}"} |= "4768" |= "0x17"{% else %}{job="windows-security"} |= "4768" |= "0x17"{% endif %}
+run_detection_query(query_name="detect_asrep_roasting")
 ```
-- TGT requests with RC4 encryption for accounts with "Do not require Kerberos preauthentication"
-- Similar to Kerberoasting but targets AS-REQ instead of TGS-REQ
+Raw LogQL fallback (pre-auth-disabled TGT request):
+```
+{% if deployment %}{job="windows-security", deployment="{{ deployment }}"} |= "4768" |~ "(?i)pre.?auth.?type[^0-9]{0,8}0"{% else %}{job="windows-security"} |= "4768" |~ "(?i)pre.?auth.?type[^0-9]{0,8}0"{% endif %}
+```
+- `PreAuthType=0` = pre-authentication NOT required → the AS-REP is roastable offline
+- Targets AS-REQ (4768) for accounts flagged "Do not require Kerberos preauthentication"
+- RC4 (`0x17`) encryption may accompany it but is NOT the defining indicator
 
 ### Lateral Movement via Admin Shares — Events 5140/5145
 ```

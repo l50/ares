@@ -65,6 +65,76 @@ warpgate-templates/                 Container image build templates
   ares-golden-image/                All-in-one red team EC2 AMI (all tools)
 ```
 
+## State & Transport Layer
+
+Ares splits transport from state, and state itself has two tiers: a durable
+NATS JetStream event log (the source of truth) and a Redis materialized
+view (a fast, indexed cache).
+
+### NATS JetStream
+
+Everything queue-, RPC-, pub/sub-, or event-log-shaped runs on NATS. The
+canonical taxonomy lives in the module header of `ares-core/src/nats.rs`.
+
+| Purpose                       | Subject                                   | Stream            | Notes                                     |
+| ----------------------------- | ----------------------------------------- | ----------------- | ----------------------------------------- |
+| Red task queue per role       | `ares.tasks.{role}`                       | `ARES_TASKS`      | Pull consumer, explicit ack               |
+| Urgent task queue per role    | `ares.tasks.urgent.{role}`                | `ARES_TASKS`      | Priority ≤ 2                              |
+| Task results                  | `ares.tasks.results.{task_id}`            | `ARES_TASKS`      | Survives orchestrator restart             |
+| Tool dispatch RPC             | `ares.tools.exec.{role}`                  | Core (no stream)  | Request/reply, inbox subject per call     |
+| Blue task queue per role      | `ares.blue.tasks.{role}`                  | `ARES_BLUE_TASKS` | Pull consumer, explicit ack               |
+| Blue task results             | `ares.blue.tasks.results.{task_id}`       | `ARES_BLUE_TASKS` |                                           |
+| Blue investigation requests   | `ares.blue.investigations`                | Core (no stream)  |                                           |
+| Deferred / delayed dispatch   | `ares.deferred.{op}.{type}`               | `ARES_DEFERRED`   | Per-orchestrator delayed re-dispatch      |
+| State-change notifications    | `ares.state.updates.{op}`                 | Core (no stream)  | Fire-and-forget wake for subscribers      |
+| Real-time discoveries         | `ares.discoveries.{op}`                   | `ARES_DISCOVERIES`|                                           |
+| **Op-state event log**        | `ares.ops.{op_id}.{entity}.{action}`      | `ARES_OPSTATE`    | **Source of truth for live op state**     |
+
+`ARES_OPSTATE` is the durable event log that Redis is rehydrated from on
+orchestrator restart (`orchestrator/state/replay.rs`). Work-queue streams
+auto-delete acked messages; `ARES_OPSTATE` retains ~30 days.
+
+### Redis
+
+Redis holds a materialized view of op state, keyed by
+`ares:op:{op_id}:{suffix}`. Full layout in `ares-core/src/state/mod.rs`.
+
+| Suffix                      | Type   | Contents                              |
+| --------------------------- | ------ | ------------------------------------- |
+| `credentials`               | HASH   | `dedup_key -> Credential JSON`        |
+| `hashes`                    | HASH   | `dedup_key -> Hash JSON`              |
+| `hosts`                     | LIST   | `Host JSON per entry`                 |
+| `users`                     | LIST   | `User JSON per entry`                 |
+| `shares`                    | HASH   | `dedup_key -> Share JSON`             |
+| `vulns`                     | HASH   | `vuln_id -> Vuln JSON`                |
+| `domains`                   | SET    | Discovered domain names               |
+| `exploited`                 | SET    | Exploited targets                     |
+| `meta`                      | HASH   | Operation metadata                    |
+| `dc_map`, `netbios_map`     | HASH   | Host → DC / NetBIOS resolution        |
+| `timeline`                  | LIST   | Attack step timeline                  |
+| `techniques`                | SET    | MITRE ATT&CK techniques observed      |
+| `dedup:{set_name}`          | SET    | Dedup guards for expensive tasks      |
+| `dominated_domains`         | SET    | Domains where DA has been achieved    |
+| `trusted_domains`           | SET    | Cross-domain / cross-forest trusts    |
+
+Locks live at `ares:lock:{op_id}`; task status at
+`ares:task_status:{task_id}`.
+
+### Retention Tiers
+
+| Layer                   | Retention                                                                 |
+| ----------------------- | ------------------------------------------------------------------------- |
+| Loki logs (Alloy → S3)  | ~4 days                                                                   |
+| Redis                   | Live-op only; wiped by `k8s:reset` / re-provision                         |
+| `ARES_TASKS` / `ARES_BLUE_TASKS` | WorkQueue — acked messages auto-delete                           |
+| `ARES_DEFERRED`         | WorkQueue — acked messages auto-delete                                    |
+| `ARES_OPSTATE`          | 30-day age, floored at stream creation date on this deployment (~Jun 29)  |
+| Postgres persistent_store | Not deployed on kali-ares (no `ARES_DATABASE_URL`)                      |
+
+Anything older than the stream-creation floor on `ARES_OPSTATE` (e.g.
+`op-20260612`) is gone everywhere — Redis has been wiped, Loki has aged
+out, and the event log doesn't reach that far back.
+
 ## Building Container Images
 
 ### Prerequisites

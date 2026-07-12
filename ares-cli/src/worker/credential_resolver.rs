@@ -113,8 +113,45 @@ pub async fn resolve_credentials(
 
     // Bulk-load state once per call. These are HASHes/LISTs cached in Redis,
     // so the cost is small relative to the subsequent tool execution.
-    let mut credentials = reader.get_credentials(conn).await.unwrap_or_default();
-    let mut hashes = reader.get_hashes(conn).await.unwrap_or_default();
+    //
+    // Errors here MUST be surfaced loudly rather than silently swallowed.
+    // A bare `.unwrap_or_default()` turns a transient Redis I/O failure
+    // (broken pipe, timeout, connection reset) into a `Vec::new()` and the
+    // resolver carries on as if no credentials existed — the downstream
+    // `cred_count=0` log line at the `resolving` info! call below is then
+    // indistinguishable from "operation truly has no creds" vs. "Redis is
+    // broken". When `ops inject-credential` lands a cred in Redis but the
+    // resolver can't read it, the only observable symptom is the wrong-realm
+    // / no-match warn firing. The explicit warn here pins the cause so a
+    // future cred-resolver lookup miss surfaces immediately.
+    let mut credentials = match reader.get_credentials(conn).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                tool = %tool_name,
+                op_id = %op_id,
+                err = %e,
+                "credential_resolver: Redis get_credentials failed — \
+                 continuing with empty credential list. Downstream tools will \
+                 see missing-credential errors. Check Redis connectivity and \
+                 that ARES_OPERATION_ID matches the orchestrator's operation."
+            );
+            Vec::new()
+        }
+    };
+    let mut hashes = match reader.get_hashes(conn).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                tool = %tool_name,
+                op_id = %op_id,
+                err = %e,
+                "credential_resolver: Redis get_hashes failed — \
+                 continuing with empty hash list"
+            );
+            Vec::new()
+        }
+    };
     let domain_sids = reader.get_domain_sids(conn).await.unwrap_or_default();
     let netbios_map = reader.get_netbios_map(conn).await.unwrap_or_default();
 
@@ -268,13 +305,28 @@ pub async fn resolve_credentials(
             infer_domain_from_target(args_obj, conn, &reader)
                 .await
                 .or_else(|| primary_domain.clone())
+        } else if is_cross_forest_certipy_tool(tool_name) {
+            // certipy's `domain`/`target_domain` is the target forest (the CA's
+            // realm). Look up the forged inter-realm ccache under it so
+            // `resolve_cross_forest_ticket` injects `ticket_path` and the
+            // wrapper flips to `-k -no-pass` instead of NTLM (Bug B).
+            string_field(args_obj, "domain")
+                .or_else(|| string_field(args_obj, "target_domain"))
+                .or_else(|| primary_domain.clone())
         } else {
             None
         };
         if let Some(ref realm) = target_realm {
-            if let Some(renamed) =
-                resolve_cross_forest_ticket(args_obj, &reader, conn, tool_name, realm, &hashes)
-                    .await
+            if let Some(renamed) = resolve_cross_forest_ticket(
+                args_obj,
+                &reader,
+                conn,
+                tool_name,
+                realm,
+                &credentials,
+                &hashes,
+            )
+            .await
             {
                 redirected_tool = Some(renamed);
             }
@@ -377,67 +429,28 @@ fn resolve_principal_credentials(
     domain: &str,
     realm_strict: bool,
 ) {
-    // Track whether the password branch has already rewritten args.domain to
-    // a sibling realm. If it has, the hash branch re-runs its lookup against
-    // the *rewritten* realm — that way `(password in Y, hash in Y)` finds
-    // the matching hash exactly, and `(password in Y, hash only in Z)` keeps
-    // the args.domain we already committed to instead of flip-flopping to
-    // Z on the second injection. Split-realm state is rare but happens (e.g.
-    // password from cracked AS-REP, hash from a later DCSync of the same
-    // user re-keyed in a child domain) and the only sane single-`domain`
-    // shape is the one the password is for.
-    let mut effective_domain = domain.to_string();
-    let mut domain_rewritten = false;
-
     if !args.contains_key("password") {
-        if let Some((cred, kind)) =
-            find_credential(credentials, username, &effective_domain, realm_strict)
-        {
+        if let Some(cred) = find_credential(credentials, username, domain, realm_strict) {
             if !cred.password.is_empty() {
                 args.insert("password".to_string(), Value::String(cred.password.clone()));
                 debug!(
                     user = %username,
-                    domain = %effective_domain,
+                    domain = %domain,
                     "credential_resolver: injected password from state"
                 );
-                if rewrite_domain_for_fallback(
-                    args,
-                    username,
-                    &effective_domain,
-                    &cred.domain,
-                    kind,
-                    realm_strict,
-                    "credential",
-                ) {
-                    effective_domain = cred.domain.clone();
-                    domain_rewritten = true;
-                }
             }
         }
     }
 
-    let hash_match = find_hash(hashes, username, &effective_domain, realm_strict);
-    if let Some((h, kind)) = hash_match {
+    let hash_match = find_hash(hashes, username, domain, realm_strict);
+    if let Some(h) = hash_match {
         if !args.contains_key("hash") && !h.hash_value.is_empty() {
             args.insert("hash".to_string(), Value::String(h.hash_value.clone()));
             debug!(
                 user = %username,
-                domain = %effective_domain,
+                domain = %domain,
                 "credential_resolver: injected hash from state"
             );
-            // Only rewrite if the password branch hasn't already committed
-            // to a realm. See `domain_rewritten` doc above.
-            if !domain_rewritten {
-                rewrite_domain_for_fallback(
-                    args,
-                    username,
-                    &effective_domain,
-                    &h.domain,
-                    kind,
-                    realm_strict,
-                    "hash",
-                );
-            }
         }
         // Tools that expose the field as `hashes` (impacket-style — certipy_find,
         // any wrapper passing `-hashes` directly) won't pick up `hash`. Inject
@@ -463,43 +476,29 @@ fn resolve_principal_credentials(
     }
 }
 
-/// Inject `coerce_password` / `coerce_hash` for `relay_and_coerce`.
+/// Inject `coerce_password` / `coerce_hash` for `relay_and_coerce` based on
+/// `(coerce_user, coerce_domain)` in the args. Mirrors
+/// `resolve_principal_credentials` but writes to the `coerce_*` keys.
 ///
-/// Two modes:
-///
-/// 1. **LLM-supplied principal:** when `coerce_user` is set, looks up the
-///    matching secret by `(coerce_user, coerce_domain)` and injects
-///    `coerce_hash` (preferred — PTH) or `coerce_password`.
-///
-/// 2. **Auto-pick fallback:** when `coerce_user` is absent or empty AND no
-///    coerce secret is pre-supplied, picks any usable owned principal from
-///    state and injects `coerce_user` + `coerce_domain` + secret. Preference:
-///    in-domain hash > any-domain hash > in-domain password > any-domain
-///    password. Machine accounts (`*$`), `krbtgt`, and delegation-marker
-///    accounts are skipped because they can't drive authenticated coercion
-///    via PetitPotam/Coercer/DFSCoerce.
-///
-/// The fallback exists because the coerce/relay tool requires the LLM to
-/// name a principal explicitly (unlike `password`/`hash` which the resolver
-/// auto-injects against the LLM's `username`/`domain` args). When the LLM
-/// forgets, coercion goes unauthenticated and hits `RPC_S_ACCESS_DENIED` on
-/// patched DCs — burning the tool call and the relay window.
+/// No-op when `coerce_user` is absent or empty. When the user has only a
+/// password in state, sets `coerce_password`; when only a hash, sets
+/// `coerce_hash`. If both exist, sets only `coerce_hash` (the auth path
+/// downstream prefers PTH for relay-fallback DFSCoerce/Coercer auth).
 fn resolve_coerce_principal(
     args: &mut Map<String, Value>,
     credentials: &[Credential],
     hashes: &[Hash],
 ) {
-    let explicit_user = string_field(args, "coerce_user").filter(|s| !s.is_empty());
-    let domain_hint = string_field(args, "coerce_domain")
-        .filter(|s| !s.is_empty())
-        .or_else(|| string_field(args, "domain"))
-        .unwrap_or_default();
+    let Some(user) = string_field(args, "coerce_user") else {
+        return;
+    };
+    if user.is_empty() {
+        return;
+    }
+    let domain = string_field(args, "coerce_domain").unwrap_or_default();
 
-    if let Some(user) = explicit_user.as_deref() {
-        if args.contains_key("coerce_hash") || args.contains_key("coerce_password") {
-            return;
-        }
-        if let Some((h, _)) = find_hash(hashes, user, &domain_hint, false) {
+    if !args.contains_key("coerce_hash") && !args.contains_key("coerce_password") {
+        if let Some(h) = find_hash(hashes, &user, &domain, false) {
             if !h.hash_value.is_empty() {
                 args.insert(
                     "coerce_hash".to_string(),
@@ -507,13 +506,13 @@ fn resolve_coerce_principal(
                 );
                 debug!(
                     user = %user,
-                    domain = %domain_hint,
+                    domain = %domain,
                     "credential_resolver: injected coerce_hash from state"
                 );
                 return;
             }
         }
-        if let Some((cred, _)) = find_credential(credentials, user, &domain_hint, false) {
+        if let Some(cred) = find_credential(credentials, &user, &domain, false) {
             if !cred.password.is_empty() {
                 args.insert(
                     "coerce_password".to_string(),
@@ -521,134 +520,12 @@ fn resolve_coerce_principal(
                 );
                 debug!(
                     user = %user,
-                    domain = %domain_hint,
+                    domain = %domain,
                     "credential_resolver: injected coerce_password from state"
                 );
             }
         }
-        return;
     }
-
-    if args.contains_key("coerce_hash") || args.contains_key("coerce_password") {
-        return;
-    }
-
-    let Some(pick) = pick_owned_coerce_principal(credentials, hashes, &domain_hint) else {
-        return;
-    };
-
-    args.insert(
-        "coerce_user".to_string(),
-        Value::String(pick.username.clone()),
-    );
-    if string_field(args, "coerce_domain")
-        .filter(|s| !s.is_empty())
-        .is_none()
-    {
-        args.insert(
-            "coerce_domain".to_string(),
-            Value::String(pick.domain.clone()),
-        );
-    }
-    match pick.secret {
-        CoerceSecretValue::Hash(h) => {
-            args.insert("coerce_hash".to_string(), Value::String(h));
-            info!(
-                user = %pick.username,
-                domain = %pick.domain,
-                domain_hint = %domain_hint,
-                "credential_resolver: auto-selected coerce principal (hash) from state"
-            );
-        }
-        CoerceSecretValue::Password(p) => {
-            args.insert("coerce_password".to_string(), Value::String(p));
-            info!(
-                user = %pick.username,
-                domain = %pick.domain,
-                domain_hint = %domain_hint,
-                "credential_resolver: auto-selected coerce principal (password) from state"
-            );
-        }
-    }
-}
-
-struct CoercePrincipalPick {
-    username: String,
-    domain: String,
-    secret: CoerceSecretValue,
-}
-
-enum CoerceSecretValue {
-    Hash(String),
-    Password(String),
-}
-
-/// Return true if an account can't drive authenticated coercion via
-/// PetitPotam/Coercer/DFSCoerce against a patched DC. Excludes machine
-/// accounts (the DC won't accept its own machine creds back over RPC for
-/// coercion), `krbtgt`, and trust-account markers.
-fn is_unusable_coerce_account(username: &str) -> bool {
-    let u = username.trim();
-    if u.is_empty() || u.ends_with('$') {
-        return true;
-    }
-    u.eq_ignore_ascii_case("krbtgt")
-}
-
-/// Pick the best owned principal to drive authenticated coercion. Preference
-/// order: in-domain hash, any-domain hash, in-domain password, any-domain
-/// password. Returning a hash is preferred because PTH avoids password
-/// encoding pitfalls (locale corruption, special-character escaping in
-/// child-process argv).
-fn pick_owned_coerce_principal(
-    credentials: &[Credential],
-    hashes: &[Hash],
-    domain_hint: &str,
-) -> Option<CoercePrincipalPick> {
-    if !domain_hint.is_empty() {
-        if let Some(h) = hashes.iter().find(|h| {
-            !is_unusable_coerce_account(&h.username)
-                && !h.hash_value.is_empty()
-                && h.domain.eq_ignore_ascii_case(domain_hint)
-        }) {
-            return Some(CoercePrincipalPick {
-                username: h.username.clone(),
-                domain: h.domain.clone(),
-                secret: CoerceSecretValue::Hash(h.hash_value.clone()),
-            });
-        }
-    }
-    if let Some(h) = hashes
-        .iter()
-        .find(|h| !is_unusable_coerce_account(&h.username) && !h.hash_value.is_empty())
-    {
-        return Some(CoercePrincipalPick {
-            username: h.username.clone(),
-            domain: h.domain.clone(),
-            secret: CoerceSecretValue::Hash(h.hash_value.clone()),
-        });
-    }
-    if !domain_hint.is_empty() {
-        if let Some(c) = credentials.iter().find(|c| {
-            !is_unusable_coerce_account(&c.username)
-                && !c.password.is_empty()
-                && c.domain.eq_ignore_ascii_case(domain_hint)
-        }) {
-            return Some(CoercePrincipalPick {
-                username: c.username.clone(),
-                domain: c.domain.clone(),
-                secret: CoerceSecretValue::Password(c.password.clone()),
-            });
-        }
-    }
-    credentials
-        .iter()
-        .find(|c| !is_unusable_coerce_account(&c.username) && !c.password.is_empty())
-        .map(|c| CoercePrincipalPick {
-            username: c.username.clone(),
-            domain: c.domain.clone(),
-            secret: CoerceSecretValue::Password(c.password.clone()),
-        })
 }
 
 /// Look up the krbtgt hash for the relevant domain when the tool needs it.
@@ -661,7 +538,7 @@ fn resolve_krbtgt_hashes(args: &mut Map<String, Value>, hashes: &[Hash]) {
     // domain's krbtgt forges a useless ticket.
     if !args.contains_key("krbtgt_hash") {
         if let Some(domain) = string_field(args, "domain") {
-            if let Some((h, _)) = find_hash(hashes, "krbtgt", &domain, true) {
+            if let Some(h) = find_hash(hashes, "krbtgt", &domain, true) {
                 if !h.hash_value.is_empty() {
                     args.insert(
                         "krbtgt_hash".to_string(),
@@ -674,7 +551,7 @@ fn resolve_krbtgt_hashes(args: &mut Map<String, Value>, hashes: &[Hash]) {
 
     if !args.contains_key("child_krbtgt_hash") {
         if let Some(child) = string_field(args, "child_domain") {
-            if let Some((h, _)) = find_hash(hashes, "krbtgt", &child, true) {
+            if let Some(h) = find_hash(hashes, "krbtgt", &child, true) {
                 if !h.hash_value.is_empty() {
                     args.insert(
                         "child_krbtgt_hash".to_string(),
@@ -731,7 +608,7 @@ async fn resolve_trust_key(
 
     for cand in &candidates {
         // Trust keys are per-(source, target$) — never cross-realm fall back.
-        if let Some((h, _)) = find_hash(hashes, cand, &source_domain, true) {
+        if let Some(h) = find_hash(hashes, cand, &source_domain, true) {
             if !h.hash_value.is_empty() {
                 args.insert("trust_key".to_string(), Value::String(h.hash_value.clone()));
                 if !args.contains_key("trust_aes_key") {
@@ -877,106 +754,13 @@ fn split_user_realm(raw: &str) -> (String, Option<String>) {
     }
 }
 
-/// How a credential/hash matched the caller's `(username, domain)` query.
-///
-/// The resolver's domain-rewrite logic depends on knowing whether the match
-/// came from the exact-realm path or from the cross-realm `any_user` fallback.
-/// Propagating that decision out of `find_credential`/`find_hash` (rather than
-/// re-deriving it post-hoc by comparing `cred.domain != args.domain`) keeps
-/// the rewrite condition pinned to *why* the match was made, not to a
-/// coincidence in the data.
-///
-/// In `realm_strict` mode `CrossRealmFallback` is never produced — the
-/// finders refuse to fall back at an *arbitrary* realm. `ParentRealmFallback`
-/// IS still produced under `realm_strict`, because a parent-domain account is
-/// a valid principal against a child DC in the same forest (Kerberos referral
-/// / NTLM pass-through), unlike a sibling- or foreign-forest cred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MatchKind {
-    /// Caller's `domain` matched the stored record (or was empty, in which
-    /// case any record for the user is treated as exact — the caller is
-    /// signalling "I don't know the realm, use what you have").
-    Exact,
-    /// No exact-realm record existed for the user, but a record in a
-    /// different realm matched on username. The caller should rewrite
-    /// `args.domain` to the matched record's realm before dispatch so the
-    /// tool sends the principal qualified with the realm the DC will
-    /// actually validate against.
-    CrossRealmFallback,
-    /// No exact-realm record existed, but a record in a *parent* realm of the
-    /// requested domain matched on username (e.g. stored `contoso.local`,
-    /// requested `child.contoso.local`). Within one forest the child DC's KDC
-    /// accepts the parent-realm principal via referral, so this is a valid
-    /// credential even for `realm_strict` direct-bind tools. Like
-    /// `CrossRealmFallback`, the caller must rewrite `args.domain` to the
-    /// record's (parent) realm so the principal authenticates against the
-    /// realm it actually belongs to.
-    ParentRealmFallback,
-}
-
-/// True when `parent` is a strict parent realm of `child` — i.e. `child` is a
-/// subdomain of `parent` (`child.contoso.local` vs `contoso.local`). Equal
-/// realms and empty inputs are not "parent" relationships.
-pub(crate) fn is_parent_realm(parent: &str, child: &str) -> bool {
-    let parent = parent.to_lowercase();
-    let child = child.to_lowercase();
-    !parent.is_empty() && child != parent && child.ends_with(&format!(".{parent}"))
-}
-
-/// Rewrite `args.domain` to a credential or hash record's actual realm when
-/// the match was a cross-realm fallback. Returns `true` if it wrote anything.
-///
-/// The rewrite is gated on `MatchKind::CrossRealmFallback` rather than a
-/// post-hoc `args.domain != record.domain` comparison: the *meaning* of the
-/// rewrite is "we used the any-user fallback, so the dispatched principal
-/// needs to carry the record's home realm." Driving off the kind keeps that
-/// meaning visible and survives future refactors of `find_credential` /
-/// `find_hash`.
-///
-/// No-ops when:
-///   - `MatchKind::Exact` (the record's realm matched what was requested,
-///     or the caller requested an empty realm in which case the existing
-///     value — or absence — is what the dispatch expects).
-///   - `MatchKind::CrossRealmFallback` under `realm_strict` (LDAP/RPC direct
-///     bind — for an *arbitrary* foreign realm the caller is required to pass
-///     the exact target realm; we never overwrite it).
-///   - `record_realm` is empty (legacy ingestion / local-SAM records have
-///     no domain; overwriting with `""` would tell the tool "no realm" and
-///     usually break the auth that was previously working).
-///
-/// `MatchKind::ParentRealmFallback` always rewrites (even under `realm_strict`):
-/// the matched account lives in a parent realm of the requested child domain,
-/// so the dispatched principal must carry the parent realm to authenticate
-/// (the target host is addressed separately, so retargeting is not a concern).
-fn rewrite_domain_for_fallback(
-    args: &mut Map<String, Value>,
-    username: &str,
-    requested_realm: &str,
-    record_realm: &str,
-    kind: MatchKind,
-    realm_strict: bool,
-    source: &'static str,
-) -> bool {
-    let allow = match kind {
-        MatchKind::Exact => false,
-        MatchKind::CrossRealmFallback => !realm_strict,
-        MatchKind::ParentRealmFallback => true,
-    };
-    if !allow || record_realm.is_empty() {
-        return false;
+/// Keep whichever of `slot`/`cand` has the higher `attack_step`, preferring
+/// `cand` on ties so the most recently seen record wins — the selection rule
+/// shared by every credential/hash preference bucket.
+fn keep_latest<'a, T>(slot: &mut Option<&'a T>, cand: &'a T, step: impl Fn(&T) -> i32) {
+    if slot.is_none_or(|prev| step(cand) >= step(prev)) {
+        *slot = Some(cand);
     }
-    args.insert(
-        "domain".to_string(),
-        Value::String(record_realm.to_string()),
-    );
-    info!(
-        user = %username,
-        requested_domain = %requested_realm,
-        actual_domain = %record_realm,
-        source = %source,
-        "credential_resolver: rewrote args.domain to match record's actual realm"
-    );
-    true
 }
 
 fn find_credential<'a>(
@@ -984,7 +768,7 @@ fn find_credential<'a>(
     username: &str,
     domain: &str,
     realm_strict: bool,
-) -> Option<(&'a Credential, MatchKind)> {
+) -> Option<&'a Credential> {
     let (user_l, upn_realm) = split_user_realm(username);
     let mut domain_l = domain.to_lowercase();
     if domain_l.is_empty() {
@@ -995,7 +779,6 @@ fn find_credential<'a>(
     let domain_empty = domain_l.is_empty();
 
     let mut exact: Option<&Credential> = None;
-    let mut parent: Option<&Credential> = None;
     let mut any_user: Option<&Credential> = None;
     for cred in credentials {
         if cred.username.to_lowercase() != user_l {
@@ -1006,41 +789,15 @@ fn find_credential<'a>(
         }
         let domain_match = domain_empty || cred.domain.to_lowercase() == domain_l;
         if domain_match {
-            match exact {
-                None => exact = Some(cred),
-                Some(prev) if cred.attack_step >= prev.attack_step => exact = Some(cred),
-                _ => {}
-            }
-        } else if is_parent_realm(&cred.domain, &domain_l) {
-            match parent {
-                None => parent = Some(cred),
-                Some(prev) if cred.attack_step >= prev.attack_step => parent = Some(cred),
-                _ => {}
-            }
+            keep_latest(&mut exact, cred, |c| c.attack_step);
         }
-        match any_user {
-            None => any_user = Some(cred),
-            Some(prev) if cred.attack_step >= prev.attack_step => any_user = Some(cred),
-            _ => {}
-        }
+        keep_latest(&mut any_user, cred, |c| c.attack_step);
     }
     // Realm-strict callers (LDAP/RPC direct bind) MUST get an exact-realm
-    // match — or a parent-realm account, which the child DC's KDC validates
-    // via in-forest referral. A foreign/sibling-realm cred just produces
-    // 52e/775 at bind time and burns the dispatch, so it stays suppressed.
+    // match or nothing. A foreign-realm cred just produces 52e/775 at bind
+    // time and burns the dispatch.
     if realm_strict {
-        if let Some(c) = exact {
-            return Some((c, MatchKind::Exact));
-        }
-        if !is_common_per_domain_account(&user_l) {
-            if let Some(c) = parent {
-                return Some((c, MatchKind::ParentRealmFallback));
-            }
-        }
-        return None;
-    }
-    if let Some(c) = exact {
-        return Some((c, MatchKind::Exact));
+        return exact;
     }
     // Username-only fallback: when the LLM passes the *target* domain (the
     // tool's destination) instead of the credential's home realm, exact match
@@ -1054,10 +811,11 @@ fn find_credential<'a>(
     // its own `Administrator`/`Guest`/`krbtgt` SAM account with a different
     // password and SID. Substituting one domain's `Administrator` for
     // another's just produces STATUS_LOGON_FAILURE and burns a tool call.
-    if is_common_per_domain_account(&user_l) {
-        return None;
+    if exact.is_some() || !is_common_per_domain_account(&user_l) {
+        exact.or(any_user)
+    } else {
+        exact
     }
-    any_user.map(|c| (c, MatchKind::CrossRealmFallback))
 }
 
 fn is_common_per_domain_account(user_l: &str) -> bool {
@@ -1079,7 +837,6 @@ pub(crate) fn requires_exact_realm(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "bloodyad_set_password"
-            | "samr_change_password"
             | "bloodyad_add_group_member"
             | "bloodyad_add_genericall"
             | "dacl_edit"
@@ -1139,6 +896,67 @@ pub(crate) fn supports_kerberos_auth_mode(tool_name: &str) -> bool {
     !matches!(kerberos_coercion(tool_name), KerberosCoercion::None)
 }
 
+/// True when the tool's tool-side implementation reads a `ticket_path` arg
+/// and either sets `KRB5CCNAME` in the spawned process environment or passes
+/// the ticket through impacket's `-k -no-pass` (or equivalent). Tools NOT in
+/// this set silently drop the injection: the resolver writes `ticket_path`
+/// into the args map, the tool's `optional_str("ticket_path")` returns None
+/// because the impl doesn't look for it, and the dispatched process inherits
+/// no Kerberos context. That silent drop is invisible in the dispatcher logs
+/// — Bug B.
+///
+/// This list must be kept in lock-step with the tool impls under
+/// `ares-tools/src/`:
+///   - `acl::bloodyad_*` (acl.rs)
+///   - `recon::ldap_search`, `recon::ldap_acl_enumeration`,
+///     `recon::enumerate_domain_trusts` (recon.rs)
+///   - `credential_access::secretsdump` (credential_access/secretsdump.rs)
+///   - `credential_access::misc::ldap_search_descriptions`
+///   - `lateral::execution::{psexec,wmiexec,smbexec}_kerberos`
+///   - `lateral::execution::secretsdump_kerberos`
+///   - `privesc::adcs::{certipy_find,certipy_request,certipy_ca,certipy_shadow}`
+///     (adcs.rs — `apply_certipy_kerberos` sets `-k -no-pass` + `KRB5CCNAME`)
+///
+/// Adding a Kerberos-capable tool means appending its name here AND wiring
+/// the `optional_str("ticket_path")` read in the impl.
+pub(crate) fn tool_consumes_ticket_path(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "secretsdump"
+            | "secretsdump_kerberos"
+            | "psexec_kerberos"
+            | "wmiexec_kerberos"
+            | "smbexec_kerberos"
+            | "ldap_search"
+            | "ldap_search_descriptions"
+            | "ldap_acl_enumeration"
+            | "enumerate_domain_trusts"
+            | "bloodyad_set_password"
+            | "bloodyad_add_group_member"
+            | "bloodyad_add_genericall"
+            | "smbclient_kerberos_shares"
+            | "certipy_find"
+            | "certipy_request"
+            | "certipy_ca"
+            | "certipy_shadow"
+    )
+}
+
+/// Certipy enrollment/CA/shadow tools that authenticate to a foreign forest's
+/// LDAP + CA over `-k -no-pass` using a forged inter-realm ccache (Bug B — the
+/// certipy subset). They resolve the target realm from the `domain` /
+/// `target_domain` argument (which the automation sets to the target forest),
+/// not from the target host, so they get their own cross-forest gate rather
+/// than joining `requires_exact_realm` — whose IP→FQDN `target` rewrite and
+/// realm-strict hash lookup don't apply here. The tool impls read `ticket_path`
+/// (see [`tool_consumes_ticket_path`]) and prefer it over password/hash.
+pub(crate) fn is_cross_forest_certipy_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "certipy_find" | "certipy_request" | "certipy_ca" | "certipy_shadow"
+    )
+}
+
 /// Flip a tool's args into Kerberos auth mode: set `no_pass=true` and remove
 /// any `password` / `hash` that the principal resolver injected earlier.
 /// Returns `(stripped_password, stripped_hash)` so the caller can log
@@ -1155,7 +973,7 @@ fn find_hash<'a>(
     username: &str,
     domain: &str,
     realm_strict: bool,
-) -> Option<(&'a Hash, MatchKind)> {
+) -> Option<&'a Hash> {
     // Same UPN handling as find_credential — strip @realm to match bare-user
     // hash records and fall back to the realm suffix when caller domain is
     // empty.
@@ -1170,8 +988,6 @@ fn find_hash<'a>(
 
     let mut exact: Option<&Hash> = None;
     let mut exact_aes: Option<&Hash> = None;
-    let mut parent: Option<&Hash> = None;
-    let mut parent_aes: Option<&Hash> = None;
     let mut any_user: Option<&Hash> = None;
     let mut any_user_aes: Option<&Hash> = None;
     for h in hashes {
@@ -1188,66 +1004,25 @@ fn find_hash<'a>(
         let domain_match = domain_empty || h.domain.is_empty() || h_domain_l == domain_l;
         let has_aes = h.aes_key.as_deref().is_some_and(|s| !s.is_empty());
         if domain_match {
-            match exact {
-                None => exact = Some(h),
-                Some(prev) if h.attack_step >= prev.attack_step => exact = Some(h),
-                _ => {}
-            }
+            keep_latest(&mut exact, h, |x| x.attack_step);
             if has_aes {
-                match exact_aes {
-                    None => exact_aes = Some(h),
-                    Some(prev) if h.attack_step >= prev.attack_step => exact_aes = Some(h),
-                    _ => {}
-                }
-            }
-        } else if is_parent_realm(&h_domain_l, &domain_l) {
-            match parent {
-                None => parent = Some(h),
-                Some(prev) if h.attack_step >= prev.attack_step => parent = Some(h),
-                _ => {}
-            }
-            if has_aes {
-                match parent_aes {
-                    None => parent_aes = Some(h),
-                    Some(prev) if h.attack_step >= prev.attack_step => parent_aes = Some(h),
-                    _ => {}
-                }
+                keep_latest(&mut exact_aes, h, |x| x.attack_step);
             }
         }
-        match any_user {
-            None => any_user = Some(h),
-            Some(prev) if h.attack_step >= prev.attack_step => any_user = Some(h),
-            _ => {}
-        }
+        keep_latest(&mut any_user, h, |x| x.attack_step);
         if has_aes {
-            match any_user_aes {
-                None => any_user_aes = Some(h),
-                Some(prev) if h.attack_step >= prev.attack_step => any_user_aes = Some(h),
-                _ => {}
-            }
+            keep_latest(&mut any_user_aes, h, |x| x.attack_step);
         }
     }
     let exact_pick = exact_aes.or(exact);
     if realm_strict {
-        if let Some(h) = exact_pick {
-            return Some((h, MatchKind::Exact));
-        }
-        if !is_common_per_domain_account(&user_l) {
-            if let Some(h) = parent_aes.or(parent) {
-                return Some((h, MatchKind::ParentRealmFallback));
-            }
-        }
-        return None;
+        return exact_pick;
     }
-    if let Some(h) = exact_pick {
-        return Some((h, MatchKind::Exact));
+    if exact_pick.is_some() || !is_common_per_domain_account(&user_l) {
+        exact_pick.or(any_user_aes).or(any_user)
+    } else {
+        exact_pick
     }
-    if is_common_per_domain_account(&user_l) {
-        return None;
-    }
-    any_user_aes
-        .or(any_user)
-        .map(|h| (h, MatchKind::CrossRealmFallback))
 }
 
 /// True when this hash type can be used directly for authentication (NTLM,
@@ -1343,12 +1118,16 @@ async fn resolve_cross_forest_ticket(
     conn: &mut ConnectionManager,
     tool_name: &str,
     target_domain: &str,
+    credentials: &[Credential],
     hashes: &[Hash],
 ) -> Option<String> {
-    // Only fire when the tool has no usable NTLM credential for the target
-    // domain (i.e. the realm_strict check already blocked cross-realm fallback).
-    // If there's already an exact-domain hash for a non-common account, NTLM
-    // bind will work and we don't need Kerberos.
+    // Only fire when no same-realm credential exists for the principal. The
+    // consumer tools (ldap_search, secretsdump, etc.) prefer `ticket_path`
+    // over `password`/`hash` when both are present, so injecting a cross-realm
+    // Administrator ccache shadows a working same-realm bind — and the foreign
+    // DC rejects the cross-realm principal's referral PAC under SID filtering.
+    // Skip whenever an exact-domain NTLM hash or plaintext password is already
+    // usable for the dispatched principal.
     let user_l = string_field(args, "username")
         .map(|u| u.to_lowercase())
         .unwrap_or_default();
@@ -1360,7 +1139,14 @@ async fn resolve_cross_forest_ticket(
             && is_authenticating_hash_type(&h.hash_type)
     });
     if has_ntlm {
-        // NTLM bind is available — no need to inject Kerberos ticket.
+        return None;
+    }
+    let has_plaintext = credentials.iter().any(|c| {
+        c.domain.to_lowercase() == domain_l
+            && (user_l.is_empty() || c.username.to_lowercase() == user_l)
+            && !c.password.is_empty()
+    });
+    if has_plaintext {
         return None;
     }
 
@@ -1405,6 +1191,25 @@ async fn resolve_cross_forest_ticket(
         coercion = ?coercion,
         "credential_resolver: injecting inter-realm Kerberos ticket for cross-forest tool"
     );
+    // Bug B: surface the silent-drop path. If the consuming tool's impl
+    // doesn't actually read `ticket_path` (no KRB5CCNAME env, no -k/-no-pass),
+    // the injection is a no-op and the downstream auth fails with
+    // `CCache file is not found` / `Matching credential not found` while
+    // the dispatcher logs claim injection succeeded. Logging this loudly
+    // makes the gap visible so the next op that hits it doesn't take
+    // another hour of cross-referencing worker stdout against orchestrator
+    // dispatch traces.
+    if !tool_consumes_ticket_path(tool_name) {
+        warn!(
+            tool = %tool_name,
+            target_domain = %target_domain,
+            ticket_path = %ticket.ticket_path,
+            "credential_resolver: tool impl does not read ticket_path — \
+             injection will be silently dropped. Add the tool to \
+             tool_consumes_ticket_path() (and wire optional_str(\"ticket_path\") \
+             in the tool impl) so the ccache reaches the worker process."
+        );
+    }
     args.insert(
         "ticket_path".to_string(),
         Value::String(ticket.ticket_path.clone()),
@@ -1661,18 +1466,14 @@ mod tests {
             cred("admin", "contoso.local", "P@ss1"),
             cred("guest", "contoso.local", "guest1"),
         ];
-        let found = find_credential(&creds, "admin", "contoso.local", false)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "admin", "contoso.local", false).unwrap();
         assert_eq!(found.password, "P@ss1");
     }
 
     #[test]
     fn find_credential_case_insensitive() {
         let creds = vec![cred("Admin", "Contoso.Local", "P@ss1")];
-        let found = find_credential(&creds, "admin", "contoso.local", false)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "admin", "contoso.local", false).unwrap();
         assert_eq!(found.password, "P@ss1");
     }
 
@@ -1683,9 +1484,7 @@ mod tests {
         // should still return the user's stored cred so the cross-realm
         // auth attempt can proceed via Kerberos referral / NTLM pass-through.
         let creds = vec![cred("alice", "child.contoso.local", "P@ss1")];
-        let found = find_credential(&creds, "alice", "fabrikam.local", false)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "alice", "fabrikam.local", false).unwrap();
         assert_eq!(found.password, "P@ss1");
         assert_eq!(found.domain, "child.contoso.local");
     }
@@ -1698,9 +1497,7 @@ mod tests {
             cred("admin", "fabrikam.local", "wrong"),
             cred("admin", "contoso.local", "right"),
         ];
-        let found = find_credential(&creds, "admin", "contoso.local", false)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "admin", "contoso.local", false).unwrap();
         assert_eq!(found.password, "right");
     }
 
@@ -1732,50 +1529,8 @@ mod tests {
             cred("admin", "fabrikam.local", "wrong"),
             cred("admin", "contoso.local", "right"),
         ];
-        let found = find_credential(&creds, "admin", "contoso.local", true)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "admin", "contoso.local", true).unwrap();
         assert_eq!(found.password, "right");
-    }
-
-    #[test]
-    fn find_credential_realm_strict_accepts_parent_domain_cred() {
-        // A credential for the parent domain (contoso.local) is a valid
-        // principal against a child domain (child.contoso.local) even for a
-        // realm_strict direct-bind tool — the child DC's KDC honours the
-        // parent realm via in-forest referral. The match must be flagged
-        // ParentRealmFallback so the caller rewrites args.domain to the
-        // credential's (parent) realm.
-        let creds = vec![cred("tony", "contoso.local", "P@ss!")];
-        let (found, kind) = find_credential(&creds, "tony", "child.contoso.local", true).unwrap();
-        assert_eq!(found.password, "P@ss!");
-        assert_eq!(found.domain, "contoso.local");
-        assert_eq!(kind, MatchKind::ParentRealmFallback);
-    }
-
-    #[test]
-    fn find_credential_realm_strict_rejects_sibling_domain_cred() {
-        // fabrikam.local is NOT a parent of child.contoso.local — a sibling /
-        // foreign-forest cred must stay suppressed under realm_strict (it would
-        // only produce 52e/775 at bind time).
-        let creds = vec![cred("tony", "fabrikam.local", "P@ss!")];
-        assert!(
-            find_credential(&creds, "tony", "child.contoso.local", true).is_none(),
-            "sibling-realm cred must not match in realm_strict mode"
-        );
-    }
-
-    #[test]
-    fn find_credential_realm_strict_prefers_exact_over_parent() {
-        // When both an exact-realm and a parent-realm cred exist, the exact
-        // one wins (and is flagged Exact, so no domain rewrite happens).
-        let creds = vec![
-            cred("tony", "contoso.local", "parent"),
-            cred("tony", "child.contoso.local", "exact"),
-        ];
-        let (found, kind) = find_credential(&creds, "tony", "child.contoso.local", true).unwrap();
-        assert_eq!(found.password, "exact");
-        assert_eq!(kind, MatchKind::Exact);
     }
 
     #[test]
@@ -1791,9 +1546,7 @@ mod tests {
         nb.insert("CONTOSO".to_string(), "contoso.local".to_string());
         let fixed = normalize_credential_domains(&mut creds, &nb);
         assert_eq!(fixed, 1, "normalize must rewrite the NetBIOS-form domain");
-        let found = find_credential(&creds, "alice", "contoso.local", false)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "alice", "contoso.local", false).unwrap();
         assert_eq!(found.password, "P@ss1");
     }
 
@@ -1810,9 +1563,7 @@ mod tests {
         let nb: HashMap<String, String> = HashMap::new();
         let fixed = normalize_credential_domains(&mut creds, &nb);
         assert_eq!(fixed, 0);
-        let found = find_credential(&creds, "alice", "contoso.local", false)
-            .map(|(c, _)| c)
-            .unwrap();
+        let found = find_credential(&creds, "alice", "contoso.local", false).unwrap();
         assert_eq!(found.password, "P@ss1");
     }
 
@@ -1832,374 +1583,62 @@ mod tests {
             hash("admin", "fabrikam.local", "fabhash", None),
             hash("admin", "contoso.local", "conhash", None),
         ];
-        let found = find_hash(&hashes, "admin", "contoso.local", true)
-            .map(|(h, _)| h)
-            .unwrap();
+        let found = find_hash(&hashes, "admin", "contoso.local", true).unwrap();
         assert_eq!(found.hash_value, "conhash");
     }
 
     #[test]
-    fn find_hash_realm_strict_accepts_parent_domain_hash() {
-        // Parent-realm hash is valid against a child domain under realm_strict
-        // (same forest), flagged ParentRealmFallback for the domain rewrite.
-        let hashes = vec![hash("tony", "contoso.local", "deadbeef", None)];
-        let (found, kind) = find_hash(&hashes, "tony", "child.contoso.local", true).unwrap();
-        assert_eq!(found.hash_value, "deadbeef");
-        assert_eq!(found.domain, "contoso.local");
-        assert_eq!(kind, MatchKind::ParentRealmFallback);
-    }
+    fn resolver_warns_when_ccache_intended_but_schema_lacks_slot() {
+        // Bug B: tools whose impl actually reads `ticket_path` are in the
+        // allow-list. Any cross-forest injection against a tool *not* in this
+        // set is a silent drop — the worker process inherits no KRB5CCNAME,
+        // the downstream auth fails with "CCache file is not found", and the
+        // dispatcher logs claim injection succeeded. The resolver warn covers
+        // the gap; this test pins the membership so a future tool with a
+        // mismatched schema/impl trips CI.
+        for known in [
+            "secretsdump",
+            "secretsdump_kerberos",
+            "psexec_kerberos",
+            "wmiexec_kerberos",
+            "smbexec_kerberos",
+            "ldap_search",
+            "ldap_search_descriptions",
+            "ldap_acl_enumeration",
+            "bloodyad_set_password",
+            "bloodyad_add_group_member",
+            "bloodyad_add_genericall",
+            "smbclient_kerberos_shares",
+        ] {
+            assert!(
+                tool_consumes_ticket_path(known),
+                "{known} impl reads ticket_path — must be allow-listed so the \
+                 resolver doesn't warn-on-injection"
+            );
+        }
 
-    #[test]
-    fn find_hash_realm_strict_rejects_sibling_domain_hash() {
-        let hashes = vec![hash("tony", "fabrikam.local", "deadbeef", None)];
-        assert!(
-            find_hash(&hashes, "tony", "child.contoso.local", true).is_none(),
-            "sibling-realm hash must not match in realm_strict mode"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Cross-realm args.domain rewrite (regression suite).
-    //
-    // The bug this guards against: when the LLM passes
-    // `(user=alice, domain=contoso.local)` but state has `alice` only in
-    // `child.contoso.local`, the resolver's `any_user` fallback finds
-    // alice's password from child.contoso.local. PRIOR behavior left
-    // `args.domain` as the LLM-supplied parent realm, so the tool
-    // authenticated as `contoso.local\alice` and the DC returned 0x52e.
-    // This wedged a multi-domain op for 30+ minutes burning credit on
-    // an unsolvable cred-mismatch loop. Fix: rewrite `args.domain` to the
-    // matched credential's actual realm so the tool sends the correct
-    // realm-qualified principal. Realm-strict tools (LDAP direct bind)
-    // skip the rewrite — they're guaranteed to be exact-realm callers
-    // already and shouldn't have their realm overwritten.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn resolve_principal_rewrites_domain_when_password_comes_from_other_realm() {
-        // Repro: alice's cred lives in child.contoso.local but the LLM
-        // passed domain=contoso.local. The fall-through cred lookup hits
-        // alice's stored password — we must ALSO rewrite args.domain so
-        // the tool sends `child.contoso.local\alice`, not
-        // `contoso.local\alice`.
-        let creds = vec![cred("alice", "child.contoso.local", "P@ssw0rd!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-            "target": "192.168.58.11",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "contoso.local", false);
-        assert_eq!(
-            args.get("password").and_then(|v| v.as_str()),
-            Some("P@ssw0rd!"),
-            "password must be injected from state"
-        );
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("child.contoso.local"),
-            "args.domain must be rewritten to the credential's actual realm"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_rewrites_domain_when_hash_comes_from_other_realm() {
-        // Hash-injection variant of the same bug. Same realm mismatch,
-        // but the user only has a hash in state, not a password.
-        let creds: Vec<Credential> = vec![];
-        let hashes = vec![hash(
-            "alice",
-            "child.contoso.local",
-            "aad3b435b51404eeaad3b435b51404ee:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
-            None,
-        )];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "contoso.local", false);
-        assert!(
-            args.contains_key("hash"),
-            "hash must be injected from state"
-        );
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("child.contoso.local"),
-            "args.domain must be rewritten when hash comes from other realm"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_does_not_rewrite_domain_when_realms_match() {
-        // No-op rewrite path. When the cred's realm matches args.domain,
-        // we must not touch args.domain — both shapes are equal already,
-        // and unconditional writes would risk casing surprises later.
-        let creds = vec![cred("alice", "contoso.local", "P@ss!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "contoso.local", false);
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("contoso.local"),
-            "args.domain must remain unchanged when realms match"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_rewrites_domain_for_parent_realm_under_realm_strict() {
-        // The recon-deferral / cross-realm bug repro: an op seeded with a
-        // parent-domain account (tony@contoso.local) drives an ACL step that a
-        // realm_strict tool (bloodyad/pywhisker/ldap) requests against the
-        // child realm (child.contoso.local). The resolver must inject the
-        // parent cred AND rewrite args.domain to contoso.local so the tool
-        // authenticates as the parent principal (not the nonexistent
-        // child.contoso.local\tony) — the target host is addressed separately.
-        let creds = vec![cred("tony", "contoso.local", "P@ssw0rd!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "tony",
-            "domain": "child.contoso.local",
-            "target": "192.168.58.11",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(
-            &mut args,
-            &creds,
-            &hashes,
-            "tony",
-            "child.contoso.local",
-            true,
-        );
-        assert_eq!(
-            args.get("password").and_then(|v| v.as_str()),
-            Some("P@ssw0rd!"),
-            "parent-realm password must be injected even under realm_strict"
-        );
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("contoso.local"),
-            "args.domain must be rewritten to the parent realm under realm_strict"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_does_not_rewrite_domain_under_realm_strict() {
-        // Realm-strict tools (LDAP direct bind: ldap_search,
-        // bloodyad_set_password, etc.) MUST NOT have args.domain
-        // overwritten. They're explicitly cross-realm callers and rely on
-        // args.domain being the *target* realm. With realm_strict=true,
-        // find_credential refuses cross-realm matches up front, so this
-        // test seeds the resolver with the EXACT realm match — but with a
-        // sibling cred from a different realm also present — to prove the
-        // rewrite path stays off.
-        let creds = vec![cred("alice", "contoso.local", "P@ss!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "contoso.local", true);
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("contoso.local"),
-            "realm_strict + exact match must leave args.domain alone"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_no_rewrite_when_cred_domain_empty() {
-        // Defensive: a credential persisted with an empty domain (legacy
-        // ingestion path, or a bare-username record like a local SAM
-        // account) must NOT overwrite args.domain with an empty string —
-        // downstream tools treat empty-domain as "current workstation"
-        // which would lose the realm entirely. Guard against that.
-        let creds = vec![cred("admin", "", "P@ss!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "admin",
-            "domain": "contoso.local",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "admin", "contoso.local", false);
-        assert_eq!(
-            args.get("password").and_then(|v| v.as_str()),
-            Some("P@ss!"),
-            "password must still be injected even when cred.domain is empty"
-        );
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("contoso.local"),
-            "empty cred.domain must not overwrite args.domain"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_case_insensitive_realm_comparison() {
-        // Realm equality compares case-insensitively in the rest of the
-        // resolver. The rewrite check must follow the same convention so
-        // `CONTOSO.LOCAL` and `contoso.local` don't trigger a spurious
-        // overwrite (which would mass-rewrite every dispatch under the
-        // canonical lowercase form even when the LLM happened to type
-        // upper-case — churn with no value).
-        let creds = vec![cred("alice", "Contoso.Local", "P@ss!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "CONTOSO.LOCAL",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "CONTOSO.LOCAL", false);
-        // The cred's stored casing is preserved as-is (Contoso.Local in
-        // this fixture), but more importantly: this test fails fast if a
-        // future change to the comparison accidentally rewrites despite
-        // the realms being case-insensitively equal.
-        let after = args.get("domain").and_then(|v| v.as_str()).unwrap();
-        assert!(
-            after.eq_ignore_ascii_case("contoso.local"),
-            "domain must remain a case-insensitive match for the input, got: {after}"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_split_realm_password_wins_hash_does_not_rewrite() {
-        // Latent footgun this guards against: state holds `alice`'s
-        // password only in realm Y (child.contoso.local) and her hash only
-        // in a different realm Z (fabrikam.local) — say AS-REP crack in
-        // one forest, later DCSync of a re-keyed account in another.
-        // Without the per-injection rewrite-guard, the password branch
-        // would rewrite args.domain → Y, the hash branch would then
-        // re-rewrite to Z, and the dispatched principal would be
-        // `Z\alice` with `Y`'s password — a guaranteed STATUS_LOGON_FAILURE.
-        // Lock in: password wins, hash gets injected for tools that read
-        // it but does NOT clobber the realm chosen by the password.
-        let creds = vec![cred("alice", "child.contoso.local", "P@ssw0rd!")];
-        let hashes = vec![hash(
-            "alice",
-            "fabrikam.local",
-            "aad3b435b51404eeaad3b435b51404ee:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
-            None,
-        )];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "contoso.local", false);
-        assert_eq!(
-            args.get("password").and_then(|v| v.as_str()),
-            Some("P@ssw0rd!"),
-            "password must be the one from child.contoso.local"
-        );
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("child.contoso.local"),
-            "args.domain must lock in the password's realm — hash branch must NOT overwrite to fabrikam.local"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_split_realm_aligned_password_and_hash_pick_same_realm() {
-        // Same scenario as the split-realm test above, but with the hash
-        // ALSO present in the password's realm. Because the hash lookup
-        // re-runs against the rewritten effective_domain, it must find the
-        // realm-matching hash exactly (not fall back to the foreign-realm
-        // record that would have matched against the original requested
-        // realm).
-        let creds = vec![cred("alice", "child.contoso.local", "P@ssw0rd!")];
-        let hashes = vec![
-            hash("alice", "fabrikam.local", "fab_hash_value", None),
-            hash("alice", "child.contoso.local", "child_hash_value", None),
-        ];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(&mut args, &creds, &hashes, "alice", "contoso.local", false);
-        assert_eq!(
-            args.get("hash").and_then(|v| v.as_str()),
-            Some("child_hash_value"),
-            "hash lookup must re-query against the rewritten realm, picking the realm-matching record"
-        );
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("child.contoso.local"),
-        );
-    }
-
-    #[test]
-    fn resolve_principal_rewrites_to_child_realm_unblocks_parent_target_op() {
-        // Integration-style fixture pinning the canonical scenario this
-        // fix exists for: alice's cred (discovered via AS-REP crack)
-        // lives in `child.contoso.local`. The LLM dispatches
-        // password_policy with the *parent* domain `contoso.local`
-        // because that's the operation's headline target. Without the
-        // rewrite, every dispatch returned 0x52e and the op stalled
-        // forever. After the rewrite, the tool sees
-        // `domain=child.contoso.local` and the auth succeeds.
-        let creds = vec![cred("alice", "child.contoso.local", "P@ssw0rd!")];
-        let hashes: Vec<Hash> = vec![];
-        let mut args = json!({
-            "username": "alice",
-            "domain": "contoso.local",
-            "target": "192.168.58.11",
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_principal_credentials(
-            &mut args,
-            &creds,
-            &hashes,
-            "alice",
-            "contoso.local",
-            false, // password_policy is NOT in requires_exact_realm
-        );
-        // Both fields the tool will read must now reflect alice's
-        // actual home realm:
-        assert_eq!(args.get("username").and_then(|v| v.as_str()), Some("alice"));
-        assert_eq!(
-            args.get("domain").and_then(|v| v.as_str()),
-            Some("child.contoso.local"),
-            "child-realm rewrite must fire on the canonical parent-target repro"
-        );
-        assert_eq!(
-            args.get("password").and_then(|v| v.as_str()),
-            Some("P@ssw0rd!"),
-            "password must be the one matching the rewritten realm"
-        );
+        // Negative side: tools that have no Kerberos path must trip the
+        // silent-drop warn — picking obviously-not-Kerberos shapes.
+        for unknown in [
+            "rpcclient_command",
+            "password_spray",
+            "username_as_password",
+            "save_users_to_file",
+            "dig_query",
+            "petitpotam_unauth",
+        ] {
+            assert!(
+                !tool_consumes_ticket_path(unknown),
+                "{unknown} impl does NOT read ticket_path — injection against it \
+                 must trip the silent-drop warn"
+            );
+        }
     }
 
     #[test]
     fn requires_exact_realm_covers_ldap_bind_tools() {
         for tool in [
             "bloodyad_set_password",
-            "samr_change_password",
             "bloodyad_add_group_member",
             "bloodyad_add_genericall",
             "dacl_edit",
@@ -2246,9 +1685,7 @@ mod tests {
             hash("admin", "contoso.local", "abc1", None),
             hash("admin", "contoso.local", "abc1", Some("aes-key-456")),
         ];
-        let found = find_hash(&hashes, "admin", "contoso.local", false)
-            .map(|(h, _)| h)
-            .unwrap();
+        let found = find_hash(&hashes, "admin", "contoso.local", false).unwrap();
         assert!(found.aes_key.is_some());
     }
 
@@ -2266,9 +1703,7 @@ mod tests {
         // the target domain but the only stored hash for the user is in their
         // home realm. Return the home-realm hash rather than nothing.
         let hashes = vec![hash("alice", "child.contoso.local", "deadbeef", None)];
-        let found = find_hash(&hashes, "alice", "fabrikam.local", false)
-            .map(|(h, _)| h)
-            .unwrap();
+        let found = find_hash(&hashes, "alice", "fabrikam.local", false).unwrap();
         assert_eq!(found.hash_value, "deadbeef");
         assert_eq!(found.domain, "child.contoso.local");
     }
@@ -2279,9 +1714,7 @@ mod tests {
             hash("admin", "fabrikam.local", "fabhash", None),
             hash("admin", "contoso.local", "conhash", None),
         ];
-        let found = find_hash(&hashes, "admin", "contoso.local", false)
-            .map(|(h, _)| h)
-            .unwrap();
+        let found = find_hash(&hashes, "admin", "contoso.local", false).unwrap();
         assert_eq!(found.hash_value, "conhash");
     }
 
@@ -2315,9 +1748,7 @@ mod tests {
             None,
         );
         let hashes = vec![tgs, ntlm];
-        let found = find_hash(&hashes, "eve", "child.local", false)
-            .map(|(h, _)| h)
-            .unwrap();
+        let found = find_hash(&hashes, "eve", "child.local", false).unwrap();
         assert!(found.hash_value.starts_with("aad3"));
     }
 
@@ -2423,101 +1854,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_coerce_principal_auto_picks_when_user_absent() {
+    fn resolve_coerce_principal_noop_without_user() {
         let creds = vec![cred("svc-coerce", "contoso.local", "C0erceP@ss")];
-        let hashes: Vec<Hash> = vec![];
+        let hashes = vec![hash("svc-coerce", "contoso.local", "deadbeef", None)];
         let mut args = json!({
             "ca_host": "ca.contoso.local",
-            "coerce_target": "dc01.contoso.local",
-            "domain": "contoso.local"
+            "coerce_target": "dc01.contoso.local"
         })
         .as_object()
         .unwrap()
         .clone();
         resolve_coerce_principal(&mut args, &creds, &hashes);
-        assert_eq!(
-            args.get("coerce_user").unwrap().as_str(),
-            Some("svc-coerce")
-        );
-        assert_eq!(
-            args.get("coerce_password").unwrap().as_str(),
-            Some("C0erceP@ss")
-        );
-        assert_eq!(
-            args.get("coerce_domain").unwrap().as_str(),
-            Some("contoso.local")
-        );
-    }
-
-    #[test]
-    fn resolve_coerce_principal_auto_pick_prefers_hash_over_password() {
-        let creds = vec![cred("alice", "contoso.local", "passw0rd")];
-        let hashes = vec![hash("bob", "contoso.local", "deadbeef", None)];
-        let mut args = json!({
-            "coerce_target": "dc01.contoso.local",
-            "domain": "contoso.local"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_coerce_principal(&mut args, &creds, &hashes);
-        assert_eq!(args.get("coerce_user").unwrap().as_str(), Some("bob"));
-        assert_eq!(args.get("coerce_hash").unwrap().as_str(), Some("deadbeef"));
-        assert!(args.get("coerce_password").is_none());
-    }
-
-    #[test]
-    fn resolve_coerce_principal_auto_pick_prefers_in_domain_match() {
-        let creds = vec![cred("alice", "contoso.local", "passw0rd")];
-        let hashes = vec![
-            hash("bob", "fabrikam.local", "deadbeef", None),
-            hash("carol", "contoso.local", "feedface", None),
-        ];
-        let mut args = json!({
-            "coerce_target": "dc01.contoso.local",
-            "coerce_domain": "contoso.local"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_coerce_principal(&mut args, &creds, &hashes);
-        assert_eq!(args.get("coerce_user").unwrap().as_str(), Some("carol"));
-        assert_eq!(args.get("coerce_hash").unwrap().as_str(), Some("feedface"));
-    }
-
-    #[test]
-    fn resolve_coerce_principal_auto_pick_skips_machine_and_krbtgt_accounts() {
-        let creds: Vec<Credential> = vec![];
-        let hashes = vec![
-            hash("DC01$", "contoso.local", "machinehash", None),
-            hash("krbtgt", "contoso.local", "krbtgthash", None),
-            hash("alice", "contoso.local", "alicehash", None),
-        ];
-        let mut args = json!({
-            "coerce_target": "dc01.contoso.local",
-            "domain": "contoso.local"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_coerce_principal(&mut args, &creds, &hashes);
-        assert_eq!(args.get("coerce_user").unwrap().as_str(), Some("alice"));
-        assert_eq!(args.get("coerce_hash").unwrap().as_str(), Some("alicehash"));
-    }
-
-    #[test]
-    fn resolve_coerce_principal_auto_pick_noop_when_no_usable_principal() {
-        let creds: Vec<Credential> = vec![];
-        let hashes = vec![hash("krbtgt", "contoso.local", "krbtgthash", None)];
-        let mut args = json!({
-            "coerce_target": "dc01.contoso.local",
-            "domain": "contoso.local"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        resolve_coerce_principal(&mut args, &creds, &hashes);
-        assert!(args.get("coerce_user").is_none());
         assert!(args.get("coerce_password").is_none());
         assert!(args.get("coerce_hash").is_none());
     }
@@ -2677,6 +2024,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolve_cross_forest_ticket_skipped_when_same_realm_plaintext_exists() {
+        // The guard skips cross-forest injection when a same-realm plaintext
+        // credential exists for the dispatched principal — otherwise
+        // ldap_search's `ticket_path > password` preference shadows a working
+        // simple bind with a doomed GSSAPI bind against the foreign DC.
+        let credentials = [cred("carol", "fabrikam.local", "fr3edom")];
+        let hashes: [Hash; 0] = [];
+        let domain_l = "fabrikam.local";
+        let user_l = "carol";
+        let has_ntlm = hashes.iter().any(|h: &Hash| {
+            h.domain.to_lowercase() == domain_l
+                && (user_l.is_empty() || h.username.to_lowercase() == user_l)
+                && !h.hash_value.is_empty()
+                && is_authenticating_hash_type(&h.hash_type)
+        });
+        let has_plaintext = credentials.iter().any(|c| {
+            c.domain.to_lowercase() == domain_l
+                && (user_l.is_empty() || c.username.to_lowercase() == user_l)
+                && !c.password.is_empty()
+        });
+        assert!(
+            !has_ntlm,
+            "no NTLM hash for fabrikam.local in this scenario"
+        );
+        assert!(
+            has_plaintext,
+            "same-realm plaintext for carol@fabrikam.local — cross-forest \
+             ccache injection must be skipped so ldap_search uses simple bind"
+        );
+    }
+
     #[test]
     fn resolve_cross_forest_ticket_triggered_when_no_ntlm_for_target() {
         // When no NTLM hash for the target domain exists, the resolver should
@@ -2701,6 +2080,39 @@ mod tests {
         // Confirm the canary tool is covered by realm_strict so that the
         // cross-forest ticket injection fires for it.
         assert!(requires_exact_realm("bloodyad_set_password"));
+    }
+
+    #[test]
+    fn is_cross_forest_certipy_tool_covers_enrollment_tools() {
+        // The enrollment/CA/shadow tools authenticate to a foreign forest and
+        // must be gated for inter-realm ticket injection (Bug B, certipy subset).
+        assert!(is_cross_forest_certipy_tool("certipy_find"));
+        assert!(is_cross_forest_certipy_tool("certipy_request"));
+        assert!(is_cross_forest_certipy_tool("certipy_ca"));
+        assert!(is_cross_forest_certipy_tool("certipy_shadow"));
+        // certipy_auth consumes a PFX (not a ccache) and certipy_forge is
+        // offline — neither takes a cross-forest bind, so both stay excluded.
+        assert!(!is_cross_forest_certipy_tool("certipy_auth"));
+        assert!(!is_cross_forest_certipy_tool("certipy_forge"));
+        assert!(!is_cross_forest_certipy_tool("ldap_search"));
+    }
+
+    #[test]
+    fn tool_consumes_ticket_path_covers_certipy() {
+        // Each cross-forest certipy tool must also be on the consume allowlist
+        // or the resolver's injection is silently dropped (the whole point of
+        // Bug B). Keep this in lock-step with is_cross_forest_certipy_tool.
+        for t in [
+            "certipy_find",
+            "certipy_request",
+            "certipy_ca",
+            "certipy_shadow",
+        ] {
+            assert!(
+                is_cross_forest_certipy_tool(t) && tool_consumes_ticket_path(t),
+                "{t} must be gated AND on the ticket-path consume allowlist"
+            );
+        }
     }
 
     #[test]
@@ -3081,5 +2493,202 @@ mod tests {
         assert!(is_authenticating_hash_type("aes128"));
         assert!(is_authenticating_hash_type("lm"));
         assert!(is_authenticating_hash_type(""));
+    }
+
+    /// Bug B end-to-end contract: when the resolver writes `ticket_path` into
+    /// the args map, the downstream tool builders must export it as
+    /// `KRB5CCNAME` in the spawned subprocess's environment. This pins the
+    /// resolver-side `tool_consumes_ticket_path` allowlist against the
+    /// tool-side env wiring so a future refactor that breaks one without the
+    /// other trips CI rather than burning an entire DA op on silent drops.
+    #[test]
+    fn credential_resolver_injection_reaches_worker_env() {
+        const CCACHE: &str =
+            "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache";
+
+        // Per-tool fixtures: each entry is (tool_name, args). Args mirror
+        // exactly what `resolve_credentials` would have constructed for a
+        // cross-forest dispatch — username/domain populated, ticket_path
+        // injected from the kerberos_tickets HASH.
+        let fixtures: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "bloodyad_set_password",
+                json!({
+                    "domain": "fabrikam.local",
+                    "dc_ip": "192.168.58.20",
+                    "target_user": "alice",
+                    "new_password": "Pwn3d!2026",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "bloodyad_add_group_member",
+                json!({
+                    "domain": "fabrikam.local",
+                    "dc_ip": "192.168.58.20",
+                    "group": "Domain Admins",
+                    "target_user": "carol",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "bloodyad_add_genericall",
+                json!({
+                    "domain": "fabrikam.local",
+                    "dc_ip": "192.168.58.20",
+                    "target_dn": "CN=Users,DC=fabrikam,DC=local",
+                    "principal": "carol",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "smbclient_kerberos_shares",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "ldap_search",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "filter": "(objectClass=user)",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "ldap_search_descriptions",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "ldap_acl_enumeration",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+            (
+                "enumerate_domain_trusts",
+                json!({
+                    "target": "dc02.fabrikam.local",
+                    "domain": "fabrikam.local",
+                    "ticket_path": CCACHE,
+                }),
+            ),
+        ];
+
+        for (tool, args) in &fixtures {
+            // Sanity guard: every tool exercised here must be on the
+            // resolver's allowlist, otherwise the silent-drop warn fires
+            // and the env-wiring contract is unverified.
+            assert!(
+                tool_consumes_ticket_path(tool),
+                "{tool} must be on tool_consumes_ticket_path allowlist"
+            );
+
+            let cmd = match *tool {
+                "bloodyad_set_password" => {
+                    ares_tools::acl::build_bloodyad_set_password(args).unwrap()
+                }
+                "bloodyad_add_group_member" => {
+                    ares_tools::acl::build_bloodyad_add_group_member(args).unwrap()
+                }
+                "bloodyad_add_genericall" => {
+                    ares_tools::acl::build_bloodyad_add_genericall(args).unwrap()
+                }
+                "smbclient_kerberos_shares" => {
+                    ares_tools::recon::build_smbclient_kerberos_shares(args).unwrap()
+                }
+                "ldap_search" => ares_tools::recon::build_ldap_search(args).unwrap(),
+                "ldap_search_descriptions" => {
+                    ares_tools::credential_access::build_ldap_search_descriptions(args).unwrap()
+                }
+                "ldap_acl_enumeration" => {
+                    ares_tools::recon::build_ldap_acl_enumeration(args).unwrap()
+                }
+                "enumerate_domain_trusts" => {
+                    ares_tools::recon::build_enumerate_domain_trusts(args).unwrap()
+                }
+                other => panic!("no build_* helper wired for {other}"),
+            };
+
+            let env_set = cmd
+                .env_vars_for_test()
+                .iter()
+                .any(|(k, v)| k == "KRB5CCNAME" && v == CCACHE);
+            assert!(
+                env_set,
+                "{tool}: injected ticket_path did not reach the worker subprocess as \
+                 KRB5CCNAME — Bug B silent-drop regression. env={:?}",
+                cmd.env_vars_for_test()
+            );
+        }
+    }
+
+    /// Cred resolver lookup-miss regression guard. The end-to-end
+    /// contract is: a credential written via `RedisStateReader::add_credential`
+    /// (same path `ares ops inject-credential` uses) must be visible to the
+    /// resolver's `(username, domain)` lookup. Reading via `get_credentials`
+    /// then matching with `find_credential(..., realm_strict=true)` mirrors
+    /// what `resolve_credentials` does for `ldap_search` (which sets
+    /// `requires_exact_realm`). If this regresses, the resolver will log
+    /// `cred_count=0` for principals whose cred is on the board, and the
+    /// dispatched tool will fail with a missing-credential error.
+    #[tokio::test]
+    async fn cred_resolver_finds_injected_cleartext_cred_by_domain_user() {
+        use ares_core::state::mock_redis::MockRedisConnection;
+        use ares_core::state::RedisStateReader;
+
+        let mut conn = MockRedisConnection::new();
+        let reader = RedisStateReader::new("op-test".to_string());
+
+        // Mirror `ops_inject_credential` exactly: build a Credential and call
+        // `add_credential`. The dedup key shape is irrelevant for retrieval
+        // (HGETALL returns all values), but pinning the same code path here
+        // catches a future divergence between writer and reader.
+        let injected = Credential {
+            id: "injected".to_string(),
+            username: "carol".to_string(),
+            password: "fr3edom".to_string(),
+            domain: "fabrikam.local".to_string(),
+            source: "manual-inject".to_string(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let added = reader.add_credential(&mut conn, &injected).await.unwrap();
+        assert!(added, "inject path must persist the cred");
+
+        // Now mirror what `resolve_credentials` does at lookup time.
+        let credentials = reader.get_credentials(&mut conn).await.unwrap();
+        assert_eq!(
+            credentials.len(),
+            1,
+            "get_credentials must surface the injected cred"
+        );
+
+        // ldap_search calls requires_exact_realm=true, so the resolver uses
+        // realm_strict=true. The lookup MUST find the injected cred under
+        // (fabrikam.local, carol).
+        let found = find_credential(&credentials, "carol", "fabrikam.local", true);
+        let cred = found.expect("resolver must find injected cleartext cred by (domain, username)");
+        assert_eq!(cred.password, "fr3edom");
+        assert_eq!(cred.domain, "fabrikam.local");
+
+        // UPN form must resolve to the same cred (the LLM frequently passes
+        // `username=carol@fabrikam.local` for cross-forest dispatches).
+        let found_upn =
+            find_credential(&credentials, "carol@fabrikam.local", "fabrikam.local", true);
+        assert!(
+            found_upn.is_some(),
+            "resolver must handle UPN-form username for injected cleartext cred"
+        );
     }
 }

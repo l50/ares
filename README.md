@@ -19,9 +19,11 @@ LLM-coordinated autonomous security operations platform with two modes:
 
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
+- [EC2 workflow (kali-ares)](#ec2-workflow-kali-ares)
 - [CLI Reference](#cli-reference)
 - [Red Team Operations](#red-team-operations)
 - [Blue Team Investigations](#blue-team-investigations)
+- [Benchmark Replay](#benchmark-replay)
 - [Infrastructure](#infrastructure)
 - [Development](#development)
 - [Configuration](#configuration)
@@ -125,6 +127,72 @@ cp .env.example .env
 
 # Verify configuration
 task ares:config:check
+```
+
+## EC2 workflow (kali-ares)
+
+The default deployment for ops is EC2 (`kali-ares` in the `lab` account,
+`us-west-1`). Observability lives in the `infrastructure` account's plundr
+cluster; the box reaches it directly, the laptop reaches it via kubectl
+port-forward.
+
+**One-time setup:**
+
+```bash
+# 1. AWS SSO — lab (kali-ares + secret) + infrastructure (plundr EKS)
+aws sso login --profile lab
+aws sso login --profile infrastructure
+
+# 2. Register the plundr EKS context (for obs:forward)
+aws eks update-kubeconfig --profile infrastructure --region us-west-2 \
+  --name dev-argonaut --alias plundr
+
+# 3. Apple Silicon: enable Docker Desktop → Settings → General →
+#    "Use Rosetta for x86_64/amd64 emulation" (task ec2:deploy cross-compiles
+#    amd64 under Rosetta; QEMU segfaults rustc)
+
+# 4. Populate .env from AWS Secrets Manager
+./scripts/env-from-secrets.sh
+```
+
+**Common gotchas:**
+
+- Tailscale MagicDNS (100.100.100.100) will eat EKS API endpoint lookups if
+  the node isn't approved by the tailnet admin. Sign in to Tailscale or add
+  a `/etc/hosts` override for the EKS API endpoint.
+- `task ec2:deploy` must use an S3 bucket in the **same account** as
+  `kali-ares` (currently the lab account). Pass `S3_BUCKET=ares-benchmark-us-west-1`
+  when deploying, or set it in `.env`.
+
+**Run an op:**
+
+```bash
+task run                              # fire-and-forget (blue enabled by default)
+task run WAIT=true                    # wait for op completion, auto-fetch red report
+task run WAIT=true CAPTURE=true       # wait + capture Loki snapshot to S3 (waits
+                                      #   for Loki flush, ~5 min after op end);
+                                      #   prints the exact benchmark:replay command
+```
+
+**Evaluate blue via replay:**
+
+```bash
+# Provisions a fresh replay stack, imports the captured Loki timeline,
+# runs a blue investigation against it, scores, tears down. Deterministic —
+# rerun anytime without re-running red.
+task benchmark:replay OP_ID=op-YYYYMMDD-HHMMSS
+```
+
+Reports land in `./reports/blue/investigations/inv-*.md` with IOC-detection
+score, MITRE technique coverage, and grade.
+
+**Blue tooling on the laptop (optional):**
+
+```bash
+# Port-forward plundr Loki+Grafana to localhost so ares blue commands
+# work from the laptop.
+task obs:forward     # keep running in a separate terminal
+task obs:status      # health check the tunnels
 ```
 
 ## CLI Reference
@@ -342,6 +410,70 @@ task blue:reports:consolidate LATEST=true
 
 See [Blue Team Documentation](docs/blue.md) for full command reference.
 
+## Benchmark Replay
+
+Snapshot a completed red op's observability state and re-run the blue team
+against it, so iterative blue-side changes are comparable across runs. The
+workflow splits by concern:
+
+- `ares benchmark capture` — dumps Loki, Prometheus (as TSDB blocks), Grafana
+  dashboards, and fired alerts to S3. `--wait-for-flush` blocks until Loki's
+  ingester lands the attack window (otherwise the snapshot silently misses it).
+- `task benchmark:replay:provision` / `:teardown` — EC2 lifecycle for the
+  replay-stack box (all AWS-CLI orchestration in Taskfile, not Rust).
+- `ares benchmark run --stack-ip <ip>` — submits the investigation, polls
+  Redis, computes the score. `--seed` / `--temperature` / `--replicates` cut
+  LLM sampling noise so a real score change is distinguishable from variance.
+- `task benchmark:replay:run STACK_IP=<ip> OP_ID=<op>` — runs one investigation
+  against an already-provisioned stack, no teardown. Reuses the stack across
+  many runs.
+- `task benchmark:replay OP_ID=<op>` — end-to-end wrapper: provision → run →
+  teardown (deferred via shell `trap`, fires on failure too).
+- `task benchmark:replay:loop OP_ID=<op> ITERATIONS=<n>` — provision once,
+  iterate N times, teardown. Optional `HOOK=<cmd>` runs between iterations
+  with `STACK_IP` / `OP_ID` / `ITERATION` exported — for a tuning driver
+  (e.g. Vibe Gepa) to rewrite prompts in place without reprovisioning.
+- `task benchmark:generalize` — sweeps the held-out attack set from
+  `benchmarks/holdout.yaml` and reports per-op + aggregate score. The
+  held-out corpus is off-limits to any tuning process; it's the only
+  measure of generalization.
+
+```bash
+# Capture from a completed op
+ares benchmark capture op-20260706-123045 --wait-for-flush
+
+# List captured snapshots
+ares benchmark list
+
+# End-to-end replay
+task benchmark:replay OP_ID=op-20260706-123045
+
+# Or split provision/run/teardown when iterating against one stack
+eval "$(task benchmark:replay:provision OP_ID=op-20260706-123045 | grep -E '^(STACK_IP|INSTANCE_ID)=')"
+task benchmark:replay:run STACK_IP="$STACK_IP" OP_ID=op-20260706-123045
+task benchmark:replay:teardown INSTANCE_ID="$INSTANCE_ID"
+
+# Tuning loop: 8 iterations against a warm stack, prompt update between each
+task benchmark:replay:loop OP_ID=op-20260706-123045 ITERATIONS=8 \
+  HOOK='python -m vibe_gepa.update --op-id "$OP_ID" --iter "$ITERATION"'
+
+# K-of-N averaging: 5 replicates against a warm stack, seeded for determinism
+# Mean/stddev/min/max land in <output-dir>/<session>-summary.json
+task benchmark:replay:run STACK_IP="$STACK_IP" OP_ID=op-20260706-123045 \
+  REPLICATES=5 SEED=42 OUTPUT_DIR=./reports
+
+# Generalization sweep against the held-out set
+task benchmark:generalize FAIL_UNDER=0.6
+```
+
+Provisioning prefers a pre-baked `ares-replay-stack` AMI
+(`warpgate build ares-replay-stack --only 'ami.*'`); it falls back to stock
+AL2023 if none is published (set `BENCHMARK_REQUIRE_BAKED_AMI=1` to fail
+instead).
+
+See [Benchmark Replay Operator Guide](docs/benchmark-replay.md) for env-var
+setup, replay modes (`timeline` vs `static`), AMI baking, and troubleshooting.
+
 ## Infrastructure
 
 ### Repository Layout
@@ -438,7 +570,7 @@ task remote:status
 
 Full reset on an EC2 instance: stop workers and any running op, deploy
 fresh binaries, wipe Redis, restart workers, then launch a new operation.
-EC2 equivalent of the K8s `task -y red:multi:sync:align && task -y red:multi`
+EC2 equivalent of the K8s `task -y k8s:reset && task -y k8s:deploy && task -y red:multi`
 shortcut.
 
 `ec2:deploy` requires `S3_BUCKET` (binary staging bucket) — export it or

@@ -69,10 +69,7 @@ impl SharedState {
             }
         }
 
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
         let added = reader.add_user(&mut conn, &user).await?;
@@ -127,12 +124,28 @@ impl SharedState {
             // forest where DCSync via the trust key won't work — AS-REP roast
             // of a vulnerable account is the only no-cred-needed entry point.
             if !user_domain.is_empty() {
-                let mut state = self.inner.write().await;
-                state.unmark_processed(super::super::DEDUP_ASREP_DOMAINS, &user_domain);
-                drop(state);
-                let _ = self
-                    .unpersist_dedup(queue, super::super::DEDUP_ASREP_DOMAINS, &user_domain)
-                    .await;
+                // The roast dedups on `{domain}:empty` / `{domain}:users`
+                // (see `asrep_dedup_key`), NOT the bare domain — clearing the
+                // bare domain here was a silent no-op, so a roastable account
+                // discovered AFTER the first userlist roast (e.g. a foreign-
+                // forest account found late via cross-forest LDAP) never
+                // triggered a re-roast and its AS-REP hash was never captured.
+                // Clear both suffixed variants so the next tick re-dispatches
+                // with the now-larger userlist.
+                let keys = crate::orchestrator::automation::credential_access::asrep_dedup_keys(
+                    &user_domain,
+                );
+                {
+                    let mut state = self.inner.write().await;
+                    for key in &keys {
+                        state.unmark_processed(super::super::DEDUP_ASREP_DOMAINS, key);
+                    }
+                }
+                for key in &keys {
+                    let _ = self
+                        .unpersist_dedup(queue, super::super::DEDUP_ASREP_DOMAINS, key)
+                        .await;
+                }
             }
         }
         Ok(added)
@@ -182,10 +195,7 @@ impl SharedState {
             }
         }
 
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
         let added = reader.add_vulnerability(&mut conn, &vuln).await?;
@@ -233,10 +243,7 @@ impl SharedState {
             }
         }
 
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id);
         let mut conn = queue.connection();
         let added = reader.add_share(&mut conn, &share).await?;
@@ -254,10 +261,7 @@ impl SharedState {
         event: &serde_json::Value,
         mitre_techniques: &[String],
     ) -> Result<()> {
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
 
@@ -287,10 +291,7 @@ impl SharedState {
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
         task: ares_core::models::TaskInfo,
     ) -> Result<()> {
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let task_id = task.task_id.clone();
         let json = serde_json::to_string(&task).unwrap_or_default();
 
@@ -320,10 +321,7 @@ impl SharedState {
         task_id: &str,
         result: ares_core::models::TaskResult,
     ) -> Result<()> {
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let result_json = serde_json::to_string(&result).unwrap_or_default();
 
         let pending_key = format!(
@@ -363,10 +361,7 @@ impl SharedState {
         netbios: &str,
         fqdn: &str,
     ) -> Result<()> {
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let key = format!(
             "{}:{}:{}",
             state::KEY_PREFIX,
@@ -399,10 +394,7 @@ impl SharedState {
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
         trust: ares_core::models::TrustInfo,
     ) -> Result<bool> {
-        let operation_id = {
-            let state = self.inner.read().await;
-            state.operation_id.clone()
-        };
+        let operation_id = self.operation_id().await;
         let reader = RedisStateReader::new(operation_id);
         let mut conn = queue.connection();
         let added = reader.add_trusted_domain(&mut conn, &trust).await?;

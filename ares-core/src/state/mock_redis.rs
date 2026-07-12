@@ -215,7 +215,7 @@ fn cmd_del(data: &mut Data, args: &[Vec<u8>]) -> RedisResult<Value> {
 
 fn cmd_exists(data: &Data, args: &[Vec<u8>]) -> RedisResult<Value> {
     let k = key(args, 1);
-    Ok(Value::Int(i64::from(data.contains_key(&k))))
+    Ok(Value::Int(if data.contains_key(&k) { 1 } else { 0 }))
 }
 
 // -- hash commands ----------------------------------------------------------

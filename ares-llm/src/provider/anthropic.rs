@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn serialize_api_request_with_cache() {
         let req = ApiRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             messages: vec![ApiMessage {
                 role: "user".to_string(),
@@ -508,7 +508,7 @@ mod tests {
             temperature: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["model"], "claude-sonnet-4-20250514");
+        assert_eq!(json["model"], "claude-sonnet-4-6");
         assert!(json["system"].is_array());
         assert_eq!(json["system"][0]["text"], "You are a recon agent.");
         assert_eq!(json["system"][0]["cache_control"]["type"], "ephemeral");
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn serialize_api_request_no_cache_no_breakpoints() {
         let req = ApiRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             messages: vec![],
             system: build_system_blocks(Some("hi"), false),
