@@ -4,6 +4,16 @@
 # `become: true` task that calls a bare tool name fails to resolve it. Restore
 # the standard secure_path via a validated drop-in (parsed after the main
 # sudoers file, so it overrides). This must run first, before any tool install.
+#
+# Skipped when sudo isn't installed (slim container images like
+# debian:trixie-slim), where /etc/sudoers.d doesn't exist and visudo isn't on
+# PATH — containers run tools as root and don't need the secure_path fix.
+- name: Check if sudoers.d is present (sudo installed)
+  ansible.builtin.stat:
+    path: /etc/sudoers.d
+  register: base_sudoers_d_stat
+  when: ansible_facts['os_family'] == 'Debian'
+
 - name: Ensure sudo secure_path includes /usr/local
   ansible.builtin.copy:
     dest: /etc/sudoers.d/10-secure-path
@@ -14,7 +24,9 @@
     mode: '0440'
     validate: /usr/sbin/visudo -cf %s
   become: true
-  when: ansible_facts['os_family'] == 'Debian'
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - base_sudoers_d_stat.stat.exists | default(false)
 
 - name: Set DEBIAN_FRONTEND to noninteractive
   ansible.builtin.lineinfile:
