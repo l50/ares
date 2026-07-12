@@ -122,27 +122,15 @@ jobs:
           CHANGED_ROLES: ${{ steps.filter.outputs.roles }}
         run: |
           # Define roles with molecule tests
+          # Attack tooling roles moved to l50.arsenal and are tested upstream;
+          # only local roles remain here.
           ROLES_WITH_MOLECULE=(
-            "acl_tools"
             "base"
-            "coercion_tools"
-            "cracking_tools"
-            "credential_access_tools"
-            "lateral_movement_tools"
-            "mythic"
-            "privesc_tools"
-            "recon_tools"
           )
 
           # Define additional scenarios (role:scenario format)
           # These only run on schedule/workflow_dispatch (too slow for PR CI)
           declare -A ADDITIONAL_SCENARIOS=()
-          if [[ "${EVENT_NAME}" == "schedule" ]] || \
-             [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            ADDITIONAL_SCENARIOS=(
-              ["cracking_tools"]="source-build"
-            )
-          fi
 
           if [[ "${TEST_ALL}" == "true" ]]; then
             # Test all roles that have molecule tests
@@ -224,15 +212,7 @@ jobs:
           INPUT_ROLE: ${{ env.ROLE }}
         run: |
           ROLES_WITH_MOLECULE=(
-            "acl_tools"
             "base"
-            "coercion_tools"
-            "cracking_tools"
-            "credential_access_tools"
-            "lateral_movement_tools"
-            "mythic"
-            "privesc_tools"
-            "recon_tools"
           )
 
           if [[ -n "${INPUT_ROLE}" ]]; then
