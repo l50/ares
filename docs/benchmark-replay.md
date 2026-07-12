@@ -196,6 +196,96 @@ shared tool dispatcher.
 - `static` — all data pre-loaded, agent knows the full attack window upfront.
   Convenient but less realistic.
 
+## Clock model
+
+The blue agent is dropped into an alert **while the attack is still unfolding**,
+exactly as it would be live: it sees the world *up to now*, never its own
+future, and more of the attack (logs *and* alerts) surfaces as it works. Plus a
+`static` mode where the whole (concluded) attack is available up front.
+
+Snapshot data stays pre-loaded in the replay stack. The agent only perceives
+the world through the query tools, so those are clamped to `replay_now` — a
+query for the future returns empty, faithful to a live analyst.
+
+### Clock modes
+
+- **`step`** (default) — deterministic, latency-independent:
+  `replay_now = attack_start + attack_duration * min(step / max_steps, 1)`.
+  A thorough agent can see the whole attack by its last step; a shallow
+  investigation cannot.
+- **`wallclock`** (opt-in, for real-time demos, not scoring):
+  `replay_now = min(attack_start + real_elapsed, attack_end)`.
+- **`static`** — `replay_now = attack_end`; everything up to the end is
+  visible immediately.
+- **live** (no replay env set) — `replay_now = now`, unchanged from prod.
+
+Trigger is the first alert at or after attack start in every mode — no
+`alerts.first()` picking pre-attack noise.
+
+### Env contract (`ares-core/src/replay_clock.rs`)
+
+`replay_now()` resolves each call against these env vars (no cache):
+
+| Env | Meaning |
+|---|---|
+| `ARES_REPLAY_CLOCK_START` | Anchor = trigger alert `fired_at` (attack entry) |
+| `ARES_REPLAY_CLOCK_END`   | `manifest.completed_at` (attack end) |
+| `ARES_REPLAY_CLOCK_MODE`  | `static` \| `step` \| `wallclock` |
+| `ARES_REPLAY_MAX_STEPS`   | Step budget (step mode) |
+
+Set by `ares benchmark run` and forwarded through `BLUE_ENV_VAR_NAMES`
+(`ares-cli/src/ops/submit.rs`). Back-compat: if `START` is set but `END`/`MODE`
+are not, `replay_now = START` (the old frozen-v1 anchor).
+
+### Clamp sites
+
+All go through the blue tools; the agent has no raw datastore access.
+
+- **Loki** (`ares-tools/src/blue/loki.rs`) — the single `query_logs` funnel
+  caps `end = min(parsed_end, replay_now())` when `is_replay()`. Covers
+  `_recent`, `_around`, `_progressive`, and `execute_parallel_queries` since
+  all funnel through here. `get_loki_label_values` end also capped.
+- **Grafana** (`grafana/query.rs`, `rules.rs`) — `get_alerts`,
+  `get_alerts_in_time_range`, `get_grafana_annotations` return only firings
+  with `fired_at ≤ replay_now` (cap `to` at `replay_now`).
+- **Prometheus** (`prometheus.rs`) — `query_instant` defaults/caps `time`
+  at `replay_now`; `query_range` caps `end`.
+- **Prompt** (`ares-llm/src/prompt/blue.rs`) — already uses `replay_now()`.
+
+`ares-llm/src/agent_loop/runner.rs` calls `set_step(step)` at the top of each
+loop iteration; no-op unless `MODE=step`.
+
+### `--trigger-mode operation` is not a valid score
+
+`build_operation_trigger` injects the ground-truth techniques + IOCs the
+scorer grades — an oracle upper bound. The runner emits a loud stderr warning
+and a `⚠ SCORE INVALID` summary whenever `effective_trigger_mode ==
+"operation"`. Default is `alert-replay`; `timeline` forces `alert-replay`.
+
+## SQL persistence — red/blue separation
+
+Blue benchmark activity lands in the **same** `ares_history` as red so "for op
+X, what red did vs what blue caught" is a JOIN and cost/token stats are
+unified — tagged so the two are cleanly separable.
+
+- `team` column (`red` \| `blue`, default `red`) on `llm_messages`,
+  `tool_calls`, `worker_events`, `log_lines`, `otel_spans` (migration
+  `20260707170000_team_flag.sql`). Stamped on every SessionLog record and
+  carried by `scripts/ingest_jsonl.py`.
+- Blue keys: `op_id` = the **replayed** operation (join to red on `op_id`);
+  `task_id` = the run/investigation id (per-run separability — each GEPA
+  run is a distinct row set, no file collisions since blue's task_id is
+  the run id).
+- Decoupled from correlation: `SessionLog` reads `op_id`/`team` from env
+  (`ARES_SESSION_OP_ID`, `ARES_SESSION_TEAM`) via `SessionLogConfig`, *not*
+  `investigation.operation_id` — the latter would trigger the red-state
+  correlation reader and leak red findings into blue. The benchmark sets
+  both env vars and points `ARES_SESSION_LOG_DIR` at
+  `/var/log/ares/session`.
+
+Enables `SELECT team, op_id, SUM(total_tokens), COUNT(*) FROM llm_messages
+GROUP BY 1, 2` — red-fleet-vs-red-fleet and red-vs-blue cost/outcome stats.
+
 ## Generalization sweep
 
 Any tuning process (prompt search, config iteration, Vibe Gepa, RL rollouts)
