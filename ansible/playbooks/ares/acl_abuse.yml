@@ -13,7 +13,7 @@
       vars:
         base_update_cache: "{{ not _container_build }}"
 
-    - role: dreadnode.nimbus_range.acl_tools
+    - role: l50.arsenal.acl_tools
       vars:
         acl_tools_update_cache: "{{ not _container_build }}"
 

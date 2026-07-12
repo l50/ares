@@ -17,19 +17,11 @@ graph TD
     Plugins --> P1[merge_list_dicts_into_list]
     Plugins --> P2[vnc_pw]
     Collection --> Roles[Roles]
-    Roles --> R0[acl_tools *]
-    Roles --> R1[base *]
-    Roles --> R2[coercion_tools *]
-    Roles --> R3[cracking_tools *]
-    Roles --> R4[credential_access_tools *]
-    Roles --> R5[fluent_bit]
-    Roles --> R6[lateral_movement_tools *]
-    Roles --> R7[mythic *]
-    Roles --> R8[nats]
-    Roles --> R9[privesc_tools *]
-    Roles --> R10[recon_tools *]
-    Roles --> R11[redis]
-    Roles --> R12[vector]
+    Roles --> R0[base *]
+    Roles --> R1[fluent_bit]
+    Roles --> R2[nats]
+    Roles --> R3[redis]
+    Roles --> R4[vector]
     Collection --> Playbooks[Playbooks]
     Playbooks --> PB0[ares]
     Playbooks --> PB1[linux]
@@ -50,9 +42,17 @@ ansible-galaxy collection install git+https://github.com/dreadnode/ansible-colle
 
 ## Roles
 
-Cloud and host-monitoring roles (`aws_ssm_agent`, `aws_cloudwatch_agent`,
-`sysmon`, `alloy`) are sourced from the [`l50.bulwark`](https://github.com/l50/ansible-collection-bulwark)
-collection — see [`requirements.yml`](requirements.yml).
+External-collection roles referenced by these playbooks:
+
+- Attack tooling (`acl_tools`, `coercion_tools`, `cracking_tools`,
+  `credential_access_tools`, `lateral_movement_tools`, `mythic`,
+  `privesc_tools`, `recon_tools`, `sliver`) — sourced from
+  [`l50.arsenal`](https://github.com/l50/ansible-collection-arsenal).
+- Cloud + host monitoring (`aws_ssm_agent`, `aws_cloudwatch_agent`,
+  `sysmon`, `alloy`) — sourced from
+  [`l50.bulwark`](https://github.com/l50/ansible-collection-bulwark).
+
+See [`requirements.yml`](requirements.yml) for the exact collection sources.
 
 ### Fluent Bit Setup
 
@@ -74,54 +74,6 @@ Installs the base dependencies and workspace layout required for **Ares AI agent
 
 - Bootstraps Python toolchains, pip packages, and system utilities.
 - Optionally installs uv, Rust, and pipx for downstream tooling.
-
-### ACL Tools Setup
-
-Installs and configures **Active Directory ACL exploitation tools** for Ares agents.
-
-- Role docs: [`roles/acl_tools/README.md`](roles/acl_tools/README.md)
-
-### Cracking Tools Setup
-
-Installs and configures **password cracking tools** and wordlists for Ares agents.
-
-- Role docs: [`roles/cracking_tools/README.md`](roles/cracking_tools/README.md)
-
-### Lateral Movement Tools Setup
-
-Installs and configures **lateral movement tooling** for Ares agents.
-
-- Role docs: [`roles/lateral_movement_tools/README.md`](roles/lateral_movement_tools/README.md)
-
-### Recon Tools Setup
-
-Installs and configures **reconnaissance tooling** for Ares agents.
-
-- Role docs: [`roles/recon_tools/README.md`](roles/recon_tools/README.md)
-
-### Credential Access Tools Setup
-
-Installs and configures **credential access tooling** for Ares agents.
-
-- Role docs: [`roles/credential_access_tools/README.md`](roles/credential_access_tools/README.md)
-
-### Coercion Tools Setup
-
-Installs and configures **coercion and relay attack tooling** for Ares agents.
-
-- Role docs: [`roles/coercion_tools/README.md`](roles/coercion_tools/README.md)
-
-### Privilege Escalation Tools Setup
-
-Installs and configures **privilege escalation tooling** for Ares agents.
-
-- Role docs: [`roles/privesc_tools/README.md`](roles/privesc_tools/README.md)
-
-### Mythic Setup
-
-Installs and configures the **Mythic C2 framework** and optional agent packages.
-
-- Role docs: [`roles/mythic/README.md`](roles/mythic/README.md)
 
 ## Usage
 

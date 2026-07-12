@@ -13,7 +13,7 @@
       vars:
         base_update_cache: "{{ not _container_build }}"
 
-    - role: dreadnode.nimbus_range.coercion_tools
+    - role: l50.arsenal.coercion_tools
       vars:
         coercion_tools_update_cache: "{{ not _container_build }}"
 

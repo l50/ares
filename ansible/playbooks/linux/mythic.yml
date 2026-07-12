@@ -56,5 +56,5 @@
             }
           }
 
-    # Nimbus Range role for mythic c2 configuration
-    - role: dreadnode.nimbus_range.mythic
+    # Arsenal role for mythic c2 configuration
+    - role: l50.arsenal.mythic
