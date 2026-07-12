@@ -168,18 +168,9 @@ impl Dispatcher {
                 Ok(SubmissionOutcome::Deferred)
             }
             Ok(false) => {
-                // Dropped here means dropped — this code path does NOT auto-retry.
-                // The originating automation may try again on its next tick, but
-                // if every same-priority task in the queue is also a duplicate of
-                // a long-running in-flight task, the cycle repeats. Bumping
-                // ARES_MAX_DEFERRED_PER_TYPE / ARES_MAX_DEFERRED_TOTAL absorbs
-                // bursty cross-fire from multiple automations targeting the
-                // same credential.
                 warn!(
                     task_type,
-                    target_role,
-                    "Deferred queue full; task dropped. Raise ARES_MAX_DEFERRED_PER_TYPE \
-                     / ARES_MAX_DEFERRED_TOTAL if this persists."
+                    target_role, "Deferred queue full, task dropped (will retry next tick)"
                 );
                 Ok(SubmissionOutcome::Dropped)
             }
@@ -323,21 +314,14 @@ impl Dispatcher {
                 task_type: task_type.to_string(),
                 role: target_role.to_string(),
                 submitted_at: std::time::Instant::now(),
-                last_activity: std::time::Instant::now(),
                 credential_key: cred_key.clone(),
             })
             .await;
 
         self.throttler.record_dispatch().await;
 
-        // Set initial task status with full metadata. We log on failure but
-        // don't abort the dispatch — the task is already in flight via the
-        // tracker. A silent swallow here was the root of `ares ops tasks`
-        // returning empty: if this write fails, the *only* record of the
-        // task that includes `operation_id` never lands, and later writes
-        // via `set_task_status` (which only knows the task_id) produce
-        // records without `operation_id` that the reader filters out.
-        if let Err(e) = self
+        // Set initial task status with full metadata
+        let _ = self
             .queue
             .set_task_status_full(
                 &task_id,
@@ -347,16 +331,7 @@ impl Dispatcher {
                 task_type,
                 Some(&payload),
             )
-            .await
-        {
-            warn!(
-                task_id = %task_id,
-                task_type,
-                role = target_role,
-                err = %e,
-                "Failed to write initial task status — task will be invisible to `ares ops tasks`"
-            );
-        }
+            .await;
 
         // Persist pending task to Redis HASH for recovery
         let now = Utc::now();
@@ -620,25 +595,12 @@ impl Dispatcher {
             // mirrors the slot to the tracker entry's lifetime, so a hung
             // future doesn't pin the slot indefinitely.
 
-            // In-process delivery first: drop the result straight into the
-            // demux cache so the next `consume_cycle` finds it immediately,
-            // independent of NATS. The publish round-trip below was the sole
-            // delivery path before, and any hang in `jetstream().publish()`
-            // or its ack — or a stalled demux drain — silently parked the
-            // task in the tracker until the 15-min stale evictor reaped it,
-            // by which point every follow-up (S4U chain, lateral-denied
-            // cache, vuln mark_exploited) had been quietly skipped.
-            queue.cache_result(&tid, result.clone()).await;
-
-            // Still publish to NATS so worker-style consumers (callbacks,
-            // any external observer subscribed to `task_result.*`) and the
-            // Redis status update inside send_result both happen. A failure
-            // here is now non-fatal — the in-process cache already has it.
+            // Push result to the normal result queue so the result consumer picks it up
             if let Err(e) = queue.send_result(&tid, &result).await {
                 warn!(
                     task_id = %tid,
                     err = %e,
-                    "Failed to publish LLM task result to NATS (in-process cache already populated; continuing)"
+                    "Failed to push LLM task result to Redis"
                 );
             }
         });
@@ -667,6 +629,10 @@ pub(crate) fn task_params_from_payload(
         "hash_value",
         "just_dc_user",
         "credential",
+        // Persisted so the attack-path diversity recorder can reconstruct the
+        // canonical (foothold, technique, target) step on exploit success.
+        "vuln_type",
+        "target",
     ] {
         if let Some(val) = payload.get(*key) {
             task_params.insert(key.to_string(), val.clone());

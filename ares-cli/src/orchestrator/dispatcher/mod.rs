@@ -96,7 +96,7 @@ pub fn credential_key_from_payload(payload: &serde_json::Value) -> Option<String
     let cred = payload.get("credential")?;
     let username = cred.get("username").and_then(|v| v.as_str())?;
     let domain = cred.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-    Some(format!("{username}@{domain}"))
+    Some(format!("{}@{}", username, domain))
 }
 
 /// Central dispatcher for submitting tasks with throttling and routing.
@@ -118,17 +118,18 @@ pub struct Dispatcher {
     pub llm_runner: Arc<LlmTaskRunner>,
     /// Per-credential concurrency limiter.
     pub credential_inflight: CredentialInflight,
-    /// Host-wide serializer for ESC8/ESC11 relay-coerce chains.
-    ///
-    /// `relay_and_coerce` and the `ntlmrelayx_to_*` standalone tools all
-    /// bind port 445 on the attacker. Without serialization, two ADCS vulns
-    /// (different CAs in the same op) race the port: one wins, the other
-    /// bails with `RELAY_BIND_BUSY` and is reaped without contributing.
-    /// This semaphore (permits = 1) serializes the *spawn*, so the second
-    /// chain queues behind the first instead of crashing the dispatcher's
-    /// bind-busy retry budget. Held only across the relay+coerce phase —
-    /// the certipy_auth and DCSync follow-ups run unsynchronized.
-    pub relay_chain_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Single-slot mutex shared by every dispatcher that submits a
+    /// coercion-or-relay-bearing task. ntlmrelayx binds the loopback
+    /// port-445 mutex on the listener host, so concurrent dispatches
+    /// from `auto_ntlm_relay`, `auto_coercion`, and the ESC8 chain in
+    /// `auto_adcs_exploitation` race the same OS lock and surface as
+    /// `RELAY_BIND_BUSY` aborts. Holding this mutex around the dispatch
+    /// serializes the dispatches at the
+    /// orchestrator layer; the per-dispatch `RELAY_BIND_BUSY` handling
+    /// in `adcs_exploitation.rs:1380-1394, 1429-1435` remains as a
+    /// fallback for the rare race the mutex didn't prevent (a still-
+    /// running ntlmrelayx from a prior dispatch).
+    pub relay_slot: Arc<Mutex<()>>,
 }
 
 impl Dispatcher {
@@ -166,7 +167,7 @@ impl Dispatcher {
             llm_runner,
             // Allow up to 3 concurrent tasks per credential
             credential_inflight: CredentialInflight::new(3),
-            relay_chain_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            relay_slot: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -355,12 +356,12 @@ mod tests {
     async fn inflight_many_independent_keys() {
         let ci = CredentialInflight::new(1);
         for i in 0..100 {
-            let key = format!("user{i}@domain");
+            let key = format!("user{}@domain", i);
             assert!(ci.try_acquire(&key).await);
         }
         // All at limit
         for i in 0..100 {
-            let key = format!("user{i}@domain");
+            let key = format!("user{}@domain", i);
             assert!(!ci.try_acquire(&key).await);
         }
     }

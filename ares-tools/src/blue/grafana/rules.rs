@@ -210,10 +210,10 @@ pub async fn get_alerts_in_time_range(args: &Value) -> Result<ToolOutput> {
     // Parse timestamps
     let from_dt = chrono::DateTime::parse_from_rfc3339(from_time)
         .or_else(|_| chrono::DateTime::parse_from_str(from_time, "%Y-%m-%dT%H:%M:%S%.fZ"))
-        .unwrap_or_else(|_| chrono::Utc::now().into());
+        .unwrap_or_else(|_| crate::blue::replay_clock::replay_now().into());
     let to_dt = chrono::DateTime::parse_from_rfc3339(to_time)
         .or_else(|_| chrono::DateTime::parse_from_str(to_time, "%Y-%m-%dT%H:%M:%S%.fZ"))
-        .unwrap_or_else(|_| chrono::Utc::now().into());
+        .unwrap_or_else(|_| crate::blue::replay_clock::replay_now().into());
 
     // Apply buffer
     let from_buffered = from_dt - chrono::Duration::minutes(buffer_minutes);
@@ -225,13 +225,20 @@ pub async fn get_alerts_in_time_range(args: &Value) -> Result<ToolOutput> {
     let client = build_client()?;
     let url = format!("{}/api/annotations", grafana_url());
 
+    let mut query = vec![
+        ("from", from_ms.to_string()),
+        ("to", to_ms.to_string()),
+        ("limit", "5000".to_string()),
+    ];
+    // Live: alert-rule annotations are type=alert. Replay: seeded firings are
+    // plain org annotations (type=annotation), so don't filter by type — the
+    // loop tag-matches `ares-replay-firing` instead.
+    if !crate::blue::replay_clock::is_replay() {
+        query.push(("type", "alert".to_string()));
+    }
     let resp = client
         .get(&url)
-        .query(&[
-            ("from", from_ms.to_string()),
-            ("to", to_ms.to_string()),
-            ("type", "alert".to_string()),
-        ])
+        .query(&query)
         .send()
         .await
         .context("Failed to query Grafana annotations")?;
@@ -249,34 +256,71 @@ pub async fn get_alerts_in_time_range(args: &Value) -> Result<ToolOutput> {
     let mut seen_fingerprints = std::collections::HashSet::new();
     let mut alerts = Vec::new();
 
+    // In replay, seeded firings are plain annotations (POST /api/annotations
+    // can't set alertId), so alertId is 0 — don't skip them then.
+    let replay = crate::blue::replay_clock::is_replay();
+
     for ann in &annotations {
         let alert_id = ann.get("alertId").and_then(|v| v.as_i64()).unwrap_or(0);
-        if alert_id == 0 {
-            continue; // skip non-alert annotations
+        if replay {
+            // Only seeded firings (tagged at seed time) — not other annotations
+            // such as investigation-lifecycle markers.
+            let is_firing = ann
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|tags| {
+                    tags.iter()
+                        .any(|t| t.as_str() == Some("ares-replay-firing"))
+                })
+                .unwrap_or(false);
+            if !is_firing {
+                continue;
+            }
+        } else if alert_id == 0 {
+            continue; // skip non-alert annotations (live only)
         }
         let panel_id = ann.get("panelId").and_then(|v| v.as_i64()).unwrap_or(0);
-        let fingerprint = format!("ann-{alert_id}-{panel_id}");
+        // alertId=0 seeded firings would all collapse to "ann-0-0"; key the dedup
+        // on the annotation's own id in that case.
+        let fingerprint = if alert_id != 0 {
+            format!("ann-{alert_id}-{panel_id}")
+        } else {
+            let ann_id = ann.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            format!("ann-id-{ann_id}")
+        };
 
         if !seen_fingerprints.insert(fingerprint.clone()) {
             continue; // deduplicate
         }
 
-        // Extract labels from tags
+        // Extract labels. Seeded replay firings carry their original labels in
+        // `data`; live alert annotations encode them in tags.
         let mut labels = serde_json::Map::new();
-        if let Some(tags) = ann.get("tags").and_then(|v| v.as_array()) {
-            for tag in tags {
-                if let Some(s) = tag.as_str() {
-                    if let Some((k, v)) = s.split_once(':').or_else(|| s.split_once('=')) {
-                        labels.insert(k.to_string(), Value::String(v.to_string()));
-                    } else {
-                        labels.insert("alertname".to_string(), Value::String(s.to_string()));
+        if replay {
+            if let Some(dl) = ann.pointer("/data/labels").and_then(|v| v.as_object()) {
+                labels = dl.clone();
+            }
+            if !labels.contains_key("alertname") {
+                if let Some(t) = ann.get("text").and_then(|v| v.as_str()) {
+                    labels.insert("alertname".to_string(), Value::String(t.to_string()));
+                }
+            }
+        } else {
+            if let Some(tags) = ann.get("tags").and_then(|v| v.as_array()) {
+                for tag in tags {
+                    if let Some(s) = tag.as_str() {
+                        if let Some((k, v)) = s.split_once(':').or_else(|| s.split_once('=')) {
+                            labels.insert(k.to_string(), Value::String(v.to_string()));
+                        } else {
+                            labels.insert("alertname".to_string(), Value::String(s.to_string()));
+                        }
                     }
                 }
             }
-        }
-        if !labels.contains_key("alertname") {
-            if let Some(name) = ann.get("alertName").and_then(|v| v.as_str()) {
-                labels.insert("alertname".to_string(), Value::String(name.to_string()));
+            if !labels.contains_key("alertname") {
+                if let Some(name) = ann.get("alertName").and_then(|v| v.as_str()) {
+                    labels.insert("alertname".to_string(), Value::String(name.to_string()));
+                }
             }
         }
 

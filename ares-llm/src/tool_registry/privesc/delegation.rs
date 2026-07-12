@@ -72,6 +72,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "NTLM hash for authentication (alternative to password)"
                     },
+                    "aes_key": {
+                        "type": "string",
+                        "description": "AES256 key (hex, 64 chars) of the delegating account. Pass it so getST requests AES-etype tickets — REQUIRED when the account or DC has RC4 disabled, otherwise the S4U TGS is rejected with KDC_ERR_ETYPE_NOSUPP. Resolved from operation state alongside the NT hash; look for the ':aes256-cts-hmac-sha1-96:' line in secretsdump output."
+                    },
                     "dc_ip": {
                         "type": "string",
                         "description": "Domain controller IP address"

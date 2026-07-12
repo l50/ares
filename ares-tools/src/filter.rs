@@ -49,6 +49,21 @@ static SECTION_HEADER_RE: LazyLock<Regex> =
 
 static EXCESS_BLANKS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{4,}").unwrap());
 
+// ── Regex: netexec's SMB banner "Null Auth:True" marker ─────────────────────
+//
+// netexec emits this on every SMB scan whose negotiate step accepted an
+// anonymous null session. The LLM has been repeatedly interpreting the
+// banner as "I can walk SYSVOL/NETLOGON anonymously" and filing dozens of
+// bogus `report_finding` calls. On stock GOAD lab config, `Null Auth:True`
+// on a DC grants only anonymous SAMR/LSA RPC (`rpcclient enumdomusers`);
+// SYSVOL/NETLOGON reads and `--shares` return `STATUS_ACCESS_DENIED`. On
+// member servers the openshares role produces real anonymous shares, but
+// the LLM must still verify via `--shares`. So annotate universally.
+static NULL_AUTH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Null Auth:True").unwrap());
+
+/// Annotation appended inline wherever the banner appears.
+const NULL_AUTH_ANNOTATION: &str = "Null Auth:True [cosmetic banner: SMB negotiated anonymously; does NOT grant share/SYSVOL/NETLOGON/LDAP/RID enum on modern DCs. Confirm exploitability via `rpcclient -U \"\" -N <target> enumdomusers` or `netexec smb <target> -u \"\" -p \"\" --shares` before filing a finding.]";
+
 /// Returns `true` if the line looks like MOTD / banner garbage.
 fn is_motd_line(line: &str) -> bool {
     let trimmed = line.trim();
@@ -122,6 +137,12 @@ pub fn filter_output(raw: &str) -> String {
     let mut result = result_lines.join("\n");
 
     result = EXCESS_BLANKS_RE.replace_all(&result, "\n\n\n").to_string();
+
+    // Inline-annotate netexec's misleading `Null Auth:True` banner so the LLM
+    // stops filing anonymous-SYSVOL findings from a cosmetic negotiation flag.
+    result = NULL_AUTH_RE
+        .replace_all(&result, NULL_AUTH_ANNOTATION)
+        .to_string();
 
     result.trim().to_string()
 }
@@ -220,5 +241,42 @@ Nmap done: 1 IP address (1 host up)";
         let input = "Learn how to install supplementary tools at kali.org/docs\nreal data";
         let out = filter_output(input);
         assert_eq!(out, "real data");
+    }
+
+    #[test]
+    fn annotates_null_auth_banner_inline() {
+        // The exact netexec SMB banner shape the LLM keeps mis-interpreting.
+        let input = "SMB   192.168.58.10   445   DC01   [*] Windows 10 / Server 2019 Build 17763 x64 (name:DC01) (domain:contoso.local) (signing:True) (SMBv1:None) (Null Auth:True)";
+        let out = filter_output(input);
+        assert!(out.contains("cosmetic banner"), "annotation missing: {out}");
+        assert!(
+            out.contains("Null Auth:True"),
+            "must preserve original banner text: {out}"
+        );
+        assert!(
+            out.contains("rpcclient"),
+            "annotation must nudge toward verification: {out}"
+        );
+    }
+
+    #[test]
+    fn annotates_all_occurrences_when_banner_repeats() {
+        // A multi-host netexec sweep emits the banner per target — every
+        // occurrence must get the annotation, not just the first.
+        let input = "\
+SMB 192.168.58.10 445 DC01 (Null Auth:True)
+SMB 192.168.58.20 445 DC02 (Null Auth:True)";
+        let out = filter_output(input);
+        let count = out.matches("cosmetic banner").count();
+        assert_eq!(count, 2, "expected 2 annotations, got {count}: {out}");
+    }
+
+    #[test]
+    fn does_not_annotate_null_auth_false() {
+        // Only True banners are the hallucination trigger. False means the
+        // negotiation was rejected — no annotation, no rewrite.
+        let input = "SMB 192.168.58.10 445 DC01 (Null Auth:False)";
+        let out = filter_output(input);
+        assert_eq!(out, input);
     }
 }

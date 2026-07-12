@@ -3,7 +3,7 @@ use std::path::PathBuf;
 /// Configuration for an agent loop execution.
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
-    /// LLM model identifier (e.g. "claude-sonnet-4-20250514").
+    /// LLM model identifier (e.g. "claude-sonnet-4-6").
     pub model: String,
     /// Maximum number of LLM steps before forcefully ending.
     pub max_steps: u32,
@@ -11,6 +11,9 @@ pub struct AgentLoopConfig {
     pub max_tokens: u32,
     /// Optional temperature override.
     pub temperature: Option<f32>,
+    /// Optional sampling seed. Threaded into `LlmRequest.seed`; providers
+    /// that don't support seeded sampling silently drop it.
+    pub seed: Option<u64>,
     /// Retry configuration for transient LLM errors (rate limits, network).
     pub retry: RetryConfig,
     /// Context window management configuration.
@@ -28,43 +31,22 @@ pub struct AgentLoopConfig {
     /// Whether to attach Anthropic prompt-cache breakpoints to the stable
     /// prefix (system + tool definitions). No-op for non-Anthropic providers.
     pub enable_prompt_cache: bool,
-    /// No-progress circuit breaker: number of consecutive tool-dispatching
-    /// steps that yield neither a new parser discovery nor a novel tool-call
-    /// signature before the loop exits early (reusing `LoopEndReason::MaxSteps`
-    /// so downstream stall-salvage credits any evidence already gathered).
-    /// This reclaims the wall-clock time and credential inflight-slots that an
-    /// agent would otherwise burn spinning the same handful of calls up to
-    /// `max_steps`. `0` disables the breaker (pure `max_steps` behavior).
-    pub no_progress_limit: u32,
-    /// Discovery-anchored stall breaker: consecutive tool-dispatching steps
-    /// that yield no *new parser discovery* before the loop exits early
-    /// (reusing `LoopEndReason::MaxSteps`). Unlike `no_progress_limit`, this
-    /// counter resets ONLY on a real discovery — never on a merely novel
-    /// tool-call signature. It catches the grind the novelty escape hatch lets
-    /// through: an agent that keeps issuing distinct-but-fruitless calls
-    /// (varying target/user/realm/flags every step) produces a "novel"
-    /// signature each iteration, so `no_progress_limit` never trips and the
-    /// agent runs all the way to `max_steps`. Set higher than
-    /// `no_progress_limit` because legitimate early exploration can take many
-    /// steps before the first discovery lands. `0` disables it.
-    pub no_discovery_limit: u32,
 }
 
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_steps: 75,
             max_tokens: 4096,
             temperature: None,
+            seed: None,
             retry: RetryConfig::default(),
             context: ContextConfig::default(),
             budget: BudgetConfig::default(),
             session_log: SessionLogConfig::default(),
             max_tool_calls_per_name: 10,
             enable_prompt_cache: true,
-            no_progress_limit: 15,
-            no_discovery_limit: 25,
         }
     }
 }
@@ -78,8 +60,8 @@ impl AgentLoopConfig {
     /// - `ARES_AGENT_MAX_TOKENS`
     /// - `ARES_AGENT_MAX_TOOL_CALLS_PER_NAME`
     /// - `ARES_AGENT_ENABLE_PROMPT_CACHE` (`true`/`false`/`1`/`0`)
-    /// - `ARES_AGENT_NO_PROGRESS_LIMIT` (`0` disables the no-progress breaker)
-    /// - `ARES_AGENT_NO_DISCOVERY_LIMIT` (`0` disables the discovery breaker)
+    /// - `ARES_LLM_SEED` — sampling seed passed to providers that honour it
+    ///   (OpenAI). Undefined → no seed (provider default).
     /// - everything from `ContextConfig::from_env`, `BudgetConfig::from_env`,
     ///   `SessionLogConfig::from_env`
     pub fn from_env(model: String, temperature: Option<f32>) -> Self {
@@ -87,6 +69,7 @@ impl AgentLoopConfig {
         Self {
             model,
             temperature,
+            seed: parse_env_u64_opt("ARES_LLM_SEED"),
             max_steps: parse_env_u32("ARES_AGENT_MAX_STEPS", defaults.max_steps),
             max_tokens: parse_env_u32("ARES_AGENT_MAX_TOKENS", defaults.max_tokens),
             max_tool_calls_per_name: parse_env_u32(
@@ -96,14 +79,6 @@ impl AgentLoopConfig {
             enable_prompt_cache: parse_env_bool(
                 "ARES_AGENT_ENABLE_PROMPT_CACHE",
                 defaults.enable_prompt_cache,
-            ),
-            no_progress_limit: parse_env_u32(
-                "ARES_AGENT_NO_PROGRESS_LIMIT",
-                defaults.no_progress_limit,
-            ),
-            no_discovery_limit: parse_env_u32(
-                "ARES_AGENT_NO_DISCOVERY_LIMIT",
-                defaults.no_discovery_limit,
             ),
             retry: defaults.retry,
             context: ContextConfig::from_env(),
@@ -244,10 +219,28 @@ impl BudgetConfig {
 /// tool result, terminal outcome) is appended as a JSON line under
 /// `dir/{op_id}/{task_id}.jsonl`. The log is the primary source of truth
 /// for crash recovery / `--resume` and post-hoc debugging.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SessionLogConfig {
     /// Root directory for session logs. `None` disables logging.
     pub dir: Option<PathBuf>,
+    /// Team owning this session (`red` | `blue`). Stamped on every record so red
+    /// and blue activity are separable in the analytical DB.
+    pub team: String,
+    /// Overrides the op_id used for the log path + records (env
+    /// `ARES_SESSION_OP_ID`). Lets the blue benchmark file its transcript under
+    /// the replayed operation id without reusing `investigation.operation_id`
+    /// (which would trigger red-state correlation).
+    pub op_id: Option<String>,
+}
+
+impl Default for SessionLogConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            team: "red".to_string(),
+            op_id: None,
+        }
+    }
 }
 
 impl SessionLogConfig {
@@ -257,11 +250,28 @@ impl SessionLogConfig {
     ///
     /// When enabled with no explicit dir, defaults to `~/.ares/sessions`.
     pub fn from_env() -> Self {
+        let team = std::env::var("ARES_SESSION_TEAM")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "red".to_string());
+        let op_id = std::env::var("ARES_SESSION_OP_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Self {
+            dir: Self::resolve_dir(),
+            team,
+            op_id,
+        }
+    }
+
+    /// Resolve the session-log root: explicit `ARES_SESSION_LOG_DIR` wins, else
+    /// `~/.ares/sessions` when logging is enabled, else `None` (disabled).
+    fn resolve_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("ARES_SESSION_LOG_DIR") {
             if !dir.trim().is_empty() {
-                return Self {
-                    dir: Some(PathBuf::from(dir)),
-                };
+                return Some(PathBuf::from(dir));
             }
         }
         if parse_env_bool("ARES_SESSION_LOG_ENABLED", true) {
@@ -269,10 +279,10 @@ impl SessionLogConfig {
                 let mut p = PathBuf::from(home);
                 p.push(".ares");
                 p.push("sessions");
-                return Self { dir: Some(p) };
+                return Some(p);
             }
         }
-        Self { dir: None }
+        None
     }
 
     /// Default session-log root used when `ARES_SESSION_LOG_DIR` is unset.
@@ -325,6 +335,15 @@ fn parse_env_u32(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Parse an optional u64 env var, returning `None` if unset or unparsable.
+/// Used for opt-in knobs like sampling seeds where "absent" and "explicit
+/// zero" carry different meanings.
+fn parse_env_u64_opt(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 fn parse_env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -362,13 +381,12 @@ mod tests {
     #[test]
     fn agent_loop_config_defaults() {
         let cfg = AgentLoopConfig::default();
-        assert_eq!(cfg.model, "claude-sonnet-4-20250514");
+        assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.max_steps, 75);
         assert_eq!(cfg.max_tokens, 4096);
         assert!(cfg.temperature.is_none());
         assert_eq!(cfg.max_tool_calls_per_name, 10);
         assert!(cfg.enable_prompt_cache);
-        assert_eq!(cfg.no_progress_limit, 15);
     }
 
     #[test]
@@ -604,7 +622,6 @@ mod tests {
         std::env::set_var("ARES_AGENT_MAX_TOKENS", "8192");
         std::env::set_var("ARES_AGENT_MAX_TOOL_CALLS_PER_NAME", "3");
         std::env::set_var("ARES_AGENT_ENABLE_PROMPT_CACHE", "false");
-        std::env::set_var("ARES_AGENT_NO_PROGRESS_LIMIT", "9");
         let cfg = AgentLoopConfig::from_env("test-model".into(), Some(0.25));
         assert_eq!(cfg.model, "test-model");
         assert_eq!(cfg.temperature, Some(0.25));
@@ -612,8 +629,6 @@ mod tests {
         assert_eq!(cfg.max_tokens, 8192);
         assert_eq!(cfg.max_tool_calls_per_name, 3);
         assert!(!cfg.enable_prompt_cache);
-        assert_eq!(cfg.no_progress_limit, 9);
-        std::env::remove_var("ARES_AGENT_NO_PROGRESS_LIMIT");
         std::env::remove_var("ARES_AGENT_MAX_STEPS");
         std::env::remove_var("ARES_AGENT_MAX_TOKENS");
         std::env::remove_var("ARES_AGENT_MAX_TOOL_CALLS_PER_NAME");

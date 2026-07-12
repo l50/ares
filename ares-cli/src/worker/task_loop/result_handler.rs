@@ -44,7 +44,19 @@ pub async fn process_task(
         warn!(task_id = %task.task_id, "Failed to set task status to running: {e}");
     }
 
-    let agent_result = run_agent_task(&task.task_type, &task.payload, config.task_timeout).await;
+    // Pass `conn` + `operation_id` so run_agent_task's per-tool dispatches
+    // pick up credential_resolver injection (KRB5CCNAME, NTLM hash,
+    // Kerberos-variant tool rename). Pre-fix this path bypassed the
+    // resolver entirely — every cred-injection fix the orchestrator made
+    // only ran via LocalToolDispatcher.
+    let agent_result = run_agent_task(
+        &task.task_type,
+        &task.payload,
+        config.task_timeout,
+        Some(conn.clone()),
+        config.operation_id.as_deref(),
+    )
+    .await;
 
     let usage_for_tracking = agent_result.as_ref().ok().and_then(|ar| ar.usage.clone());
 
@@ -64,9 +76,8 @@ pub async fn process_task(
                     conn,
                     op_id,
                     usage.input_tokens,
+                    usage.cache_read_input_tokens,
                     usage.output_tokens,
-                    0, // worker-side LLM uses Anthropic claude only via blue runner;
-                    // native tool dispatch (this path) has no LLM usage to count.
                     model,
                 )
                 .await
@@ -275,6 +286,7 @@ mod tests {
                 input_tokens: 12,
                 output_tokens: 34,
                 total_tokens: 46,
+                cache_read_input_tokens: 0,
                 model: Some("openai/gpt-4.1-mini".into()),
             }),
             discoveries: None,

@@ -22,15 +22,11 @@ use crate::orchestrator::state::*;
 ///
 /// Pure logic extracted from `auto_domain_user_enum` so it can be unit-tested
 /// without needing a `Dispatcher` or async runtime.
-///
-/// Returns one work item per domain-with-DC that hasn't been processed.
-/// When a usable credential exists, it's attached for authenticated LDAP
-/// enumeration. When no credential exists, the item is still emitted so the
-/// dispatcher can fire a null-session enumeration via netexec. The original
-/// `credentials.is_empty()` early-return was the root cause of the
-/// chicken-and-egg stall: nothing produced creds because every cred-producing
-/// path required a userlist, and the userlist was gated on creds.
 fn collect_user_enum_work(state: &StateInner) -> Vec<UserEnumWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
     let mut items = Vec::new();
 
     for (domain, dc_ip) in &state.all_domains_with_dcs() {
@@ -41,8 +37,7 @@ fn collect_user_enum_work(state: &StateInner) -> Vec<UserEnumWork> {
 
         // Prefer a credential from the target domain.
         // Fall back to any available credential (cross-domain LDAP may work).
-        // None ⇒ null-session path (still dispatched).
-        let cred = state
+        let cred = match state
             .credentials
             .iter()
             .find(|c| {
@@ -55,8 +50,10 @@ fn collect_user_enum_work(state: &StateInner) -> Vec<UserEnumWork> {
                     !c.password.is_empty()
                         && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
-            })
-            .cloned();
+            }) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
 
         items.push(UserEnumWork {
             dedup_key,
@@ -97,99 +94,21 @@ pub async fn auto_domain_user_enum(
         };
 
         for item in work {
-            // Mark dedup BEFORE dispatch so a deferred / errored throttled_submit
-            // can't loop and re-fire on the next tick. Matches the AS-REP
-            // pattern in `auto_credential_access`.
-            dispatcher
-                .state
-                .write()
-                .await
-                .mark_processed(DEDUP_DOMAIN_USER_ENUM, item.dedup_key.clone());
-            let _ = dispatcher
-                .state
-                .persist_dedup(&dispatcher.queue, DEDUP_DOMAIN_USER_ENUM, &item.dedup_key)
-                .await;
-
-            // Path A: deterministic null-session enumerate_users via netexec.
-            // Fires for EVERY tick (regardless of creds) — bypasses the LLM,
-            // which has been observed to skip user enumeration in favour of
-            // dig_query/coercer loops. Discoveries land in state via
-            // push_realtime_discoveries → wakes auto_credential_access for
-            // AS-REP / spray.
-            let det_call = ares_llm::ToolCall {
-                id: format!("user_enum_det_{}", uuid::Uuid::new_v4().simple()),
-                name: "enumerate_users".to_string(),
-                arguments: json!({
-                    "target": item.dc_ip,
-                    "domain": item.domain,
-                    "null_session": true,
-                }),
-            };
-            let det_task_id = format!(
-                "user_enum_det_{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            );
-            info!(
-                task_id = %det_task_id,
-                domain = %item.domain,
-                dc = %item.dc_ip,
-                "Null-session user enumeration dispatched (direct tool, no LLM)"
-            );
-            let dispatcher_bg = dispatcher.clone();
-            let domain_bg = item.domain.clone();
-            tokio::spawn(async move {
-                match dispatcher_bg
-                    .llm_runner
-                    .tool_dispatcher()
-                    .dispatch_tool("recon", &det_task_id, &det_call)
-                    .await
-                {
-                    Ok(result) => {
-                        let user_count = result
-                            .discoveries
-                            .as_ref()
-                            .and_then(|d| d.get("users"))
-                            .and_then(|u| u.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        info!(
-                            task_id = %det_task_id,
-                            domain = %domain_bg,
-                            user_count,
-                            "Deterministic null-session user enum completed"
-                        );
-                        if user_count > 0 {
-                            dispatcher_bg.credential_access_notify.notify_waiters();
-                        }
-                    }
-                    Err(e) => {
-                        warn!(err = %e, domain = %domain_bg, "Deterministic null-session user enum failed");
-                    }
-                }
-            });
-
-            // Path B: LLM-driven authenticated LDAP enumeration when a credential
-            // is available. Adds description-field harvesting, SPN inventory and
-            // userAccountControl flags that the netexec --users path doesn't
-            // produce. Skipped when we have no creds — Path A covers cold start.
-            let Some(cred) = item.credential.clone() else {
-                continue;
-            };
-            let cross_domain = cred.domain.to_lowercase() != item.domain.to_lowercase();
+            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
             let mut payload = json!({
                 "technique": "ldap_user_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
                 "credential": {
-                    "username": cred.username,
-                    "password": cred.password,
-                    "domain": cred.domain,
+                    "username": item.credential.username,
+                    "password": item.credential.password,
+                    "domain": item.credential.domain,
                 },
                 "filters": ["(objectCategory=person)(objectClass=user)"],
                 "attributes": ["sAMAccountName", "description", "memberOf", "userAccountControl", "servicePrincipalName"],
             });
             if cross_domain {
-                payload["bind_domain"] = json!(cred.domain);
+                payload["bind_domain"] = json!(item.credential.domain);
             }
 
             let priority = dispatcher.effective_priority("domain_user_enumeration");
@@ -202,9 +121,18 @@ pub async fn auto_domain_user_enum(
                         task_id = %task_id,
                         domain = %item.domain,
                         dc = %item.dc_ip,
-                        cred_user = %cred.username,
+                        cred_user = %item.credential.username,
                         "Domain user enumeration dispatched"
                     );
+                    dispatcher
+                        .state
+                        .write()
+                        .await
+                        .mark_processed(DEDUP_DOMAIN_USER_ENUM, item.dedup_key.clone());
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_DOMAIN_USER_ENUM, &item.dedup_key)
+                        .await;
                 }
                 Ok(None) => {
                     debug!(domain = %item.domain, "Domain user enumeration deferred");
@@ -221,8 +149,7 @@ struct UserEnumWork {
     dedup_key: String,
     domain: String,
     dc_ip: String,
-    /// None ⇒ no usable credential yet; dispatch null-session enumeration only.
-    credential: Option<ares_core::models::Credential>,
+    credential: ares_core::models::Credential,
 }
 
 #[cfg(test)]
@@ -309,14 +236,11 @@ mod tests {
             dedup_key: "user_enum:contoso.local".into(),
             domain: "contoso.local".into(),
             dc_ip: "192.168.58.10".into(),
-            credential: Some(cred),
+            credential: cred,
         };
         assert_eq!(work.domain, "contoso.local");
         assert_eq!(work.dc_ip, "192.168.58.10");
-        assert_eq!(
-            work.credential.as_ref().map(|c| c.username.as_str()),
-            Some("admin")
-        );
+        assert_eq!(work.credential.username, "admin");
     }
 
     #[test]
@@ -331,7 +255,7 @@ mod tests {
         let cred = ares_core::models::Credential {
             id: "c1".into(),
             username: "admin".into(),
-            password: String::new(),
+            password: "".into(),
             domain: "contoso.local".into(),
             source: "test".into(),
             is_admin: false,
@@ -392,17 +316,13 @@ mod tests {
     }
 
     #[test]
-    fn collect_no_credentials_emits_null_session_work() {
+    fn collect_no_credentials_no_work() {
         let mut state = StateInner::new("test-op".into());
         state
             .domain_controllers
             .insert("contoso.local".into(), "192.168.58.10".into());
         let work = collect_user_enum_work(&state);
-        // Cold start: no creds, but still emit work so null-session
-        // enumeration can happen and break the chicken-and-egg stall.
-        assert_eq!(work.len(), 1);
-        assert!(work[0].credential.is_none());
-        assert_eq!(work[0].domain, "contoso.local");
+        assert!(work.is_empty());
     }
 
     #[test]
@@ -418,10 +338,7 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].domain, "contoso.local");
         assert_eq!(work[0].dc_ip, "192.168.58.10");
-        assert_eq!(
-            work[0].credential.as_ref().map(|c| c.username.as_str()),
-            Some("admin")
-        );
+        assert_eq!(work[0].credential.username, "admin");
     }
 
     #[test]
@@ -450,13 +367,12 @@ mod tests {
             .push(make_credential("crossuser", "P@ssw0rd!", "fabrikam.local")); // pragma: allowlist secret
         let work = collect_user_enum_work(&state);
         assert_eq!(work.len(), 1);
-        let cred = work[0].credential.as_ref().expect("cred attached");
-        assert_eq!(cred.username, "crossuser");
-        assert_eq!(cred.domain, "fabrikam.local");
+        assert_eq!(work[0].credential.username, "crossuser");
+        assert_eq!(work[0].credential.domain, "fabrikam.local");
     }
 
     #[test]
-    fn collect_empty_password_still_emits_null_session() {
+    fn collect_skips_empty_password() {
         let mut state = StateInner::new("test-op".into());
         state
             .domain_controllers
@@ -465,10 +381,7 @@ mod tests {
             .credentials
             .push(make_credential("admin", "", "contoso.local"));
         let work = collect_user_enum_work(&state);
-        // Empty-password cred is filtered out, but work item is still emitted
-        // with credential=None so null-session enumeration can still run.
-        assert_eq!(work.len(), 1);
-        assert!(work[0].credential.is_none());
+        assert!(work.is_empty());
     }
 
     #[test]
@@ -486,10 +399,7 @@ mod tests {
         state.quarantine_principal("baduser", "contoso.local");
         let work = collect_user_enum_work(&state);
         assert_eq!(work.len(), 1);
-        assert_eq!(
-            work[0].credential.as_ref().map(|c| c.username.as_str()),
-            Some("gooduser")
-        );
+        assert_eq!(work[0].credential.username, "gooduser");
     }
 
     #[test]

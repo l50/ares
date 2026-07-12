@@ -6,9 +6,7 @@ use tracing::{debug, info, instrument};
 
 use ares_core::models::{Credential, Hash};
 
-use crate::orchestrator::state::{
-    StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_LATERAL_DENIED, DEDUP_SCANNED_TARGETS,
-};
+use crate::orchestrator::state::{StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_SCANNED_TARGETS};
 
 use super::Dispatcher;
 
@@ -39,23 +37,6 @@ impl ExploitAuth {
             .map(|h| h.domain.eq_ignore_ascii_case(target_domain))
             .unwrap_or(false);
         cred_match || hash_match
-    }
-
-    /// True when the selected auth clears the dispatch credential gate.
-    ///
-    /// Non-MSSQL exploits require a domain-matched credential
-    /// ([`Self::matches_domain`]) — firing with a wrong-realm cred just
-    /// produces KRB failures. MSSQL exploits relax to "any usable credential
-    /// or hash": a SQL Server login is decoupled from the AD realm (SQL
-    /// logins, `sa`, Windows-auth across trusts), so an exact domain-string
-    /// match is the wrong gate and would defer dispatch forever when the only
-    /// creds we hold carry a NetBIOS/short or trusted-realm domain form.
-    fn satisfies_dispatch_gate(&self, target_domain: &str, is_mssql: bool) -> bool {
-        if is_mssql {
-            self.credential.is_some() || self.hash.is_some()
-        } else {
-            self.matches_domain(target_domain)
-        }
     }
 }
 
@@ -159,19 +140,113 @@ fn is_acl_style_vuln_type(vtype: &str) -> bool {
         || v.contains("addself")
 }
 
+/// Gather crack-seed material from op state for [`Dispatcher::request_crack`]:
+/// distinct usernames (for the cracker's dynamic username→candidate generator)
+/// and distinct recovered plaintexts (every op credential — cracked passwords
+/// AND harvested cleartext like autologon/SYSVOL/description leaks). Machine
+/// accounts (`$`-suffixed) are dropped from the username seed — their passwords
+/// are un-guessable and only bloat the candidate list. Both are bounded so the
+/// task payload (and the Redis message that carries it) stays small.
+fn collect_crack_seed(state: &StateInner) -> (Vec<String>, Vec<String>) {
+    const MAX_USERNAMES: usize = 512;
+    const MAX_PASSWORDS: usize = 256;
+
+    let mut users_seen = std::collections::HashSet::new();
+    let mut usernames = Vec::new();
+    for name in state
+        .users
+        .iter()
+        .map(|u| u.username.as_str())
+        .chain(state.credentials.iter().map(|c| c.username.as_str()))
+    {
+        let name = name.trim();
+        if name.is_empty() || name.ends_with('$') {
+            continue;
+        }
+        if users_seen.insert(name.to_lowercase()) {
+            usernames.push(name.to_string());
+            if usernames.len() >= MAX_USERNAMES {
+                break;
+            }
+        }
+    }
+
+    let mut pw_seen = std::collections::HashSet::new();
+    let mut passwords = Vec::new();
+    for password in state.credentials.iter().map(|c| c.password.as_str()) {
+        let password = password.trim();
+        if password.is_empty() || password.len() > 128 {
+            continue;
+        }
+        if pw_seen.insert(password.to_string()) {
+            passwords.push(password.to_string());
+            if passwords.len() >= MAX_PASSWORDS {
+                break;
+            }
+        }
+    }
+
+    (usernames, passwords)
+}
+
 impl Dispatcher {
-    /// Submit a crack task for a hash.
+    /// Submit a crack task for a single hash.
     #[instrument(
         name = "automation.request_crack",
         skip(self, hash),
         fields(username = %hash.username, domain = %hash.domain, hash_type = %hash.hash_type),
     )]
     pub async fn request_crack(&self, hash: &ares_core::models::Hash) -> Result<Option<String>> {
+        self.request_crack_batch(std::slice::from_ref(hash)).await
+    }
+
+    /// Submit one crack task covering a batch of hashes that share a hashcat
+    /// mode. hashcat cracks every hash in the file in a single run, so batching
+    /// all same-mode roastable tickets recovers each crackable one in the first
+    /// wordlist pass — instead of serializing a full crack budget per ticket and
+    /// letting a slow, ultimately-uncrackable AES ticket starve a crackable one
+    /// behind it. A single-hash crack is just a batch of one.
+    ///
+    /// Seeds the crack with everything the op already knows. `known_passwords`
+    /// — every plaintext already recovered, cracked or harvested cleartext — is
+    /// the high-value part: the cracker tries these first, so a fresh or
+    /// different-etype ticket for an already-cracked account, or any account
+    /// reusing another's password, cracks instantly instead of re-grinding
+    /// rockyou. `known_usernames` feeds the dynamic username-derived candidate
+    /// generator, which the automation path otherwise never populated.
+    ///
+    /// The per-task `username`/`domain` are taken from the first hash purely as
+    /// an NTLM attribution fallback (a `<32hex>:pw` cracked line carries no
+    /// principal); roastable cracked lines self-identify via their embedded
+    /// `$krb5tgs$…user$realm` / `$krb5asrep$user@realm`, so for a roastable
+    /// batch these representative fields don't affect attribution. Callers must
+    /// therefore only batch self-identifying (roastable) hashes; NTLM stays
+    /// one hash per task.
+    pub async fn request_crack_batch(
+        &self,
+        hashes: &[ares_core::models::Hash],
+    ) -> Result<Option<String>> {
+        let Some(first) = hashes.first() else {
+            return Ok(None);
+        };
+        let (known_usernames, known_passwords) = {
+            let state = self.state.read().await;
+            collect_crack_seed(&state)
+        };
+        // One hash per line: crack_with_hashcat / crack_with_john write the whole
+        // `hash_value` to the hash file verbatim, so hashcat loads every ticket.
+        let joined = hashes
+            .iter()
+            .map(|h| h.hash_value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let payload = json!({
-            "hash_type": hash.hash_type,
-            "hash_value": hash.hash_value,
-            "username": hash.username,
-            "domain": hash.domain,
+            "hash_type": first.hash_type,
+            "hash_value": joined,
+            "username": first.username,
+            "domain": first.domain,
+            "known_usernames": known_usernames,
+            "known_passwords": known_passwords,
         });
         // Crack tasks are non-LLM, normal priority
         self.throttled_submit("crack", "cracker", payload, 5).await
@@ -448,38 +523,6 @@ impl Dispatcher {
                 );
                 return Ok(None);
             }
-
-            // Refuse if a prior lateral attempt with this credential against
-            // this target already returned a terminal denied indicator (any
-            // technique, or this specific technique). Without this guard the
-            // LLM lateral agent burns the credential's CredentialInflight slots
-            // re-trying psexec/winrm against a host where the cred has no
-            // admin, starving every higher-priority privesc/exploit task that
-            // also targets the same cred.
-            let denied_any = format!(
-                "{}@{}:{}:*",
-                credential.username.to_lowercase(),
-                credential.domain.to_lowercase(),
-                target_ip
-            );
-            let denied_specific = format!(
-                "{}@{}:{}:{}",
-                credential.username.to_lowercase(),
-                credential.domain.to_lowercase(),
-                target_ip,
-                technique
-            );
-            if state.is_processed(DEDUP_LATERAL_DENIED, &denied_any)
-                || state.is_processed(DEDUP_LATERAL_DENIED, &denied_specific)
-            {
-                debug!(
-                    target_ip = target_ip,
-                    cred_user = %credential.username,
-                    technique = technique,
-                    "Skipping lateral — credential already denied on this target"
-                );
-                return Ok(None);
-            }
         }
 
         // Resolve target's realm from state.hosts (FQDN suffix).
@@ -585,20 +628,10 @@ impl Dispatcher {
             //
             // Pre-auth attacks (zerologon and friends) bypass the gate
             // because they don't need authentication to fire.
-            //
-            // MSSQL primitives use a relaxed gate: a SQL Server login is
-            // decoupled from the AD realm (SQL logins, `sa`, and Windows-auth
-            // across trusts all authenticate fine), so requiring an exact
-            // `c.domain == details["domain"]` string match defers dispatch
-            // forever when the only creds we hold carry a NetBIOS/short or
-            // trusted-realm domain form — even though they are exactly the
-            // sysadmin/impersonator accounts on the box. Gate MSSQL on
-            // "we hold *some* usable credential or hash" instead; the worker
-            // is handed every domain credential via `all_credentials` below
-            // and tries each. Non-MSSQL exploits keep the strict domain gate.
-            let is_mssql_exploit = vuln.vuln_type.to_lowercase().starts_with("mssql");
-            let auth_satisfied = auth.satisfies_dispatch_gate(domain, is_mssql_exploit);
-            if !domain.is_empty() && !vuln_type_is_preauth(&vuln.vuln_type) && !auth_satisfied {
+            if !domain.is_empty()
+                && !vuln_type_is_preauth(&vuln.vuln_type)
+                && !auth.matches_domain(domain)
+            {
                 debug!(
                     vuln_id = %vuln.vuln_id,
                     vuln_type = %vuln.vuln_type,
@@ -663,8 +696,7 @@ impl Dispatcher {
         // the right tools: ACL primitives (genericall/writedacl/writeproperty/
         // allextendedrights/etc.) route to the `acl` worker which exposes
         // `bloodyad_add_group_member`, `bloodyad_set_password`,
-        // `samr_change_password`, `bloodyad_add_genericall`, `pywhisker`,
-        // and `dacl_edit`. The
+        // `bloodyad_add_genericall`, `pywhisker`, and `dacl_edit`. The
         // legacy default of `privesc` left the agent with certipy/mssql/
         // delegation tools only, so AllExtendedRights-on-group primitives
         // dispatched as `exploit_*` would bail with "missing bloodyAD".
@@ -723,21 +755,6 @@ impl Dispatcher {
                 "password": credential.password,
                 "domain": credential.domain,
             },
-            "bind_domain": credential.domain,
-            "instructions": concat!(
-                "Enumerate SMB shares on target_ip using the provided credential.\n\n",
-                "AUTHENTICATION: SMB binds against the credential's HOME domain, not the target host's domain. ",
-                "Always pass `domain=<credential.domain>` (i.e. the `bind_domain` field) to enumerate_shares. ",
-                "Do NOT use a domain inferred from the target host's FQDN — that produces ",
-                "STATUS_LOGON_FAILURE silently and returns an empty share list. ",
-                "If the credential.domain is `child.contoso.local` and the target host is in ",
-                "`contoso.local`, authenticate as user@child.contoso.local — the share ",
-                "enumeration still works across forest/child trust as long as the bind domain is the user's home.\n\n",
-                "For each share found, register it via the appropriate state-write tool ",
-                "(host_ip, share_name, permissions). Pay attention to non-default shares ",
-                "(anything beyond ADMIN$/C$/IPC$/NETLOGON/SYSVOL) — they often hold credentials, ",
-                "scripts, or sensitive data."
-            ),
         });
         self.throttled_submit("recon", "recon", payload, 5).await
     }
@@ -769,32 +786,21 @@ impl Dispatcher {
     }
 
     /// Submit a coercion task.
-    ///
-    /// `target_domain` is the AD realm of the box being coerced. It's plumbed
-    /// into the task payload so the credential resolver can auto-pick an
-    /// in-realm principal when the LLM forgets to set `coerce_user` — without
-    /// it the coerce goes unauthenticated and bounces off `RPC_S_ACCESS_DENIED`
-    /// on any patched DC. Pass `""` when the realm isn't known yet; the
-    /// resolver will fall back to any owned principal.
     #[instrument(
         name = "automation.request_coercion",
         skip(self),
-        fields(target_ip = %target_ip, listener_ip = %listener_ip, target_domain = %target_domain, technique_count = techniques.len()),
+        fields(target_ip = %target_ip, listener_ip = %listener_ip, technique_count = techniques.len()),
     )]
     pub async fn request_coercion(
         &self,
         target_ip: &str,
         listener_ip: &str,
         techniques: &[&str],
-        target_domain: &str,
     ) -> Result<Option<String>> {
         let payload = json!({
             "target_ip": target_ip,
             "listener_ip": listener_ip,
             "techniques": techniques,
-            "target_domain": target_domain,
-            "domain": target_domain,
-            "coerce_domain": target_domain,
         });
         self.throttled_submit("coercion", "coercion", payload, 3)
             .await
@@ -967,40 +973,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_gate_non_mssql_requires_domain_match() {
-        // Non-MSSQL: a wrong-realm cred must NOT satisfy the gate.
-        let auth = ExploitAuth {
-            credential: Some(make_cred("alice", "contoso.local")),
-            hash: None,
-        };
-        assert!(!auth.satisfies_dispatch_gate("fabrikam.local", false));
-        assert!(auth.satisfies_dispatch_gate("contoso.local", false));
-    }
-
-    #[test]
-    fn dispatch_gate_mssql_accepts_cross_realm_cred() {
-        // MSSQL: a cred whose domain string does not match the vuln's domain
-        // (NetBIOS/short/trusted-realm form) still clears the gate — SQL login
-        // is decoupled from the AD realm. This is the symptom-2 fix: holding
-        // the sysadmin/impersonator account must let the exploit dispatch.
-        let auth = ExploitAuth {
-            credential: Some(make_cred("svc_sql", "contoso.local")),
-            hash: None,
-        };
-        assert!(auth.satisfies_dispatch_gate("CONTOSO", true));
-        assert!(auth.satisfies_dispatch_gate("child.contoso.local", true));
-    }
-
-    #[test]
-    fn dispatch_gate_mssql_still_requires_some_auth() {
-        // MSSQL relaxation is "any usable auth", not "no auth" — with nothing
-        // in state the gate must still defer so we don't loop a credless
-        // exploit until abandonment.
-        let auth = ExploitAuth::default();
-        assert!(!auth.satisfies_dispatch_gate("contoso.local", true));
-    }
-
-    #[test]
     fn preauth_vuln_types_bypass_gate() {
         for vt in [
             "zerologon",
@@ -1110,5 +1082,57 @@ mod tests {
         assert!(is_acl_style_vuln_type("genericwrite"));
         assert!(is_acl_style_vuln_type("GenericWrite"));
         assert!(is_acl_style_vuln_type("acl_genericwrite_dc01"));
+    }
+
+    fn make_cred_pw(username: &str, password: &str) -> Credential {
+        Credential {
+            id: format!("cred-{username}"),
+            username: username.into(),
+            password: password.into(),
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_user(username: &str) -> ares_core::models::User {
+        ares_core::models::User {
+            username: username.into(),
+            domain: "contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: "test".into(),
+        }
+    }
+
+    #[test]
+    fn collect_crack_seed_dedups_users_and_harvests_passwords() {
+        let mut state = StateInner::new("op-test".into());
+        state.users.push(make_user("alice"));
+        // Machine account — dropped from the username seed.
+        state.users.push(make_user("dc01$"));
+        // A credential whose username duplicates a user (case-insensitive) and
+        // whose password is a harvested cleartext we want as a crack candidate.
+        state.credentials.push(make_cred_pw("Alice", "P@ssw0rd!"));
+        state.credentials.push(make_cred_pw("bob", "P@ssw0rd!")); // dup password
+        state.credentials.push(make_cred_pw("carol", "P@ssw0rd2!"));
+
+        let (usernames, passwords) = collect_crack_seed(&state);
+
+        // alice (from users, deduped against the "Alice" cred), bob, carol.
+        // dc01$ dropped.
+        assert!(usernames.iter().any(|u| u.eq_ignore_ascii_case("alice")));
+        assert!(usernames.iter().any(|u| u == "bob"));
+        assert!(usernames.iter().any(|u| u == "carol"));
+        assert!(!usernames.iter().any(|u| u.ends_with('$')));
+        assert_eq!(usernames.len(), 3, "case-insensitive username dedup");
+
+        // Passwords deduped; both harvested plaintexts present, no blanks.
+        assert_eq!(passwords.len(), 2);
+        assert!(passwords.contains(&"P@ssw0rd!".to_string()));
+        assert!(passwords.contains(&"P@ssw0rd2!".to_string()));
     }
 }

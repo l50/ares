@@ -21,7 +21,11 @@ pub(crate) async fn ops_status(
     let meta = reader.get_meta(&mut conn).await?;
     let is_running = reader.is_running(&mut conn).await?;
 
-    let status = if meta.completed_at.is_some() {
+    // `red_completed_at` is set the instant the red side finishes, before the
+    // orchestrator's blue-drain wait (up to 45m). Treat that as completed so the
+    // Taskfile watch loop auto-fetches the red report as soon as red is done,
+    // rather than blocking on blue.
+    let status = if meta.completed_at.is_some() || meta.red_completed_at.is_some() {
         "completed"
     } else if is_running {
         "running"

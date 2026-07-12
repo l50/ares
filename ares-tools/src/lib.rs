@@ -15,7 +15,6 @@ pub mod credential_access;
 pub mod credentials;
 pub mod executor;
 pub mod filter;
-pub mod kerberos_skew;
 pub mod lateral;
 pub mod parsers;
 pub mod privesc;
@@ -158,6 +157,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         }
         "mssql_linked_xpcmdshell" => lateral::mssql_linked_xpcmdshell(arguments).await,
         "mssql_openquery" => lateral::mssql_openquery(arguments).await,
+        "mssql_far_host_secretsdump" => lateral::mssql_far_host_secretsdump(arguments).await,
         "mssql_ntlm_coerce" => lateral::mssql_ntlm_coerce(arguments).await,
 
         // ── Privilege Escalation ────────────────────────────────────
@@ -166,6 +166,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "certipy_auth" => privesc::certipy_auth(arguments).await,
         "certipy_shadow" => privesc::certipy_shadow(arguments).await,
         "certipy_template_esc4" => privesc::certipy_template_esc4(arguments).await,
+        "certipy_account_update" => privesc::certipy_account_update(arguments).await,
         "certipy_esc4_full_chain" => privesc::certipy_esc4_full_chain(arguments).await,
         "certipy_esc3_full_chain" => privesc::certipy_esc3_full_chain(arguments).await,
         "certipy_esc1_full_chain" => privesc::certipy_esc1_full_chain(arguments).await,
@@ -174,6 +175,8 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "certipy_retrieve" => privesc::certipy_retrieve(arguments).await,
         "certipy_esc7_full_chain" => privesc::certipy_esc7_full_chain(arguments).await,
         "certipy_relay" => privesc::certipy_relay(arguments).await,
+        "esc8_relay_probe" => privesc::esc8_relay_probe(arguments).await,
+        "certipy_find_anon" => privesc::certipy_find_anon(arguments).await,
         "find_delegation" => privesc::find_delegation(arguments).await,
         "s4u_attack" => privesc::s4u_attack(arguments).await,
         "generate_golden_ticket" => privesc::generate_golden_ticket(arguments).await,
@@ -181,7 +184,6 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "addspn" => privesc::addspn(arguments).await,
         "rbcd_write" => privesc::rbcd_write(arguments).await,
         "krbrelayup" => privesc::krbrelayup(arguments).await,
-        "raise_child" => privesc::raise_child(arguments).await,
         "extract_trust_key" => privesc::extract_trust_key(arguments).await,
         "create_inter_realm_ticket" => privesc::create_inter_realm_ticket(arguments).await,
         "forge_inter_realm_and_dump" => privesc::forge_inter_realm_and_dump(arguments).await,
@@ -199,7 +201,6 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         // ── ACL Exploitation ────────────────────────────────────────
         "bloodyad_add_group_member" => acl::bloodyad_add_group_member(arguments).await,
         "bloodyad_set_password" => acl::bloodyad_set_password(arguments).await,
-        "samr_change_password" => acl::samr_change_password(arguments).await,
         "bloodyad_add_genericall" => acl::bloodyad_add_genericall(arguments).await,
         "bloodyad_set_object_attr" => acl::bloodyad_set_object_attr(arguments).await,
         "adminsd_holder_add_ace" => acl::adminsd_holder_add_ace(arguments).await,

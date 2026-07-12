@@ -52,6 +52,7 @@ A `GITHUB_TOKEN` environment variable is required for any template that clones t
 | [ares-orchestrator](./templates/ares-orchestrator) | Ares orchestrator (`ares orchestrator`) with embedded Python for LLM agent steps | `debian:trixie-slim` | `linux/amd64`, `linux/arm64` |
 | [ares-worker](./templates/ares-worker) | Ares worker (`ares worker`) with embedded Python for LLM agent steps | `debian:trixie-slim` | `linux/amd64`, `linux/arm64` |
 | [ares-golden-image](./templates/ares-golden-image) | Kali AMI pre-loaded with all Ares red team tools and Alloy telemetry | Kali Linux AMI | AMI (`us-west-1`, `x86_64`) |
+| [ares-replay-stack](./templates/ares-replay-stack) | AL2023 AMI with Docker + the 6 replay-stack observability images pre-pulled, consumed by `ares benchmark run` | Amazon Linux 2023 AMI | AMI (`us-west-1`, `x86_64`) |
 
 ### Red Team Agents
 
@@ -87,7 +88,7 @@ A `GITHUB_TOKEN` environment variable is required for any template that clones t
 
 - [Warpgate](https://github.com/cowdogmoo/warpgate) CLI (`>= 1.0.0`)
 - Docker or Podman for container builds
-- AWS credentials for AMI builds (`ares-golden-image` only)
+- AWS credentials for AMI builds (`ares-golden-image`, `ares-replay-stack`)
 - `GITHUB_TOKEN` for templates that clone the Ares repository
 
 ### Building
@@ -204,6 +205,7 @@ warpgate-templates/
 │   ├── ares-orchestrator/                  # Multi-agent coordinator
 │   ├── ares-worker/                        # Task polling worker
 │   ├── ares-golden-image/                  # Kali AMI with all red team tools
+│   ├── ares-replay-stack/                  # AL2023 AMI with Docker + replay-stack images pre-pulled
 │   ├── ares-recon-agent/                   # Network and AD reconnaissance
 │   ├── ares-acl-agent/                     # AD ACL exploitation
 │   ├── ares-coercion-agent/                # NTLM relay / coercion

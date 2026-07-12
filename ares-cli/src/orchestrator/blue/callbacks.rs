@@ -87,7 +87,15 @@ impl BlueCallbackHandler {
     }
 
     /// Run a sub-agent loop for a blue team role and return the result text.
-    async fn run_sub_agent(&self, role: BlueAgentRole, task_prompt: &str) -> Result<String> {
+    ///
+    /// `pub(crate)` so the investigation lifecycle can drive auto-chained
+    /// follow-up hunts inline after the orchestrator loop finishes (there is no
+    /// blue-task worker fleet to consume an enqueued chained task).
+    pub(crate) async fn run_sub_agent(
+        &self,
+        role: BlueAgentRole,
+        task_prompt: &str,
+    ) -> Result<String> {
         let tools = blue::blue_tools_for_role(role);
         let capabilities: Vec<String> = tools
             .iter()
@@ -105,6 +113,14 @@ impl BlueCallbackHandler {
             model: self.model.clone(),
             max_steps: 50,
             max_tool_calls_per_name: 25,
+            // Capture the blue transcript when ARES_SESSION_LOG_DIR is set;
+            // `..default()` disables session logging otherwise.
+            session_log: ares_llm::SessionLogConfig::from_env(),
+            // Sub-agents inherit the same deterministic-sampling knobs so all
+            // three layers (root investigation, sub-agent, tool loop) sample
+            // identically under `benchmark run --seed/--temperature`.
+            temperature: super::investigation::parse_env_temperature(),
+            seed: super::investigation::parse_env_seed(),
             ..AgentLoopConfig::default()
         };
 
@@ -490,8 +506,7 @@ impl CallbackHandler for BlueCallbackHandler {
     }
 
     async fn on_token_usage(&self, usage: &TokenUsage, model: &str) {
-        if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cache_read_input_tokens == 0
-        {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
             return;
         }
         if let Ok(client) = redis::Client::open(self.redis_url.as_str()) {
@@ -500,8 +515,8 @@ impl CallbackHandler for BlueCallbackHandler {
                     &mut conn,
                     &self.investigation_id,
                     usage.input_tokens.into(),
-                    usage.output_tokens.into(),
                     usage.cache_read_input_tokens.into(),
+                    usage.output_tokens.into(),
                     model,
                 )
                 .await

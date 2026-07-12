@@ -1,7 +1,7 @@
 mod format;
 mod snapshot;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::warn;
 
@@ -9,7 +9,7 @@ use ares_core::state::RedisStateReader;
 
 use crate::redis_conn::{connect_redis, resolve_operation_id};
 
-pub(crate) use self::format::{print_loot, print_runtime_summary, EXPLOITABLE_PRIORITY_MAX};
+pub(crate) use self::format::{print_loot, print_runtime_summary, reportable_counts};
 pub(crate) use self::snapshot::{loot_snapshot, print_diff, LootSnapshot};
 
 pub(crate) async fn ops_loot(
@@ -38,30 +38,13 @@ async fn loot_once(
     json_output: bool,
 ) -> Result<()> {
     let reader = RedisStateReader::new(op_id.to_string());
-    if let Some(state) = reader.load_state(conn).await? {
-        print_loot(&state, json_output);
-        return Ok(());
-    }
+    let state = reader
+        .load_state(conn)
+        .await?
+        .with_context(|| format!("No state found for operation: {op_id}"))?;
 
-    // Live state keys can be LRU-evicted from Redis (maxmemory-policy
-    // allkeys-lru) while the `:report` markdown snapshot survives — it's
-    // written once at completion with no TTL. Without this fallback,
-    // queries against an older completed op return "No state found"
-    // even though a full, human-readable report still exists.
-    // JSON output isn't satisfiable from a markdown report, so error.
-    use redis::AsyncCommands;
-    let report_key = format!("ares:op:{op_id}:report");
-    let report: Option<String> = conn.get(&report_key).await.ok();
-    match report {
-        Some(r) if !r.is_empty() && !json_output => {
-            eprintln!(
-                "note: live state evicted from Redis; printing cached :report snapshot for {op_id}"
-            );
-            println!("{r}");
-            Ok(())
-        }
-        _ => Err(anyhow::anyhow!("No state found for operation: {op_id}")),
-    }
+    print_loot(&state, json_output);
+    Ok(())
 }
 
 async fn loot_watch(

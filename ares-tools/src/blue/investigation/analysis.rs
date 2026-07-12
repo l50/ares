@@ -607,12 +607,12 @@ pub async fn pop_all_queued(args: &Value) -> Result<ToolOutput> {
     let mut seen = std::collections::HashSet::new();
     let mut all_queries = Vec::new();
 
-    for q in &pivots {
+    for q in pivots.iter() {
         if seen.insert(q.clone()) {
             all_queries.push(format!("[pivot] {q}"));
         }
     }
-    for q in &chains {
+    for q in chains.iter() {
         if seen.insert(q.clone()) {
             all_queries.push(format!("[chain] {q}"));
         }

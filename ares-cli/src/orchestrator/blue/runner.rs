@@ -62,8 +62,10 @@ impl BlueOrchestrator {
     /// status has been `in_progress` for longer than the threshold. Marks
     /// them as `failed` with an orphaned message and removes from the active set.
     async fn cleanup_stale_investigations(&self) {
+        let cm_config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(std::time::Duration::from_secs(30)));
         let conn = match redis::Client::open(self.redis_url.as_str()) {
-            Ok(client) => match client.get_connection_manager().await {
+            Ok(client) => match client.get_connection_manager_with_config(cm_config).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Stale cleanup: failed to connect to Redis: {e}");

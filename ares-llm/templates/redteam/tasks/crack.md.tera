@@ -1,28 +1,16 @@
 ## Crack Task: {{ task_id }}
 
 **Hash Type:** {{ hash_type }}
-**Hash:** {{ hash_value }}
+**Hash:**
+```text
+{{ hash_value }}
+```
 {% if username %}**Username:** {{ username }}
 {% endif -%}
 {% if domain %}**Domain:** {{ domain }}
 {% endif -%}
 
-Run `crack_with_hashcat` (it transparently uses remote crackd when
-`HASHCAT_SERVICE_URL` is set, otherwise local hashcat). Read the leading
-`SUCCESS:` or `RESULT:` line in its stdout — `SUCCESS` means a hash was
-cracked, `RESULT ... 0 hashes cracked` means hashcat ran the full wordlist
-(and rules) without finding a match. Either way, **call `task_complete` and
-stop**. Do not invoke `crack_with_john` on the same hash — running the same
-wordlist on a CPU backend after a GPU has already exhausted it is pure waste.
-
-Only fall back to `crack_with_john` when hashcat itself was **unavailable**:
-the tool returned `success=false` with `exit_code=127` and the stderr says
-`hashcat unavailable`. That's the one case john can do something hashcat
-couldn't. Stage-error failures (`success=false`, other exit codes) mean the
-remote crackd service is broken — fix it rather than wasting CPU on a
-duplicate attack.
-
-In the `task_complete` summary, attribute the password to the tool that
-actually produced it — `crack_with_hashcat` (and note "via remote crackd" if
-the stdout includes `crackd stage` headers) or `crack_with_john`. Include the
-wordlist that succeeded. Do not invent a backend you did not run.
+Crack this hash using hashcat or john. If the fenced hash block contains multiple
+lines, pass the entire multi-line value to the cracking tool verbatim, preserving
+every newline and hash line. Try rockyou.txt first, then rules.
+Call `task_complete` with the cracked password or report failure.

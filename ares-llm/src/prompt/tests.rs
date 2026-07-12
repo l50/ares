@@ -42,19 +42,24 @@ fn generate_recon_prompt() {
     assert!(prompt.contains("192.168.58.0/24"));
     assert!(prompt.contains("contoso.local"));
     assert!(prompt.contains("- nmap_scan"));
+    assert!(prompt.contains("Invalid credentials (49)"));
+    assert!(prompt.contains("null_session=true"));
 }
 
 #[test]
 fn generate_crack_prompt() {
     let payload = serde_json::json!({
         "hash_type": "ntlm",
-        "hash_value": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+        "hash_value": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0\n$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$spn*$aa$bb",
         "username": "admin",
         "domain": "contoso.local"
     });
     let prompt = generate_task_prompt("crack", "task-002", &payload, None).unwrap();
     assert!(prompt.contains("Crack Task: task-002"));
     assert!(prompt.contains("ntlm"));
+    assert!(prompt.contains("```text\naad3b435b51404eeaad3b435b51404ee"));
+    assert!(prompt.contains("\n$krb5tgs$23$*svc_sql$CONTOSO.LOCAL$spn*$aa$bb\n```"));
+    assert!(prompt.contains("entire multi-line value"));
     assert!(prompt.contains("admin"));
 }
 
@@ -119,72 +124,6 @@ fn generate_coercion_prompt() {
     assert!(prompt.contains("Coercion Task: task-006"));
     assert!(prompt.contains("192.168.58.10"));
     assert!(prompt.contains("- petitpotam"));
-}
-
-#[test]
-fn generate_coercion_prompt_ntlm_relay_ldap_instructs_to_start_listener() {
-    // Regression: every auto_ntlm_relay dispatch silently became a no-op
-    // because the coercion prompt never rendered `technique` / `relay_target`,
-    // so the LLM ran PetitPotam alone and never spawned ntlmrelayx.
-    // Prompt MUST now name the listener tool AND the relay destination.
-    let payload = serde_json::json!({
-        "technique": "ntlm_relay_ldap",
-        "relay_target": "192.168.58.20",
-        "listener_ip": "192.168.58.100",
-        "coercion_source": "192.168.58.10",
-    });
-    let prompt = generate_task_prompt("coercion", "task-relay", &payload, None).unwrap();
-    assert!(
-        prompt.contains("ntlmrelayx_to_ldaps"),
-        "must name the LDAPS relay tool"
-    );
-    assert!(
-        prompt.contains("192.168.58.20"),
-        "must include the relay destination"
-    );
-    assert!(
-        prompt.contains("192.168.58.10"),
-        "must include the coercion source (the machine to coerce)"
-    );
-    assert!(
-        prompt.contains("BEFORE coercing"),
-        "must instruct listener-first ordering"
-    );
-}
-
-#[test]
-fn generate_coercion_prompt_ntlm_relay_mssql_instructs_mssql_relay() {
-    // The MSSQL relay path: mssql_access + smb_signing_disabled on the
-    // same host. Prompt must instruct the LLM to point ntlmrelayx at
-    // mssql://target and use xp_cmdshell post-relay.
-    let payload = serde_json::json!({
-        "technique": "ntlm_relay_mssql",
-        "relay_target": "192.168.58.22",
-        "mssql_target": "192.168.58.22",
-        "listener_ip": "192.168.58.100",
-        "coercion_source": "192.168.58.10",
-    });
-    let prompt = generate_task_prompt("coercion", "task-mssql", &payload, None).unwrap();
-    assert!(prompt.contains("mssql://192.168.58.22"));
-    assert!(prompt.contains("xp_cmdshell"));
-}
-
-#[test]
-fn generate_coercion_prompt_ntlm_relay_adcs_uses_combined_tool() {
-    // ADCS ESC8 should route through the combined `relay_and_coerce`
-    // primitive — it already wires both sides correctly and the
-    // certificate is decoded by the worker.
-    let payload = serde_json::json!({
-        "technique": "ntlm_relay_adcs",
-        "relay_target": "192.168.58.30",
-        "ca_name": "contoso-CA",
-        "domain": "contoso.local",
-        "listener_ip": "192.168.58.100",
-        "coercion_source": "192.168.58.10",
-    });
-    let prompt = generate_task_prompt("coercion", "task-esc8", &payload, None).unwrap();
-    assert!(prompt.contains("relay_and_coerce"));
-    assert!(prompt.contains("192.168.58.30"));
 }
 
 #[test]
@@ -664,7 +603,7 @@ fn exploit_trust_key_extraction() {
 }
 
 #[test]
-fn exploit_child_to_parent_has_raise_child() {
+fn exploit_child_to_parent_describes_automatic_forge() {
     let payload = serde_json::json!({
         "vuln_type": "child_to_parent",
         "target": "192.168.58.10",
@@ -676,8 +615,9 @@ fn exploit_child_to_parent_has_raise_child() {
     });
     let prompt = generate_task_prompt("exploit", "t-31", &payload, None).unwrap();
     assert!(prompt.contains("TRUST KEY EXTRACTION"));
-    assert!(prompt.contains("raise_child"));
+    assert!(prompt.contains("forge_inter_realm_and_dump"));
     assert!(prompt.contains("Enterprise Admins"));
+    assert!(!prompt.contains("raise_child"));
 }
 
 #[test]

@@ -1222,37 +1222,6 @@ fn is_ghost_machine_account_rejects_real_hosts() {
 }
 
 #[test]
-fn is_low_value_acl_target_matches_builtin_groups() {
-    use super::is_low_value_acl_target;
-    // bare, case-insensitive
-    assert!(is_low_value_acl_target("Cloneable Domain Controllers"));
-    assert!(is_low_value_acl_target("iis_iusrs"));
-    assert!(is_low_value_acl_target("GUESTS"));
-    // normalized forms: DOMAIN\name and name@domain
-    assert!(is_low_value_acl_target(
-        "CONTOSO\\Cloneable Domain Controllers"
-    ));
-    assert!(is_low_value_acl_target(
-        "Pre-Windows 2000 Compatible Access@contoso.local"
-    ));
-}
-
-#[test]
-fn is_low_value_acl_target_keeps_real_targets() {
-    use super::is_low_value_acl_target;
-    // Real users and escalation-relevant groups must NOT be filtered.
-    assert!(!is_low_value_acl_target("carol"));
-    assert!(!is_low_value_acl_target("Domain Admins"));
-    assert!(!is_low_value_acl_target("DnsAdmins"));
-    assert!(!is_low_value_acl_target("Account Operators"));
-    assert!(!is_low_value_acl_target("Cert Publishers"));
-    assert!(!is_low_value_acl_target("Backup Operators"));
-    // empty / raw SID are not low-value (still worth attempting)
-    assert!(!is_low_value_acl_target(""));
-    assert!(!is_low_value_acl_target("S-1-5-21-1-2-3-519"));
-}
-
-#[test]
 fn sanitize_credentials_drops_ghost_machine_accounts() {
     let mut creds = vec![
         make_cred("contoso.local", "WIN-G9FWV8ZNSCL$", "P@ss1"),

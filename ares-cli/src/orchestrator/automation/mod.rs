@@ -15,9 +15,9 @@ mod adcs;
 mod adcs_exploitation;
 mod bloodhound;
 mod certipy_auth;
-mod coercion;
+pub(crate) mod coercion;
 mod crack;
-mod credential_access;
+pub(crate) mod credential_access;
 mod credential_expansion;
 mod credential_reuse;
 mod cross_forest_enum;
@@ -55,7 +55,6 @@ mod refresh;
 mod s4u;
 mod searchconnector_coercion;
 mod secretsdump;
-mod seimpersonate;
 mod shadow_credentials;
 mod share_coercion;
 mod share_enum;
@@ -86,6 +85,7 @@ pub use credential_access::auto_credential_access;
 pub use credential_expansion::auto_credential_expansion;
 pub use credential_reuse::auto_credential_reuse;
 pub use cross_forest_enum::auto_cross_forest_enum;
+pub(crate) use cross_forest_enum::is_cross_forest;
 pub use dacl_abuse::auto_dacl_abuse;
 pub use delegation::auto_delegation_enumeration;
 pub use dfs_coercion::auto_dfs_coercion;
@@ -105,7 +105,6 @@ pub use lsassy_dump::auto_lsassy_dump;
 pub use machine_account_quota::auto_machine_account_quota;
 pub use mssql::auto_mssql_detection;
 pub use mssql_coercion::auto_mssql_coercion;
-pub use mssql_exploitation::auto_mssql_enum_bridge;
 pub use mssql_exploitation::auto_mssql_exploitation;
 pub use mssql_exploitation::auto_mssql_impersonation;
 pub use mssql_link_pivot::auto_mssql_link_pivot;
@@ -123,8 +122,6 @@ pub use s4u::auto_s4u_exploitation;
 pub use searchconnector_coercion::auto_searchconnector_coercion;
 pub use secretsdump::auto_krbtgt_extraction;
 pub use secretsdump::auto_local_admin_secretsdump;
-pub(crate) use secretsdump::{dispatch_krbtgt_extraction_with_ticket, krbtgt_extraction_dedup_key};
-pub use seimpersonate::auto_seimpersonate;
 pub use shadow_credentials::auto_shadow_credentials;
 pub use share_coercion::auto_share_coercion;
 pub use share_enum::auto_share_enumeration;
@@ -166,99 +163,10 @@ fn extract_nt_from_lm_nt(value: &str) -> Option<&str> {
     }
 }
 
-/// Cooldown window applied after a recon work item is *deferred* (throttler
-/// backpressure or the per-credential in-flight cap) before its automation loop
-/// may re-dispatch it.
-///
-/// The recon planners tick every ~20-30s and re-collect any work item whose
-/// permanent dedup key isn't set — and that key is only written on a
-/// *successful* dispatch (`Ok(Some)`). So while an item sits deferred, the loop
-/// re-submits a fresh copy every tick, flooding the deferred queue with
-/// hundreds of duplicates that starve credential-access / coercion / exploit
-/// tasks (observed: 2,936 "Task deferred" vs 9 completed in one window).
-/// Suppressing re-dispatch for this window collapses the flood to one
-/// re-attempt per window instead of one per tick, without permanently dropping
-/// the item — if it's still needed after the window, it fires again.
-pub(crate) const RECON_DEFER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Per-automation tracker that suppresses re-dispatch of a deferred work item
-/// for [`RECON_DEFER_COOLDOWN`]. Mirrors the `seimpersonate` dispatch tracker
-/// but for recon planners whose permanent dedup only commits on success. One
-/// instance lives for the lifetime of a single `auto_*` loop (persists across
-/// ticks); keys are the same dedup keys the planner would mark on success.
-pub(crate) struct DeferCooldown {
-    seen: std::collections::HashMap<String, std::time::Instant>,
-    window: std::time::Duration,
-}
-
-impl DeferCooldown {
-    pub(crate) fn new(window: std::time::Duration) -> Self {
-        Self {
-            seen: std::collections::HashMap::new(),
-            window,
-        }
-    }
-
-    /// True if `key` was deferred within the cooldown window and should be
-    /// skipped this tick.
-    pub(crate) fn active(&self, key: &str, now: std::time::Instant) -> bool {
-        self.seen
-            .get(key)
-            .is_some_and(|t| now.duration_since(*t) < self.window)
-    }
-
-    /// Record that `key` was just deferred, starting/refreshing its cooldown.
-    pub(crate) fn record(&mut self, key: &str, now: std::time::Instant) {
-        self.seen.insert(key.to_string(), now);
-    }
-
-    /// Forget `key` after a successful dispatch — the permanent dedup now gates
-    /// it, and dropping the entry keeps the map bounded by live target count.
-    pub(crate) fn clear(&mut self, key: &str) {
-        self.seen.remove(key);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ares_core::models::Hash;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn defer_cooldown_suppresses_only_within_window() {
-        let mut c = DeferCooldown::new(Duration::from_secs(120));
-        let t0 = Instant::now();
-        // Never deferred → never suppressed.
-        assert!(!c.active("k", t0));
-        c.record("k", t0);
-        // Just deferred → suppressed for the window.
-        assert!(c.active("k", t0));
-        assert!(c.active("k", t0 + Duration::from_secs(119)));
-        // Window elapsed → free to retry.
-        assert!(!c.active("k", t0 + Duration::from_secs(120)));
-        assert!(!c.active("k", t0 + Duration::from_secs(121)));
-    }
-
-    #[test]
-    fn defer_cooldown_clear_allows_immediate_retry() {
-        let mut c = DeferCooldown::new(Duration::from_secs(120));
-        let t0 = Instant::now();
-        c.record("k", t0);
-        assert!(c.active("k", t0));
-        // A successful dispatch clears the entry; permanent dedup takes over.
-        c.clear("k");
-        assert!(!c.active("k", t0));
-    }
-
-    #[test]
-    fn defer_cooldown_keys_are_independent() {
-        let mut c = DeferCooldown::new(Duration::from_secs(120));
-        let t0 = Instant::now();
-        c.record("a", t0);
-        assert!(c.active("a", t0));
-        assert!(!c.active("b", t0));
-    }
 
     fn make_hash(username: &str, domain: &str, hash_value: &str) -> Hash {
         Hash {

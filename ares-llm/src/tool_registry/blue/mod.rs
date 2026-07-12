@@ -91,6 +91,10 @@ pub fn blue_tools_for_role(role: BlueAgentRole) -> Vec<ToolDefinition> {
 fn triage_tool_definitions() -> Vec<ToolDefinition> {
     let mut tools = loki::loki_tool_definitions();
     tools.extend(grafana::grafana_tool_definitions());
+    // Triage is stage 1 (initial scoping) and must be able to invoke the
+    // pre-built detection templates (ADCS / AS-REP / cross-realm) directly,
+    // not just re-derive their LogQL by hand.
+    tools.extend(detection::detection_query_tool_definitions());
     tools.extend(learning::learning_tool_definitions());
     tools.extend(callbacks::worker_callback_definitions());
     tools
@@ -113,4 +117,46 @@ fn lateral_analyst_tool_definitions() -> Vec<ToolDefinition> {
     tools.extend(learning::learning_tool_definitions());
     tools.extend(callbacks::worker_callback_definitions());
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_names(role: BlueAgentRole) -> Vec<String> {
+        blue_tools_for_role(role)
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    #[test]
+    fn triage_has_detection_query_tools() {
+        // Triage is stage 1 and must be able to invoke the pre-built ADCS /
+        // AS-REP / cross-realm detection templates directly (P1).
+        let names = tool_names(BlueAgentRole::Triage);
+        assert!(
+            names.iter().any(|n| n == "run_detection_query"),
+            "triage should expose run_detection_query, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "run_parallel_detections"),
+            "triage should expose run_parallel_detections, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "list_detection_templates"),
+            "triage should expose list_detection_templates, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn threat_hunter_and_lateral_still_have_detection_tools() {
+        for role in [BlueAgentRole::ThreatHunter, BlueAgentRole::LateralAnalyst] {
+            let names = tool_names(role);
+            assert!(
+                names.iter().any(|n| n == "run_detection_query"),
+                "{role:?} should expose run_detection_query, got: {names:?}"
+            );
+        }
+    }
 }

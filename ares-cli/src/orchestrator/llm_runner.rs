@@ -3,6 +3,7 @@
 //! Builds prompts, calls the LLM, dispatches tool calls to workers via Redis,
 //! and handles callbacks in Rust.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
@@ -12,63 +13,98 @@ use ares_llm::prompt::templates;
 use ares_llm::prompt::StateSnapshot;
 use ares_llm::tool_registry::{self, AgentRole};
 use ares_llm::{
-    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, CallbackResult,
-    HostnameMap, LlmProvider, LoopEndReason, RunAgentLoopParams, TokenUsage, ToolCall,
-    ToolDispatcher, ToolExecResult,
+    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, HostnameMap, LlmProvider,
+    LoopEndReason, RunAgentLoopParams, ToolDispatcher,
 };
 
-use crate::orchestrator::routing::ActiveTaskTracker;
 use crate::orchestrator::state::SharedState;
+
+/// Per-role LLM provider plus its agent-loop configuration. Different roles
+/// can ship different models (e.g. a cheap mini model for mechanical recon vs
+/// a reasoning model for the orchestrator) so we keep one entry per role.
+pub struct RoleProvider {
+    pub provider: Arc<dyn LlmProvider>,
+    pub config: AgentLoopConfig,
+}
 
 /// Drives LLM-powered tasks through the Rust agent loop.
 ///
-/// Owns an LLM provider and tool dispatcher, and builds prompts from
-/// the current operation state.
+/// Owns a per-role map of LLM providers and a tool dispatcher, and builds
+/// prompts from the current operation state.
 pub struct LlmTaskRunner {
-    provider: Box<dyn LlmProvider>,
+    /// Per-role LLM provider + agent-loop config. Lookup fails over to
+    /// `fallback_role` (orchestrator) for any role not in the map.
+    providers: HashMap<AgentRole, RoleProvider>,
+    /// Role to use when `providers` has no entry for the requested role.
+    /// Set to `AgentRole::Orchestrator` by construction.
+    fallback_role: AgentRole,
     dispatcher: Arc<dyn ToolDispatcher>,
     state: SharedState,
-    config: AgentLoopConfig,
     /// Sorted technique priorities from strategy (technique, weight).
     /// Passed to the system prompt template to render a dynamic priority table.
     technique_priorities: Vec<(String, i32)>,
-    /// Orchestrator listener IP — injected into agent prompt templates so
-    /// example tool calls (e.g. coercion `listener=...`) show the real IP
-    /// instead of a literal that the LLM may copy verbatim.
-    listener_ip: String,
+    /// Operation-scoped context frozen at runner creation. Inserted into the
+    /// system prompt with stable values so OpenAI's prefix auto-caching can
+    /// hit across every step of every task. Current values (which may shift
+    /// as recon discovers new infrastructure) flow through the task prompt
+    /// instead — see `dynamic_context_block`.
+    frozen_op_context: FrozenOpContext,
     /// Deferred callback handler — set after construction to break the
     /// `LlmTaskRunner → Dispatcher → LlmTaskRunner` circular dependency.
     callback_handler: OnceLock<Arc<dyn CallbackHandler>>,
-    /// Deferred handle to the active-task tracker. When set, each LLM response
-    /// touches the running task so the staleness sweep keys eviction on
-    /// inactivity rather than total runtime. Optional (unset in tests).
-    active_task_tracker: OnceLock<ActiveTaskTracker>,
+}
+
+/// Operation context frozen at runner creation so the system prompt stays
+/// byte-stable for prefix caching. Use [`FrozenOpContext::from_parts`] to
+/// build one from the orchestrator's initial snapshot + config.
+#[derive(Debug, Clone, Default)]
+pub struct FrozenOpContext {
+    pub target_domain: String,
+    pub target_dc_ip: String,
+    pub target_dc_fqdn: String,
+    pub listener_ip: String,
+}
+
+impl FrozenOpContext {
+    fn as_template(&self) -> templates::OperationContext<'_> {
+        templates::OperationContext {
+            target_domain: &self.target_domain,
+            target_dc_ip: &self.target_dc_ip,
+            target_dc_fqdn: &self.target_dc_fqdn,
+            listener_ip: &self.listener_ip,
+        }
+    }
 }
 
 impl LlmTaskRunner {
     pub fn new(
-        provider: Box<dyn LlmProvider>,
-        model_name: String,
+        providers: HashMap<AgentRole, RoleProvider>,
         dispatcher: Arc<dyn ToolDispatcher>,
         state: SharedState,
-        temperature: Option<f32>,
         technique_priorities: Vec<(String, i32)>,
-        listener_ip: String,
+        frozen_op_context: FrozenOpContext,
     ) -> Self {
-        // Layer env-var overrides (ARES_AGENT_*, ARES_CONTEXT_*, ARES_BUDGET_*,
-        // ARES_SESSION_LOG_*) on top of compiled defaults so operators can
-        // tune the loop without a code change.
-        let config = AgentLoopConfig::from_env(model_name, temperature);
+        assert!(
+            providers.contains_key(&AgentRole::Orchestrator),
+            "LlmTaskRunner requires a provider entry for the orchestrator role (used as fallback)"
+        );
         Self {
-            provider,
+            providers,
+            fallback_role: AgentRole::Orchestrator,
             dispatcher,
             state,
-            config,
             technique_priorities,
-            listener_ip,
+            frozen_op_context,
             callback_handler: OnceLock::new(),
-            active_task_tracker: OnceLock::new(),
         }
+    }
+
+    fn provider_for(&self, role: AgentRole) -> &RoleProvider {
+        self.providers.get(&role).unwrap_or_else(|| {
+            self.providers
+                .get(&self.fallback_role)
+                .expect("fallback orchestrator provider must be present")
+        })
     }
 
     /// Set the callback handler after construction.
@@ -78,13 +114,6 @@ impl LlmTaskRunner {
     /// `Dispatcher`, which itself holds an `Arc<LlmTaskRunner>`.
     pub fn set_callback_handler(&self, handler: Arc<dyn CallbackHandler>) {
         let _ = self.callback_handler.set(handler);
-    }
-
-    /// Set the active-task tracker after construction (interior mutability via
-    /// `OnceLock`). Enables per-task activity heartbeats: each LLM response
-    /// touches the task so a slow-but-progressing agent loop isn't stale-evicted.
-    pub fn set_active_task_tracker(&self, tracker: ActiveTaskTracker) {
-        let _ = self.active_task_tracker.set(tracker);
     }
 
     /// Get a reference to the tool dispatcher for direct tool calls.
@@ -108,16 +137,21 @@ impl LlmTaskRunner {
         // 1. Snapshot state (releases RwLock before LLM calls)
         let snapshot = self.state.snapshot().await;
 
-        // 2. Build system prompt from agent template
+        // 2. Build system prompt from agent template using FROZEN context so
+        //    OpenAI's prefix auto-caching can hit across every step. The
+        //    snapshot's current target_dc_ip / undominated_forests flow
+        //    through the task prompt instead — see step 3.
         let system_prompt = build_system_prompt(
             role,
-            &snapshot,
             &self.technique_priorities,
-            &self.listener_ip,
+            self.frozen_op_context.as_template(),
         )?;
 
-        // 3. Build task prompt from Tera template + payload
-        let task_prompt = build_task_prompt(task_type, task_id, payload, &snapshot)?;
+        // 3. Build task prompt from Tera template + payload, then prepend a
+        //    dynamic Operation Context block so the LLM sees current
+        //    discoveries without invalidating the system-prompt cache.
+        let task_prompt_body = build_task_prompt(task_type, task_id, payload, &snapshot)?;
+        let task_prompt = dynamic_context_block(role, &snapshot) + &task_prompt_body;
 
         // 4. Get tool schemas for this role
         let tools = tool_registry::tools_for_role(role);
@@ -159,76 +193,18 @@ impl LlmTaskRunner {
             }
         };
 
-        // 6. Run the agent loop.
-        //
-        // Wrap the shared callback handler AND the tool dispatcher so every
-        // forward-progress signal bumps this task's activity timestamp on the
-        // tracker. Two sources of progress:
-        //   * Each LLM response   → wrapped CallbackHandler::on_token_usage
-        //   * Each tool dispatch  → wrapped ToolDispatcher::dispatch_tool
-        // Together they cover the whole agent step (LLM thinking + tool work).
-        // Without the dispatcher wrapper, a multi-minute tool call (slow LDAP
-        // query, big nmap sweep) would emit no on_token_usage signal and the
-        // staleness sweep would evict a perfectly healthy task at 300s.
-        // A loop wedged inside a *single* tool call that itself runs past the
-        // timeout will still be reaped — exactly the intended signal.
-        let (callback_handler, dispatcher): (
-            Option<Arc<dyn CallbackHandler>>,
-            Arc<dyn ToolDispatcher>,
-        ) = match self.active_task_tracker.get() {
-            Some(tracker) => (
-                Some(Arc::new(TaskActivityCallbackHandler {
-                    inner: self.callback_handler.get().cloned(),
-                    tracker: tracker.clone(),
-                    task_id: task_id.to_string(),
-                })),
-                Arc::new(TaskActivityToolDispatcher {
-                    inner: Arc::clone(&self.dispatcher),
-                    tracker: tracker.clone(),
-                    task_id: task_id.to_string(),
-                }),
-            ),
-            None => (
-                self.callback_handler.get().cloned(),
-                Arc::clone(&self.dispatcher),
-            ),
-        };
-
-        // Per-role model override (cost lever for low-value roles).
-        //
-        // Each role can be routed to a cheaper model via
-        // `ARES_MODEL_FOR_<ROLE>` (e.g. `ARES_MODEL_FOR_RECON=gpt-5-mini`).
-        // The provider is unchanged — `LlmRequest.model` is sent on every
-        // call, so any model the existing provider can serve works without
-        // wiring a second provider. If the override and the configured
-        // provider don't share an API (e.g. routing recon to claude while
-        // the runner holds an OpenAI provider), the call will fail at
-        // request time with the provider's normal error path.
-        let config_for_role = match resolve_role_model_override(role_str) {
-            Some(model) if model != self.config.model => {
-                let mut cfg = self.config.clone();
-                debug!(
-                    role = role_str,
-                    base_model = %cfg.model,
-                    override_model = %model,
-                    "Routing role to per-role model override"
-                );
-                cfg.model = model;
-                cfg
-            }
-            _ => self.config.clone(),
-        };
-
+        // 6. Run the agent loop with this role's provider+config.
+        let rp = self.provider_for(role);
         let outcome = run_agent_loop(RunAgentLoopParams {
-            provider: self.provider.as_ref(),
-            dispatcher,
-            config: &config_for_role,
+            provider: rp.provider.as_ref(),
+            dispatcher: Arc::clone(&self.dispatcher),
+            config: &rp.config,
             system_prompt: &system_prompt,
             task_prompt: &task_prompt,
             role: role_str,
             task_id,
             tools: &tools,
-            callback_handler,
+            callback_handler: self.callback_handler.get().cloned(),
             hostname_map,
         })
         .await;
@@ -239,112 +215,18 @@ impl LlmTaskRunner {
     }
 }
 
-/// Per-task wrapper around the shared [`CallbackHandler`] that records forward
-/// progress on the [`ActiveTaskTracker`].
-///
-/// `on_token_usage` fires after each LLM response, so touching the task there
-/// gives the staleness sweep an activity signal: a healthy-but-slow loop keeps
-/// resetting its clock and survives, while a loop wedged inside a single tool
-/// call emits no token usage, never touches, and is correctly reaped. All other
-/// callback behavior is delegated unchanged to the wrapped handler.
-struct TaskActivityCallbackHandler {
-    inner: Option<Arc<dyn CallbackHandler>>,
-    tracker: ActiveTaskTracker,
-    task_id: String,
-}
-
-#[async_trait::async_trait]
-impl CallbackHandler for TaskActivityCallbackHandler {
-    async fn handle_callback(&self, call: &ToolCall) -> Option<Result<CallbackResult>> {
-        match &self.inner {
-            Some(h) => h.handle_callback(call).await,
-            None => None,
-        }
-    }
-
-    fn is_callback(&self, tool_name: &str) -> bool {
-        self.inner
-            .as_ref()
-            .map(|h| h.is_callback(tool_name))
-            .unwrap_or(false)
-    }
-
-    async fn on_token_usage(&self, usage: &TokenUsage, model: &str) {
-        self.tracker.touch(&self.task_id).await;
-        if let Some(h) = &self.inner {
-            h.on_token_usage(usage, model).await;
-        }
-    }
-}
-
-/// Per-task wrapper around the shared [`ToolDispatcher`] that bookends every
-/// tool dispatch with an activity touch on the [`ActiveTaskTracker`].
-///
-/// Touches *before* the inner dispatch so that picking a tool counts as
-/// progress (the agent decided what to do), and *after* it returns so that the
-/// result landing also counts. A tool call that runs longer than the staleness
-/// window with no internal heartbeat will still trip eviction — that's the
-/// intended single-tool-wedge signal — but ordinary multi-second tool work no
-/// longer reaps the parent task during the gap between LLM responses.
-struct TaskActivityToolDispatcher {
-    inner: Arc<dyn ToolDispatcher>,
-    tracker: ActiveTaskTracker,
-    task_id: String,
-}
-
-#[async_trait::async_trait]
-impl ToolDispatcher for TaskActivityToolDispatcher {
-    async fn dispatch_tool(
-        &self,
-        role: &str,
-        task_id: &str,
-        call: &ToolCall,
-    ) -> Result<ToolExecResult> {
-        self.tracker.touch(&self.task_id).await;
-        let result = self.inner.dispatch_tool(role, task_id, call).await;
-        self.tracker.touch(&self.task_id).await;
-        result
-    }
-}
-
-/// Resolve a per-role model override from environment variables.
-///
-/// Lookup order (first match wins):
-///   1. `ARES_MODEL_FOR_<ROLE>` — exact role override (e.g.
-///      `ARES_MODEL_FOR_RECON=openai/gpt-5-mini`)
-///   2. `ARES_MODEL_FOR_DEFAULT` — applies to roles not individually overridden
-///
-/// Returns `None` when neither env var is set (caller uses the configured
-/// default). This is opt-in: with no env vars set, behavior is identical to
-/// the pre-routing version.
-///
-/// Use case: route low-value enumeration roles (recon, cracker) to cheaper
-/// models (gpt-5-mini at $0.25/M input) while reserving expensive models
-/// (gpt-5.2 at $1.75/M) for high-leverage roles (privesc, lateral, exploit).
-/// On a typical run, recon emits 60–70% of total input tokens; switching it
-/// alone to gpt-5-mini drops the bill ~50%.
-fn resolve_role_model_override(role: &str) -> Option<String> {
-    let role_upper = role.to_uppercase();
-    let role_key = format!("ARES_MODEL_FOR_{role_upper}");
-    if let Ok(model) = std::env::var(&role_key) {
-        if !model.is_empty() {
-            return Some(model);
-        }
-    }
-    if let Ok(model) = std::env::var("ARES_MODEL_FOR_DEFAULT") {
-        if !model.is_empty() {
-            return Some(model);
-        }
-    }
-    None
-}
-
 /// Build the system prompt for a given agent role.
+///
+/// The system prompt is intentionally byte-stable across every step of every
+/// task: it depends only on the role, the frozen operation context (set at
+/// runner creation), and strategy weights — all of which are immutable for
+/// the lifetime of the runner. This is what lets OpenAI's prefix auto-cache
+/// fire across the agent loop. Anything that mutates per step (snapshot
+/// state, undominated forests, multi-forest flag) lives in the task prompt.
 fn build_system_prompt(
     role: AgentRole,
-    snapshot: &StateSnapshot,
     technique_priorities: &[(String, i32)],
-    listener_ip: &str,
+    op: templates::OperationContext<'_>,
 ) -> Result<String> {
     // Get capabilities from the tool definitions for this role
     let tools = tool_registry::tools_for_role(role);
@@ -371,24 +253,44 @@ fn build_system_prompt(
     } else {
         Some(technique_priorities)
     };
-    let op = templates::OperationContext {
-        target_domain: &snapshot.target_domain,
-        target_dc_ip: &snapshot.target_dc_ip,
-        target_dc_fqdn: &snapshot.target_dc_fqdn,
-        listener_ip,
-    };
     let system_instructions = templates::render_system_instructions(None, priorities, op)?;
 
-    // Render agent-specific instructions
-    let agent_instructions = templates::render_agent_instructions(
-        template_name,
-        &capabilities,
-        !snapshot.undominated_forests.is_empty(),
-        &snapshot.undominated_forests,
-        op,
-    )?;
+    // Render agent-specific instructions. Always pass `multi_forest_mode=false`
+    // and an empty forest list — the orchestrator's dynamic Multi-Forest Status
+    // is injected into the task prompt via `dynamic_context_block` so the
+    // system prompt stays byte-stable for prefix caching.
+    let agent_instructions =
+        templates::render_agent_instructions(template_name, &capabilities, false, &[], op)?;
 
     Ok(format!("{system_instructions}\n\n{agent_instructions}"))
+}
+
+/// Build the dynamic operation context block that prepends to every task
+/// prompt. This carries the snapshot state that previously lived in the
+/// system prompt (current discoveries, undominated forests) so the system
+/// prompt itself stays byte-stable for prefix-cache hits.
+fn dynamic_context_block(role: AgentRole, snapshot: &StateSnapshot) -> String {
+    let mut out = String::from("## Current Operation Context\n\n");
+    if !snapshot.target_domain.is_empty() {
+        out.push_str(&format!("- Target Domain: {}\n", snapshot.target_domain));
+    }
+    if !snapshot.target_dc_ip.is_empty() {
+        out.push_str(&format!("- Target DC IP: {}\n", snapshot.target_dc_ip));
+    }
+    if !snapshot.target_dc_fqdn.is_empty() {
+        out.push_str(&format!("- Target DC FQDN: {}\n", snapshot.target_dc_fqdn));
+    }
+    if role == AgentRole::Orchestrator && !snapshot.undominated_forests.is_empty() {
+        out.push_str("\n### Multi-Forest Status\n\n**The following forest roots have NOT been dominated (no krbtgt hash obtained):**\n\n");
+        for forest in &snapshot.undominated_forests {
+            out.push_str(&format!("- **{forest}** — needs krbtgt extraction\n"));
+        }
+        out.push_str(
+            "\nYou MUST NOT call `complete_operation()` until ALL forests are dominated or all attack paths are exhausted.\n",
+        );
+    }
+    out.push('\n');
+    out
 }
 
 /// Build the task-specific prompt from payload and state.
@@ -498,52 +400,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_role_model_override_default_priority() {
-        // Single test combines all branches to avoid env-var races between
-        // parallel tests in the same process.
-        std::env::remove_var("ARES_MODEL_FOR_RECON");
-        std::env::remove_var("ARES_MODEL_FOR_DEFAULT");
-
-        // Neither set → None (caller uses the configured default).
-        assert_eq!(resolve_role_model_override("recon"), None);
-
-        // Only DEFAULT set → applies to every role.
-        std::env::set_var("ARES_MODEL_FOR_DEFAULT", "openai/gpt-5-mini");
-        assert_eq!(
-            resolve_role_model_override("recon"),
-            Some("openai/gpt-5-mini".into())
-        );
-        assert_eq!(
-            resolve_role_model_override("privesc"),
-            Some("openai/gpt-5-mini".into())
-        );
-
-        // Per-role override beats DEFAULT for that role only.
-        std::env::set_var("ARES_MODEL_FOR_RECON", "openai/gpt-5-mini");
-        std::env::set_var("ARES_MODEL_FOR_DEFAULT", "openai/gpt-5.2");
-        assert_eq!(
-            resolve_role_model_override("recon"),
-            Some("openai/gpt-5-mini".into())
-        );
-        assert_eq!(
-            resolve_role_model_override("privesc"),
-            Some("openai/gpt-5.2".into())
-        );
-
-        // Empty string is treated as unset (avoids "= " in env files
-        // accidentally overriding to the empty model).
-        std::env::set_var("ARES_MODEL_FOR_RECON", "");
-        // Falls through to DEFAULT.
-        assert_eq!(
-            resolve_role_model_override("recon"),
-            Some("openai/gpt-5.2".into())
-        );
-
-        std::env::remove_var("ARES_MODEL_FOR_RECON");
-        std::env::remove_var("ARES_MODEL_FOR_DEFAULT");
-    }
-
-    #[test]
     fn role_for_task_type_recon_variants() {
         for tt in &[
             "recon",
@@ -602,9 +458,17 @@ mod tests {
         assert_eq!(role_for_task_type(""), None);
     }
 
+    fn test_op() -> templates::OperationContext<'static> {
+        templates::OperationContext {
+            target_domain: "contoso.local",
+            target_dc_ip: "192.168.58.10",
+            target_dc_fqdn: "dc01.contoso.local",
+            listener_ip: "192.168.58.50",
+        }
+    }
+
     #[test]
     fn build_system_prompt_all_roles() {
-        let snapshot = StateSnapshot::default();
         for role in &[
             AgentRole::Recon,
             AgentRole::CredentialAccess,
@@ -615,11 +479,54 @@ mod tests {
             AgentRole::Coercion,
             AgentRole::Orchestrator,
         ] {
-            let result = build_system_prompt(*role, &snapshot, &[], "192.168.58.50");
-            assert!(result.is_ok(), "Failed for role: {role:?}");
+            let result = build_system_prompt(*role, &[], test_op());
+            assert!(result.is_ok(), "Failed for role: {:?}", role);
             let prompt = result.unwrap();
-            assert!(!prompt.is_empty(), "Empty prompt for role: {role:?}");
+            assert!(!prompt.is_empty(), "Empty prompt for role: {:?}", role);
         }
+    }
+
+    #[test]
+    fn build_system_prompt_byte_stable_across_calls() {
+        let a = build_system_prompt(AgentRole::Recon, &[], test_op()).unwrap();
+        let b = build_system_prompt(AgentRole::Recon, &[], test_op()).unwrap();
+        assert_eq!(a, b, "system prompt must be byte-stable for prefix caching");
+    }
+
+    #[test]
+    fn build_system_prompt_independent_of_snapshot_state() {
+        // Same frozen op context + same role → same bytes, regardless of
+        // what discoveries the orchestrator has made. This is the cache
+        // contract: snapshot mutations land in the user message, not here.
+        let prompt_with_data =
+            build_system_prompt(AgentRole::Orchestrator, &[], test_op()).unwrap();
+        let prompt_again = build_system_prompt(AgentRole::Orchestrator, &[], test_op()).unwrap();
+        assert_eq!(prompt_with_data, prompt_again);
+        assert!(!prompt_with_data.contains("Multi-Forest Status"));
+    }
+
+    #[test]
+    fn dynamic_context_block_includes_forests_for_orchestrator() {
+        let snap = StateSnapshot {
+            target_dc_ip: "10.0.0.10".into(),
+            undominated_forests: vec!["evil.corp".into()],
+            ..Default::default()
+        };
+        let block = dynamic_context_block(AgentRole::Orchestrator, &snap);
+        assert!(block.contains("Target DC IP: 10.0.0.10"));
+        assert!(block.contains("Multi-Forest Status"));
+        assert!(block.contains("evil.corp"));
+    }
+
+    #[test]
+    fn dynamic_context_block_omits_forests_for_non_orchestrator() {
+        let snap = StateSnapshot {
+            undominated_forests: vec!["evil.corp".into()],
+            ..Default::default()
+        };
+        let block = dynamic_context_block(AgentRole::Recon, &snap);
+        assert!(!block.contains("Multi-Forest Status"));
+        assert!(!block.contains("evil.corp"));
     }
 
     #[test]

@@ -313,7 +313,12 @@ fn ssm_send_command(
 
 /// Poll SSM command invocation until it reaches a terminal state.
 fn ssm_poll(cmd_id: &str, instance_id: &str, profile: &str, region: &str, max_secs: u32) -> String {
-    for _ in 0..max_secs {
+    // Poll by wall-clock deadline (not iteration count) so a long-running remote
+    // command — e.g. the benchmark blue investigation, which can run tens of
+    // minutes — isn't cut off early by per-poll `aws` latency. Short commands
+    // still return the instant they reach a terminal state.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs as u64);
+    while std::time::Instant::now() < deadline {
         if let Ok(output) = Command::new("aws")
             .args([
                 "ssm",
@@ -403,7 +408,9 @@ pub(crate) fn maybe_exec_ec2() -> Option<i32> {
         }
     };
 
-    let status = ssm_poll(&cmd_id, &instance_id, &profile, &region, 120);
+    // 50 min — covers the blue investigation's 45-min timeout plus setup/scoring.
+    // Short --ec2 commands (ops runtime/stop, etc.) return as soon as they finish.
+    let status = ssm_poll(&cmd_id, &instance_id, &profile, &region, 3000);
 
     if let Ok(stdout) = ssm_get_output(
         &cmd_id,
@@ -451,7 +458,7 @@ mod tests {
 
     #[test]
     fn shell_join_empty_string_arg() {
-        let args = vec![String::new()];
+        let args = vec!["".to_string()];
         assert_eq!(shell_join(&args), "''");
     }
 

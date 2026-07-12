@@ -17,6 +17,11 @@ pub(crate) const BLUE_ENV_VAR_NAMES: &[&str] = &[
     "LOKI_URL",
     "LOKI_AUTH_TOKEN",
     "PROMETHEUS_URL",
+    "TEMPO_URL",
+    "ARES_REPLAY_CLOCK_START",
+    "ARES_REPLAY_CLOCK_END",
+    "ARES_REPLAY_CLOCK_MODE",
+    "ARES_REPLAY_MAX_STEPS",
     "DREADNODE_API_KEY",
     "DREADNODE_SERVER_URL",
     "DREADNODE_ORGANIZATION",
@@ -41,6 +46,14 @@ pub(crate) const OPS_ENV_VAR_NAMES: &[&str] = &[
     "GRAFANA_URL",
     "ARES_MODEL",
     "ARES_ORCHESTRATOR_MODEL",
+    "ARES_WORKER_MODEL",
+    "ARES_AGENT_RECON_MODEL",
+    "ARES_AGENT_CREDENTIAL_ACCESS_MODEL",
+    "ARES_AGENT_CRACKER_MODEL",
+    "ARES_AGENT_ACL_MODEL",
+    "ARES_AGENT_PRIVESC_MODEL",
+    "ARES_AGENT_LATERAL_MODEL",
+    "ARES_AGENT_COERCION_MODEL",
 ];
 
 /// Collect environment variables that are set, returning a map of name->value.
@@ -140,7 +153,6 @@ pub(crate) async fn ops_submit(p: OpsSubmitParams) -> Result<String> {
     info!("Target: {target} ({domain})");
     info!("IPs: {}", ips.join(", "));
 
-    // Collect environment variables
     let env_vars = collect_env_vars(OPS_ENV_VAR_NAMES);
     if !env_vars.is_empty() {
         let mut keys: Vec<&str> = env_vars.keys().map(|s| s.as_str()).collect();
@@ -150,7 +162,6 @@ pub(crate) async fn ops_submit(p: OpsSubmitParams) -> Result<String> {
         warn!("No env vars found to submit with operation request");
     }
 
-    // Resolve model
     let effective_model = resolve_model(&model);
     if let Some(ref m) = effective_model {
         if m.starts_with("gpt-") && std::env::var("OPENAI_API_KEY").is_err() {
@@ -316,7 +327,6 @@ mod tests {
         const NAME_B: &str = "ARES_TEST_SUBMIT_COLLECT_B_9c1a";
         const NAME_C: &str = "ARES_TEST_SUBMIT_COLLECT_C_9c1a";
 
-        // --- collect_env_vars ---
         std::env::remove_var(NAME_A);
         std::env::remove_var(NAME_B);
         std::env::remove_var(NAME_C);
@@ -335,7 +345,6 @@ mod tests {
         std::env::remove_var(NAME_A);
         std::env::remove_var(NAME_B);
 
-        // --- resolve_model ---
         const ORCH: &str = "ARES_ORCHESTRATOR_MODEL";
         const LEGACY: &str = "ARES_MODEL";
         // Snapshot + clear so we don't trample a developer-set var.

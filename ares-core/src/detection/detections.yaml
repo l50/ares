@@ -668,6 +668,79 @@ templates:
       - ['certsrv', 'certfnsh', 'certenroll', 'ntlmrelayx']
       - ['relay', 'coerce', 'petitpotam', 'printerbug', 'dfscoerce']
 
+  # ─── Cross-Forest / Inter-Realm Trust Abuse (T1134.005) ────────────────────
+  # These cover the child→parent and forest→forest pivots: forged inter-realm
+  # TGTs, SID-history / ExtraSids injection, and trust-key extraction. They are
+  # the crown-jewel techniques blue historically missed — reference them from
+  # threat_hunter.md.tera and the orchestrator dispatch table.
+
+  detect_cross_realm_tgs:
+    description: "Cross-Realm / Inter-Realm TGT/TGS Referral Detection"
+    mitre_id: "T1134.005"
+    tactic: lateral_movement
+    severity: critical
+    red_team_tool: ticketer
+    auto_pivot: true
+    # A krbtgt SPN (krbtgt/<realm>) in a 4768/4769 ServiceName is a cross-realm
+    # referral — a child DC requesting a parent-realm TGT, or a forged
+    # inter-realm ticket presented across a trust. Legitimate intra-realm
+    # traffic references the krbtgt *account*, not a krbtgt/<realm> SPN.
+    event_ids: ["4768", "4769"]
+    patterns:
+      - 'krbtgt/'
+      - 'servicename.{0,40}krbtgt/'
+      - 'service.name.{0,40}krbtgt/'
+
+  detect_child_krbtgt_forge:
+    description: "Child-Domain krbtgt Forge / Inter-Realm Golden Ticket Detection"
+    mitre_id: "T1134.005"
+    tactic: privilege_escalation
+    severity: critical
+    red_team_tool: ticketer
+    auto_pivot: true
+    # A forged inter-realm TGT carries anomalous ticket options / encryption
+    # types alongside a krbtgt reference. Golden/inter-realm forges commonly
+    # show TicketOptions 0x40810000 / 0x50800000 / 0x60810010 and RC4 (0x17)
+    # where a real referral would use AES.
+    event_ids: ["4768", "4769"]
+    filter_stages:
+      - ['krbtgt', 'ticketoptions', 'ticket.options', 'encryptiontype', 'encryption.type']
+      - ['0x40810000', '0x50800000', '0x60810010', '0x17', 'forged', 'child.*dc', 'inter.?realm']
+
+  detect_sid_history_extrasid:
+    description: "SID History / ExtraSids Injection Detection"
+    mitre_id: "T1134.005"
+    tactic: privilege_escalation
+    severity: critical
+    red_team_tool: ticketer
+    auto_pivot: true
+    # ExtraSids / SID-history in a ticket PAC surfaces as enterprise/domain-admin
+    # RIDs (-519 Enterprise Admins, -512 Domain Admins) appearing for a principal
+    # from a different domain. 4662/4627/4672 carry the group SIDs.
+    event_ids: ["4662", "4627", "4672"]
+    patterns:
+      - 'sidhistory'
+      - 'sid.history'
+      - 'extrasids'
+      - 'extra.sids'
+      - 's-1-5-21-.*-519'
+      - 's-1-5-21-.*-512'
+
+  detect_trust_key_exfil:
+    description: "Domain Trust Key Extraction / Cross-Domain Machine Auth Detection"
+    mitre_id: "T1003.006"
+    tactic: credential_access
+    severity: critical
+    red_team_tool: secretsdump
+    auto_pivot: true
+    # Extracting the inter-domain trust key is a DCSync/secretsdump of the
+    # trust account (DOMAIN$ / krbtgt), or cross-domain machine-account NTLM
+    # auth (4776/4624 logon type 3) originating from a DC machine account.
+    event_ids: ["4662", "4776", "4624"]
+    filter_stages:
+      - ['trust', 'interdomain', 'krbtgt', 'drsuapi', '1131f6aa', 'machine.account']
+      - ['secretsdump', 'replication', 'ntlm', 'logon.type.{0,4}3', '\$', '4776']
+
   # ─── BloodHound LDAP Signatures ────────────────────────────────────────────
 
   detect_bloodhound_domain_enum:

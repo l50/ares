@@ -10,12 +10,12 @@ mod util;
 
 #[cfg(feature = "blue")]
 pub use blue::{
-    BlueTaskInfo, Evidence, InvestigationStage, PyramidLevel, SharedBlueTeamState, TimelineEvent,
-    TriageDecision, TriageRecord,
+    BlueTaskInfo, Evidence, InvestigationStage, LateralMovement, PyramidLevel, SharedBlueTeamState,
+    TimelineEvent, TriageDecision, TriageRecord,
 };
 pub use core::{
-    is_always_disabled_account, CandidateDomain, Credential, DomainEvidence, Hash, Host,
-    KerberosTicket, Share, Target, TrustInfo, User,
+    is_always_disabled_account, CandidateDomain, Credential, DomainEvidence,
+    ForceInterRealmForgeRequest, Hash, Host, KerberosTicket, Share, Target, TrustInfo, User,
 };
 pub use op_state_event::{OpStateEvent, OpStateEventPayload};
 pub use operation::{AttackChainStep, OperationMeta, SharedRedTeamState};
@@ -145,7 +145,7 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("target_domain".to_string(), "null".to_string());
         data.insert("target_ip".to_string(), "\"\"".to_string());
-        data.insert("domain_admin_path".to_string(), String::new());
+        data.insert("domain_admin_path".to_string(), "".to_string());
 
         let meta = OperationMeta::from_redis_hash(&data);
         assert!(meta.target_domain.is_none());

@@ -240,7 +240,8 @@ fn recommendations_sorted_by_priority() {
     for window in priorities.windows(2) {
         assert!(
             priority_val(window[0]) <= priority_val(window[1]),
-            "Recommendations not sorted: {priorities:?}",
+            "Recommendations not sorted: {:?}",
+            priorities,
         );
     }
 }

@@ -4,79 +4,10 @@ use super::admin_checks::{
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
 use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
 use super::{
-    extract_created_machine_accounts, result_has_credential_evidence, result_has_mssql_session,
-    result_has_parser_evidence,
+    extract_asrep_roastable_users, result_has_credential_evidence, result_has_parser_evidence,
 };
 use ares_core::models::{Credential, Hash};
 use serde_json::json;
-
-#[test]
-fn mssql_session_recognised_from_envchange_banner() {
-    // impacket-mssqlclient emits ENVCHANGE only after a successful login.
-    let result = Some(json!({
-        "tool_outputs": [
-            "[*] Encryption required, switching to TLS\n\
-             [*] ENVCHANGE(DATABASE): Old Value: master, New Value: master\n\
-             SQL> SELECT @@version"
-        ]
-    }));
-    assert!(result_has_mssql_session(&result));
-}
-
-#[test]
-fn mssql_session_recognised_from_sql_prompt_object_output() {
-    // tool_outputs entries can be objects carrying an `output` field.
-    let result = Some(json!({
-        "tool_outputs": [
-            {"output": "SQL (SQL01\\svc_sql  dbo@master)> SELECT SYSTEM_USER"}
-        ]
-    }));
-    assert!(result_has_mssql_session(&result));
-}
-
-#[test]
-fn mssql_session_rejects_login_failure() {
-    // A login failure carries none of the post-auth banner tokens.
-    let result = Some(json!({
-        "tool_outputs": ["[-] ERROR(SQL01): Login failed for user 'svc_sql'"]
-    }));
-    assert!(!result_has_mssql_session(&result));
-}
-
-#[test]
-fn mssql_session_rejects_bare_llm_claim() {
-    // A summary-only "I connected" with no tool banner must not count —
-    // collect_result_text_parts only reads tool_outputs.
-    let result = Some(json!({"summary": "Connected to MSSQL and confirmed access"}));
-    assert!(!result_has_mssql_session(&result));
-    assert!(!result_has_mssql_session(&None));
-}
-
-#[test]
-fn extract_created_machine_accounts_from_impacket_addcomputer() {
-    let output = "Impacket v0.12.0 - Copyright Fortra, LLC\n\
-        [*] Successfully added machine account ARESATK01$ with password somepass.\n";
-    let names = extract_created_machine_accounts(output);
-    assert_eq!(names, vec!["ARESATK01$".to_string()]);
-}
-
-#[test]
-fn extract_created_machine_accounts_handles_multiple_and_case() {
-    let output = "[*] SUCCESSFULLY ADDED MACHINE ACCOUNT ARESATTACK01$ with password x\n\
-        noise line\n\
-        [*] Successfully added machine account KRBUJS01$ with password y\n";
-    let names = extract_created_machine_accounts(output);
-    assert_eq!(
-        names,
-        vec!["ARESATTACK01$".to_string(), "KRBUJS01$".to_string()]
-    );
-}
-
-#[test]
-fn extract_created_machine_accounts_none_on_unrelated_output() {
-    assert!(extract_created_machine_accounts("[-] Failed to add machine account").is_empty());
-    assert!(extract_created_machine_accounts("").is_empty());
-}
 
 #[test]
 fn parser_evidence_requires_discoveries_key() {
@@ -2317,4 +2248,511 @@ fn high_trust_sources_are_not_recognised() {
             "{src} should not be low-trust"
         );
     }
+}
+
+// ── is_dcsync_chain_blocked_by_sid_filter (Bug C) ──────────────────────────
+
+#[test]
+fn auto_trust_follow_skips_dcsync_chain_for_sid_filtered_target() {
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+    state.trusted_domains.insert(
+        "fabrikam.local".into(),
+        ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: true,
+            security_identifier: None,
+        },
+    );
+    assert!(is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "fabrikam.local"
+    ));
+    // Case-insensitive lookup.
+    assert!(is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "FABRIKAM.LOCAL"
+    ));
+}
+
+#[test]
+fn dcsync_chain_not_blocked_when_sid_filter_off() {
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+    state.trusted_domains.insert(
+        "fabrikam.local".into(),
+        ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: false,
+            security_identifier: None,
+        },
+    );
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "fabrikam.local"
+    ));
+}
+
+#[test]
+fn dcsync_chain_not_blocked_for_intra_forest_trust() {
+    // child→parent intra-forest trusts may have sid_filtering=true logically
+    // but `is_cross_forest()` is false, so DCSync chain is fine.
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+    state.trusted_domains.insert(
+        "child.contoso.local".into(),
+        ares_core::models::TrustInfo {
+            domain: "child.contoso.local".into(),
+            flat_name: "CHILD".into(),
+            direction: "bidirectional".into(),
+            trust_type: "parent_child".into(),
+            sid_filtering: true,
+            security_identifier: None,
+        },
+    );
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "child.contoso.local"
+    ));
+}
+
+#[test]
+fn dcsync_chain_not_blocked_when_no_trust_metadata() {
+    // Unlike trust-follow (which is conservative re: missing metadata), the
+    // S4U chain has the LDAP-bind ticket regardless — so we only skip the
+    // DCSync when we have *positive evidence* of SID filtering.
+    use super::is_dcsync_chain_blocked_by_sid_filter;
+    use crate::orchestrator::state::StateInner;
+    let state = StateInner::new("op-test".into());
+    assert!(!is_dcsync_chain_blocked_by_sid_filter(
+        &state,
+        "fabrikam.local"
+    ));
+}
+
+// ── Bug E: AES kerberoast retry + SPN lockout propagation ──────────────────
+
+#[test]
+fn etype_nosupp_detector_matches_canonical_marker() {
+    use super::result_text_indicates_etype_nosupp;
+    let result = Some(serde_json::json!({
+        "tool_outputs": [
+            "Kerberos SessionError: KDC_ERR_ETYPE_NOSUPP(KDC has no support for encryption type)"
+        ]
+    }));
+    assert!(result_text_indicates_etype_nosupp(&result));
+}
+
+#[test]
+fn etype_nosupp_detector_negative() {
+    use super::result_text_indicates_etype_nosupp;
+    let result = Some(serde_json::json!({
+        "tool_outputs": ["TGS-REP captured: $krb5tgs$18$*svc_sql$..."]
+    }));
+    assert!(!result_text_indicates_etype_nosupp(&result));
+}
+
+#[test]
+fn kerberoast_retries_with_aes_after_etype_nosupp() {
+    use super::should_retry_kerberoast_with_aes;
+    let result = Some(serde_json::json!({
+        "tool_outputs": ["[-] KDC_ERR_ETYPE_NOSUPP for svc_sql@fabrikam.local"]
+    }));
+    assert!(should_retry_kerberoast_with_aes(
+        Some("kerberoast"),
+        &result
+    ));
+    assert!(should_retry_kerberoast_with_aes(
+        Some("targeted_kerberoast"),
+        &result
+    ));
+    // Non-kerberoast technique: no retry.
+    assert!(!should_retry_kerberoast_with_aes(
+        Some("password_spray"),
+        &result
+    ));
+    // No technique at all: no retry.
+    assert!(!should_retry_kerberoast_with_aes(None, &result));
+}
+
+#[test]
+fn build_aes_kerberoast_retry_payload_includes_etype_hint() {
+    use crate::orchestrator::automation::credential_access::build_aes_kerberoast_retry_payload;
+    let cred = ares_core::models::Credential {
+        id: "c1".into(),
+        username: "carol".into(),
+        password: "fr3edom".into(), // pragma: allowlist secret
+        domain: "fabrikam.local".into(),
+        source: "test".into(),
+        discovered_at: None,
+        is_admin: false,
+        parent_id: None,
+        attack_step: 0,
+    };
+    let payload = build_aes_kerberoast_retry_payload(
+        "fabrikam.local",
+        "192.168.58.20",
+        &cred,
+        Some("sql_svc"),
+    );
+    assert_eq!(payload["technique"], "kerberoast");
+    assert_eq!(payload["target_user"], "sql_svc");
+    let etypes = payload["etype_hint"].as_array().expect("etype_hint array");
+    assert!(etypes.iter().any(|v| v == "aes256-cts-hmac-sha1-96"));
+    assert!(etypes.iter().any(|v| v == "aes128-cts-hmac-sha1-96"));
+    assert_eq!(payload["retry_reason"], "kdc_err_etype_nosupp");
+}
+
+#[test]
+fn lockout_on_spn_account_propagates_to_spray_exclusion() {
+    use crate::orchestrator::automation::credential_access::{
+        is_kerberoastable_principal, SPN_LOCKOUT_QUARANTINE_SECS,
+    };
+    use crate::orchestrator::state::StateInner;
+    let mut state = StateInner::new("op-test".into());
+
+    // Register a SPN-bearing account via a kerberoastable_account vuln.
+    let mut details = std::collections::HashMap::new();
+    details.insert(
+        "account_name".into(),
+        serde_json::Value::String("sql_svc".into()),
+    );
+    details.insert(
+        "domain".into(),
+        serde_json::Value::String("fabrikam.local".into()),
+    );
+    state.discovered_vulnerabilities.insert(
+        "v-spn-1".into(),
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: "v-spn-1".into(),
+            vuln_type: "kerberoastable_account".into(),
+            target: "192.168.58.20".into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: "credential_access".into(),
+            priority: 2,
+        },
+    );
+    assert!(is_kerberoastable_principal(
+        &state,
+        "sql_svc",
+        "fabrikam.local"
+    ));
+    // Plain non-SPN principal: not flagged.
+    assert!(!is_kerberoastable_principal(
+        &state,
+        "alice",
+        "fabrikam.local"
+    ));
+
+    // Quarantine with the SPN window — verify the expiry is longer than the
+    // 5-min default (300s). 1800s expiry should still be present after a
+    // hypothetical 600s probe.
+    state.quarantine_principal_for("sql_svc", "fabrikam.local", SPN_LOCKOUT_QUARANTINE_SECS);
+    let excluded = state.quarantined_principals_in_domain("fabrikam.local");
+    assert!(
+        excluded.iter().any(|u| u == "sql_svc"),
+        "SPN-bearing principal must land in spray exclusion list, got: {:?}",
+        excluded
+    );
+
+    // Subsequent shorter quarantine must not shrink the 30-min window.
+    state.quarantine_principal("sql_svc", "fabrikam.local"); // 5-min
+    let now = chrono::Utc::now();
+    let key = "sql_svc@fabrikam.local".to_string();
+    let expiry = state
+        .quarantined_principals
+        .get(&key)
+        .copied()
+        .expect("entry");
+    let remaining = (expiry - now).num_seconds();
+    assert!(
+        remaining > 900,
+        "30-min quarantine should still have >15min remaining, got {}s",
+        remaining
+    );
+}
+
+// ── shadow-cred pre-flight helpers ─────────────────────────────────────
+
+use super::{is_shadow_cred_vuln_type, result_indicates_keycredlink_access_denied};
+
+#[test]
+fn shadow_cred_vuln_type_matches_dispatch_shapes() {
+    for t in [
+        "genericall",
+        "GenericAll",
+        "genericwrite",
+        "writedacl",
+        "writeowner",
+        "writeproperty",
+        "shadow_credentials",
+        "acl_genericall",
+        "acl_writeproperty",
+    ] {
+        assert!(is_shadow_cred_vuln_type(t), "should match: {t}");
+    }
+}
+
+#[test]
+fn shadow_cred_vuln_type_rejects_non_acl_shapes() {
+    for t in [
+        "rbcd",
+        "esc1",
+        "constrained_delegation",
+        "unconstrained_delegation",
+        "forcechangepassword",
+        "allextendedrights", // deliberately excluded — not a valid shadow-cred primitive
+        "acl_allextendedrights",
+        "",
+    ] {
+        assert!(!is_shadow_cred_vuln_type(t), "should NOT match: {t}");
+    }
+}
+
+#[test]
+fn keycredlink_denied_detects_impacket_insuff_access_rights() {
+    let payload = json!({
+        "tool_outputs": [
+            "[+] Connecting to LDAP",
+            "[!] Result: ldap.INSUFFICIENTACCESSRIGHTS: 00002098: LdapErr: DSID-0C09075A, comment: 000020BD: SecErr on msDS-KeyCredentialLink write"
+        ]
+    });
+    assert!(result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        "operation failed"
+    ));
+}
+
+#[test]
+fn keycredlink_denied_detects_bare_insuff_access_rights_with_attribute() {
+    let payload = json!({
+        "tool_outputs": [
+            "[-] pywhisker error: INSUFF_ACCESS_RIGHTS when writing msDS-KeyCredentialLink for target CB-ATTK1$"
+        ]
+    });
+    assert!(result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_detects_certipy_no_permission_phrase() {
+    // certipy_shadow surfaces a plain-English refusal without naming the
+    // attribute — treat that phrase alone as a shadow-cred deny.
+    let payload = json!({
+        "tool_outputs": [
+            "[!] certipy: The user has no permission to add a certificate to this account"
+        ]
+    });
+    assert!(result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_ignores_unrelated_access_denied() {
+    // INSUFF_ACCESS_RIGHTS on a different attribute (servicePrincipalName)
+    // must NOT flip the shadow-cred flag — that's a DACL edge for a
+    // different primitive.
+    let payload = json!({
+        "tool_outputs": [
+            "[-] INSUFF_ACCESS_RIGHTS writing servicePrincipalName"
+        ]
+    });
+    assert!(!result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_ignores_success_output() {
+    let payload = json!({
+        "tool_outputs": [
+            "[+] Successfully added msDS-KeyCredentialLink to target CB-ATTK1$"
+        ]
+    });
+    assert!(!result_indicates_keycredlink_access_denied(
+        &Some(payload),
+        ""
+    ));
+}
+
+#[test]
+fn keycredlink_denied_accepts_worker_error_string() {
+    // `result.error` at this call site is worker-authored (tool_executor /
+    // result_handler), not LLM-authored — so a worker-reported deny in the
+    // error field IS a real signal and the pre-flight should honor it.
+    assert!(result_indicates_keycredlink_access_denied(
+        &None,
+        "INSUFF_ACCESS_RIGHTS on msDS-KeyCredentialLink for target CB-ATTK1$"
+    ));
+}
+
+// ── extract_asrep_roastable_users ──
+
+/// Shape a `report_finding` payload the way `merge_result_extras` / the
+/// `report_finding` callback produce it: an `llm_findings` array of
+/// `{vulnerabilities: [{vuln_type, target, details}]}` objects.
+fn asrep_finding(vuln: serde_json::Value) -> serde_json::Value {
+    json!({ "llm_findings": [ { "vulnerabilities": [vuln] } ] })
+}
+
+#[test]
+fn asrep_finding_target_names_account() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "alice",
+        "details": {"description": "DoesNotRequirePreAuth set"},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "alice");
+    assert_eq!(users[0].domain, "contoso.local");
+    assert_eq!(users[0].source, "asrep_roastable_finding");
+}
+
+#[test]
+fn asrep_finding_details_domain_overrides_default() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "bob",
+        "details": {"domain": "fabrikam.local"},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "bob");
+    assert_eq!(users[0].domain, "fabrikam.local");
+}
+
+#[test]
+fn asrep_finding_upn_target_yields_sam_and_realm() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "carol@fabrikam.local",
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "carol");
+    assert_eq!(users[0].domain, "fabrikam.local");
+}
+
+#[test]
+fn asrep_finding_netbios_qualified_target_strips_domain_prefix() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "CONTOSO\\alice",
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "alice");
+    // NetBIOS prefix is not a DNS realm — fall back to the task domain.
+    assert_eq!(users[0].domain, "contoso.local");
+}
+
+#[test]
+fn asrep_finding_ip_target_falls_back_to_description() {
+    // The agent put the DC IP in `target`; recover the account from the prose.
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "192.168.58.10",
+        "details": {"description": "User alice has DoesNotRequirePreAuth enabled."},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "alice");
+    assert_eq!(users[0].domain, "contoso.local");
+}
+
+#[test]
+fn asrep_finding_structured_account_field_preferred() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "192.168.58.10",
+        "details": {"account_name": "svc_backup", "domain": "contoso.local"},
+    }));
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "svc_backup");
+    assert_eq!(users[0].domain, "contoso.local");
+}
+
+#[test]
+fn asrep_finding_ignores_non_asrep_vuln_types() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "kerberoastable",
+        "target": "svc_sql",
+    }));
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_machine_account_target_rejected() {
+    // No structured account field and no prose principal; the `$`-suffixed
+    // target is not a roastable user.
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "DC01$",
+    }));
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_unresolvable_principal_skipped() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "asrep_roastable",
+        "target": "192.168.58.10",
+        "details": {"description": "Domain controller allows AS-REP roasting."},
+    }));
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_no_llm_findings_key() {
+    let payload = json!({"discoveries": {"hashes": []}});
+    assert!(extract_asrep_roastable_users(&payload, "contoso.local").is_empty());
+}
+
+#[test]
+fn asrep_finding_case_insensitive_vuln_type() {
+    let payload = asrep_finding(json!({
+        "vuln_type": "ASREP_Roastable",
+        "target": "alice",
+    }));
+    assert_eq!(
+        extract_asrep_roastable_users(&payload, "contoso.local").len(),
+        1
+    );
+}
+
+#[test]
+fn asrep_finding_multiple_findings_all_recovered() {
+    let payload = json!({
+        "llm_findings": [
+            {"vulnerabilities": [{"vuln_type": "asrep_roastable", "target": "alice"}]},
+            {"vulnerabilities": [
+                {"vuln_type": "kerberoastable", "target": "svc_sql"},
+                {"vuln_type": "asrep_roastable", "target": "bob@fabrikam.local"},
+            ]},
+        ]
+    });
+    let users = extract_asrep_roastable_users(&payload, "contoso.local");
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].username, "alice");
+    assert_eq!(users[0].domain, "contoso.local");
+    assert_eq!(users[1].username, "bob");
+    assert_eq!(users[1].domain, "fabrikam.local");
 }

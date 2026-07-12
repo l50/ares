@@ -33,14 +33,29 @@ pub fn parse_delegation(output: &str, params: &Value) -> Vec<Value> {
             continue;
         }
 
-        // Determine delegation type from keywords in the line
+        // Determine delegation type from keywords in the line. "resource" /
+        // "rbcd" MUST be checked before "constrained" because findDelegation
+        // prints "Resource-Based Constrained Delegation" which also contains
+        // "constrained" — matching constrained first would misroute RBCD rows to
+        // the S4U automation, which always fails on them.
         let delegation_type = if line_lower.contains("unconstrained") {
             "unconstrained"
+        } else if line_lower.contains("resource") || line_lower.contains("rbcd") {
+            "rbcd"
         } else if line_lower.contains("constrained") {
             "constrained"
         } else {
             continue;
         };
+
+        // For constrained delegation, distinguish protocol-transition
+        // (S4U2Self+S4U2Proxy works from a cleartext/hash) from kerberos-only
+        // (S4U2Self is rejected — needs an existing TGT, e.g. a machine account).
+        // findDelegation annotates this as "w/ Protocol Transition" vs
+        // "w/o Protocol Transition". Default true (the common, plain-"Constrained"
+        // case) preserves prior behaviour; only an explicit "w/o" flips it.
+        let protocol_transition =
+            !(line_lower.contains("w/o protocol") || line_lower.contains("without protocol"));
 
         let account = extract_delegation_account(trimmed);
         if account.is_empty() {
@@ -52,7 +67,13 @@ pub fn parse_delegation(output: &str, params: &Value) -> Vec<Value> {
         // "Constrained w/ Protocol Transition" that break simple column indexing.
         let delegation_target = extract_spn_from_parts(&parts);
 
-        let vuln_type = format!("{delegation_type}_delegation");
+        // RBCD uses the bare "rbcd" vuln_type that auto_rbcd_exploitation
+        // watches; constrained/unconstrained use the "{type}_delegation" form.
+        let vuln_type = if delegation_type == "rbcd" {
+            "rbcd".to_string()
+        } else {
+            format!("{delegation_type}_delegation")
+        };
         let dedup_key = format!("{}:{}", account.to_lowercase(), vuln_type);
         if !seen.insert(dedup_key) {
             continue; // skip duplicate account+type
@@ -66,6 +87,9 @@ pub fn parse_delegation(output: &str, params: &Value) -> Vec<Value> {
         if let Some(ref spn) = delegation_target {
             details["delegation_target"] = json!(spn);
         }
+        if delegation_type == "constrained" {
+            details["protocol_transition"] = json!(protocol_transition);
+        }
 
         vulns.push(json!({
             "vuln_id": format!("{}_{}", vuln_type, account),
@@ -74,7 +98,11 @@ pub fn parse_delegation(output: &str, params: &Value) -> Vec<Value> {
             "discovered_by": "find_delegation",
             "details": details,
             "recommended_agent": "privesc",
-            "priority": if delegation_type == "constrained" { 8 } else { 7 },
+            "priority": match delegation_type {
+                "constrained" => 8,
+                "rbcd" => 6,
+                _ => 7,
+            },
         }));
     }
 
@@ -221,7 +249,7 @@ DC02$   Computer     Unconstrained                        N/A                   
 
         // Dedup: sarah.connor unconstrained, john.smith constrained,
         // SRV01$ constrained, DC02$ unconstrained = 4
-        assert_eq!(vulns.len(), 4, "Expected 4 deduped vulns, got {vulns:?}");
+        assert_eq!(vulns.len(), 4, "Expected 4 deduped vulns, got {:?}", vulns);
 
         // sarah.connor → unconstrained
         assert_eq!(vulns[0]["vuln_type"], "unconstrained_delegation");
@@ -233,7 +261,8 @@ DC02$   Computer     Unconstrained                        N/A                   
         let spn = vulns[1]["details"]["delegation_target"].as_str().unwrap();
         assert!(
             spn.starts_with("CIFS/dc02"),
-            "Expected CIFS/dc02 SPN, got {spn}"
+            "Expected CIFS/dc02 SPN, got {}",
+            spn
         );
 
         // SRV01$ → constrained with HTTP SPN
@@ -242,7 +271,8 @@ DC02$   Computer     Unconstrained                        N/A                   
         let spn = vulns[2]["details"]["delegation_target"].as_str().unwrap();
         assert!(
             spn.starts_with("HTTP/dc02"),
-            "Expected HTTP/dc02 SPN, got {spn}"
+            "Expected HTTP/dc02 SPN, got {}",
+            spn
         );
 
         // DC02$ → unconstrained
@@ -253,6 +283,32 @@ DC02$   Computer     Unconstrained                        N/A                   
         for v in &vulns {
             assert_eq!(v["discovered_by"], "find_delegation");
         }
+    }
+
+    #[test]
+    fn parse_delegation_rbcd_not_misclassified_as_constrained() {
+        // findDelegation prints "Resource-Based Constrained Delegation" — must
+        // classify as rbcd, not constrained (which would misroute to S4U).
+        let output = "\
+AccountName  AccountType  DelegationType                          DelegationRightsTo
+svc$         Computer     Resource-Based Constrained Delegation   kingslanding$";
+        let params = json!({"domain": "contoso.local", "target_ip": "10.0.0.1"});
+        let vulns = parse_delegation(output, &params);
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["vuln_type"], "rbcd");
+    }
+
+    #[test]
+    fn parse_delegation_protocol_transition_flag() {
+        let output = "\
+AccountName  AccountType  DelegationType                       DelegationRightsTo
+jon.snow     Person       Constrained w/ Protocol Transition   HTTP/winterfell
+castelblack$ Computer     Constrained w/o Protocol Transition  HTTP/winterfell";
+        let params = json!({"domain": "north.local", "target_ip": "10.0.0.2"});
+        let vulns = parse_delegation(output, &params);
+        assert_eq!(vulns.len(), 2);
+        assert_eq!(vulns[0]["details"]["protocol_transition"], true);
+        assert_eq!(vulns[1]["details"]["protocol_transition"], false);
     }
 
     // ── extract_spn_from_parts ────────────────────────────────────

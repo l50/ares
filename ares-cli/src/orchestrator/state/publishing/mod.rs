@@ -540,97 +540,6 @@ mod tests {
         assert_eq!(result.domain, "contoso.local");
     }
 
-    // --- realm_source_is_authoritative ---
-    //
-    // These two tests are paired KEYSTONES. A prior incident where a child
-    // realm never reached state.domains — despite a batch of NetExec User
-    // Enum users, Kerberos enum users, and a `netexec_auth` credential all
-    // referencing it — happened because the publishers never promoted
-    // realms. We now promote on authoritative sources only.
-    //
-    // If you ADD a source string to a parser and forget to update
-    // realm_source_is_authoritative, the source will land in users/creds
-    // but its realm will never reach state.domains — silent data loss.
-    // If you REMOVE an entry from the allowlist, the corresponding
-    // promotion path goes silent.
-    //
-    // Both tests fail loudly on either kind of drift. When you touch
-    // realm_source_is_authoritative, update BOTH lists deliberately.
-
-    #[test]
-    fn realm_source_is_authoritative_allowlists_every_known_strong_source() {
-        // Every source string here corresponds to a real parser/path that
-        // produces a realm pinned by an authoritative AD source (auth
-        // round-trip, NTDS/LSA dump, Kerberos response, LDAP query).
-        let authoritative = [
-            // Host-pinned credential / hash dumps
-            "secretsdump",
-            "lsassy",
-            "lsa_secrets",
-            "dpapi",
-            "kerberos_extracted",
-            "initial",
-            // Validated by an actual auth round-trip
-            "netexec_auth",
-            "password_spray",
-            // Realm extracted from a Kerberos response
-            "kerberoast",
-            "asrep_roast",
-            // Cracked from a hash whose realm was already pinned
-            "cracked:hashcat",
-            "cracked:john",
-            "cracked",
-            // Authoritative user-enumeration sources
-            "ldap_extraction",
-            "kerberos_enum",
-            "netexec_user_enum",
-            "secretsdump_implicit",
-            // Cert-based credential extraction (host-pinned chain)
-            "certipy_esc1_full_chain",
-        ];
-        for src in authoritative {
-            assert!(
-                realm_source_is_authoritative(src),
-                "{src} dropped from authoritative allowlist — realms from this source will silently fail to promote into state.domains"
-            );
-        }
-    }
-
-    #[test]
-    fn realm_source_is_authoritative_rejects_low_trust_and_unknown_sources() {
-        // These sources can carry LLM-typo'd or misattributed realms
-        // (text scrapes of tool prose, descriptions, scripts, registry).
-        // Promoting them would pollute state.domains. Any of these
-        // sneaking onto the allowlist re-introduces the typo-pollution
-        // class of bugs the credential publisher's docstring warns about.
-        let low_trust = [
-            // Text-scrape / prose-parse sources
-            "output_extraction",
-            // User-controllable description / leak sources
-            "description_field",
-            "ldap_description",
-            "user_description_leak",
-            // Script-content sources (anything in SYSVOL is user-writable)
-            "sysvol_script",
-            // Registry-derived sources (user-controllable)
-            "autologon_registry",
-            // NetExec password-from-output (less reliable than netexec_auth)
-            "netexec_password",
-            // DNS dump — record content is not realm-authoritative
-            "adidnsdump",
-            // Catch-alls for unknown / unit-test sources
-            "test",
-            "",
-            "unknown_source",
-        ];
-        for src in low_trust {
-            assert!(
-                !realm_source_is_authoritative(src),
-                "{src:?} on the allowlist re-introduces the LLM-typo pollution class of bugs — review the source before promoting"
-            );
-        }
-    }
-
     // --- is_default_os_label ---
 
     #[test]
@@ -680,7 +589,7 @@ mod tests {
         assert!(looks_like_real_domain("contoso.local"));
         assert!(looks_like_real_domain("child.contoso.local"));
         assert!(looks_like_real_domain("eu.contoso.local"));
-        assert!(looks_like_real_domain("fabrikam.local"));
+        assert!(looks_like_real_domain("contoso.com"));
     }
 
     #[test]

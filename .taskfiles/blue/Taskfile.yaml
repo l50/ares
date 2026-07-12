@@ -9,6 +9,25 @@ vars:
   PROFILE: '{{.PROFILE | default "infrastructure"}}'
   REGION: '{{.REGION | default "us-west-2"}}'
 
+  # Transport for `ares blue *` query commands. Blue investigations live on
+  # whichever backend the orchestrator is deployed to. Set BLUE_TRANSPORT=k8s
+  # to point the multi:list/status/evidence/etc. tasks at the K8s cluster
+  # instead of the current EC2 box.
+  BLUE_TRANSPORT: '{{.BLUE_TRANSPORT | default "ec2"}}'
+  EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
+  EC2_PROFILE: '{{.EC2_PROFILE | default ""}}'
+  EC2_REGION: '{{.EC2_REGION | default ""}}'
+  TRANSPORT_ARGS:
+    sh: |
+      if [ "{{.BLUE_TRANSPORT}}" = "ec2" ]; then
+        args="--ec2 {{.EC2_NAME}}"
+        [ -n "{{.EC2_PROFILE}}" ] && args="$args --ec2-profile {{.EC2_PROFILE}}"
+        [ -n "{{.EC2_REGION}}" ] && args="$args --ec2-region {{.EC2_REGION}}"
+        echo "$args"
+      else
+        echo "--k8s {{.K8S_NAMESPACE}}"
+      fi
+
   # 1Password API keys (shared across tasks) - read from .env if exists, otherwise 1Password
   ANTHROPIC_API_KEY:
     sh: grep -E '^ANTHROPIC_API_KEY=' .env 2>/dev/null | cut -d= -f2- | tr -d '"' || op item get "Dreadnode Claude" --fields api-key --reveal 2>/dev/null || echo ""
@@ -364,15 +383,15 @@ tasks:
         msg: "Either INVESTIGATION_ID or LATEST=true is required"
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue status
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue status
         {{if ne .INVESTIGATION_ID ""}}{{.INVESTIGATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
 
   multi:list:
-    desc: "List all investigations"
+    desc: "List all investigations (set BLUE_TRANSPORT=k8s to query the K8s cluster instead of EC2)"
     silent: true
     cmds:
-      - '{{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue list'
+      - '{{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue list'
 
   multi:evidence:
     desc: "Show evidence for an investigation (usage: task blue:multi:evidence [INVESTIGATION_ID=inv-xxx] [LATEST=true])"
@@ -386,7 +405,7 @@ tasks:
         msg: "Either INVESTIGATION_ID or LATEST=true is required"
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue evidence
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue evidence
         {{if ne .INVESTIGATION_ID ""}}{{.INVESTIGATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
         {{if eq .JSON "true"}}--json{{end}}
@@ -402,7 +421,7 @@ tasks:
         msg: "Either INVESTIGATION_ID or LATEST=true is required"
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue techniques
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue techniques
         {{if ne .INVESTIGATION_ID ""}}{{.INVESTIGATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
 
@@ -417,7 +436,7 @@ tasks:
         msg: "Either INVESTIGATION_ID or LATEST=true is required"
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue runtime
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue runtime
         {{if ne .INVESTIGATION_ID ""}}{{.INVESTIGATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
 
@@ -432,7 +451,7 @@ tasks:
         msg: "Either INVESTIGATION_ID or LATEST=true is required"
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue triage-status
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue triage-status
         {{if ne .INVESTIGATION_ID ""}}{{.INVESTIGATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
 
@@ -448,7 +467,7 @@ tasks:
         msg: "Either OPERATION_ID or LATEST=true is required"
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue operation-status
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue operation-status
         {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
         {{if eq .LATEST "true"}}--latest{{end}}
         {{if ne .WATCH "0"}}--watch {{.WATCH}}{{end}}
@@ -462,7 +481,7 @@ tasks:
       - sh: test -n "{{.INVESTIGATION_ID}}"
         msg: "INVESTIGATION_ID variable is required"
     cmds:
-      - '{{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue delete "{{.INVESTIGATION_ID}}" --force'
+      - '{{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue delete "{{.INVESTIGATION_ID}}" --force'
 
   multi:delete-operation:
     desc: "Delete an operation and all its investigations (usage: task blue:multi:delete-operation OPERATION_ID=op-xxx)"
@@ -473,7 +492,7 @@ tasks:
       - sh: test -n "{{.OPERATION_ID}}"
         msg: "OPERATION_ID variable is required"
     cmds:
-      - '{{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue delete-operation "{{.OPERATION_ID}}" --force'
+      - '{{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue delete-operation "{{.OPERATION_ID}}" --force'
 
   multi:cleanup:
     desc: "Clean up old investigations (usage: task blue:multi:cleanup [MAX_AGE_HOURS=24] [ALL=true])"
@@ -484,7 +503,7 @@ tasks:
       DRY_RUN: '{{.DRY_RUN | default "false"}}'
     cmds:
       - >-
-        {{.ARES_CLI}} --k8s {{.K8S_NAMESPACE}} blue cleanup
+        {{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue cleanup
         --max-age-hours {{.MAX_AGE_HOURS}}
         {{if eq .ALL "true"}}--all --force{{end}}
         {{if eq .DRY_RUN "true"}}--dry-run{{end}}

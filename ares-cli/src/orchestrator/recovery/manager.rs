@@ -47,19 +47,25 @@ impl OperationRecoveryManager {
         let mut last_err: Option<anyhow::Error> = None;
 
         for attempt in 1..=MAX_CONNECTION_RETRIES {
-            let queue = match TaskQueue::connect(&self.redis_url, &self.nats_url).await {
+            let queue = match TaskQueue::connect_state_only(&self.redis_url, &self.nats_url).await {
                 Ok(q) => q,
                 Err(e) => {
                     if attempt < MAX_CONNECTION_RETRIES {
+                        // `connect_state_only` opens both Redis and NATS, so a
+                        // failure here can originate from either backend (e.g. a
+                        // transient JetStream error). Don't pin the blame on
+                        // Redis — the wrong label previously read as "Redis
+                        // flapping" when the real fault was on the NATS side.
                         warn!(
                             attempt = attempt,
                             err = %e,
-                            "Redis connection failed, retrying"
+                            "State backend (Redis/NATS) connect failed, retrying"
                         );
                         last_err = Some(e);
                         continue;
                     }
-                    return Err(e).context("Failed to connect to Redis for recovery");
+                    return Err(e)
+                        .context("Failed to connect to state backend (Redis/NATS) for recovery");
                 }
             };
 
@@ -95,14 +101,17 @@ impl OperationRecoveryManager {
             .await
             .context("Failed to check operation existence")?;
         if !exists {
-            anyhow::bail!("Operation {operation_id} not found in Redis -- cannot recover");
+            anyhow::bail!(
+                "Operation {} not found in Redis -- cannot recover",
+                operation_id
+            );
         }
 
         let mut loaded_state = reader
             .load_state(&mut conn)
             .await
             .context("Failed to load state from Redis")?
-            .ok_or_else(|| anyhow::anyhow!("Operation {operation_id} has no state data"))?;
+            .ok_or_else(|| anyhow::anyhow!("Operation {} has no state data", operation_id))?;
 
         info!(
             operation_id = operation_id,
@@ -223,7 +232,8 @@ impl OperationRecoveryManager {
                 // Exceeded max retries
                 task.status = TaskStatus::Failed;
                 task.error = Some(format!(
-                    "Pod restart during execution (max retries {max_retries} exceeded)"
+                    "Pod restart during execution (max retries {} exceeded)",
+                    max_retries
                 ));
                 task.completed_at = Some(chrono::Utc::now());
                 failed_task_ids.push(task_id.clone());

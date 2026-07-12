@@ -16,6 +16,15 @@ const QUARANTINE_DURATION_SECS: i64 = 300;
 
 const CAPTURE_IN_FLIGHT_TTL_SECS: i64 = 180;
 
+/// Maximum number of entries kept in `state.hashes`. ESC8 relay + coerce
+/// floods can dump thousands of machine-account NTLMv2 rows into state
+/// (WAYSFUCKED op-20260612 saw 11,977) which crowds out signal at every
+/// read site. When ingestion hits this cap, `push_hash_capped` evicts the
+/// oldest low-value entry to make room. High-value entries (krbtgt,
+/// cracked, trust keys, AES256-bearing) are never evicted, so the cap is
+/// soft — an all-high-value overflow logs a warn and still pushes.
+const MAX_HASHES: usize = 500;
+
 /// How long an LLM-marked "assist-abandoned" task pattern stays
 /// dispatch-blocked before the orchestrator allows a single re-try.
 ///
@@ -107,14 +116,6 @@ pub struct StateInner {
     // ACL step dedup (tracks which chain steps have been dispatched)
     pub dispatched_acl_steps: HashSet<String>,
 
-    // Machine accounts ares created during the op (via impacket-addcomputer in
-    // the RBCD / shadow-cred / KrbRelayUp chains). Stored normalized: lowercase,
-    // trailing `$` stripped. ACL/RBCD chain-followers exclude these as targets so
-    // ares never burns cycles attacking (or `bloodyad_set_password`-ing) the
-    // decoy/helper accounts it planted itself. In-memory only — on restart the
-    // worst case is re-observing the addcomputer success line.
-    pub created_machine_accounts: HashSet<String>,
-
     // Pending/completed tasks (in-memory only)
     pub pending_tasks: HashMap<String, TaskInfo>,
     pub completed_tasks: HashMap<String, ares_core::models::TaskResult>,
@@ -140,6 +141,16 @@ pub struct StateInner {
     // so we don't defer indefinitely if AES never arrives.
     pub forge_aes_defers: HashMap<String, u32>,
 
+    // Per-trust counter: how many times the cross-forest forge has fired
+    // NTLM-only (the AES256 trust key never upserted within the defer window)
+    // and come back with zero hashes. AES-only target forests reject an RC4
+    // inter-realm ticket with KDC_ERR_ETYPE_NOSUPP, so a zero-hash result there
+    // is the etype rejection — not SID filtering. We clear dedup and re-wait
+    // for AES up to this bound so a late trust-key extraction can drive a
+    // successful AES forge; past the bound we lock so a genuinely-unreachable
+    // target can't hot-loop.
+    pub forge_ntlm_fallback_attempts: HashMap<String, u32>,
+
     // Per-(trust_follow dedup key) timestamp recording when the
     // cross-forest forge dispatch was marked-processed. `auto_trust_follow`
     // marks dedup *before* spawning the dispatch so the next 30s tick
@@ -158,6 +169,17 @@ pub struct StateInner {
     // pivot dedup'd — keeps a flaky link from looping forever while
     // still tolerating transient auth races.
     pub mssql_link_pivot_attempts: HashMap<String, u32>,
+
+    // Per-(dc, domain, principal) consecutive-`Transient` counter for
+    // `auto_krbtgt_extraction`, keyed by `krbtgt_principal_attempt_key`. A
+    // `Transient` outcome intentionally leaves state clean so genuine network
+    // blips retry, but a principal that keeps returning non-logon-failure
+    // output that never advances (e.g. a full-dump retry that still can't
+    // parse krbtgt) would otherwise be re-picked every tick forever. After
+    // `KRBTGT_MAX_TRANSIENT` consecutive Transients we mark the principal dedup
+    // so the loop rotates to the next candidate. In-memory only — restart just
+    // resets the budget, which is the safe direction (re-try, don't over-skip).
+    pub krbtgt_transient_counts: HashMap<String, u32>,
 
     // Per-hash crack attempt counter, keyed by `crack_dedup_key`. Lets a
     // failed crack (wrong wordlist, password not in list, hashcat transient)
@@ -179,6 +201,17 @@ pub struct StateInner {
     /// Timestamp when all forests were first detected as dominated.
     /// Used by the completion monitor to enforce a post-exploitation grace period.
     pub all_forests_dominated_at: Option<tokio::time::Instant>,
+
+    /// Per-DC coercion phase state — Bug F. Tracks which coercion techniques
+    /// have already been attempted, the attempt count, the last observed error
+    /// signal, and any active cooldown. The previous boolean dedup
+    /// (`DEDUP_COERCED_DCS`) accepted one attempt per DC and never cycled
+    /// techniques, so one `RPC_S_ACCESS_DENIED` on PetitPotam locked the DC
+    /// out of every other coercion forever. The cycling logic in
+    /// `auto_coercion` reads this map to pick the next un-tried technique
+    /// (unauth ladder → authenticated retry when a same-forest cred lands).
+    pub coercion_phase_state:
+        HashMap<String, crate::orchestrator::automation::coercion::CoercionPhaseState>,
 
     /// IPv4 addresses bound to the orchestrator's own network interfaces.
     /// Populated once at orchestrator startup via `SharedState::initialize_self_ips`
@@ -226,120 +259,22 @@ impl StateInner {
             mssql_enum_dispatched: HashSet::new(),
             acl_chains: Vec::new(),
             dispatched_acl_steps: HashSet::new(),
-            created_machine_accounts: HashSet::new(),
             pending_tasks: HashMap::new(),
             completed_tasks: HashMap::new(),
             quarantined_principals: HashMap::new(),
             forge_aes_defers: HashMap::new(),
+            forge_ntlm_fallback_attempts: HashMap::new(),
             forge_in_flight: HashMap::new(),
             mssql_link_pivot_attempts: HashMap::new(),
+            krbtgt_transient_counts: HashMap::new(),
             crack_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,
+            coercion_phase_state: HashMap::new(),
             self_ips: HashSet::new(),
         }
     }
-
-    // ----- Typed write surface --------------------------------------------
-    //
-    // The publishing layer (orchestrator/state/publishing/) writes to
-    // StateInner through the methods below instead of poking fields
-    // directly. Keeps the in-memory mutation surface visible and gives
-    // future invariants (e.g. realm canonicalization, dedup) one place to
-    // land. Redis remains the dedup oracle for credentials and hashes —
-    // these methods mirror successful redis inserts into the in-memory view.
-
-    /// Append a credential to in-memory state. Callers must run
-    /// `RedisStateReader::add_credential` first; this mirrors the redis
-    /// insert.
-    pub fn add_credential(&mut self, cred: ares_core::models::Credential) {
-        self.credentials.push(cred);
-    }
-
-    /// Append a hash to in-memory state. Same redis-oracle contract as
-    /// [`add_credential`].
-    pub fn add_hash(&mut self, hash: ares_core::models::Hash) {
-        self.hashes.push(hash);
-    }
-
-    /// Upsert an AES256 key onto an existing in-memory hash matching by
-    /// `(username, domain, hash_type, hash_value)`. Returns true when the
-    /// existing entry was found and its `aes_key` was filled in (i.e. it had
-    /// no key before). Used when redis dedup rejected a hash insert but the
-    /// incoming entry carries an AES key the in-memory entry lacks —
-    /// Win2016+ rejects RC4-only inter-realm tickets, so losing AES to
-    /// dedup blocks cross-forest forge.
-    pub fn upsert_hash_aes_key(&mut self, hash: &ares_core::models::Hash) -> bool {
-        if hash.aes_key.is_none() {
-            return false;
-        }
-        match self.hashes.iter_mut().find(|h| {
-            h.username.eq_ignore_ascii_case(&hash.username)
-                && h.domain.eq_ignore_ascii_case(&hash.domain)
-                && h.hash_type.eq_ignore_ascii_case(&hash.hash_type)
-                && h.hash_value == hash.hash_value
-        }) {
-            Some(existing) if existing.aes_key.is_none() => {
-                existing.aes_key = hash.aes_key.clone();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Mark `domain` as dominated. Returns true when newly inserted.
-    pub fn mark_dominated(&mut self, domain: String) -> bool {
-        self.dominated_domains.insert(domain)
-    }
-
-    /// Normalize a machine-account name for self-created tracking: lowercase
-    /// and strip the trailing `$` so `ARESATK01$`, `aresatk01$`, and
-    /// `aresatk01` all collapse to the same key.
-    fn normalize_machine_account(name: &str) -> String {
-        name.trim().trim_end_matches('$').to_lowercase()
-    }
-
-    /// Record a machine account ares created (e.g. via impacket-addcomputer).
-    /// Returns true when newly inserted.
-    pub fn record_created_machine_account(&mut self, name: &str) -> bool {
-        let key = Self::normalize_machine_account(name);
-        if key.is_empty() {
-            return false;
-        }
-        self.created_machine_accounts.insert(key)
-    }
-
-    /// True when `name` is a machine account ares created itself during this op.
-    /// Chain-followers consult this to avoid attacking their own planted
-    /// helper/decoy accounts.
-    pub fn is_self_created_machine_account(&self, name: &str) -> bool {
-        let key = Self::normalize_machine_account(name);
-        !key.is_empty() && self.created_machine_accounts.contains(&key)
-    }
-
-    /// Set the cracked password on the first matching hash (by username and
-    /// domain, case-insensitive) that has no cracked password yet. Returns
-    /// `(operation_id, hash_type)` on success so the caller can persist the
-    /// change to Redis under the right key; returns `None` when no matching
-    /// uncracked hash exists.
-    pub fn set_first_uncracked_password(
-        &mut self,
-        username: &str,
-        domain: &str,
-        password: &str,
-    ) -> Option<(String, String)> {
-        let idx = self.hashes.iter().position(|h| {
-            h.username.eq_ignore_ascii_case(username)
-                && h.domain.eq_ignore_ascii_case(domain)
-                && h.cracked_password.is_none()
-        })?;
-        self.hashes[idx].cracked_password = Some(password.to_string());
-        let ht = self.hashes[idx].hash_type.clone();
-        Some((self.operation_id.clone(), ht))
-    }
-
-    // ----- /Typed write surface -------------------------------------------
 
     /// Check if a username is the delegating account for a constrained
     /// delegation or RBCD vulnerability.  These accounts must be reserved
@@ -377,9 +312,25 @@ impl StateInner {
     /// Quarantine a principal for `QUARANTINE_DURATION_SECS` after a lockout
     /// signal. See [`is_principal_quarantined`] for which signals feed in.
     pub fn quarantine_principal(&mut self, username: &str, domain: &str) {
+        self.quarantine_principal_for(username, domain, QUARANTINE_DURATION_SECS);
+    }
+
+    /// Quarantine a principal for `duration_secs`. Caller chooses the window:
+    /// the default 5-min `QUARANTINE_DURATION_SECS` is appropriate for ordinary
+    /// auth-attempt lockouts where the next 5-min window probably clears the
+    /// AD lockout policy; a SPN-bearing service account observed locked from
+    /// password_spray should use the AD default (~30 min) instead so the
+    /// spray loop doesn't keep re-hammering the same locked principal across
+    /// neighbouring domains. Picks the longer of the existing and new expiry
+    /// so a 30-min extension never accidentally shortens an in-flight cooldown.
+    pub fn quarantine_principal_for(&mut self, username: &str, domain: &str, duration_secs: i64) {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
-        let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
-        self.quarantined_principals.insert(key, expiry);
+        let new_expiry = Utc::now() + chrono::Duration::seconds(duration_secs);
+        let final_expiry = match self.quarantined_principals.get(&key) {
+            Some(existing) if *existing > new_expiry => *existing,
+            _ => new_expiry,
+        };
+        self.quarantined_principals.insert(key, final_expiry);
     }
 
     pub fn mark_credential_capture_in_flight(&mut self, domain: &str) {
@@ -396,6 +347,41 @@ impl StateInner {
             return false;
         };
         Utc::now().signed_duration_since(*ts).num_seconds() < CAPTURE_IN_FLIGHT_TTL_SECS
+    }
+
+    /// Push a hash onto `state.hashes`, evicting the oldest low-value entry
+    /// when the vector is at or above `MAX_HASHES`. "Low-value" here means:
+    /// not `krbtgt`, not cracked, no trust-key flag, no AES256 key. If every
+    /// entry is high-value the push still lands (warn logged); the cap is
+    /// deliberately soft so we never drop a hash the attack chain actually
+    /// needs.
+    pub fn push_hash_capped(&mut self, hash: Hash) {
+        if self.hashes.len() >= MAX_HASHES {
+            let evict = self.hashes.iter().position(|h| {
+                h.username.to_lowercase() != "krbtgt"
+                    && h.cracked_password.is_none()
+                    && !h.is_trust_key
+                    && h.aes_key.is_none()
+            });
+            if let Some(idx) = evict {
+                let dropped = self.hashes.remove(idx);
+                tracing::debug!(
+                    username = %dropped.username,
+                    domain = %dropped.domain,
+                    hash_type = %dropped.hash_type,
+                    len_after = self.hashes.len(),
+                    cap = MAX_HASHES,
+                    "state.hashes evicted low-value entry at cap"
+                );
+            } else {
+                tracing::warn!(
+                    len = self.hashes.len(),
+                    cap = MAX_HASHES,
+                    "state.hashes at cap but every entry is high-value — allowing overflow"
+                );
+            }
+        }
+        self.hashes.push(hash);
     }
 
     /// Return a deduplicated list of currently-quarantined usernames in
@@ -431,7 +417,6 @@ impl StateInner {
     /// environments.
     pub fn resolve_dc_ip(&self, domain: &str) -> Option<String> {
         let domain_lower = domain.to_lowercase();
-        // Tier 1: explicit DC map (case-insensitive)
         if let Some(ip) = self.domain_controllers.get(&domain_lower).or_else(|| {
             self.domain_controllers
                 .iter()
@@ -440,58 +425,32 @@ impl StateInner {
         }) {
             return Some(ip.clone());
         }
-        // Tier 2: scan hosts for a DC matching this domain by FQDN suffix
         for host in &self.hosts {
-            if !(host.is_dc || host.detect_dc()) {
+            if !(host.is_dc || host.detect_dc()) || host.hostname.is_empty() {
                 continue;
             }
-            if host.hostname.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = host.hostname.split('.').collect();
-            if parts.len() >= 3 {
-                let host_domain = parts[1..].join(".").to_lowercase();
-                if host_domain == domain_lower {
-                    return Some(host.ip.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve a host's IP from its hostname by scanning other host records.
-    ///
-    /// A host discovered only via a kerberoast `MSSQLSvc/<fqdn>` SPN carries an
-    /// empty `ip` (see `extract_mssql_hosts_from_kerberoast`); `publish_host`
-    /// merges it by hostname into an IP-bearing scan record. That merge misses
-    /// when the scan record knows the machine by its bare NetBIOS short name
-    /// (`sql01`) while the SPN carries the FQDN (`sql01.contoso.local`),
-    /// leaving two split records. This recovers the IP so `auto_mssql_detection`
-    /// can still target the host instead of emitting an empty `target`.
-    pub fn resolve_host_ip_by_hostname(&self, hostname: &str) -> Option<String> {
-        if hostname.is_empty() {
-            return None;
-        }
-        let hostname_lower = hostname.to_lowercase();
-        // Pass 1: exact FQDN match (case-insensitive).
-        for host in &self.hosts {
-            if host.ip.is_empty() || host.hostname.is_empty() {
-                continue;
-            }
-            if host.hostname.eq_ignore_ascii_case(&hostname_lower) {
+            if host
+                .hostname
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(&domain_lower)
+            {
                 return Some(host.ip.clone());
             }
         }
-        // Pass 2: a bare short-name record matching this FQDN's first label.
-        // Restricted to dotless hostnames so we never cross-match
-        // `sql01.contoso.local` to `sql01.fabrikam.local`.
-        let short = hostname_lower.split('.').next().unwrap_or(&hostname_lower);
         for host in &self.hosts {
-            if host.ip.is_empty() || host.hostname.is_empty() {
+            if !(host.is_dc || host.detect_dc()) || host.hostname.is_empty() {
                 continue;
             }
-            let other = host.hostname.to_lowercase();
-            if !other.contains('.') && other == short {
+            let hostname_lower = host.hostname.trim_end_matches('.').to_lowercase();
+            if self
+                .domains
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&hostname_lower))
+            {
+                continue;
+            }
+            let parts: Vec<&str> = hostname_lower.split('.').collect();
+            if parts.len() >= 3 && parts[1..].join(".") == domain_lower {
                 return Some(host.ip.clone());
             }
         }
@@ -505,31 +464,14 @@ impl StateInner {
     /// `(domain, dc_ip)` pairs.
     pub fn all_domains_with_dcs(&self) -> Vec<(String, String)> {
         let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-
-        // Gather all known domain names (lowercased for dedup)
-        let mut all_domains: Vec<String> = Vec::new();
-        for d in self.domain_controllers.keys() {
-            all_domains.push(d.to_lowercase());
-        }
-        for d in &self.domains {
-            all_domains.push(d.to_lowercase());
-        }
-        for d in self.trusted_domains.keys() {
-            all_domains.push(d.to_lowercase());
-        }
-
-        for domain in all_domains {
-            if seen.contains(&domain) {
-                continue;
-            }
-            seen.insert(domain.clone());
-            if let Some(ip) = self.resolve_dc_ip(&domain) {
-                result.push((domain, ip));
-            }
-        }
-
-        result
+        self.domain_controllers
+            .keys()
+            .chain(&self.domains)
+            .chain(self.trusted_domains.keys())
+            .map(|d| d.to_lowercase())
+            .filter(|d| seen.insert(d.clone()))
+            .filter_map(|d| self.resolve_dc_ip(&d).map(|ip| (d, ip)))
+            .collect()
     }
 
     /// Find a cleartext credential from a trusted domain that can authenticate
@@ -665,124 +607,6 @@ impl StateInner {
         self.credentials.iter().find(|c| usable(c)).cloned()
     }
 
-    /// Group-aware credential resolver for ACL/RBCD source principals.
-    ///
-    /// When an ACL edge's source is a group name (e.g. BloodHound emits an
-    /// RBCD vuln with `source: "Cross-Forest Admins"` because that Domain
-    /// Local group holds GenericAll on a target computer), `source_user` is
-    /// not a username — it's a group sAMAccountName. The base
-    /// [`find_source_credential`] only matches by username and returns
-    /// `None`, so the vuln gets silently dropped.
-    ///
-    /// This resolver:
-    ///   1. Tries [`find_source_credential`] directly. If `source_user` is a
-    ///      real principal (the common case), this returns immediately.
-    ///   2. On miss, walks `discovered_vulnerabilities` for
-    ///      `foreign_group_membership` entries whose `target` matches
-    ///      `source_user` and whose `domain` matches `target_domain` — the
-    ///      shape emitted by `auto_foreign_group_enum` (see
-    ///      `automation/foreign_group_enum.rs`). For each foreign member
-    ///      `(source, source_domain)` it finds, it recurses into
-    ///      [`find_source_credential`] using `member@source_domain`.
-    ///
-    /// Returns `(credential, via_group)` where `via_group` is `Some(group)`
-    /// when the credential was resolved through group expansion. Callers
-    /// use that to detect cross-realm dispatch and attach the right
-    /// Kerberos ccache.
-    pub fn resolve_principal_to_credential(
-        &self,
-        source_user: &str,
-        target_domain: &str,
-    ) -> Option<(ares_core::models::Credential, Option<String>)> {
-        if let Some(c) = self.find_source_credential(source_user, target_domain) {
-            return Some((c, None));
-        }
-        for principal in self.foreign_group_members(source_user, target_domain) {
-            if let Some(c) = self.find_source_credential(&principal, target_domain) {
-                return Some((c, Some(source_user.to_string())));
-            }
-        }
-        None
-    }
-
-    /// NTLM-hash variant of [`resolve_principal_to_credential`]: tries the
-    /// direct hash lookup first, then walks `foreign_group_membership`
-    /// entries to resolve a group-typed source to a foreign member's NTLM
-    /// hash. Same `(hash, via_group)` shape so callers can flag
-    /// cross-realm dispatch.
-    pub fn resolve_principal_to_hash(
-        &self,
-        source_user: &str,
-        target_domain: &str,
-    ) -> Option<(ares_core::models::Hash, Option<String>)> {
-        if let Some(h) = self.find_source_hash(source_user, target_domain) {
-            return Some((h, None));
-        }
-        for principal in self.foreign_group_members(source_user, target_domain) {
-            if let Some(h) = self.find_source_hash(&principal, target_domain) {
-                return Some((h, Some(source_user.to_string())));
-            }
-        }
-        None
-    }
-
-    /// Walk `discovered_vulnerabilities` for `foreign_group_membership`
-    /// entries whose `target` is `group` and whose `domain` is
-    /// `target_domain`, yielding each foreign member as a principal string
-    /// (`member@source_domain`, or just `member` if no domain is recorded).
-    ///
-    /// Shared by [`resolve_principal_to_credential`] /
-    /// [`resolve_principal_to_hash`] — both need the same expansion to
-    /// translate a group-typed ACL/RBCD source into the concrete principals
-    /// whose creds or hashes can sign the action.
-    fn foreign_group_members<'a>(
-        &'a self,
-        group: &'a str,
-        target_domain: &'a str,
-    ) -> impl Iterator<Item = String> + 'a {
-        let group_l = group.to_lowercase();
-        let target_l = target_domain.to_lowercase();
-        self.discovered_vulnerabilities
-            .values()
-            .filter_map(move |vuln| {
-                if !vuln
-                    .vuln_type
-                    .eq_ignore_ascii_case("foreign_group_membership")
-                {
-                    return None;
-                }
-                let vt = vuln
-                    .details
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_lowercase)
-                    .unwrap_or_default();
-                if vt != group_l {
-                    return None;
-                }
-                let vd = vuln
-                    .details
-                    .get("domain")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_lowercase)
-                    .unwrap_or_default();
-                if vd != target_l {
-                    return None;
-                }
-                let member = vuln.details.get("source").and_then(|v| v.as_str())?;
-                let member_dom = vuln
-                    .details
-                    .get("source_domain")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                Some(if member_dom.is_empty() {
-                    member.to_string()
-                } else {
-                    format!("{member}@{member_dom}")
-                })
-            })
-    }
-
     /// NTLM-hash variant of [`find_source_credential`] with the same priority
     /// order. Restricts to NTLM hashes (the only type usable for PTH).
     pub fn find_source_hash(
@@ -845,7 +669,7 @@ impl StateInner {
     pub fn forest_root_of(&self, domain: &str) -> String {
         let d = domain.to_lowercase();
         // Check if this domain is a child of any known domain
-        for known in &self.domains {
+        for known in self.domains.iter() {
             let k = known.to_lowercase();
             if d != k && d.ends_with(&format!(".{k}")) {
                 return k;
@@ -978,26 +802,12 @@ impl StateInner {
     /// before going idle — DA in one forest doesn't mean we're done if cross-forest
     /// targets remain.
     pub fn all_forests_dominated(&self) -> bool {
-        // Lean completion (ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1):
-        // restrict DC-only required-set to domains we hold credentials for.
-        // Matches the semantic used by `undominated_forests()` so the
-        // automation gates (this method) and the completion loop (that
-        // function) make consistent stop decisions.
-        let lean = crate::orchestrator::completion::lean_completion_enabled();
-        let cred_domains: Option<std::collections::HashSet<String>> = lean.then(|| {
-            self.credentials
-                .iter()
-                .filter(|c| !c.domain.is_empty())
-                .map(|c| c.domain.to_lowercase())
-                .collect()
-        });
         crate::orchestrator::completion::compute_undominated_forests(
             self.target.as_ref().map(|t| t.domain.as_str()),
             self.domains.first().map(|d| d.as_str()),
             &self.trusted_domains,
             &self.dominated_domains,
             &self.domain_controllers,
-            cred_domains.as_ref(),
         )
         .is_empty()
     }
@@ -1213,31 +1023,6 @@ mod tests {
     }
 
     #[test]
-    fn created_machine_account_tracking_normalizes() {
-        let mut state = StateInner::new("op-1".into());
-        assert!(!state.is_self_created_machine_account("ARESATK01$"));
-
-        // Record with trailing `$` and uppercase; lookups in any case/with or
-        // without `$` must all hit.
-        assert!(state.record_created_machine_account("ARESATK01$"));
-        assert!(state.is_self_created_machine_account("ARESATK01$"));
-        assert!(state.is_self_created_machine_account("aresatk01"));
-        assert!(state.is_self_created_machine_account("  ARESATK01$  "));
-        // A different account is not matched.
-        assert!(!state.is_self_created_machine_account("SQL01$"));
-        // Re-recording the same (normalized) name is idempotent.
-        assert!(!state.record_created_machine_account("aresatk01"));
-    }
-
-    #[test]
-    fn created_machine_account_ignores_empty() {
-        let mut state = StateInner::new("op-1".into());
-        assert!(!state.record_created_machine_account("$"));
-        assert!(!state.record_created_machine_account("   "));
-        assert!(!state.is_self_created_machine_account(""));
-    }
-
-    #[test]
     fn domain_controller_map() {
         let mut state = StateInner::new("op-1".into());
         state
@@ -1323,9 +1108,9 @@ mod tests {
             DEDUP_MSSQL_RETRY,
             DEDUP_MSSQL_LINK_PIVOT,
             DEDUP_MSSQL_IMPERSONATION,
+            DEDUP_MSSQL_FAR_HOST_DUMP,
             DEDUP_SID_HISTORY,
             DEDUP_STALL_COLD_START,
-            DEDUP_LATERAL_DENIED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {
@@ -1349,11 +1134,11 @@ mod tests {
             ares_core::models::VulnerabilityInfo {
                 vuln_id: "constrained_delegation_john.smith".into(),
                 vuln_type: "constrained_delegation".into(),
-                target: String::new(),
-                discovered_by: String::new(),
+                target: "".into(),
+                discovered_by: "".into(),
                 discovered_at: chrono::Utc::now(),
                 details,
-                recommended_agent: String::new(),
+                recommended_agent: "".into(),
                 priority: 8,
             },
         );
@@ -1502,163 +1287,17 @@ mod tests {
         assert!(!state.is_principal_quarantined("jdoe", "child.contoso.local"));
     }
 
-    fn fsp_vuln(
-        group: &str,
-        group_domain: &str,
-        member: &str,
-        member_domain: &str,
-    ) -> ares_core::models::VulnerabilityInfo {
-        let mut details = std::collections::HashMap::new();
-        details.insert("source".into(), serde_json::json!(member));
-        details.insert("source_domain".into(), serde_json::json!(member_domain));
-        details.insert("target".into(), serde_json::json!(group));
-        details.insert("domain".into(), serde_json::json!(group_domain));
-        ares_core::models::VulnerabilityInfo {
-            vuln_id: format!("fsp:{group}:{member}"),
-            vuln_type: "foreign_group_membership".into(),
-            target: group.into(),
-            discovered_by: "test".into(),
-            discovered_at: Utc::now(),
-            details,
-            recommended_agent: String::new(),
-            priority: 1,
-        }
-    }
+    // --- push_hash_capped ---------------------------------------------------
 
-    fn cred(user: &str, password: &str, domain: &str) -> Credential {
-        Credential {
-            id: format!("c-{user}@{domain}"),
-            username: user.into(),
-            password: password.into(),
-            domain: domain.into(),
-            source: String::new(),
-            is_admin: false,
-            discovered_at: None,
-            parent_id: None,
-            attack_step: 0,
-        }
-    }
-
-    #[test]
-    fn resolve_principal_direct_match_returns_without_via_group() {
-        let mut state = StateInner::new("op-1".into());
-        state
-            .credentials
-            .push(cred("alice", "Pw!", "contoso.local"));
-        let resolved = state
-            .resolve_principal_to_credential("alice", "contoso.local")
-            .expect("alice should resolve directly");
-        assert_eq!(resolved.0.username, "alice");
-        assert_eq!(resolved.0.domain, "contoso.local");
-        assert!(
-            resolved.1.is_none(),
-            "direct match must not set via_group: {:?}",
-            resolved.1
-        );
-    }
-
-    #[test]
-    fn resolve_principal_expands_group_via_foreign_member() {
-        // `CrossForestAdmins` is a Domain Local group in fabrikam.local
-        // whose only foreign member is `alice@contoso.local`. An RBCD vuln
-        // discovered against a fabrikam computer carries
-        // source="CrossForestAdmins", domain="fabrikam.local" — no matching
-        // credential by username. The resolver must walk the
-        // foreign_group_membership vuln and find alice.
-        let mut state = StateInner::new("op-1".into());
-        let v = fsp_vuln(
-            "CrossForestAdmins",
-            "fabrikam.local",
-            "alice",
-            "contoso.local",
-        );
-        state
-            .discovered_vulnerabilities
-            .insert(v.vuln_id.clone(), v);
-        state
-            .credentials
-            .push(cred("alice", "P@ssw0rd!", "contoso.local"));
-
-        let resolved = state
-            .resolve_principal_to_credential("CrossForestAdmins", "fabrikam.local")
-            .expect("group expansion should resolve to alice");
-        assert_eq!(resolved.0.username, "alice");
-        assert_eq!(resolved.0.domain, "contoso.local");
-        assert_eq!(
-            resolved.1.as_deref(),
-            Some("CrossForestAdmins"),
-            "via_group must surface the indirection"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_group_expansion_returns_none_when_member_uncrackable() {
-        let mut state = StateInner::new("op-1".into());
-        let v = fsp_vuln(
-            "CrossForestAdmins",
-            "fabrikam.local",
-            "alice",
-            "contoso.local",
-        );
-        state
-            .discovered_vulnerabilities
-            .insert(v.vuln_id.clone(), v);
-        // No cred for alice → resolver must report None, not panic and
-        // not return an unrelated credential.
-        state.credentials.push(cred("bob", "Pw!", "contoso.local"));
-
-        assert!(state
-            .resolve_principal_to_credential("CrossForestAdmins", "fabrikam.local")
-            .is_none());
-    }
-
-    #[test]
-    fn resolve_principal_skips_unrelated_fsp_vulns() {
-        // FSP vuln targeting a different group/domain must not contaminate
-        // the lookup. Caller asked about CrossForestAdmins/fabrikam; an
-        // unrelated edge naming a different group must not satisfy it.
-        let mut state = StateInner::new("op-1".into());
-        let v = fsp_vuln(
-            "OtherForeignGroup",
-            "contoso.local",
-            "bob",
-            "fabrikam.local",
-        );
-        state
-            .discovered_vulnerabilities
-            .insert(v.vuln_id.clone(), v);
-        state
-            .credentials
-            .push(cred("bob", "bobpw", "fabrikam.local"));
-
-        assert!(
-            state
-                .resolve_principal_to_credential("CrossForestAdmins", "fabrikam.local")
-                .is_none(),
-            "unrelated FSP edge must not satisfy CrossForestAdmins expansion"
-        );
-    }
-
-    #[test]
-    fn resolve_principal_to_hash_expands_group() {
-        let mut state = StateInner::new("op-1".into());
-        let v = fsp_vuln(
-            "CrossForestAdmins",
-            "fabrikam.local",
-            "alice",
-            "contoso.local",
-        );
-        state
-            .discovered_vulnerabilities
-            .insert(v.vuln_id.clone(), v);
-        state.hashes.push(ares_core::models::Hash {
-            id: "h-alice".into(),
-            username: "alice".into(),
-            hash_value: "deadbeef".into(),
-            hash_type: "NTLM".into(),
-            domain: "contoso.local".into(),
+    fn make_test_hash(username: &str, hash_value: &str) -> Hash {
+        Hash {
+            id: format!("h-{username}-{hash_value}"),
+            username: username.to_string(),
+            hash_value: hash_value.to_string(),
+            hash_type: "NTLM".to_string(),
+            domain: "contoso.local".to_string(),
             cracked_password: None,
-            source: String::new(),
+            source: "test".to_string(),
             discovered_at: None,
             parent_id: None,
             attack_step: 0,
@@ -1667,78 +1306,146 @@ mod tests {
             source_host: None,
             is_trust_key: false,
             trust_pair_label: None,
-        });
-
-        let resolved = state
-            .resolve_principal_to_hash("CrossForestAdmins", "fabrikam.local")
-            .expect("group expansion should resolve to alice's NTLM hash");
-        assert_eq!(resolved.0.username, "alice");
-        assert_eq!(resolved.0.domain, "contoso.local");
-        assert_eq!(resolved.1.as_deref(), Some("CrossForestAdmins"));
+        }
     }
 
-    // --- resolve_host_ip_by_hostname (kerberoast MSSQLSvc IP recovery) -----
+    #[test]
+    fn push_hash_capped_under_cap_just_appends() {
+        let mut state = StateInner::new("op-1".into());
+        for i in 0..10 {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert_eq!(state.hashes.len(), 10);
+    }
 
-    fn host_with(ip: &str, hostname: &str) -> Host {
+    #[test]
+    fn push_hash_capped_evicts_oldest_low_value_at_cap() {
+        let mut state = StateInner::new("op-1".into());
+        // Fill to cap with uncracked, non-krbtgt, non-trust-key, no-AES entries.
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert_eq!(state.hashes.len(), MAX_HASHES);
+        let first_before = state.hashes[0].username.clone();
+        // Push one more — oldest low-value entry (index 0) should be evicted.
+        state.push_hash_capped(make_test_hash("newcomer", "deadbeef"));
+        assert_eq!(state.hashes.len(), MAX_HASHES);
+        assert_ne!(state.hashes[0].username, first_before);
+        assert_eq!(state.hashes.last().unwrap().username, "newcomer");
+    }
+
+    #[test]
+    fn push_hash_capped_never_evicts_krbtgt() {
+        let mut state = StateInner::new("op-1".into());
+        // krbtgt at index 0, then fill with low-value entries.
+        let mut krb = make_test_hash("krbtgt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        krb.hash_type = "NTLM".into();
+        state.push_hash_capped(krb);
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        // krbtgt must still be present.
+        assert!(state
+            .hashes
+            .iter()
+            .any(|h| h.username.eq_ignore_ascii_case("krbtgt")));
+        assert_eq!(state.hashes.len(), MAX_HASHES);
+    }
+
+    #[test]
+    fn push_hash_capped_never_evicts_cracked() {
+        let mut state = StateInner::new("op-1".into());
+        let mut cracked = make_test_hash("victim", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        cracked.cracked_password = Some("P@ssw0rd!".into());
+        state.push_hash_capped(cracked);
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert!(state
+            .hashes
+            .iter()
+            .any(|h| h.username == "victim" && h.cracked_password.is_some()));
+    }
+
+    #[test]
+    fn push_hash_capped_never_evicts_trust_key_or_aes() {
+        let mut state = StateInner::new("op-1".into());
+        let mut trust = make_test_hash("CONTOSO$", "cccccccccccccccccccccccccccccccc");
+        trust.is_trust_key = true;
+        state.push_hash_capped(trust);
+        let mut aes = make_test_hash("svc_aes", "dddddddddddddddddddddddddddddddd");
+        aes.aes_key = Some("a".repeat(64));
+        state.push_hash_capped(aes);
+        for i in 0..MAX_HASHES {
+            state.push_hash_capped(make_test_hash(&format!("user{i}"), &format!("{i:032x}")));
+        }
+        assert!(state.hashes.iter().any(|h| h.is_trust_key));
+        assert!(state.hashes.iter().any(|h| h.aes_key.is_some()));
+    }
+
+    #[test]
+    fn push_hash_capped_all_high_value_overflows() {
+        let mut state = StateInner::new("op-1".into());
+        // Fill entirely with cracked entries (all high-value).
+        for i in 0..MAX_HASHES {
+            let mut h = make_test_hash(&format!("user{i}"), &format!("{i:032x}"));
+            h.cracked_password = Some("pw".into());
+            state.push_hash_capped(h);
+        }
+        // Add one more — cap is soft, all entries are protected, so we overflow.
+        let mut extra = make_test_hash("extra", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        extra.cracked_password = Some("pw".into());
+        state.push_hash_capped(extra);
+        assert_eq!(state.hashes.len(), MAX_HASHES + 1);
+    }
+
+    fn make_dc_host(ip: &str, hostname: &str) -> Host {
         Host {
             ip: ip.to_string(),
             hostname: hostname.to_string(),
             os: String::new(),
-            roles: vec![],
+            roles: vec!["domain_controller".to_string()],
             services: vec![],
-            is_dc: false,
+            is_dc: true,
             owned: false,
         }
     }
 
     #[test]
-    fn resolve_host_ip_by_hostname_matches_exact_fqdn() {
+    fn resolve_dc_ip_zone_apex_does_not_transpose_parent_and_child() {
         let mut state = StateInner::new("op-1".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("north.contoso.local".into());
         state
             .hosts
-            .push(host_with("192.168.58.30", "sql01.contoso.local"));
-        assert_eq!(
-            state.resolve_host_ip_by_hostname("SQL01.contoso.local"),
-            Some("192.168.58.30".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_host_ip_by_hostname_matches_bare_short_name() {
-        // The split-record case: the scan record knows the host only by its
-        // short NetBIOS name while the kerberoast SPN carries the FQDN.
-        let mut state = StateInner::new("op-1".into());
-        state.hosts.push(host_with("192.168.58.30", "sql01"));
-        assert_eq!(
-            state.resolve_host_ip_by_hostname("sql01.contoso.local"),
-            Some("192.168.58.30".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_host_ip_by_hostname_no_cross_domain_fqdn_match() {
-        // A short-label collision across domains must NOT resolve: the only
-        // IP-bearing record is sql01.fabrikam.local, but we asked about
-        // sql01.contoso.local.
-        let mut state = StateInner::new("op-1".into());
+            .push(make_dc_host("192.168.58.240", "north.contoso.local"));
         state
             .hosts
-            .push(host_with("192.168.58.40", "sql01.fabrikam.local"));
+            .push(make_dc_host("192.168.58.243", "contoso.local"));
+
         assert_eq!(
-            state.resolve_host_ip_by_hostname("sql01.contoso.local"),
-            None
+            state.resolve_dc_ip("contoso.local"),
+            Some("192.168.58.243".to_string()),
+            "parent domain must resolve to the parent DC, not the child"
+        );
+        assert_eq!(
+            state.resolve_dc_ip("north.contoso.local"),
+            Some("192.168.58.240".to_string()),
+            "child domain must resolve to the child DC"
         );
     }
 
     #[test]
-    fn resolve_host_ip_by_hostname_ignores_empty_ip_and_empty_arg() {
+    fn resolve_dc_ip_normal_fqdn_still_strips_machine_label() {
         let mut state = StateInner::new("op-1".into());
-        // Only an empty-IP record exists — nothing to recover from.
-        state.hosts.push(host_with("", "sql01.contoso.local"));
+        state.domains.push("contoso.local".into());
+        state
+            .hosts
+            .push(make_dc_host("192.168.58.10", "dc01.contoso.local"));
+
         assert_eq!(
-            state.resolve_host_ip_by_hostname("sql01.contoso.local"),
-            None
+            state.resolve_dc_ip("contoso.local"),
+            Some("192.168.58.10".to_string())
         );
-        assert_eq!(state.resolve_host_ip_by_hostname(""), None);
     }
 }

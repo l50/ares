@@ -9,7 +9,7 @@
 //! recursively, including Foreign Security Principals for cross-domain groups.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -147,10 +147,6 @@ pub async fn auto_group_enumeration(
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Suppress re-dispatch of items the throttler / credential-inflight cap just
-    // deferred, so the 20s tick doesn't flood the deferred queue with duplicates
-    // (dedup only commits on success). See super::DeferCooldown.
-    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -177,11 +173,7 @@ pub async fn auto_group_enumeration(
                 "Group enumeration work items collected"
             );
         }
-        let now = Instant::now();
         for item in work {
-            if cooldown.active(&item.dedup_key, now) {
-                continue;
-            }
             // When PTH hash is available, use the hash user's identity for the target domain
             // instead of a cross-domain credential that will fail LDAP simple bind.
             let (cred_user, cred_pass, cred_domain) = if item.ntlm_hash.is_some() {
@@ -231,6 +223,12 @@ pub async fn auto_group_enumeration(
                     "you MUST pass bind_domain=<credential_domain> to ldap_search. ",
                     "Check the 'bind_domain' field in the task payload — if present, always pass it ",
                     "to ldap_search so the LDAP bind uses user@bind_domain while querying the target domain.\n\n",
+                    "LDAP AUTH FAILURE FALLBACK: If ldap_search returns Invalid credentials (49) / data 52e, ",
+                    "do NOT call request_assistance. Retry ldap_search once without bind_domain if bind_domain ",
+                    "was used. If an NTLM hash is available, use rpcclient_command with hash=<ntlm_hash> ",
+                    "and command='enumdomgroups'. If no credential works, use rpcclient_command with ",
+                    "null_session=true for 'enumdomgroups' and 'enumdomusers'. If all fallbacks fail, ",
+                    "call task_complete with a concise summary of attempts and failures.\n\n",
                     "For EACH group found, report it as a vulnerability:\n",
                     "  vuln_type: 'group_enumerated'\n",
                     "  target: the group sAMAccountName\n",
@@ -272,7 +270,6 @@ pub async fn auto_group_enumeration(
                         "Group enumeration dispatched"
                     );
 
-                    cooldown.clear(&item.dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -285,7 +282,6 @@ pub async fn auto_group_enumeration(
                 }
                 Ok(None) => {
                     info!(domain = %item.domain, dc = %item.dc_ip, "Group enumeration deferred by throttler");
-                    cooldown.record(&item.dedup_key, now);
                 }
                 Err(e) => {
                     warn!(err = %e, domain = %item.domain, "Failed to dispatch group enumeration");

@@ -67,7 +67,7 @@ pub fn extract_hosts(output: &str) -> Vec<Host> {
                 if !netbios_name.is_empty() && !domain.is_empty() && !netbios_name.contains('.') {
                     let nb = netbios_name.to_lowercase();
                     let dom = domain.to_lowercase();
-                    let workgroup_self = dom == nb || dom.starts_with(&format!("{nb}."));
+                    let workgroup_self = dom == nb || dom.starts_with(&format!("{}.", nb));
                     if workgroup_self {
                         netbios_name
                     } else {

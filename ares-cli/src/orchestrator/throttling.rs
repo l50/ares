@@ -7,7 +7,6 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -76,11 +75,6 @@ pub struct Throttler {
     rate_limit_errors: tokio::sync::Mutex<u32>,
     /// Global backoff deadline (if any).
     backoff_until: tokio::sync::Mutex<Option<Instant>>,
-    /// Stall-pressure signal written by `auto_stall_detection`: 0 means the
-    /// op is making forward progress, >0 means N consecutive recovery rounds
-    /// produced zero new creds/hashes. Used to tighten the per-role cap so a
-    /// stuck op doesn't keep multiplying parallel duplicated-context agents.
-    stall_pressure: Arc<AtomicU32>,
 }
 
 impl Throttler {
@@ -93,29 +87,7 @@ impl Throttler {
             last_dispatch: tokio::sync::Mutex::new(Instant::now()),
             rate_limit_errors: tokio::sync::Mutex::new(0),
             backoff_until: tokio::sync::Mutex::new(None),
-            stall_pressure: Arc::new(AtomicU32::new(0)),
         }
-    }
-
-    /// Update the stall-pressure signal from the stall-recovery loop.
-    ///
-    /// Zero means progress was observed (back to normal caps). Positive values
-    /// are the count of consecutive unproductive recovery rounds; the
-    /// effective per-role cap is halved (rounded up, min 1) when this is >0,
-    /// throttling parallel agent expansion against a stuck operation.
-    pub fn set_stall_pressure(&self, streak: u32) {
-        self.stall_pressure.store(streak, Ordering::Relaxed);
-    }
-
-    /// Returns the per-role cap to apply right now, accounting for stall
-    /// pressure. Stalled ops contract to ⌈base/2⌉ slots per role (minimum 1).
-    fn effective_max_tasks_per_role(&self) -> usize {
-        let base = self.config.max_tasks_per_role;
-        if self.stall_pressure.load(Ordering::Relaxed) == 0 {
-            return base;
-        }
-        // ⌈base/2⌉ — never below 1 so we don't starve the op entirely.
-        base.div_ceil(2).max(1)
     }
 
     /// Evaluate whether `task_type` targeting `role` should be allowed now.
@@ -143,33 +115,6 @@ impl Throttler {
         let llm_count = self.tracker.llm_task_count().await;
         let max_tasks = self.config.max_concurrent_tasks;
         let hard_cap = self.config.hard_cap();
-
-        // Per-role hard ceiling — applies before any global cap check. One
-        // role cannot hold more than `max_tasks_per_role` LLM slots, even
-        // when the global tracker is below the soft cap. Without this, a
-        // role with long-running tool calls (coercion blocking on
-        // ntlmrelayx for 600s) keeps accumulating slots while shorter-task
-        // roles churn through theirs, eventually saturating the global cap
-        // and forcing recon/lateral into the deferred queue where they
-        // stale-evict before running. Critical-path and always-bypass
-        // task types are exempt — those exist precisely to punch through
-        // congestion.
-        if !self.is_always_bypass(task_type) && !self.is_critical_path(task_type, payload) {
-            let role_count = self.tracker.count_for_role(target_role).await;
-            let cap = self.effective_max_tasks_per_role();
-            if role_count >= cap {
-                debug!(
-                    role = target_role,
-                    role_count,
-                    cap,
-                    base_cap = self.config.max_tasks_per_role,
-                    stall_pressure = self.stall_pressure.load(Ordering::Relaxed),
-                    task_type,
-                    "Per-role cap: deferring task"
-                );
-                return ThrottleDecision::Defer;
-            }
-        }
 
         if llm_count >= hard_cap {
             // Always-bypass tasks (acl_chain_step) skip even the bypass-cap.
@@ -210,15 +155,22 @@ impl Throttler {
             return ThrottleDecision::Defer;
         }
 
-        // No separate soft-cap branch: the per-role ceiling above already
-        // enforces fairness across roles, and the hard-cap branch handles
-        // overall saturation. Any candidate that reaches here is below both
-        // the role ceiling AND the global hard cap — allow it, subject only
-        // to the dispatch-delay rate-limit below. The old "soft cap" branch
-        // used `max_tasks_per_role` as a minimum floor; that semantic is
-        // now subsumed by the ceiling (same value, opposite direction:
-        // allow iff role_count < cap).
-        let _ = max_tasks;
+        if llm_count >= max_tasks {
+            let role_count = self.tracker.count_for_role(target_role).await;
+            let min_per_role = self.config.max_tasks_per_role;
+            if role_count < min_per_role {
+                info!(
+                    llm_count,
+                    max_tasks,
+                    role = target_role,
+                    role_count,
+                    "Soft cap: allowing — role below minimum"
+                );
+                return ThrottleDecision::Allow;
+            }
+            debug!(llm_count, max_tasks, task_type, "Soft cap: deferring task");
+            return ThrottleDecision::Defer;
+        }
 
         {
             let last = self.last_dispatch.lock().await;
@@ -340,27 +292,6 @@ impl Throttler {
             }
         }
 
-        // Secretsdump is the canonical DA route once a local-admin credential
-        // is in hand. auto_local_admin_secretsdump (and the PTH child-to-parent
-        // path) submit as task_type=credential_access, which shares a per-role
-        // cap with kerberoast/AS-REP roast/password-spray automations. When
-        // those long-running enumeration tasks saturate the role, every fresh
-        // secretsdump request gets deferred and then stale-evicted from the
-        // deferred queue before it can run — the op stalls with 0 DCs
-        // compromised despite having valid credentials. Whitelist the
-        // `secretsdump` technique only (not the whole role) so it rides the
-        // bypass channel without giving roast/spray automations a free pass.
-        if task_type == "credential_access" {
-            if let Some(technique) = payload
-                .and_then(|p| p.get("technique"))
-                .and_then(|v| v.as_str())
-            {
-                if technique.eq_ignore_ascii_case("secretsdump") {
-                    return true;
-                }
-            }
-        }
-
         false
     }
 }
@@ -385,6 +316,7 @@ mod tests {
             max_tasks_per_role: 3,
             dispatch_delay: std::time::Duration::from_millis(0),
             stale_task_timeout: std::time::Duration::from_secs(300),
+            non_llm_task_timeout: std::time::Duration::from_secs(6000),
             deferred_task_max_age: std::time::Duration::from_secs(300),
             max_deferred_per_type: 5,
             max_deferred_total: 20,
@@ -430,7 +362,6 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -451,7 +382,6 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -473,7 +403,6 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -496,7 +425,6 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -520,7 +448,6 @@ mod tests {
                     task_type: "recon".into(),
                     role: "recon".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -531,46 +458,6 @@ mod tests {
                 t.check("exploit", "privesc", Some(&payload)).await,
                 ThrottleDecision::Allow,
                 "{vt} should bypass hard cap"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn critical_path_secretsdump_bypasses_role_cap() {
-        // Saturate the credential_access role with kerberoast-style work
-        // (no payload), then verify a secretsdump submission rides the bypass
-        // while sibling techniques (kerberoast, asreproast, password_spray)
-        // still defer. Per-role fairness for high-volume enumeration is
-        // preserved; only the DA-route technique punches through.
-        let (t, tracker) = make_throttler(8);
-        for i in 0..3 {
-            tracker
-                .add(ActiveTask {
-                    task_id: format!("kr{i}"),
-                    task_type: "credential_access".into(),
-                    role: "credential_access".into(),
-                    submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
-                    credential_key: None,
-                })
-                .await;
-        }
-
-        let secretsdump = json!({"technique": "secretsdump", "target_ip": "192.168.58.10"});
-        assert_eq!(
-            t.check("credential_access", "credential_access", Some(&secretsdump))
-                .await,
-            ThrottleDecision::Allow,
-            "secretsdump must bypass per-role cap"
-        );
-
-        for technique in ["kerberoast", "asreproast", "password_spray"] {
-            let payload = json!({"technique": technique});
-            assert_eq!(
-                t.check("credential_access", "credential_access", Some(&payload))
-                    .await,
-                ThrottleDecision::Defer,
-                "{technique} must still be capped"
             );
         }
     }
@@ -587,7 +474,6 @@ mod tests {
                     task_type: "exploit".into(),
                     role: "privesc".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -611,7 +497,6 @@ mod tests {
                     task_type: "exploit".into(),
                     role: "privesc".into(),
                     submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
                     credential_key: None,
                 })
                 .await;
@@ -621,118 +506,6 @@ mod tests {
             t.check("exploit", "privesc", Some(&payload)).await,
             ThrottleDecision::Defer
         );
-    }
-
-    #[tokio::test]
-    async fn per_role_cap_defers_with_global_headroom() {
-        // max_tasks_per_role=3 in make_config. Even though global is below
-        // the soft cap (8), a role already at 3 must defer.
-        let (t, tracker) = make_throttler(8);
-        for i in 0..3 {
-            tracker
-                .add(ActiveTask {
-                    task_id: format!("c{i}"),
-                    task_type: "coercion".into(),
-                    role: "coercion".into(),
-                    submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
-                    credential_key: None,
-                })
-                .await;
-        }
-        assert_eq!(
-            t.check("coercion", "coercion", None).await,
-            ThrottleDecision::Defer,
-            "role at cap should defer even with global headroom"
-        );
-        // Different role still has headroom.
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Allow,
-            "different role should still be allowed"
-        );
-    }
-
-    #[tokio::test]
-    async fn per_role_cap_bypassed_by_critical_path() {
-        // Critical-path task types must punch through the per-role cap —
-        // forest-pivot vulns can't be parked behind a saturated role queue.
-        let (t, tracker) = make_throttler(8);
-        for i in 0..5 {
-            tracker
-                .add(ActiveTask {
-                    task_id: format!("p{i}"),
-                    task_type: "exploit".into(),
-                    role: "privesc".into(),
-                    submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
-                    credential_key: None,
-                })
-                .await;
-        }
-        let payload = json!({"vuln_type": "forest_trust_escalation"});
-        assert_eq!(
-            t.check("exploit", "privesc", Some(&payload)).await,
-            ThrottleDecision::Allow,
-            "critical-path vuln should bypass per-role cap"
-        );
-    }
-
-    #[tokio::test]
-    async fn stall_pressure_halves_per_role_cap() {
-        // Baseline: with max_tasks_per_role=3 and zero stall pressure, two
-        // tasks already in flight allows a third. Under stall pressure the
-        // effective cap becomes ⌈3/2⌉=2, so the third must defer.
-        let (t, tracker) = make_throttler(8);
-        for i in 0..2 {
-            tracker
-                .add(ActiveTask {
-                    task_id: format!("r{i}"),
-                    task_type: "recon".into(),
-                    role: "recon".into(),
-                    submitted_at: Instant::now(),
-                    last_activity: Instant::now(),
-                    credential_key: None,
-                })
-                .await;
-        }
-
-        // No stall pressure: 2 < 3 → Allow.
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Allow,
-            "below cap with no stall pressure should allow"
-        );
-
-        // Mark the op as stuck (1 unproductive recovery round).
-        t.set_stall_pressure(1);
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Defer,
-            "stall pressure should contract the cap and defer"
-        );
-
-        // Recovery: clearing the pressure restores the full cap.
-        t.set_stall_pressure(0);
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Allow,
-            "clearing stall pressure should restore full cap"
-        );
-    }
-
-    #[tokio::test]
-    async fn stall_pressure_never_falls_below_one() {
-        // Even with max_tasks_per_role=1, stall mode must leave at least one
-        // slot per role open — otherwise no role can ever dispatch and the
-        // op deadlocks instead of degrading gracefully.
-        let (t, _tracker) = make_throttler(8);
-        // Override per-role cap to 1 (lower bound).
-        let _ = t.config.max_tasks_per_role; // sanity: 3 in make_throttler
-        t.set_stall_pressure(5);
-        // ⌈3/2⌉=2, still > 0. With our cap=3 default, effective=2.
-        // Test the floor by inspecting effective_max_tasks_per_role directly.
-        assert!(t.effective_max_tasks_per_role() >= 1);
     }
 
     #[tokio::test]
@@ -769,88 +542,5 @@ mod tests {
         assert!(_p1.is_some() && _p2.is_some() && _p3.is_some());
         assert!(t.acquire_role_permit("recon").await.is_none());
         assert!(t.acquire_role_permit("lateral").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn stale_cleanup_releases_per_role_slot_for_throttler() {
-        // End-to-end: saturate the per-role cap with stale tasks, run cleanup,
-        // and verify the throttler now allows a fresh dispatch. Before the
-        // fix, the per-role counter leaked when stale eviction landed and
-        // the throttler kept returning `Defer` indefinitely — wedging the
-        // orchestrator with `llm_count` frozen and zero outbound LLM
-        // traffic.
-        let (t, tracker) = make_throttler(8);
-        let max_per_role = t.config.max_tasks_per_role; // 3 from make_throttler
-        let stale_at = std::time::Instant::now() - std::time::Duration::from_secs(600);
-        for i in 0..max_per_role {
-            tracker
-                .add(ActiveTask {
-                    task_id: format!("stuck{i}"),
-                    task_type: "recon".into(),
-                    role: "recon".into(),
-                    submitted_at: stale_at,
-                    last_activity: stale_at,
-                    credential_key: None,
-                })
-                .await;
-        }
-
-        // Confirm the wedge: with the role at cap, new recon dispatch defers.
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Defer,
-            "saturated per-role cap should defer before cleanup"
-        );
-
-        // Cleanup runs (mirrors monitoring.rs::cleanup_stale_tasks).
-        let removed = tracker
-            .remove_stale_tasks(std::time::Duration::from_secs(60))
-            .await;
-        assert_eq!(removed.len(), max_per_role);
-
-        // Throttler must now see the freed slots — Allow, not Defer.
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Allow,
-            "stale cleanup must release per-role slots so dispatch resumes"
-        );
-        assert_eq!(tracker.count_for_role("recon").await, 0);
-        assert_eq!(tracker.llm_task_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn stale_cleanup_double_call_does_not_underflow() {
-        // Defensive: cleanup called twice (or racing with the result
-        // consumer) must not underflow the per-role counter. The throttler
-        // would interpret an underflowed `usize` as a huge in-flight count
-        // and over-defer — exactly the wedge symptom we're guarding against.
-        let (t, tracker) = make_throttler(8);
-        let stale_at = std::time::Instant::now() - std::time::Duration::from_secs(600);
-        tracker
-            .add(ActiveTask {
-                task_id: "stuck".into(),
-                task_type: "recon".into(),
-                role: "recon".into(),
-                submitted_at: stale_at,
-                last_activity: stale_at,
-                credential_key: None,
-            })
-            .await;
-
-        let first = tracker
-            .remove_stale_tasks(std::time::Duration::from_secs(60))
-            .await;
-        assert_eq!(first.len(), 1);
-        let second = tracker
-            .remove_stale_tasks(std::time::Duration::from_secs(60))
-            .await;
-        assert!(second.is_empty());
-
-        assert_eq!(tracker.count_for_role("recon").await, 0);
-        assert_eq!(tracker.llm_task_count().await, 0);
-        assert_eq!(
-            t.check("recon", "recon", None).await,
-            ThrottleDecision::Allow
-        );
     }
 }

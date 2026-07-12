@@ -59,7 +59,7 @@ pub fn extract_ntlm_hashes(output: &str) -> Vec<ParsedHash> {
                 continue;
             }
 
-            let hash_value = format!("{lm_hash}:{nt_hash}");
+            let hash_value = format!("{}:{}", lm_hash, nt_hash);
             let username_lower = username.to_lowercase();
 
             results.push(ParsedHash {
@@ -90,7 +90,7 @@ pub fn extract_ntlm_hashes(output: &str) -> Vec<ParsedHash> {
                 continue;
             }
 
-            let hash_value = format!("{lm_hash}:{nt_hash}");
+            let hash_value = format!("{}:{}", lm_hash, nt_hash);
             let username_lower = username.to_lowercase();
 
             results.push(ParsedHash {
@@ -115,20 +115,20 @@ pub fn extract_ntlm_hashes(output: &str) -> Vec<ParsedHash> {
                 if let Some(cont_caps) = CONTINUATION_RE.captures(next_line) {
                     let first_half = partial_caps[1].to_lowercase();
                     let second_half = cont_caps[1].to_lowercase();
-                    let combined_nt = format!("{first_half}{second_half}");
+                    let combined_nt = format!("{}{}", first_half, second_half);
 
                     if combined_nt.len() == 32 && combined_nt != EMPTY_NT_HASH {
                         // Try to extract context from the line before the partial hash
                         let prefix = &line[..line.len() - 16].trim_end();
                         // Try domain\user:rid:lm: pattern on the prefix + combined
-                        let reconstructed = format!("{prefix}{combined_nt}:::");
+                        let reconstructed = format!("{}{}:::", prefix, combined_nt);
                         if let Some(rcaps) = NTLM_DOMAIN_RE.captures(&reconstructed) {
                             let domain = rcaps[1].to_string();
                             let username = rcaps[2].to_string();
                             let rid: u32 = rcaps[3].parse().unwrap_or(0);
                             let lm_hash = rcaps[4].to_lowercase();
                             let nt_hash_full = rcaps[5].to_lowercase();
-                            let hash_value = format!("{lm_hash}:{nt_hash_full}");
+                            let hash_value = format!("{}:{}", lm_hash, nt_hash_full);
                             let username_lower = username.to_lowercase();
 
                             results.push(ParsedHash {
@@ -152,7 +152,7 @@ pub fn extract_ntlm_hashes(output: &str) -> Vec<ParsedHash> {
                             let rid: u32 = rcaps[2].parse().unwrap_or(0);
                             let lm_hash = rcaps[3].to_lowercase();
                             let nt_hash_full = rcaps[4].to_lowercase();
-                            let hash_value = format!("{lm_hash}:{nt_hash_full}");
+                            let hash_value = format!("{}:{}", lm_hash, nt_hash_full);
                             let username_lower = username.to_lowercase();
 
                             results.push(ParsedHash {

@@ -2,49 +2,55 @@
 # EC2 deployment tasks — run ares directly on EC2 via AWS SSM
 # Alternative to K8s for faster testing iterations.
 #
-# Architecture: single EC2 with Redis + NATS + orchestrator + per-role worker fleet.
-# Workers run as systemd template units (ares@{role}); the orchestrator routes
-# tool calls over NATS to them so heavy tools run in the worker's own cgroup.
-# All provisioning (Redis, NATS, the ares@ fleet, system-ares.slice, swap + OOM
-# tuning) is baked into the attack-box AMI by the Ansible collection in ansible/
-# (playbooks/ares/goad_attack_box.yml); ec2:setup only verifies readiness.
+# Architecture: single EC2 with Redis + NATS + orchestrator + worker fleet.
+# The orchestrator leaves ARES_TOOL_DISPATCH unset and routes every tool call
+# over NATS to per-role ares@<role>.service workers, so heavy tools (hashcat,
+# netexec) run inside the worker's own cgroup rather than the orchestrator's.
+# The fleet (recon, credential_access, cracker, acl, privesc, lateral,
+# coercion) and its infra are baked into the attack-box AMI by the Ansible
+# collection in ansible/ (goad_attack_box.yml). If the workers are down,
+# dispatches return "no responders" and the operation wedges at zero progress;
+# ec2:setup verifies they are up.
 #
 # Usage:
-#   task ec2:setup EC2_NAME=ares-tools       # Readiness check: ensure baked fleet is up, smoke-test Redis+NATS
+#   task ec2:setup EC2_NAME=ares-tools       # Readiness check: guard impacket drift, ensure fleet up, smoke test
 #   task ec2:deploy EC2_NAME=ares-tools      # Build + push Rust binaries via S3 + SSM
-#   task ec2:start EC2_NAME=ares-tools       # Start Redis + workers
+#   task ec2:start EC2_NAME=ares-tools       # Start Redis + NATS (infra only)
 #   task ec2:status EC2_NAME=ares-tools      # Show process status
 #   task ec2:redis:forward EC2_NAME=ares-tools  # Port-forward Redis for local CLI
-#   task ec2:logs EC2_NAME=ares-tools ROLE=lateral  # Tail worker logs
+#   task ec2:logs EC2_NAME=ares-tools ROLE=orchestrator  # Tail orchestrator logs
 version: "3"
 
 set: [errexit, pipefail]
 
 vars:
+  # Local ares CLI (matches the README build output + the red/blue includes).
+  # Passed in from the root Taskfile; defaults so this taskfile works standalone.
+  ARES_CLI: '{{.ARES_CLI | default "./target/release/ares"}}'
   INFO: '\033[0;34m[INFO]\033[0m'
   SUCCESS: '\033[0;32m[SUCCESS]\033[0m'
   ERROR: '\033[0;31m[ERROR]\033[0m'
   WARN: '\033[1;33m[WARN]\033[0m'
   # EC2 instance identification (Name tag filter)
   EC2_NAME: '{{.EC2_NAME | default "kali-ares"}}'
-  EC2_PROFILE: '{{.EC2_PROFILE | default "lab"}}'
-  EC2_REGION: '{{.EC2_REGION | default "us-west-1"}}'
+  # Honor standard AWS env vars (AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION).
+  # Override per-invocation with AWS_PROFILE=foo task ec2:foo or by passing
+  # AWS_PROFILE=foo AWS_REGION=us-east-1 explicitly on the task command line.
+  AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
+  AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
   # S3 bucket for file staging (required; pass S3_BUCKET=your-bucket or set as env var)
   S3_BUCKET: '{{.S3_BUCKET | default ""}}'
   # Remote paths on EC2
   ARES_REMOTE_BIN: '/usr/local/bin'
   ARES_REMOTE_CONFIG: '/etc/ares/config.yaml'
   ARES_LOG_DIR: '/var/log/ares'
-  # Build tool: auto (cross on macOS due to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo, remote
-  # remote: builds natively on EC2 (fastest for iteration, no cross-compilation)
+  # Build tool: auto (cross on macOS due to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo
+  # `remote` (native EC2 build) is also accepted but currently undocumented —
+  # tokio OOMs the linker on the kali-ares instance size. Bump RAM/swap before using it.
   BUILD_TOOL: '{{.BUILD_TOOL | default "auto"}}'
   # Build profile: release (optimized) or dev-deploy (fast compile, less optimized)
   BUILD_PROFILE: '{{.BUILD_PROFILE | default "dev-deploy"}}'
   REMOTE_BUILD_DIR: '/tmp/ares-build'
-  # Worker roles
-  WORKER_ROLES: 'recon credential_access cracker acl privesc lateral coercion'
-  # Worker mode: tool_exec (Rust LLM orchestrator) or task (Python-style)
-  WORKER_MODE: '{{.WORKER_MODE | default "tool_exec"}}'
   # Loki deployment label for blue team queries
   EC2_DEPLOYMENT: '{{.EC2_DEPLOYMENT | default "alpha-operator-range"}}'
 
@@ -58,8 +64,8 @@ tasks:
     cmds:
       - |
         INSTANCE_INFO=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].[InstanceId,PrivateIpAddress,Tags[?Key==\`Name\`].Value|[0]]" \
@@ -89,13 +95,18 @@ tasks:
       CARGO_BUILD_JOBS: '{{.CARGO_BUILD_JOBS | default "0"}}'
       S3_DEPLOY_PREFIX: 'ares-deploy'
     preconditions:
-      - sh: aws sts get-caller-identity --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}" >/dev/null 2>&1
-        msg: "Not logged into AWS (profile: {{.EC2_PROFILE}}). Run: aws sso login --profile {{.EC2_PROFILE}}"
+      - sh: aws sts get-caller-identity --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" >/dev/null 2>&1
+        msg: "Not logged into AWS (profile: {{.AWS_PROFILE}}). Run: aws sso login --profile {{.AWS_PROFILE}}"
       - sh: test -n "{{.S3_BUCKET}}"
         msg: "S3_BUCKET not set. Pass S3_BUCKET=your-bucket or export it as an env var."
     cmds:
       # Build binaries (local cross-compile or remote native build)
       - |
+        # cross/cargo-zigbuild/sccache live in ~/.cargo/bin; fresh non-login
+        # shells (and Task's own env) don't always inherit it, so `command -v`
+        # misses them and auto-detect falls back to plain cargo.
+        export PATH="$HOME/.cargo/bin:$PATH"
+
         BUILD_TOOL="{{.BUILD_TOOL}}"
 
         # Resolve 'auto': cross is required on macOS because aws-lc-sys
@@ -119,18 +130,11 @@ tasks:
         if [ "$BUILD_TOOL" = "remote" ]; then
           echo -e "{{.INFO}} Building natively on EC2..."
 
-          # Resolve instance
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --filters "Name=instance-state-name,Values=running" \
-                      "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-            --query "Reservations[*].Instances[*].InstanceId" \
-            --output text | head -1)
-          if [ -z "$INSTANCE_ID" ]; then
-            echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-            exit 1
-          fi
+          export AWS_PROFILE="{{.AWS_PROFILE}}"
+          export AWS_REGION="{{.AWS_REGION}}"
+          . .taskfiles/ec2/scripts/run-ssm.sh
+
+          INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
           # Create source tarball (exclude build artifacts and git metadata).
           # .cargo/ holds an OPTIONAL gitignored per-dev config.toml; include
@@ -151,17 +155,16 @@ tasks:
           # Upload source to S3
           echo -e "{{.INFO}} Uploading source to S3..."
           aws s3 cp "$SRC_TAR" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/ares-src.tar.gz" \
-            --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}"
+            --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
           # Build on EC2 via SSM
           echo -e "{{.INFO}} Building on $INSTANCE_ID (this may take a few minutes on first run)..."
-          PARAMS_FILE=$(mktemp)
-          trap "rm -f $SRC_TAR $PARAMS_FILE" EXIT
-          jq -n \
+
+          PAYLOAD=$(jq -rn \
             --arg bucket "{{.S3_BUCKET}}" \
             --arg prefix "{{.S3_DEPLOY_PREFIX}}" \
             --arg build_dir "{{.REMOTE_BUILD_DIR}}" \
-            '{"commands": [
+            '[
               "set -ex",
               "mkdir -p " + $build_dir,
               "aws s3 cp s3://" + $bucket + "/" + $prefix + "/ares-src.tar.gz /tmp/ares-src.tar.gz",
@@ -177,65 +180,14 @@ tasks:
               "echo Deploy SHA: $DEPLOY_SHA",
               "if [ \"$BUILD_SHA\" != \"$DEPLOY_SHA\" ]; then echo ERROR: deployed sha differs from build artifact build=$BUILD_SHA deploy=$DEPLOY_SHA; exit 1; fi",
               "echo Deployed: && ls -lh /usr/local/bin/ares"
-            ]}' > "$PARAMS_FILE"
+            ] | join("\n")')
 
           # Clean cargo builds on a t3.medium can run 15-25 min — pre-EC2-reboot
           # cache may be wiped, and incremental builds still need to relink.
           # Allow 30 min total for both the SSM command itself and the local
           # polling loop so we don't bail mid-build with a "InProgress" report.
-          CMD_ID=$(aws ssm send-command \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "file://$PARAMS_FILE" \
-            --timeout-seconds 1800 \
-            --query "Command.CommandId" --output text)
-
-          # Poll for completion (up to 30 minutes)
-          for i in $(seq 1 900); do
-            STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null) || true
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 2
-          done
-
-          # Show build output
-          OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text 2>/dev/null)
+          OUTPUT=$(run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 1800) || exit 1
           echo "$OUTPUT" | tail -20
-
-          if [ "$STATUS" != "Success" ]; then
-            DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StatusDetails" --output text 2>/dev/null)
-            echo -e "{{.ERROR}} Remote build failed (status: $STATUS, details: $DETAILS)"
-            if [ "$DETAILS" = "Undeliverable" ]; then
-              echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-              echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-            fi
-            aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardErrorContent" --output text
-            exit 1
-          fi
-
           echo -e "{{.SUCCESS}} Remote build + deploy complete"
           exit 0
         fi
@@ -270,10 +222,27 @@ tasks:
           JOBS_FLAG="-j $JOBS"
         fi
 
-        # Use sccache if available for dependency caching
+        # Use sccache for dependency caching, but ONLY when it's actually
+        # installed on the host. The cross path passes RUSTC_WRAPPER through to
+        # the container (where Cross.toml also installs sccache) and bind-mounts
+        # SCCACHE_DIR — but exporting the wrapper without a host sccache breaks
+        # cross's host-side `rustc` version probe ("couldn't fetch the rustc
+        # version"). sccache stays a genuine optional accelerator: the build
+        # works with or without it.
         if command -v sccache >/dev/null 2>&1; then
           export RUSTC_WRAPPER=sccache
-          echo -e "{{.INFO}} Using sccache for compilation caching"
+          export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
+          mkdir -p "$SCCACHE_DIR"
+          echo -e "{{.INFO}} Using sccache (cache: $SCCACHE_DIR)"
+        fi
+
+        # cross-rs images publish amd64 only; on an Apple Silicon (arm64) host
+        # Docker finds no native manifest ("no match for platform in manifest")
+        # and the pre-build fails. Pin the platform so it builds the amd64 image
+        # under emulation. No-op on amd64 hosts and for non-cross build tools.
+        if [ "$BUILD_TOOL" = "cross" ] && [ "$(uname -m)" = "arm64" ]; then
+          export DOCKER_DEFAULT_PLATFORM=linux/amd64
+          echo -e "{{.INFO}} arm64 host — building amd64 cross image under emulation (DOCKER_DEFAULT_PLATFORM=linux/amd64)"
         fi
 
         case "$BUILD_TOOL" in
@@ -292,7 +261,7 @@ tasks:
             cargo build $PROFILE_FLAG --target {{.RUST_TARGET}} $JOBS_FLAG -p ares-cli
             ;;
           *)
-            echo -e "{{.ERROR}} Unknown BUILD_TOOL: $BUILD_TOOL (valid: auto, cross, zigbuild, cargo, remote)"
+            echo -e "{{.ERROR}} Unknown BUILD_TOOL: $BUILD_TOOL (valid: auto, cross, zigbuild, cargo)"
             exit 1
             ;;
         esac
@@ -339,7 +308,7 @@ tasks:
 
         echo -e "{{.INFO}} Uploading binary to s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/..."
         aws s3 cp "$BIN_PATH" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/ares" \
-          --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}"
+          --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
         echo -e "{{.SUCCESS}} Binary staged in S3 (sha=$BUILD_SHA)"
 
@@ -347,18 +316,11 @@ tasks:
       - |
         if [ "{{.BUILD_TOOL}}" = "remote" ]; then exit 0; fi
 
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         echo -e "{{.INFO}} Pulling binaries from S3 to $INSTANCE_ID..."
 
@@ -367,13 +329,11 @@ tasks:
           EXPECTED_SHA=$(cat target/.deploy/ares.sha256)
         fi
 
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n \
+        PAYLOAD=$(jq -rn \
           --arg bucket "{{.S3_BUCKET}}" \
           --arg prefix "{{.S3_DEPLOY_PREFIX}}" \
           --arg expected_sha "$EXPECTED_SHA" \
-          '{"commands": [
+          '[
             "set -ex",
             "aws s3 cp s3://" + $bucket + "/" + $prefix + "/ares /tmp/ares.staged",
             "STAGED_RAW=$(sha256sum /tmp/ares.staged); STAGED_SHA=${STAGED_RAW%% *}",
@@ -385,62 +345,22 @@ tasks:
             "if [ \"$STAGED_SHA\" != \"$DEPLOY_SHA\" ]; then echo ERROR: deployed sha differs from staged staged=$STAGED_SHA deploy=$DEPLOY_SHA; exit 1; fi",
             "rm -f /tmp/ares.staged",
             "echo Deployed: && ls -lh /usr/local/bin/ares"
-          ]}' > "$PARAMS_FILE"
+          ] | join("\n")')
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 240 || exit 1
 
-        # Poll for completion
-        for i in $(seq 1 120); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 2
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          # StatusDetails distinguishes script failure (script returned non-zero) from
-          # delivery failure (Undeliverable = SSM agent on instance is offline / instance
-          # in ConnectionLost). For Undeliverable, stdout/stderr are both empty, so
-          # without this the operator sees only "status: Failed" and two blank lines.
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Deploy failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID."
-            echo -e "{{.ERROR}} Check 'aws ssm describe-instance-information' — PingStatus is likely ConnectionLost."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        # Restart every ares@<role> worker unit so the freshly-installed
+        # binary is actually the code servicing NATS. Without this the
+        # deploy silently ships a new /usr/local/bin/ares while systemd
+        # keeps the pre-deploy process alive and executing the old binary
+        # against the same NATS subscription — the classic 14h-stale-worker
+        # wedge (see PR discussion). Uses a glob so newly-added roles come
+        # along for free; each unit's Restart=on-failure handles the
+        # transient window.
+        RESTART_CMD='set -e; UNITS=$(systemctl list-units --type=service --state=active --no-legend "ares@*.service" 2>/dev/null | awk "{print \$1}" | sort -u); '
+        RESTART_CMD+='if [ -z "$UNITS" ]; then echo "no ares@ worker units active — skipping restart"; else echo "restarting: $UNITS"; systemctl restart $UNITS; sleep 2; systemctl is-active $UNITS | sort -u; fi'
+        echo -e "{{.INFO}} Restarting ares@ worker units so they load the new binary..."
+        run_ssm_cmd "$INSTANCE_ID" "$RESTART_CMD" 60 || exit 1
 
         echo -e "{{.SUCCESS}} Deploy complete"
 
@@ -462,78 +382,20 @@ tasks:
         msg: "S3_BUCKET not set. Pass S3_BUCKET=your-bucket or export it as an env var."
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         echo -e "{{.INFO}} Uploading config to S3..."
         aws s3 cp "{{.ARES_CONFIG}}" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml" \
-          --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}"
+          --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
 
         echo -e "{{.INFO}} Pulling config to $INSTANCE_ID..."
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg bucket "{{.S3_BUCKET}}" --arg prefix "{{.S3_DEPLOY_PREFIX}}" \
-          '{"commands": ["mkdir -p /etc/ares && aws s3 cp s3://" + $bucket + "/" + $prefix + "/config.yaml /etc/ares/config.yaml && echo Config deployed: && cat /etc/ares/config.yaml | head -5"]}' \
-          > "$PARAMS_FILE"
+        PAYLOAD="mkdir -p /etc/ares && aws s3 cp s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml /etc/ares/config.yaml && echo Config deployed: && cat /etc/ares/config.yaml | head -5"
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Config deploy failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 30 || exit 1
 
         echo -e "{{.SUCCESS}} Config deployed to $INSTANCE_ID:{{.ARES_REMOTE_CONFIG}}"
 
@@ -541,243 +403,55 @@ tasks:
   # One-Time Setup
   # ============================================================================
   setup:
-    desc: "EC2 readiness check: guard impacket drift, ensure the baked fleet is up, smoke-test Redis+NATS (provisioning is baked into the AMI; usage: task ec2:setup [EC2_NAME=ares-tools])"
+    desc: "EC2 readiness check: guard impacket drift, ensure baked fleet is up, smoke-test Redis+NATS (provisioning is baked into the AMI; usage: task ec2:setup [EC2_NAME=ares-tools])"
     silent: true
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         echo -e "{{.INFO}} Setting up ares on $INSTANCE_ID..."
+        echo -e "{{.INFO}} Waiting for setup to complete..."
 
-        # JSON-encode the setup script for SSM
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/setup.sh > "$PARAMS_FILE"
-
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --timeout-seconds 120 \
-          --query "Command.CommandId" --output text)
-
-        echo -e "{{.INFO}} Waiting for setup to complete (command: $CMD_ID)..."
-
-        for i in $(seq 1 120); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
+        PAYLOAD=$(cat .taskfiles/ec2/scripts/setup.sh)
         echo ""
-        aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 120 || exit 1
 
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Setup failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
-
-        echo -e "{{.SUCCESS}} EC2 shell setup complete"
-      - task: setup:nats
-
-  setup:nats:
-    desc: "Install NATS on EC2 via Ansible over SSM (usage: task ec2:setup:nats EC2_NAME=kali-ares)"
-    silent: true
-    preconditions:
-      - sh: command -v ansible-playbook >/dev/null
-        msg: "ansible-playbook not found. Install ansible-core (e.g. pipx install ansible-core)."
-      - sh: command -v session-manager-plugin >/dev/null
-        msg: "session-manager-plugin not installed. See https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
-      - sh: aws sts get-caller-identity --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}" >/dev/null 2>&1
-        msg: "Not logged into AWS (profile: {{.EC2_PROFILE}}). Run: aws sso login --profile {{.EC2_PROFILE}}"
-    vars:
-      # The community.aws.aws_ssm connection plugin uploads file payloads via
-      # S3; reuses the deploy bucket when set, otherwise the operator must
-      # pass S3_BUCKET=<bucket>.
-      ANSIBLE_SSM_BUCKET: '{{.S3_BUCKET}}'
-    cmds:
-      - |
-        if [ -z "{{.ANSIBLE_SSM_BUCKET}}" ]; then
-          echo -e "{{.ERROR}} S3_BUCKET not set. The aws_ssm connection plugin needs an S3 bucket for file transfer."
-          echo -e "{{.ERROR}} Pass S3_BUCKET=<bucket> or export it as an env var."
-          exit 1
-        fi
-
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
-
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
-
-        INVENTORY=$(mktemp -t ares-ansible-inv.XXXXXX)
-        trap "rm -f $INVENTORY" EXIT
-        cat >"$INVENTORY" <<EOF
-        [ares_attack_box]
-        {{.EC2_NAME}} ansible_host=$INSTANCE_ID
-
-        [ares_attack_box:vars]
-        ansible_connection=community.aws.aws_ssm
-        ansible_aws_ssm_region={{.EC2_REGION}}
-        ansible_aws_ssm_bucket_name={{.ANSIBLE_SSM_BUCKET}}
-        ansible_aws_ssm_profile={{.EC2_PROFILE}}
-        ansible_python_interpreter=/usr/bin/python3
-        EOF
-
-        echo -e "{{.INFO}} Running NATS role on $INSTANCE_ID via SSM (bucket: {{.ANSIBLE_SSM_BUCKET}})..."
-        cd "{{.ROOT_DIR}}" && \
-          ANSIBLE_CONFIG=ansible/ansible.cfg \
-          AWS_PROFILE={{.EC2_PROFILE}} \
-          AWS_REGION={{.EC2_REGION}} \
-          ansible-playbook -i "$INVENTORY" ansible/playbooks/ares/runtime_nats.yml
-
-        echo -e "{{.SUCCESS}} NATS install complete on $INSTANCE_ID"
+        echo -e "{{.SUCCESS}} EC2 setup complete"
 
   # ============================================================================
   # Process Management
   # ============================================================================
   start:
-    desc: "Start Redis + all worker roles on EC2 (usage: task ec2:start [EC2_NAME=ares-tools])"
+    desc: "Start Redis + NATS on EC2 (infra only; orchestrator launched per-op via red:ec2:multi)"
     silent: true
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
-        # Build systemctl start command for all roles
-        WORKER_UNITS=""
-        for role in {{.WORKER_ROLES}}; do
-          WORKER_UNITS="$WORKER_UNITS ares@${role}.service"
-        done
+        echo -e "{{.INFO}} Starting infra services on $INSTANCE_ID..."
 
-        echo -e "{{.INFO}} Starting ares services on $INSTANCE_ID..."
-
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
         START_CMD="systemctl start redis-server 2>/dev/null || systemctl start redis; sleep 1; redis-cli ping; "
-        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'; "
-        START_CMD+="systemctl start $WORKER_UNITS; sleep 2; echo Worker status:; "
-        START_CMD+='for role in recon credential_access cracker acl privesc lateral coercion; do '
-        START_CMD+='st=$(systemctl is-active ares@${role} 2>/dev/null || echo dead); '
-        START_CMD+='printf "  %-20s %s\n" $role $st; done'
-        jq -n --arg cmd "$START_CMD" '{"commands": [$cmd]}' > "$PARAMS_FILE"
+        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'"
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" = "Success" ]; then
-          echo -e "{{.SUCCESS}} All services started"
-        else
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Start failed (status: $STATUS, details: $DETAILS)"
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$START_CMD" 30 || exit 1
+        echo -e "{{.SUCCESS}} Infra services started"
 
   stop:
-    desc: "Stop all worker roles on EC2 (keeps Redis running) (usage: task ec2:stop [EC2_NAME=ares-tools])"
+    desc: "Stop the running ares orchestrator on EC2 (keeps Redis/NATS running)"
     silent: true
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -788,20 +462,15 @@ tasks:
           exit 1
         fi
 
-        WORKER_UNITS=""
-        for role in {{.WORKER_ROLES}}; do
-          WORKER_UNITS="$WORKER_UNITS ares@${role}.service"
-        done
-
-        echo -e "{{.INFO}} Stopping ares services on $INSTANCE_ID..."
+        echo -e "{{.INFO}} Stopping ares orchestrator on $INSTANCE_ID..."
 
         PARAMS_FILE=$(mktemp)
         trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg units "$WORKER_UNITS" '{"commands": ["systemctl stop " + $units + " 2>/dev/null || true; pkill -f \"ares orchestrator\" 2>/dev/null || true; echo Stopped all ares workers and orchestrator"]}' > "$PARAMS_FILE"
+        jq -n '{"commands": ["systemctl stop ares-orchestrator.service 2>/dev/null || true; pkill -f \"ares orchestrator\" 2>/dev/null || true; echo Stopped orchestrator"]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -809,8 +478,8 @@ tasks:
 
         for i in $(seq 1 15); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -821,8 +490,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -839,13 +508,13 @@ tasks:
       - sh: '[ -n "{{.OPERATION_ID}}" ] || [ "{{.LATEST}}" = "true" ]'
         msg: "Provide OPERATION_ID=op-xxx or LATEST=true"
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops stop
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
 
   restart:
-    desc: "Restart all worker roles on EC2 (usage: task ec2:restart [EC2_NAME=ares-tools])"
+    desc: "Restart the ares orchestrator + infra services on EC2"
     silent: true
     cmds:
       - task: stop
@@ -860,8 +529,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -877,8 +546,8 @@ tasks:
         jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/status.sh > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -886,8 +555,8 @@ tasks:
 
         for i in $(seq 1 15); do
           RESULT=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -898,8 +567,58 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --command-id "$CMD_ID" \
+          --instance-id "$INSTANCE_ID" \
+          --query "StandardOutputContent" --output text
+
+  hashcat:
+    desc: "Show hashcat jobs currently running on EC2 (usage: task ec2:hashcat [EC2_NAME=ares-tools])"
+    silent: true
+    cmds:
+      - |
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" \
+          --output text | head -1)
+
+        if [ -z "$INSTANCE_ID" ]; then
+          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
+          exit 1
+        fi
+
+        PARAMS_FILE=$(mktemp)
+        trap "rm -f $PARAMS_FILE" EXIT
+        jq -Rs '{"commands": [.]}' < .taskfiles/ec2/scripts/hashcat-status.sh > "$PARAMS_FILE"
+
+        CMD_ID=$(aws ssm send-command \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --instance-ids "$INSTANCE_ID" \
+          --document-name "AWS-RunShellScript" \
+          --parameters "file://$PARAMS_FILE" \
+          --query "Command.CommandId" --output text)
+
+        for i in $(seq 1 15); do
+          RESULT=$(aws ssm get-command-invocation \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "Status" --output text 2>/dev/null) || true
+          case "$RESULT" in
+            Success|Failed|Cancelled|TimedOut) break ;;
+          esac
+          sleep 1
+        done
+
+        aws ssm get-command-invocation \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -913,8 +632,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -929,11 +648,100 @@ tasks:
         echo -e "{{.INFO}} Tailing $LOG_FILE on $INSTANCE_ID (Ctrl+C to stop)..."
 
         aws ssm start-session \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartInteractiveCommand" \
           --parameters "command=[\"tail -n {{.LINES}} -f $LOG_FILE\"]"
+
+  logs:fetch:
+    desc: "Fetch ares logs from EC2 to a local file for programmatic reading (usage: task ec2:logs:fetch [ROLE=orchestrator|recon|all] [LINES=2000] [OP_ID=op-YYYYMMDD-HHMMSS] [SINCE=2026-07-02T15:00])"
+    silent: true
+    vars:
+      ROLE: '{{.ROLE | default "orchestrator"}}'
+      LINES: '{{.LINES | default "2000"}}'
+      OP_ID: '{{.OP_ID | default ""}}'
+      SINCE: '{{.SINCE | default ""}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./logs"}}'
+    cmds:
+      - |
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+
+        mkdir -p "{{.OUTPUT_DIR}}"
+        TS=$(date +%Y%m%d-%H%M%S)
+        TAG="{{.OP_ID}}"
+        if [ -z "$TAG" ]; then TAG="latest"; fi
+
+        # Filters run remotely (grep+awk cheap on the box; keeps SSM payload small).
+        # When OP_ID or SINCE is set, over-fetch by 20x so the final `tail -n LINES`
+        # still lands on real content instead of an empty slice.
+        REMOTE_LINES={{.LINES}}
+        if [ -n "{{.OP_ID}}" ] || [ -n "{{.SINCE}}" ]; then
+          REMOTE_LINES=$(({{.LINES}} * 20))
+        fi
+
+        # Build the shared filter pipe applied to each log file.
+        FILTER=""
+        if [ -n "{{.OP_ID}}" ]; then
+          FILTER="$FILTER | grep -F '{{.OP_ID}}'"
+        fi
+        if [ -n "{{.SINCE}}" ]; then
+          # tracing_subscriber fmt timestamps are ISO-8601 in field 1 — lex-comparable.
+          # Timestamped lines gate on SINCE; multi-line continuation lines (tool
+          # output, stack traces) have no leading timestamp and pass through so
+          # they stay attached to the log entry they belong to.
+          FILTER="$FILTER | awk -v s='{{.SINCE}}' '\$1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ { if (\$1 >= s) print; next } { print }'"
+        fi
+        FILTER="$FILTER | tail -n {{.LINES}}"
+
+        OUT_FILE="{{.OUTPUT_DIR}}/ec2-{{.ROLE}}-$TAG-$TS.log"
+
+        # Strip ANSI escape codes locally. systemd `StandardOutput=append:` usually
+        # captures without a TTY (no color) but this is cheap belt-and-suspenders.
+        strip_ansi() { LC_ALL=C sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+
+        # Pick role scope. `all` fans out one SSM call per role — remote
+        # concatenation blows past SSM's StandardOutputContent cap (~24KB) and
+        # silently truncates trailing files. Single-role hits its file directly.
+        if [ "{{.ROLE}}" = "all" ]; then
+          : > "$OUT_FILE"
+          for role in orchestrator recon credential_access lateral_movement coercion acl cracker privesc; do
+            LOG_PATH="{{.ARES_LOG_DIR}}/$role.log"
+            REMOTE_CMD="tail -n $REMOTE_LINES $LOG_PATH 2>/dev/null $FILTER"
+            echo "===FILE:$LOG_PATH===" >> "$OUT_FILE"
+            run_ssm_cmd "$INSTANCE_ID" "$REMOTE_CMD" 60 \
+              | strip_ansi \
+              >> "$OUT_FILE" || true
+            # run_ssm_cmd emits with no trailing newline; keep the next FILE
+            # marker on its own line.
+            printf '\n' >> "$OUT_FILE"
+          done
+        else
+          LOG_PATH="{{.ARES_LOG_DIR}}/{{.ROLE}}.log"
+          REMOTE_CMD="tail -n $REMOTE_LINES $LOG_PATH $FILTER"
+          if ! run_ssm_cmd "$INSTANCE_ID" "$REMOTE_CMD" 60 \
+            | strip_ansi \
+            > "$OUT_FILE"; then
+            echo -e "{{.ERROR}} Failed to fetch logs from $INSTANCE_ID"
+            rm -f "$OUT_FILE"
+            exit 1
+          fi
+        fi
+
+        LINE_COUNT=$(wc -l < "$OUT_FILE" | tr -d ' ')
+        BYTE_COUNT=$(wc -c < "$OUT_FILE" | tr -d ' ')
+        echo -e "{{.INFO}} Fetched $LINE_COUNT lines ($BYTE_COUNT bytes) from {{.ROLE}} log on $INSTANCE_ID"
+        if [ -n "{{.OP_ID}}" ]; then
+          echo -e "{{.INFO}} Filtered by OP_ID={{.OP_ID}}"
+        fi
+        if [ -n "{{.SINCE}}" ]; then
+          echo -e "{{.INFO}} Filtered by SINCE={{.SINCE}}"
+        fi
+        echo "$OUT_FILE"
 
   # ============================================================================
   # Redis Port Forward
@@ -944,8 +752,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -966,11 +774,44 @@ tasks:
         echo ""
 
         aws ssm start-session \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartPortForwardingSession" \
           --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}'
+
+  nats:forward:
+    desc: "SSM port-forward NATS to localhost:14222 for local CLI access (usage: task ec2:nats:forward [EC2_NAME=kali-ares])"
+    silent: true
+    cmds:
+      - |
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --filters "Name=instance-state-name,Values=running" \
+                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
+          --query "Reservations[*].Instances[*].InstanceId" \
+          --output text | head -1)
+
+        if [ -z "$INSTANCE_ID" ]; then
+          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
+          exit 1
+        fi
+
+        lsof -ti:14222 | xargs kill 2>/dev/null || true
+        sleep 1
+
+        echo -e "{{.INFO}} Port-forwarding NATS: localhost:14222 -> $INSTANCE_ID:4222"
+        echo -e "{{.INFO}} Use: NATS_URL=nats://localhost:14222 (pair with ARES_REDIS_URL=redis://localhost:16379)"
+        echo -e "{{.INFO}} Press Ctrl+C to stop"
+        echo ""
+
+        aws ssm start-session \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
+          --target "$INSTANCE_ID" \
+          --document-name "AWS-StartPortForwardingSession" \
+          --parameters '{"portNumber":["4222"],"localPortNumber":["14222"]}'
 
   # ============================================================================
   # CLI Operations (loot, runtime, report, list)
@@ -985,7 +826,7 @@ tasks:
       JSON: '{{.JSON | default "false"}}'
       DIFF: '{{.DIFF | default "false"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops loot
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -999,7 +840,7 @@ tasks:
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
       LATEST: '{{.LATEST | default "true"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops runtime
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
@@ -1014,83 +855,11 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
-
-        run_ssm_cmd() {
-          CMD_PAYLOAD="$1"
-          TIMEOUT="${2:-120}"
-          PARAMS_FILE=$(mktemp)
-          jq -n --arg cmd "$CMD_PAYLOAD" '{"commands": [$cmd]}' > "$PARAMS_FILE"
-
-          CMD_ID=$(aws ssm send-command \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "file://$PARAMS_FILE" \
-            --timeout-seconds "$TIMEOUT" \
-            --query "Command.CommandId" --output text)
-
-          rm -f "$PARAMS_FILE"
-
-          STATUS=""
-          for i in $(seq 1 "$TIMEOUT"); do
-            STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null) || true
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 1
-          done
-
-          OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text)
-
-          if [ "$STATUS" != "Success" ]; then
-            DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StatusDetails" --output text 2>/dev/null)
-            echo -e "{{.ERROR}} SSM command failed (status: $STATUS, details: $DETAILS)" >&2
-            if [ "$DETAILS" = "Undeliverable" ]; then
-              echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)." >&2
-              echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
-            fi
-            if [ -n "$OUTPUT" ]; then
-              echo "$OUTPUT" >&2
-            fi
-            aws ssm get-command-invocation \
-              --profile "{{.EC2_PROFILE}}" \
-              --region "{{.EC2_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardErrorContent" --output text >&2
-            return 1
-          fi
-
-          printf '%s' "$OUTPUT"
-        }
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         REPORT_ARGS=""
         {{if ne .OPERATION_ID ""}}REPORT_ARGS="$REPORT_ARGS {{.OPERATION_ID}}"{{end}}
@@ -1110,7 +879,7 @@ tasks:
 
         echo -e "{{.INFO}} Generating report on EC2..."
 
-        OUTPUT=$(run_ssm_cmd "$REPORT_CMD" 120)
+        OUTPUT=$(run_ssm_cmd "$INSTANCE_ID" "$REPORT_CMD" 120)
         BEFORE_MARKER=$(echo "$OUTPUT" | sed '/===REPORT_META===/,$d')
         META=$(echo "$OUTPUT" | sed -n '/===REPORT_META===/,$p' | tail -n +2)
 
@@ -1139,7 +908,7 @@ tasks:
         CHUNK=0
         while [ $CHUNK -lt $CHUNKS ]; do
           CHUNK_CMD="dd if=\"$REMOTE_PATH\" bs=$CHUNK_SIZE skip=$CHUNK count=1 status=none | base64 | tr -d '\n'"
-          CHUNK_B64=$(run_ssm_cmd "$CHUNK_CMD" 30)
+          CHUNK_B64=$(run_ssm_cmd "$INSTANCE_ID" "$CHUNK_CMD" 30)
           if ! printf '%s' "$CHUNK_B64" | base64 -d >> "$TMP_OUT"; then
             echo -e "{{.ERROR}} Failed to decode report chunk $((CHUNK + 1))/$CHUNKS" >&2
             exit 1
@@ -1172,9 +941,23 @@ tasks:
     vars:
       LATEST: '{{.LATEST | default "false"}}'
     cmd: >-
-      ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}}
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
       ops list
       {{if eq .LATEST "true"}}--latest{{end}}
+
+  ops:ids:
+    desc: "List all operation IDs on EC2 with started_at + derived status, columns separated by ' | ' (usage: task ec2:ops:ids [EC2_NAME=kali-ares])"
+    silent: true
+    cmds:
+      - |
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+
+        PAYLOAD=$(cat .taskfiles/ec2/scripts/list-ops.sh)
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 60
 
   # ============================================================================
   # Watch + auto-report
@@ -1215,7 +998,7 @@ tasks:
             exit 1
           fi
 
-          STATUS_OUT=$(ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}} \
+          STATUS_OUT=$({{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}} \
             ops status $OP_ARG $LATEST_FLAG 2>&1 || true)
 
           STATUS=$(echo "$STATUS_OUT" | grep -E '^Status: ' | head -1 | awk '{print $2}')
@@ -1260,27 +1043,47 @@ tasks:
       CRED_PASS: '{{.CRED_PASS | default "Heartsbane"}}'
       CRED_DOMAIN: '{{.CRED_DOMAIN | default "north.sevenkingdoms.local"}}'
       SECRETS_ID: '{{.SECRETS_ID | default "ares/api-keys"}}'
+      # Postgres history DB (ares-history). The orchestrator's projector + op
+      # finalizer persist every run here so red ops are comparable across runs.
+      # Password comes from Secrets Manager (never committed); host/user/db are
+      # stable lab defaults. Set RDS_SECRET_ID="" to disable SQL persistence, or
+      # pass ARES_DATABASE_URL=... to override the constructed URL entirely.
+      ARES_DATABASE_URL: '{{.ARES_DATABASE_URL | default ""}}'
+      RDS_SECRET_ID: '{{.RDS_SECRET_ID | default "ares/rds/master"}}'
+      RDS_ENDPOINT: '{{.RDS_ENDPOINT | default "ares-history.cr8uqakiuqnq.us-west-1.rds.amazonaws.com"}}'
+      RDS_USER: '{{.RDS_USER | default "ares_admin"}}'
+      RDS_DB: '{{.RDS_DB | default "ares_history"}}'
       LLM_MODEL: '{{.LLM_MODEL | default ""}}'
       FLUSH_REDIS: '{{.FLUSH_REDIS | default "true"}}'
+      # Observability endpoint overrides — take precedence over Secrets Manager
+      # values so laptop-shape URLs in ares/api-keys (e.g. http://localhost:3000
+      # from the obs:forward pattern) don't wedge on the EC2 box, which reaches
+      # observability via VPC peering to the plundr ingress instead.
+      EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL | default "https://grafana.dev.plundr.ai"}}'
+      EC2_LOKI_URL: '{{.EC2_LOKI_URL | default "https://loki.dev.plundr.ai"}}'
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
       WAIT: '{{.WAIT | default "true"}}'
       POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
       MAX_WAIT: '{{.MAX_WAIT | default "7200"}}'
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+      # Opt-in: auto-capture a benchmark snapshot once the op completes (WAIT=true).
+      CAPTURE: '{{.CAPTURE | default "false"}}'
+      # Blue-team mode {off, replay, live}. This task is a direct-launch escape
+      # hatch (not the normal launcher), so default off. red:ec2:multi is the
+      # user-facing task and it defaults to replay.
+      BLUE_MODE: '{{.BLUE_MODE | default "off"}}'
+      # Per-op strategy knobs plumbed into the ARES_OPERATION_ID JSON payload.
+      # Empty means "don't override" — Strategy::resolve falls through to YAML.
+      STRATEGY: '{{.STRATEGY | default ""}}'
+      EXCLUDE_TECHNIQUES: '{{.EXCLUDE_TECHNIQUES | default ""}}'
+      CONTINUE_AFTER_DA: '{{.CONTINUE_AFTER_DA | default ""}}'
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
         if [ -n "{{.OPERATION_ID}}" ]; then
           OP_ID="{{.OPERATION_ID}}"
@@ -1292,6 +1095,28 @@ tasks:
         # Build target IPs JSON array
         TARGET_ARRAY=$(echo '{{.TARGETS}}' | tr ',' '\n' | jq -R . | jq -sc .)
 
+        # Optional per-op strategy overrides. Empty vars are omitted so the
+        # orchestrator's Strategy::resolve falls through to YAML/preset defaults.
+        EXTRA_JQ=""
+        EXTRA_ARGS=()
+        if [ -n "{{.STRATEGY}}" ]; then
+          EXTRA_JQ="$EXTRA_JQ | .strategy = \$strategy"
+          EXTRA_ARGS+=(--arg strategy "{{.STRATEGY}}")
+        fi
+        if [ -n "{{.EXCLUDE_TECHNIQUES}}" ]; then
+          EXCLUDE_ARRAY=$(echo '{{.EXCLUDE_TECHNIQUES}}' | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -sc .)
+          EXTRA_JQ="$EXTRA_JQ | .exclude_techniques = \$exclude"
+          EXTRA_ARGS+=(--argjson exclude "$EXCLUDE_ARRAY")
+        fi
+        if [ -n "{{.CONTINUE_AFTER_DA}}" ]; then
+          case "{{.CONTINUE_AFTER_DA}}" in
+            true|1|yes) CAD_BOOL=true ;;
+            *) CAD_BOOL=false ;;
+          esac
+          EXTRA_JQ="$EXTRA_JQ | .continue_after_da = \$cad"
+          EXTRA_ARGS+=(--argjson cad "$CAD_BOOL")
+        fi
+
         PAYLOAD=$(jq -c -n \
           --arg op_id "$OP_ID" \
           --arg domain "{{.DOMAIN}}" \
@@ -1299,17 +1124,18 @@ tasks:
           --arg user "{{.CRED_USER}}" \
           --arg pass "{{.CRED_PASS}}" \
           --arg cred_domain "{{.CRED_DOMAIN}}" \
-          '{
-            "operation_id": $op_id,
-            "target_domain": $domain,
-            "target_ips": $targets,
-            "initial_credential": { "username": $user, "password": $pass, "domain": $cred_domain }
-          }')
+          "${EXTRA_ARGS[@]}" \
+          "{
+            \"operation_id\": \$op_id,
+            \"target_domain\": \$domain,
+            \"target_ips\": \$targets,
+            \"initial_credential\": { \"username\": \$user, \"password\": \$pass, \"domain\": \$cred_domain }
+          } $EXTRA_JQ")
 
         # Fetch API keys from Secrets Manager
         SECRETS=$(aws secretsmanager get-secret-value \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --secret-id "{{.SECRETS_ID}}" \
           --query SecretString --output text 2>/dev/null) || true
 
@@ -1327,7 +1153,52 @@ tasks:
         if [ -z "$LOKI_URL_VAL" ]; then
           LOKI_URL_VAL="{{.LOKI_URL}}"
         fi
+        LOKI_AUTH_TOKEN_VAL=$(echo "$SECRETS" | jq -r '.LOKI_AUTH_TOKEN // empty')
+
+        # EC2 override: the secret's GRAFANA_URL/LOKI_URL are laptop-shape
+        # (localhost:PORT from `task obs:forward`) and never pass the reachability
+        # probe below. On EC2 we always want the plundr ingress URL, which is
+        # reachable via VPC peering. Override iff the task var is set (default:
+        # the plundr ingress). Set EC2_GRAFANA_URL="" / EC2_LOKI_URL="" to keep
+        # the secret's value verbatim.
+        if [ -n "{{.EC2_GRAFANA_URL}}" ]; then
+          GRAFANA_URL_VAL="{{.EC2_GRAFANA_URL}}"
+        fi
+        if [ -n "{{.EC2_LOKI_URL}}" ]; then
+          LOKI_URL_VAL="{{.EC2_LOKI_URL}}"
+        fi
         DREADNODE_API_KEY=$(echo "$SECRETS" | jq -r '.DREADNODE_API_KEY // empty')
+
+        # Build ARES_DATABASE_URL for the ares-history Postgres so the
+        # orchestrator's projector + op finalizer persist every run to SQL.
+        # Explicit ARES_DATABASE_URL wins; otherwise construct it from the RDS
+        # master password in Secrets Manager. The password stays out of git and
+        # the /etc/ares/env file is chmod 600 below.
+        ARES_DATABASE_URL_VAL="{{.ARES_DATABASE_URL}}"
+        if [ -z "$ARES_DATABASE_URL_VAL" ] && [ -n "{{.RDS_SECRET_ID}}" ]; then
+          DB_PASSWORD=$(aws secretsmanager get-secret-value \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
+            --secret-id "{{.RDS_SECRET_ID}}" \
+            --query SecretString --output text 2>/dev/null) || true
+          if [ -n "$DB_PASSWORD" ]; then
+            ARES_DATABASE_URL_VAL="postgresql://{{.RDS_USER}}:${DB_PASSWORD}@{{.RDS_ENDPOINT}}:5432/{{.RDS_DB}}"
+          else
+            echo -e "{{.WARN}} could not read {{.RDS_SECRET_ID}} — SQL history persistence disabled for this op" >&2
+          fi
+        fi
+
+        # Parse host:port from URLs for box-side reachability probes. The
+        # observability endpoints in Secrets Manager may live in a VPC the box
+        # can't reach (e.g. loki.dev.plundr.ai is behind the plundr VPC ingress
+        # while personal-account kali-ares is in a separate VPC with no
+        # peering). We probe TCP connect from the box and only inject the
+        # values if the probe succeeds — blue tools then fall through to their
+        # built-in defaults instead of wedging on a black-holed URL.
+        _url_host() { printf %s "$1" | awk -F/ '{print $3}' | cut -d: -f1; }
+        _url_port() { case "$1" in http://*) echo 80 ;; https://*|*) echo 443 ;; esac; }
+        GRAFANA_HOST=$(_url_host "$GRAFANA_URL_VAL"); GRAFANA_PORT=$(_url_port "$GRAFANA_URL_VAL")
+        LOKI_HOST=$(_url_host "$LOKI_URL_VAL");       LOKI_PORT=$(_url_port "$LOKI_URL_VAL")
         OTEL_TRACES_ENDPOINT="{{.OTEL_TRACES_ENDPOINT}}"
 
         FLUSH_CMD=""
@@ -1335,31 +1206,44 @@ tasks:
           FLUSH_CMD="redis-cli FLUSHDB; echo Redis flushed;"
         fi
 
-        # Write shared env vars for workers (EnvironmentFile in systemd template)
-        ENV_FILE_CMD="mkdir -p /etc/ares"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OPENAI_API_KEY=${OPENAI_KEY}' > /etc/ares/env"
+        # Write shared env vars for workers (EnvironmentFile in systemd template).
+        # Values are printf %q-escaped so shell metachars in secrets
+        # (parens/semicolons/dollars in RDS passwords) survive `. /etc/ares/env`.
+        # Writes go through a tmp file + mv so concurrent launches don't
+        # interleave partial content into /etc/ares/env.
+        ENV_FILE_CMD="mkdir -p /etc/ares; ENV_TMP=\$(mktemp /etc/ares/.env.XXXXXX)"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OPENAI_API_KEY=%q\n' '${OPENAI_KEY}' > \$ENV_TMP"
         if [ -n "$GRAFANA_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; echo 'GRAFANA_URL=${GRAFANA_URL_VAL}' >> /etc/ares/env"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${GRAFANA_HOST}/${GRAFANA_PORT}' 2>/dev/null; then printf 'GRAFANA_URL=%q\n' '${GRAFANA_URL_VAL}' >> \$ENV_TMP"
           if [ -n "$GRAFANA_TOKEN_VAL" ]; then
-            ENV_FILE_CMD="$ENV_FILE_CMD; echo 'GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_TOKEN_VAL}' >> /etc/ares/env"
+            ENV_FILE_CMD="$ENV_FILE_CMD; printf 'GRAFANA_SERVICE_ACCOUNT_TOKEN=%q\n' '${GRAFANA_TOKEN_VAL}' >> \$ENV_TMP"
           fi
+          ENV_FILE_CMD="$ENV_FILE_CMD; else echo 'SKIP: GRAFANA_URL ${GRAFANA_URL_VAL} unreachable from box' >&2; fi"
         fi
         if [ -n "$LOKI_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; echo 'LOKI_URL=${LOKI_URL_VAL}' >> /etc/ares/env"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${LOKI_HOST}/${LOKI_PORT}' 2>/dev/null; then printf 'LOKI_URL=%q\n' '${LOKI_URL_VAL}' >> \$ENV_TMP"
+          if [ -n "$LOKI_AUTH_TOKEN_VAL" ]; then
+            ENV_FILE_CMD="$ENV_FILE_CMD; printf 'LOKI_AUTH_TOKEN=%q\n' '${LOKI_AUTH_TOKEN_VAL}' >> \$ENV_TMP"
+          fi
+          ENV_FILE_CMD="$ENV_FILE_CMD; else echo 'SKIP: LOKI_URL ${LOKI_URL_VAL} unreachable from box' >&2; fi"
         fi
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_DEPLOYMENT={{.EC2_DEPLOYMENT}}' >> /etc/ares/env"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'NATS_URL=nats://127.0.0.1:4222' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_DEPLOYMENT=%q\n' '{{.EC2_DEPLOYMENT}}' >> \$ENV_TMP"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'NATS_URL=%q\n' 'nats://127.0.0.1:4222' >> \$ENV_TMP"
         # OTEL: send traces to Alloy OTLP gateway → Tempo via HTTP/protobuf
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_TRACES_ENDPOINT}' >> /etc/ares/env"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' >> /etc/ares/env"
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_RESOURCE_ATTRIBUTES=deployment.environment=staging,attack.team=red' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=%q\n' '${OTEL_TRACES_ENDPOINT}' >> \$ENV_TMP"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_EXPORTER_OTLP_PROTOCOL=%q\n' 'http/protobuf' >> \$ENV_TMP"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_RESOURCE_ATTRIBUTES=%q\n' 'deployment.environment=staging,attack.team=red' >> \$ENV_TMP"
         # JSONL session log capture (ingested into Postgres llm_messages / tool_calls).
         # Env var name per ares-llm/src/agent_loop/config.rs.
-        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_SESSION_LOG_DIR=/var/log/ares/session' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_SESSION_LOG_DIR=%q\n' '/var/log/ares/session' >> \$ENV_TMP"
         ENV_FILE_CMD="$ENV_FILE_CMD; mkdir -p /var/log/ares/session && chmod 0755 /var/log/ares/session"
-        ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 /etc/ares/env; echo Wrote /etc/ares/env"
-        # Restart workers so they pick up the new env file
-        ENV_FILE_CMD="$ENV_FILE_CMD; for role in recon credential_access cracker acl privesc lateral coercion; do systemctl restart ares@\${role} 2>/dev/null || true; done; echo Workers restarted"
+        # ares-history Postgres — gated on box→RDS reachability (5432) so an
+        # unreachable DB never wedges orchestrator startup; the projector +
+        # finalizer both no-op cleanly when ARES_DATABASE_URL is absent.
+        if [ -n "$ARES_DATABASE_URL_VAL" ]; then
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/{{.RDS_ENDPOINT}}/5432' 2>/dev/null; then printf 'ARES_DATABASE_URL=%q\n' '${ARES_DATABASE_URL_VAL}' >> \$ENV_TMP; else echo 'SKIP: ARES_DATABASE_URL {{.RDS_ENDPOINT}}:5432 unreachable from box' >&2; fi"
+        fi
+        ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 \$ENV_TMP; mv \$ENV_TMP /etc/ares/env; echo Wrote /etc/ares/env"
 
         LAUNCH_SCRIPT="#!/bin/bash
         set -e
@@ -1368,9 +1252,11 @@ tasks:
         pkill -f 'ares orchestrator' 2>/dev/null || true; sleep 1
         export OPENAI_API_KEY='${OPENAI_KEY}'
         export ANTHROPIC_API_KEY='${ANTHROPIC_KEY}'
-        export GRAFANA_URL='${GRAFANA_URL_VAL}'
-        export GRAFANA_SERVICE_ACCOUNT_TOKEN='${GRAFANA_TOKEN_VAL}'
-        export LOKI_URL='${LOKI_URL_VAL}'
+        # Observability endpoints (GRAFANA_URL/LOKI_URL and tokens) are gated by
+        # the box-side probe above and only appear in /etc/ares/env when
+        # reachable. Source rather than re-export so we never leak an
+        # unreachable URL from Secrets Manager into the orchestrator process.
+        set -a; . /etc/ares/env; set +a
         export ARES_REDIS_URL=redis://127.0.0.1:6379
         export NATS_URL=nats://127.0.0.1:4222
         {{- if .LLM_MODEL}}
@@ -1378,7 +1264,6 @@ tasks:
         {{- end}}
         export RUST_LOG=info
         export ARES_CONFIG={{.ARES_REMOTE_CONFIG}}
-        export ARES_TOOL_DISPATCH=local
         export ARES_BLUE_ENABLED=1
         export ARES_DEPLOYMENT='{{.EC2_DEPLOYMENT}}'
         export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT='${OTEL_TRACES_ENDPOINT}'
@@ -1397,58 +1282,11 @@ tasks:
         fi"
 
         B64=$(echo "$LAUNCH_SCRIPT" | base64)
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg b64 "$B64" '{"commands": ["echo " + $b64 + " | base64 -d | /bin/bash"]}' > "$PARAMS_FILE"
+        LAUNCH_PAYLOAD="echo $B64 | base64 -d | /bin/bash"
 
         echo -e "{{.INFO}} Launching orchestrator on $INSTANCE_ID..."
 
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 30); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} Launch failed (status: $STATUS, details: $DETAILS)" >&2
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)." >&2
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text >&2
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "$LAUNCH_PAYLOAD" 30 || exit 1
 
         echo -e "{{.SUCCESS}} Operation $OP_ID launched"
         echo -e "{{.INFO}} Monitor: task ec2:runtime EC2_NAME={{.EC2_NAME}}"
@@ -1461,6 +1299,28 @@ tasks:
             POLL_INTERVAL={{.POLL_INTERVAL}} \
             MAX_WAIT={{.MAX_WAIT}} \
             OUTPUT_DIR={{.OUTPUT_DIR}}
+
+          # Opt-in benchmark capture, client-side. Runs here (this host has the
+          # infra + lab creds the account-segmented box lacks) rather than on the
+          # box. Flush-aware: --wait-for-flush blocks until Loki has flushed the
+          # attack window to S3. Non-fatal — the op is finalized regardless.
+          if [ "{{.CAPTURE}}" = "true" ]; then
+            echo -e "{{.INFO}} CAPTURE=true — auto-capturing benchmark snapshot for $OP_ID (waits for Loki flush)"
+            ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+              --instance-ids "$INSTANCE_ID" \
+              --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true
+            lsof -ti:16379 | xargs kill 2>/dev/null || true; sleep 1
+            aws ssm start-session --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" --target "$INSTANCE_ID" \
+              --document-name AWS-StartPortForwardingSession \
+              --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}' >/tmp/ares-capture-fwd.log 2>&1 &
+            PF_PID=$!
+            for _ in $(seq 1 20); do nc -z localhost 16379 2>/dev/null && break; sleep 2; done
+            {{.ARES_CLI}} benchmark capture "$OP_ID" \
+              --redis-url redis://localhost:16379 \
+              ${ATTACKER_IP:+--attacker-ips "$ATTACKER_IP"} \
+              || echo -e "{{.WARN}} auto-capture failed — op is finalized; run 'ares benchmark capture $OP_ID' later (flush-wait is on by default)"
+            kill "$PF_PID" 2>/dev/null || true
+          fi
         fi
 
   # ============================================================================
@@ -1472,8 +1332,8 @@ tasks:
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
           --query "Reservations[*].Instances[*].InstanceId" \
@@ -1527,17 +1387,6 @@ tasks:
           echo "rockyou.txt already present"
         fi
 
-        echo "=== Fixing worker PATH ==="
-        if ! grep -q "^Environment=PATH=" /etc/systemd/system/ares@.service 2>/dev/null; then
-          sed -i '/\[Service\]/a Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin' /etc/systemd/system/ares@.service
-          systemctl daemon-reload
-        fi
-
-        echo "=== Restarting workers ==="
-        for role in recon credential_access cracker acl privesc lateral coercion; do
-          systemctl restart ares@$role 2>/dev/null || true
-        done
-
         echo "=== Verifying ==="
         for cmd in nmap netexec impacket-secretsdump impacket-GetNPUsers smbclient rpcclient ldapsearch lsassy evil-winrm; do
           printf "%-30s %s\n" "$cmd:" "$(which $cmd 2>/dev/null || echo NOT_FOUND)"
@@ -1553,8 +1402,8 @@ tasks:
         echo -e "{{.INFO}} Installing pentest tools on $INSTANCE_ID (2-3 minutes)..."
 
         CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunShellScript" \
           --parameters "file://$PARAMS_FILE" \
@@ -1562,8 +1411,8 @@ tasks:
 
         for i in $(seq 1 180); do
           STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "Status" --output text 2>/dev/null) || true
@@ -1572,8 +1421,8 @@ tasks:
         done
 
         aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
+          --profile "{{.AWS_PROFILE}}" \
+          --region "{{.AWS_REGION}}" \
           --command-id "$CMD_ID" \
           --instance-id "$INSTANCE_ID" \
           --query "StandardOutputContent" --output text
@@ -1582,8 +1431,8 @@ tasks:
           echo -e "{{.SUCCESS}} Tools installed on $INSTANCE_ID"
         else
           DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StatusDetails" --output text 2>/dev/null)
@@ -1593,8 +1442,8 @@ tasks:
             echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
           fi
           aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
+            --profile "{{.AWS_PROFILE}}" \
+            --region "{{.AWS_REGION}}" \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE_ID" \
             --query "StandardErrorContent" --output text >&2
@@ -1614,68 +1463,10 @@ tasks:
         msg: "CMD required. Usage: task ec2:exec CMD='redis-cli info keyspace'"
     cmds:
       - |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" \
-                    "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" \
-          --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
 
-        if [ -z "$INSTANCE_ID" ]; then
-          echo -e "{{.ERROR}} No running instance found matching: {{.EC2_NAME}}"
-          exit 1
-        fi
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
-        PARAMS_FILE=$(mktemp)
-        trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg cmd "{{.CMD}}" '{"commands": [$cmd]}' > "$PARAMS_FILE"
-
-        CMD_ID=$(aws ssm send-command \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters "file://$PARAMS_FILE" \
-          --query "Command.CommandId" --output text)
-
-        for i in $(seq 1 60); do
-          STATUS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "Status" --output text 2>/dev/null) || true
-          case "$STATUS" in
-            Success|Failed|Cancelled|TimedOut) break ;;
-          esac
-          sleep 1
-        done
-
-        aws ssm get-command-invocation \
-          --profile "{{.EC2_PROFILE}}" \
-          --region "{{.EC2_REGION}}" \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" --output text
-
-        if [ "$STATUS" != "Success" ]; then
-          DETAILS=$(aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StatusDetails" --output text 2>/dev/null)
-          echo -e "{{.ERROR}} exec failed (status: $STATUS, details: $DETAILS)" >&2
-          if [ "$DETAILS" = "Undeliverable" ]; then
-            echo -e "{{.ERROR}} SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)." >&2
-            echo -e "{{.ERROR}} Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')." >&2
-          fi
-          aws ssm get-command-invocation \
-            --profile "{{.EC2_PROFILE}}" \
-            --region "{{.EC2_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text >&2
-          exit 1
-        fi
+        run_ssm_cmd "$INSTANCE_ID" "{{.CMD}}" 60 || exit 1

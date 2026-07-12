@@ -121,16 +121,9 @@ pub async fn run() -> anyhow::Result<()> {
         }
         #[cfg(feature = "blue")]
         config::WorkerMode::BlueTask => {
-            // Blue team mode requires an LLM provider. Prefer the blue-specific
-            // override, then fall back to the shared model var. Matches the
-            // orchestrator's blue-only mode (see orchestrator/mod.rs).
-            let model_spec = std::env::var("ARES_BLUE_LLM_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| std::env::var("ARES_LLM_MODEL").ok().filter(|s| !s.is_empty()))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "No LLM model configured for blue worker — set ARES_BLUE_LLM_MODEL or ARES_LLM_MODEL"
-                ))?;
+            // Blue team mode requires an LLM provider
+            let model_spec = std::env::var("ARES_LLM_MODEL")
+                .unwrap_or_else(|_| "anthropic/claude-sonnet-4-6".to_string());
             let (provider, model_name) = match ares_llm::create_provider(&model_spec) {
                 Ok(p) => p,
                 Err(e) => {

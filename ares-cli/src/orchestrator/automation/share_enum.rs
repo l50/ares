@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -126,10 +126,6 @@ pub async fn auto_share_enumeration(
     let mut interval = tokio::time::interval(Duration::from_secs(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut no_cred_logged = false;
-    // Suppress re-dispatch of items the throttler just deferred, so the 20s
-    // tick doesn't flood the deferred queue with duplicates (dedup only commits
-    // on success). See super::DeferCooldown.
-    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -163,15 +159,10 @@ pub async fn auto_share_enumeration(
         }
         no_cred_logged = false;
 
-        let now = Instant::now();
         for (dedup_key, host_ip, cred) in work {
-            if cooldown.active(&dedup_key, now) {
-                continue;
-            }
             match dispatcher.request_share_enumeration(&host_ip, &cred).await {
                 Ok(Some(task_id)) => {
                     info!(task_id = %task_id, host = %host_ip, "Share enumeration dispatched");
-                    cooldown.clear(&dedup_key);
                     dispatcher
                         .state
                         .write()
@@ -182,7 +173,7 @@ pub async fn auto_share_enumeration(
                         .persist_dedup(&dispatcher.queue, DEDUP_SHARE_ENUM, &dedup_key)
                         .await;
                 }
-                Ok(None) => cooldown.record(&dedup_key, now),
+                Ok(None) => {}
                 Err(e) => warn!(err = %e, "Failed to dispatch share enumeration"),
             }
         }

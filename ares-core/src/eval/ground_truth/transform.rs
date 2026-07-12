@@ -72,15 +72,17 @@ pub fn create_ground_truth_from_red_state(
         });
     }
 
-    // Hashes → hash IOCs
-    for hash in &state.all_hashes {
-        expected_iocs.push(ExpectedIOC {
-            ioc_type: "hash".to_string(),
-            value: hash.hash_value.clone(),
-            pyramid_level: PyramidLevel::HashValues,
-            mitre_techniques: vec!["T1003".to_string()],
-            required: false,
-            source: "hash_extraction".to_string(),
+    // Credential dumping (secretsdump / DCSync) produces NTLM hash *values* that
+    // are the attacker's loot and never appear in defender telemetry — so we do
+    // NOT expect the blue team to recover the hashes themselves. Instead, if
+    // hashes were dumped, we expect the team to DETECT that dumping occurred,
+    // expressed as a required technique.
+    if !state.all_hashes.is_empty() {
+        expected_techniques.push(ExpectedTechnique {
+            technique_id: "T1003".to_string(),
+            technique_name: "OS Credential Dumping".to_string(),
+            required: true,
+            parent_id: None,
         });
     }
 
@@ -172,10 +174,13 @@ pub fn create_ground_truth_from_red_state(
         }
     }
 
-    // Deduplicate IOCs by value
+    // Deduplicate IOCs by value, dropping empty-valued ones. A host record
+    // discovered by hostname only yields an empty IP IOC that is required yet
+    // unachievable — this removes it (and any other blank indicator).
     let mut seen_values: HashSet<String> = HashSet::new();
     let unique_iocs: Vec<ExpectedIOC> = expected_iocs
         .into_iter()
+        .filter(|ioc| !ioc.value.trim().is_empty())
         .filter(|ioc| seen_values.insert(ioc.value.clone()))
         .collect();
 
@@ -186,6 +191,26 @@ pub fn create_ground_truth_from_red_state(
         .filter(|t| seen_techniques.insert(t.technique_id.clone()))
         .collect();
 
+    // Host aliases: group each host's identifiers (IP, hostname, short name) so
+    // the scorer credits a hostname finding against that host's IP IOC.
+    let mut host_aliases: Vec<Vec<String>> = Vec::new();
+    for host in &state.all_hosts {
+        let mut group: Vec<String> = Vec::new();
+        if !host.ip.is_empty() {
+            group.push(host.ip.clone());
+        }
+        if !host.hostname.is_empty() {
+            let short = host.hostname.split('.').next().unwrap_or(&host.hostname);
+            group.push(host.hostname.clone());
+            if short != host.hostname {
+                group.push(short.to_string());
+            }
+        }
+        if group.len() > 1 {
+            host_aliases.push(group);
+        }
+    }
+
     EvaluationGroundTruth {
         operation_id: state.operation_id.clone(),
         target_ip,
@@ -194,6 +219,7 @@ pub fn create_ground_truth_from_red_state(
         expected_timeline: Vec::new(),
         expected_shares,
         expected_vulnerabilities,
+        host_aliases,
         min_pyramid_level: 4,
         target_pyramid_level: 6,
         min_technique_coverage: 0.6,
@@ -210,8 +236,6 @@ mod tests {
         SharedRedTeamState::new("op-test".to_string())
     }
 
-    // ── basic ──────────────────────────────────────────────────────
-
     #[test]
     fn empty_state_produces_empty_gt() {
         let state = empty_state();
@@ -222,8 +246,6 @@ mod tests {
         assert!(gt.expected_shares.is_empty());
         assert!(gt.expected_vulnerabilities.is_empty());
     }
-
-    // ── hosts → IOCs ───────────────────────────────────────────────
 
     #[test]
     fn hosts_produce_ip_iocs() {
@@ -262,8 +284,6 @@ mod tests {
         assert!(types.contains(&&"ip".to_string()));
         assert!(types.contains(&&"hostname".to_string()));
     }
-
-    // ── users → IOCs ───────────────────────────────────────────────
 
     #[test]
     fn users_produce_user_iocs() {
@@ -304,8 +324,6 @@ mod tests {
         assert!(!user_iocs[0].required);
     }
 
-    // ── credentials → IOCs ─────────────────────────────────────────
-
     #[test]
     fn credentials_produce_user_iocs() {
         let mut state = empty_state();
@@ -330,8 +348,6 @@ mod tests {
         assert_eq!(user_iocs[0].value, "svc_account");
     }
 
-    // ── hashes → IOCs ──────────────────────────────────────────────
-
     #[test]
     fn hashes_produce_hash_iocs() {
         let mut state = empty_state();
@@ -353,16 +369,14 @@ mod tests {
             trust_pair_label: None,
         });
         let gt = create_ground_truth_from_red_state(&state, &[]);
-        let hash_iocs: Vec<_> = gt
-            .expected_iocs
+        // Hash values are the attacker's loot — not scored as IOCs. The
+        // dumping act is expected as a required technique instead.
+        assert!(!gt.expected_iocs.iter().any(|i| i.ioc_type == "hash"));
+        assert!(gt
+            .expected_techniques
             .iter()
-            .filter(|i| i.ioc_type == "hash")
-            .collect();
-        assert_eq!(hash_iocs.len(), 1);
-        assert!(!hash_iocs[0].required);
+            .any(|t| t.technique_id == "T1003" && t.required));
     }
-
-    // ── techniques ─────────────────────────────────────────────────
 
     #[test]
     fn identified_techniques_produce_expected() {
@@ -389,8 +403,6 @@ mod tests {
         assert!(gt.expected_techniques[0].parent_id.is_none());
     }
 
-    // ── domain admin / golden ticket flags ──────────────────────────
-
     #[test]
     fn domain_admin_adds_technique() {
         let mut state = empty_state();
@@ -412,8 +424,6 @@ mod tests {
             .iter()
             .any(|t| t.technique_id == "T1558.001"));
     }
-
-    // ── shares ─────────────────────────────────────────────────────
 
     #[test]
     fn shares_produce_expected_shares() {
@@ -443,8 +453,6 @@ mod tests {
         let gt = create_ground_truth_from_red_state(&state, &[]);
         assert!(!gt.expected_shares[0].required);
     }
-
-    // ── deduplication ──────────────────────────────────────────────
 
     #[test]
     fn deduplicates_iocs_by_value() {
@@ -487,5 +495,158 @@ mod tests {
             .filter(|t| t.technique_id == "T1078.002")
             .count();
         assert_eq!(t1078_count, 1);
+    }
+
+    #[test]
+    fn host_with_ip_and_fqdn_builds_alias_group_with_short_name() {
+        let mut state = empty_state();
+        state.all_hosts.push(Host {
+            ip: "192.168.58.10".to_string(),
+            hostname: "dc01.contoso.local".to_string(),
+            os: String::new(),
+            roles: vec![],
+            services: vec![],
+            is_dc: true,
+            owned: false,
+        });
+        let gt = create_ground_truth_from_red_state(&state, &[]);
+        assert_eq!(gt.host_aliases.len(), 1);
+        let group = &gt.host_aliases[0];
+        assert!(group.contains(&"192.168.58.10".to_string()));
+        assert!(group.contains(&"dc01.contoso.local".to_string()));
+        assert!(group.contains(&"dc01".to_string()));
+    }
+
+    #[test]
+    fn host_with_ip_only_builds_no_alias_group() {
+        // A single identifier (IP with no hostname) forms no alias group.
+        let mut state = empty_state();
+        state.all_hosts.push(Host {
+            ip: "192.168.58.10".to_string(),
+            hostname: String::new(),
+            os: String::new(),
+            roles: vec![],
+            services: vec![],
+            is_dc: false,
+            owned: false,
+        });
+        let gt = create_ground_truth_from_red_state(&state, &[]);
+        assert!(gt.host_aliases.is_empty());
+    }
+
+    #[test]
+    fn host_with_short_hostname_omits_duplicate_short_name() {
+        // hostname has no dot, so short == hostname; only [ip, hostname] stored.
+        let mut state = empty_state();
+        state.all_hosts.push(Host {
+            ip: "192.168.58.20".to_string(),
+            hostname: "web01".to_string(),
+            os: String::new(),
+            roles: vec![],
+            services: vec![],
+            is_dc: false,
+            owned: false,
+        });
+        let gt = create_ground_truth_from_red_state(&state, &[]);
+        assert_eq!(gt.host_aliases.len(), 1);
+        let group = &gt.host_aliases[0];
+        assert_eq!(group.len(), 2);
+        assert!(group.contains(&"192.168.58.20".to_string()));
+        assert!(group.contains(&"web01".to_string()));
+    }
+
+    #[test]
+    fn empty_ip_ioc_is_dropped_but_hostname_kept() {
+        // A host with no IP still pushes an empty-valued "ip" IOC; the blank
+        // filter drops it, leaving only the hostname IOC.
+        let mut state = empty_state();
+        state.all_hosts.push(Host {
+            ip: String::new(),
+            hostname: "dc01.contoso.local".to_string(),
+            os: String::new(),
+            roles: vec![],
+            services: vec![],
+            is_dc: false,
+            owned: false,
+        });
+        let gt = create_ground_truth_from_red_state(&state, &[]);
+        assert!(gt.expected_iocs.iter().all(|i| !i.value.trim().is_empty()));
+        assert!(gt
+            .expected_iocs
+            .iter()
+            .any(|i| i.ioc_type == "hostname" && i.value == "dc01.contoso.local"));
+        assert!(!gt.expected_iocs.iter().any(|i| i.ioc_type == "ip"));
+    }
+
+    #[test]
+    fn exploited_vulnerability_marks_techniques_required() {
+        use crate::models::VulnerabilityInfo;
+        use std::collections::HashMap;
+
+        let mut state = empty_state();
+        let mut vulns: HashMap<String, VulnerabilityInfo> = HashMap::new();
+        vulns.insert(
+            "vuln-1".to_string(),
+            VulnerabilityInfo {
+                vuln_id: "vuln-1".to_string(),
+                vuln_type: "KERBEROASTING".to_string(),
+                target: "svc_sql".to_string(),
+                discovered_by: String::new(),
+                discovered_at: chrono::Utc::now(),
+                details: HashMap::new(),
+                recommended_agent: String::new(),
+                priority: 1,
+            },
+        );
+        state.discovered_vulnerabilities = vulns;
+        state.exploited_vulnerabilities.insert("vuln-1".to_string());
+
+        let gt = create_ground_truth_from_red_state(&state, &[]);
+        let vuln = &gt.expected_vulnerabilities[0];
+        assert!(vuln.exploited, "vuln in exploited set must be exploited");
+        assert!(vuln.required, "exploited vuln must be required");
+        let tech = gt
+            .expected_techniques
+            .iter()
+            .find(|t| t.technique_id == "T1558.003")
+            .expect("KERBEROASTING technique present");
+        assert!(
+            tech.required,
+            "technique of exploited vuln must be required"
+        );
+    }
+
+    #[test]
+    fn unexploited_vulnerability_technique_not_required() {
+        use crate::models::VulnerabilityInfo;
+        use std::collections::HashMap;
+
+        let mut state = empty_state();
+        let mut vulns: HashMap<String, VulnerabilityInfo> = HashMap::new();
+        vulns.insert(
+            "vuln-2".to_string(),
+            VulnerabilityInfo {
+                vuln_id: "vuln-2".to_string(),
+                vuln_type: "KERBEROASTING".to_string(),
+                target: "svc_http".to_string(),
+                discovered_by: String::new(),
+                discovered_at: chrono::Utc::now(),
+                details: HashMap::new(),
+                recommended_agent: String::new(),
+                priority: 1,
+            },
+        );
+        state.discovered_vulnerabilities = vulns;
+        // Not added to exploited_vulnerabilities.
+
+        let gt = create_ground_truth_from_red_state(&state, &[]);
+        assert!(!gt.expected_vulnerabilities[0].exploited);
+        assert!(!gt.expected_vulnerabilities[0].required);
+        let tech = gt
+            .expected_techniques
+            .iter()
+            .find(|t| t.technique_id == "T1558.003")
+            .expect("KERBEROASTING technique present");
+        assert!(!tech.required, "unexploited vuln technique is optional");
     }
 }

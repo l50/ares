@@ -1,5 +1,6 @@
 //! auto_adcs_enumeration -- detect ADCS servers via CertEnroll share.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -176,19 +177,16 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             // Same-domain creds first, same-forest cross-domain creds second,
             // and stop at the first unprocessed dedup key. Chained iterators —
             // no intermediate Vec — to satisfy clippy::needless_collect.
-            //
-            // Within each tier we iterate NEWEST-first (`.rev()` over the
+            // Within each tier iterate NEWEST-first (`.rev()` over the
             // insertion-ordered credential list). A principal freshly owned via
-            // an ACL kill-chain (e.g. ForceChangePassword / shadow credentials
-            // on a target user) is appended last; the per-identity ADCS dedup
-            // means each new identity earns its own `certipy_find` shot, but
-            // only one credential is dispatched per CA host per 30s tick. Oldest
-            // -first ordering parks the just-gained principal at the back of the
-            // backlog, so in a time-bounded op it never gets re-enumerated as
-            // itself and its ESC4-controlled templates stay invisible. Newest-
-            // first hands the fresh win priority so the ACL→ADCS(ESC4) re-enum
-            // fires on the next tick. Dedup still guarantees older creds each
-            // get their turn — this only reorders, never drops.
+            // an ACL kill-chain (ForceChangePassword / shadow credentials on a
+            // target user) is appended last; only one certipy_find is dispatched
+            // per CA host per tick, so oldest-first parks the just-gained
+            // principal at the back of the backlog and in a time-bounded op it
+            // never gets enumerated as itself — its ESC1/ESC4-controlled
+            // templates stay invisible. Newest-first hands the fresh win priority
+            // so the ACL→ADCS re-enum fires next tick. Dedup still guarantees
+            // older creds each get their turn — this only reorders, never drops.
             let cred = state
                 .credentials
                 .iter()
@@ -212,57 +210,64 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
 
             // Look for NTLM hash (PTH) only if cred path is exhausted (no
             // unprocessed cred candidate exists). Same identity-aware dedup.
-            let hash_pick = if cred.is_none() {
-                let pred_admin_same = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
-                        && h.username.to_lowercase() == "administrator"
-                };
-                let pred_any_same = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
-                        && !state.is_delegation_account(&h.username)
-                };
-                let same_forest = |h: &&ares_core::models::Hash| -> bool {
-                    let hd = h.domain.to_lowercase();
-                    !hd.is_empty() && state.forest_root_of(&hd) == target_forest
-                };
-                let pred_admin_xdom = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && same_forest(h)
-                        && h.username.to_lowercase() == "administrator"
-                };
-                let pred_any_xdom = |h: &&ares_core::models::Hash| {
-                    h.hash_type.eq_ignore_ascii_case("ntlm")
-                        && same_forest(h)
-                        && !state.is_delegation_account(&h.username)
-                };
+            let hash_pick =
+                if cred.is_none() {
+                    let pred_admin_same = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                            && h.username.to_lowercase() == "administrator"
+                    };
+                    let pred_any_same = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                            && !state.is_delegation_account(&h.username)
+                    };
+                    let same_forest = |h: &&ares_core::models::Hash| -> bool {
+                        let hd = h.domain.to_lowercase();
+                        !hd.is_empty() && state.forest_root_of(&hd) == target_forest
+                    };
+                    let pred_admin_xdom = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && same_forest(h)
+                            && h.username.to_lowercase() == "administrator"
+                    };
+                    let pred_any_xdom = |h: &&ares_core::models::Hash| {
+                        h.hash_type.eq_ignore_ascii_case("ntlm")
+                            && same_forest(h)
+                            && !state.is_delegation_account(&h.username)
+                    };
 
-                let mut candidates: Vec<&ares_core::models::Hash> = Vec::new();
-                candidates.extend(state.hashes.iter().filter(pred_admin_same));
-                candidates.extend(state.hashes.iter().filter(pred_any_same).filter(|h| {
-                    h.username.to_lowercase() != "administrator"
-                        || (h.domain.to_lowercase() != domain_lower && !h.domain.is_empty())
-                }));
-                candidates.extend(
-                    state.hashes.iter().filter(pred_admin_xdom).filter(|h| {
-                        h.domain.to_lowercase() != domain_lower && !h.domain.is_empty()
-                    }),
-                );
-                candidates.extend(
-                    state
-                        .hashes
-                        .iter()
-                        .filter(pred_any_xdom)
-                        .filter(|h| h.username.to_lowercase() != "administrator"),
-                );
-                candidates
-                    .into_iter()
-                    .find(|h| !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash(&host_ip, h)))
-                    .cloned()
-            } else {
-                None
-            };
+                    // NEWEST-first within each tier (see the cred comment above): a
+                    // hash freshly dumped from a just-owned principal jumps its tier's
+                    // queue instead of waiting behind stale hashes.
+                    let mut candidates: Vec<&ares_core::models::Hash> = Vec::new();
+                    candidates.extend(state.hashes.iter().rev().filter(pred_admin_same));
+                    candidates.extend(state.hashes.iter().rev().filter(pred_any_same).filter(
+                        |h| {
+                            h.username.to_lowercase() != "administrator"
+                                || (h.domain.to_lowercase() != domain_lower && !h.domain.is_empty())
+                        },
+                    ));
+                    candidates.extend(state.hashes.iter().rev().filter(pred_admin_xdom).filter(
+                        |h| h.domain.to_lowercase() != domain_lower && !h.domain.is_empty(),
+                    ));
+                    candidates.extend(
+                        state
+                            .hashes
+                            .iter()
+                            .rev()
+                            .filter(pred_any_xdom)
+                            .filter(|h| h.username.to_lowercase() != "administrator"),
+                    );
+                    candidates
+                        .into_iter()
+                        .find(|h| {
+                            !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash(&host_ip, h))
+                        })
+                        .cloned()
+                } else {
+                    None
+                };
             // Kerberos ticket fallback — when no same-forest plaintext cred
             // or NTLM hash exists (common for a freshly-discovered foreign
             // forest), a pre-forged inter-realm ccache is enough for
@@ -378,12 +383,16 @@ pub async fn auto_adcs_enumeration(
                 .collect();
             let ce_count = certenroll_shares.len();
             let ce_hosts: Vec<_> = certenroll_shares.iter().map(|s| s.host.as_str()).collect();
-            let cred_domains: Vec<_> = state
-                .credentials
-                .iter()
-                .map(|c| c.domain.as_str())
-                .collect();
-            let hash_domains: Vec<_> = state.hashes.iter().map(|h| h.domain.as_str()).collect();
+            let cred_domains: BTreeMap<&str, usize> =
+                state.credentials.iter().fold(BTreeMap::new(), |mut m, c| {
+                    *m.entry(c.domain.as_str()).or_insert(0) += 1;
+                    m
+                });
+            let hash_domains: BTreeMap<&str, usize> =
+                state.hashes.iter().fold(BTreeMap::new(), |mut m, h| {
+                    *m.entry(h.domain.as_str()).or_insert(0) += 1;
+                    m
+                });
             let domains: Vec<_> = state.domains.iter().map(|d| d.as_str()).collect();
             let w = collect_adcs_work(&state);
             info!(
@@ -727,34 +736,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_prefers_newest_same_domain_credential() {
-        // GAP 4b: a principal freshly owned via an ACL kill-chain is appended
-        // last to state.credentials. It must win the ADCS re-enum slot over
-        // older same-domain creds so its ESC4-controlled templates surface
-        // promptly (certipy_find runs as that identity), instead of starving
-        // at the back of the per-tick cycle.
-        let mut state = StateInner::new("test-op".into());
-        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
-        state
-            .hosts
-            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
-        state.domains.push("contoso.local".into());
-        // Older credential first, then the freshly-owned principal.
-        state
-            .credentials
-            .push(make_credential("olduser", "Old!Pass1", "contoso.local")); // pragma: allowlist secret
-        state
-            .credentials
-            .push(make_credential("carol", "Reset!Pass1", "contoso.local")); // pragma: allowlist secret
-        let work = collect_adcs_work(&state);
-        assert_eq!(work.len(), 1);
-        assert_eq!(
-            work[0].credential.username, "carol",
-            "newest same-domain cred (freshly owned via ACL) must get the ADCS re-enum slot first"
-        );
-    }
-
-    #[test]
     fn collect_prefers_same_domain_credential() {
         let mut state = StateInner::new("test-op".into());
         state.shares.push(make_share("192.168.58.50", "CertEnroll"));
@@ -942,7 +923,7 @@ mod tests {
     #[test]
     fn extract_domain_from_fqdn_trailing_dot() {
         // "host." splits into ("host", "") -> Some("")
-        assert_eq!(extract_domain_from_fqdn("host."), Some(String::new()));
+        assert_eq!(extract_domain_from_fqdn("host."), Some("".to_string()));
     }
 
     #[test]

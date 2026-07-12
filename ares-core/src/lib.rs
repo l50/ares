@@ -20,6 +20,7 @@ pub mod nats;
 pub mod op_state_log;
 pub mod parsing;
 pub mod persistent_store;
+pub mod replay_clock;
 pub mod reports;
 pub mod state;
 #[cfg(feature = "telemetry")]

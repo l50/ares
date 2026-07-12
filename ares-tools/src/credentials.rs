@@ -216,6 +216,20 @@ pub fn kerberos_env(ticket_path: &str) -> (String, String) {
     ("KRB5CCNAME".to_string(), ticket_path.to_string())
 }
 
+/// Build the `KRB5_CONFIG` env value that pairs with `KRB5CCNAME=<ticket>`.
+///
+/// The forge tool writes a per-ccache shim at `<ticket>.krb5.conf` with
+/// `[domain_realm]` mappings for the source and target realms — without
+/// these, MIT libkrb5 falls back to the system `default_realm` and misses
+/// the cached service ticket ("Matching credential not found"). Fall back
+/// to `/etc/krb5.conf` so a missing shim doesn't nuke the system config.
+pub fn krb5_config_env(ticket_path: &str) -> (String, String) {
+    (
+        "KRB5_CONFIG".to_string(),
+        format!("{ticket_path}.krb5.conf:/etc/krb5.conf"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

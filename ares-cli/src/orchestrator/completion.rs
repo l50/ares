@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -22,89 +22,63 @@ use tracing::{info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::SharedState;
 
-/// Pure computation: given state fields, return undominated domains (forest
-/// roots AND child domains) that still need their krbtgt extracted.
-///
-/// Each Active Directory domain has its own krbtgt principal; dominating a
-/// parent forest root does NOT also dominate any of its child domains, and
-/// vice versa. So the required-set is built from every discovered domain
-/// (target, trust enumeration, known DC), not collapsed to forest roots.
+/// Pure computation: given state fields, return undominated forest root domains.
 ///
 /// Used by both the async `undominated_forests()` and `SharedState::snapshot()`.
-/// The historical `_forests` suffix is retained on the public name to avoid
-/// churning every call site; the semantics are "all discovered domains".
-///
-/// When `cred_domains` is `Some`, **lean completion** is enabled: domains that
-/// were discovered only through the `domain_controllers` map (i.e. an exposed
-/// DC, no explicit target/trust intent) are filtered out unless we hold at
-/// least one credential for them. This prevents the operation from holding
-/// indefinitely on child domains we have no path to compromise — the cost
-/// driver behind ops that hit 0/N domains for hours while keeping all agents
-/// alive. Lean mode is opt-in via `ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1`.
-/// When `None`, strict completion (current default) requires every discovered
-/// domain regardless of credential coverage.
 pub fn compute_undominated_forests(
     target_domain: Option<&str>,
     first_domain: Option<&str>,
     trusted_domains: &std::collections::HashMap<String, ares_core::models::TrustInfo>,
     dominated_domains: &HashSet<String>,
     domain_controllers: &std::collections::HashMap<String, String>,
-    cred_domains: Option<&HashSet<String>>,
 ) -> Vec<String> {
-    let mut required_domains: HashSet<String> = HashSet::new();
+    let mut required_forests: HashSet<String> = HashSet::new();
 
     if let Some(td) = target_domain {
         if !td.is_empty() {
-            required_domains.insert(td.to_lowercase());
+            required_forests.insert(forest_root_of(td));
         }
     }
     if let Some(fd) = first_domain {
-        if !fd.is_empty() {
-            required_domains.insert(fd.to_lowercase());
-        }
+        required_forests.insert(forest_root_of(fd));
     }
 
-    // Every enumerated trust — parent/child intra-forest AND cross-forest —
-    // is a distinct domain with its own krbtgt. Owning the parent doesn't
-    // free the child (separate KDC, separate krbtgt principal) and the
-    // operator's success criterion is "all discovered domains compromised".
     for trust in trusted_domains.values() {
-        if !trust.domain.is_empty() {
-            required_domains.insert(trust.domain.to_lowercase());
+        if trust.is_cross_forest() {
+            required_forests.insert(forest_root_of(&trust.domain));
         }
     }
 
-    // Include every domain whose DC we've discovered. Catches both the
-    // pre-trust-enumeration case (DC discovered via recon, trust details
-    // not yet known) and child domains whose DC is known directly.
-    //
-    // In lean-completion mode (`cred_domains.is_some()`), only count DC-only
-    // domains that we actually have a credential for. A discovered child DC
-    // with no creds is unreachable — the orchestrator would otherwise loop
-    // agents against it forever, burning $1+/min on a compromise it can't
-    // achieve.
+    // Include forest roots from all known DCs. This prevents premature
+    // completion when trust enumeration hasn't finished yet — domains
+    // discovered via recon (e.g. fabrikam.local with a known DC) are tracked
+    // as required forests even before trust relationships are enumerated.
     for dc_domain in domain_controllers.keys() {
-        if dc_domain.is_empty() {
-            continue;
+        if !dc_domain.is_empty() {
+            required_forests.insert(forest_root_of(dc_domain));
         }
-        let lowered = dc_domain.to_lowercase();
-        if let Some(creds) = cred_domains {
-            if !creds.contains(&lowered) {
-                continue;
-            }
-        }
-        required_domains.insert(lowered);
     }
 
-    if required_domains.is_empty() {
+    if required_forests.is_empty() {
         return Vec::new();
     }
 
-    let dominated_lower: HashSet<String> =
-        dominated_domains.iter().map(|d| d.to_lowercase()).collect();
+    // Only count a domain as covering a forest root when that domain IS the
+    // forest root.  Dominating a child domain (e.g. contoso.local)
+    // does NOT mean the forest root (contoso.local) is compromised — its
+    // DC has a separate krbtgt.  The child-to-parent escalation (ExtraSid /
+    // trust key) must still happen before we declare the forest dominated.
+    let dominated_roots: HashSet<String> = dominated_domains
+        .iter()
+        .filter(|d| {
+            let root = forest_root_of(d);
+            root == d.to_lowercase()
+        })
+        .map(|d| forest_root_of(d))
+        .collect();
 
-    required_domains
-        .difference(&dominated_lower)
+    required_forests
+        .difference(&dominated_roots)
         .cloned()
         .collect()
 }
@@ -114,40 +88,63 @@ pub fn compute_undominated_forests(
 /// Returns a list of forest root domains that still need krbtgt hashes.
 /// An empty list means all forests are dominated. Domination requires krbtgt
 /// hashes from every trusted forest, not just the initial target domain.
-///
-/// Honors `ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1` for lean completion:
-/// see `compute_undominated_forests` doc for semantics.
 pub async fn undominated_forests(state: &SharedState) -> Vec<String> {
     let inner = state.read().await;
-    let lean = lean_completion_enabled();
-    let cred_domains: Option<HashSet<String>> = lean.then(|| {
-        inner
-            .credentials
-            .iter()
-            .filter(|c| !c.domain.is_empty())
-            .map(|c| c.domain.to_lowercase())
-            .collect()
-    });
     compute_undominated_forests(
         inner.target.as_ref().map(|t| t.domain.as_str()),
         inner.domains.first().map(|d| d.as_str()),
         &inner.trusted_domains,
         &inner.dominated_domains,
         &inner.domain_controllers,
-        cred_domains.as_ref(),
     )
 }
 
-/// Whether lean completion is enabled via env var.
+/// Whether any discovered `forest_trust_escalation` vuln is still unexploited
+/// and not written off — cross-forest work the op must not abandon.
 ///
-/// Default: false (strict — every discovered DC blocks completion). Set
-/// `ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN=1` to require at least one
-/// credential per child domain before it holds the operation open.
-pub fn lean_completion_enabled() -> bool {
-    std::env::var("ARES_COMPLETION_REQUIRE_CREDS_FOR_DOMAIN")
-        .ok()
-        .as_deref()
-        == Some("1")
+/// Pure over the two vuln collections so it unit-tests without a live
+/// `SharedState`.
+fn has_pending_cross_forest_escalation(
+    discovered: &std::collections::HashMap<String, ares_core::models::VulnerabilityInfo>,
+    exploited: &HashSet<String>,
+) -> bool {
+    discovered.values().any(|v| {
+        v.vuln_type == "forest_trust_escalation"
+            && !exploited.contains(&v.vuln_id)
+            && !is_trust_escalation_written_off(v)
+    })
+}
+
+/// A cross-forest escalation is "written off" only once the fallback automation
+/// has flagged it: SID filtering blocks the ExtraSid DCSync path AND the
+/// ACL/MSSQL/enum fallbacks have been exhausted, at which point it stamps
+/// `details["written_off"] = true`. Until that flag is set the op stays alive
+/// so a retry burst or the operator escape hatch can still land the forge.
+/// This is the escape valve that keeps a genuinely-dead trust from pinning the
+/// op open to max_runtime forever.
+fn is_trust_escalation_written_off(vuln: &ares_core::models::VulnerabilityInfo) -> bool {
+    vuln.details
+        .get("written_off")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Backstop for [`undominated_forests`]: false while any cross-forest
+/// `forest_trust_escalation` remains unexploited and not written off.
+///
+/// [`compute_undominated_forests`] only marks a forest required when its trust
+/// is classified `is_cross_forest()` or a DC is keyed under the forest root. A
+/// `forest_trust_escalation` vuln can sit in state (queued against the foreign
+/// DC's IP) while neither holds — that gap let a two-forest op self-terminate
+/// with the parent forest still unowned and its escalation un-fired. Gating
+/// completion on the vuln directly closes it: the op runs on (bounded by
+/// max_runtime) until the escalation is exploited or explicitly written off.
+async fn is_multi_forest_op_complete(state: &SharedState) -> bool {
+    let inner = state.read().await;
+    !has_pending_cross_forest_escalation(
+        &inner.discovered_vulnerabilities,
+        &inner.exploited_vulnerabilities,
+    )
 }
 
 /// Redis-authoritative count of red-team tasks still pending completion.
@@ -158,6 +155,21 @@ async fn redis_pending_red_tasks(dispatcher: &Arc<Dispatcher>) -> Result<usize, 
     );
     let mut conn = dispatcher.queue.connection();
     redis::cmd("HLEN").arg(&key).query_async(&mut conn).await
+}
+
+/// Extract forest root from a domain FQDN.
+///
+/// For `child.contoso.local` → `contoso.local`
+/// For `contoso.local` → `contoso.local`
+fn forest_root_of(domain: &str) -> String {
+    let lower = domain.to_lowercase();
+    let parts: Vec<&str> = lower.split('.').collect();
+    if parts.len() <= 2 {
+        lower
+    } else {
+        // Walk up to find the 2-part root (assumes .local/.com TLD)
+        parts[parts.len() - 2..].join(".")
+    }
 }
 
 /// Main operation completion loop.
@@ -203,23 +215,35 @@ pub(crate) enum CompletionDecision {
 /// Decide whether the completion loop should stop, begin the post-DA grace
 /// period, or continue waiting. Pure — no Redis, no tokio sleeps.
 ///
-/// Decision priority (matches the inline logic this replaces):
+/// Runtime is bounded by a **soft** and a **hard** cap. The soft cap is the
+/// normal budget; the hard cap is a strict ceiling that always terminates.
+/// The soft cap yields to `Continue` only when the op has achieved DA on at
+/// least one domain *and* still has an undominated forest — i.e. the run is
+/// visibly progressing on multi-forest work but ran out of the primary
+/// budget. Without DA there's no evidence the op is close enough to warrant
+/// more time; with DA but all forests done, the op is just idling.
+///
+/// Decision priority:
 /// 1. `completed` flag set externally → Stop("operation marked completed")
-/// 2. `elapsed >= max_runtime` → Stop("max runtime exceeded")
-/// 3. `has_domain_admin && stop_on_da` → Stop on DA
-/// 4. `has_domain_admin && stop_on_gt`:
+/// 2. `elapsed >= hard_max_runtime` → Stop("hard max runtime exceeded")
+/// 3. `elapsed >= soft_max_runtime`:
+///     - DA achieved AND undominated forests remain → fall through (extend)
+///     - otherwise → Stop("max runtime exceeded")
+/// 4. `has_domain_admin && stop_on_da` → Stop on DA
+/// 5. `has_domain_admin && stop_on_gt`:
 ///     - `has_golden_ticket` → Stop on GT
 ///     - otherwise → Continue (still waiting for GT)
-/// 5. `has_domain_admin` (default mode):
+/// 6. `has_domain_admin` (default mode):
 ///     - undominated forests remain → Continue
 ///     - all dominated, grace timer set, `elapsed_since >= grace_period` → Stop
 ///     - all dominated, grace timer set, still inside grace → Continue
 ///     - all dominated, grace timer unset → BeginGracePeriod
-/// 6. otherwise → Continue
+/// 7. otherwise → Continue
 pub(crate) fn evaluate_completion(
     snapshot: &CompletionSnapshot,
     elapsed: Duration,
-    max_runtime: Duration,
+    soft_max_runtime: Duration,
+    hard_max_runtime: Duration,
     stop_on_da: bool,
     stop_on_gt: bool,
     grace_period: Duration,
@@ -227,7 +251,12 @@ pub(crate) fn evaluate_completion(
     if snapshot.completed {
         return CompletionDecision::Stop("operation marked completed");
     }
-    if elapsed >= max_runtime {
+    if elapsed >= hard_max_runtime {
+        return CompletionDecision::Stop("hard max runtime exceeded");
+    }
+    if elapsed >= soft_max_runtime
+        && (!snapshot.has_domain_admin || snapshot.undominated_forests_empty)
+    {
         return CompletionDecision::Stop("max runtime exceeded");
     }
     if !snapshot.has_domain_admin {
@@ -261,6 +290,7 @@ pub async fn wait_for_completion(
     mut shutdown_rx: watch::Receiver<bool>,
     max_runtime: Duration,
     interval: Duration,
+    blue_enabled: bool,
 ) {
     let start = tokio::time::Instant::now();
 
@@ -276,8 +306,14 @@ pub async fn wait_for_completion(
         })
         .unwrap_or((false, false));
 
+    // Hard cap = 2× the configured budget. The soft cap (max_runtime) is the
+    // normal ceiling; the hard cap is the strict upper bound that fires even
+    // when the op is still visibly progressing on an undominated forest.
+    let hard_max_runtime = max_runtime.saturating_mul(2);
+
     info!(
         max_runtime_secs = max_runtime.as_secs(),
+        hard_max_runtime_secs = hard_max_runtime.as_secs(),
         stop_on_domain_admin = stop_on_da,
         stop_on_golden_ticket = stop_on_gt,
         "Completion monitor started"
@@ -304,8 +340,15 @@ pub async fn wait_for_completion(
         // The grace-period check needs to know whether ALL forests are dominated.
         // That helper takes the SharedState (it reads inner under a fresh lock)
         // and is async, so it can't live inside the pure decision helper.
+        //
+        // Also require that no cross-forest `forest_trust_escalation` is left
+        // unexploited-and-not-written-off: `undominated_forests` misses a forest
+        // whose trust wasn't classified `is_cross_forest()` and whose DC isn't
+        // keyed under its root, so the vuln is the authoritative "cross-forest
+        // work remains" signal. Both must clear before the op is eligible to
+        // stop.
         let undominated_forests_empty = if has_da && !stop_on_da && !stop_on_gt {
-            undominated_forests(state).await.is_empty()
+            undominated_forests(state).await.is_empty() && is_multi_forest_op_complete(state).await
         } else {
             false
         };
@@ -322,6 +365,7 @@ pub async fn wait_for_completion(
             &snapshot,
             elapsed,
             max_runtime,
+            hard_max_runtime,
             stop_on_da,
             stop_on_gt,
             grace_period,
@@ -351,7 +395,6 @@ pub async fn wait_for_completion(
                 "Completion condition met"
             );
 
-            let blue_enabled = std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1");
             if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, blue_enabled).await {
                 warn!(err = %e, "Failed to persist red completion metadata");
             }
@@ -549,6 +592,18 @@ async fn mark_red_completion_for_loot(
         .expire(&key, 86400)
         .query_async::<()>(&mut conn)
         .await?;
+
+    // Eagerly render + cache the red report from live state so the Taskfile
+    // watch loop's `ops report` fetch (which fires as soon as `ops status`
+    // reports completed) hits the cached copy instead of racing on partial
+    // Redis reads. Best-effort: a render failure must not fail red completion.
+    if let Err(e) =
+        crate::ops::report::generate_and_cache_report(&mut conn, &dispatcher.config.operation_id)
+            .await
+    {
+        warn!(err = %e, "Failed to eagerly cache red report on completion");
+    }
+
     Ok(())
 }
 
@@ -599,9 +654,24 @@ async fn auto_submit_blue_investigation(
         .await
         .unwrap_or_default();
 
+    // Read the op's real start time from Redis — bootstrap.rs writes it once
+    // via HSETNX so this survives restarts. Falling back to `now` would give
+    // blue a zero-width window and score 0.
+    let meta_key = format!("ares:op:{op_id}:meta");
+    let started_at_raw: Option<String> = redis::cmd("HGET")
+        .arg(&meta_key)
+        .arg("started_at")
+        .query_async(conn)
+        .await
+        .unwrap_or_default();
+    let attack_window_start = started_at_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<DateTime<Utc>>(s).ok())
+        .unwrap_or(now);
+
     let operation_context = serde_json::json!({
         "operation_id": op_id,
-        "attack_window_start": now.to_rfc3339(),
+        "attack_window_start": attack_window_start.to_rfc3339(),
         "attack_window_end": now.to_rfc3339(),
         "techniques_used": &techniques[..std::cmp::min(techniques.len(), 20)],
         "deployment": target_env,
@@ -714,6 +784,89 @@ async fn auto_submit_blue_investigation(
 mod tests {
     use super::*;
 
+    #[test]
+    fn forest_root_of_simple() {
+        assert_eq!(forest_root_of("contoso.local"), "contoso.local");
+    }
+
+    #[test]
+    fn forest_root_of_child() {
+        assert_eq!(forest_root_of("child.contoso.local"), "contoso.local");
+    }
+
+    #[test]
+    fn forest_root_of_deep_child() {
+        assert_eq!(forest_root_of("sub.child.contoso.local"), "contoso.local");
+    }
+
+    fn make_forest_escalation_vuln(
+        vuln_id: &str,
+        written_off: bool,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut details = std::collections::HashMap::new();
+        if written_off {
+            details.insert("written_off".to_string(), serde_json::json!(true));
+        }
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: vuln_id.to_string(),
+            vuln_type: "forest_trust_escalation".to_string(),
+            target: "192.168.58.159".to_string(),
+            discovered_by: "trust_automation".to_string(),
+            discovered_at: Utc::now(),
+            details,
+            recommended_agent: "privesc".to_string(),
+            priority: 100,
+        }
+    }
+
+    #[test]
+    fn pending_escalation_blocks_completion() {
+        // A discovered, unexploited forest_trust_escalation keeps the op alive.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", false));
+        let exploited = HashSet::new();
+        assert!(has_pending_cross_forest_escalation(&discovered, &exploited));
+    }
+
+    #[test]
+    fn exploited_escalation_allows_completion() {
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", false));
+        let mut exploited = HashSet::new();
+        exploited.insert("v1".to_string());
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited
+        ));
+    }
+
+    #[test]
+    fn written_off_escalation_allows_completion() {
+        // The escape valve: a flagged-dead trust must not pin the op open.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", true));
+        let exploited = HashSet::new();
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited
+        ));
+    }
+
+    #[test]
+    fn non_forest_vulns_ignored_by_completion_gate() {
+        // Only forest_trust_escalation gates multi-forest completion; a stray
+        // unexploited esc1 (single-forest) must not block the op forever.
+        let mut discovered = std::collections::HashMap::new();
+        let mut esc1 = make_forest_escalation_vuln("v1", false);
+        esc1.vuln_type = "esc1".to_string();
+        discovered.insert("v1".to_string(), esc1);
+        let exploited = HashSet::new();
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited
+        ));
+    }
+
     fn make_trust(domain: &str, trust_type: &str) -> ares_core::models::TrustInfo {
         ares_core::models::TrustInfo {
             domain: domain.to_string(),
@@ -737,7 +890,6 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert_eq!(result, vec!["contoso.local"]);
 
@@ -749,7 +901,6 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert!(result.is_empty());
     }
@@ -772,7 +923,6 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert_eq!(result, vec!["fabrikam.local"]);
     }
@@ -795,17 +945,13 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert!(result.is_empty());
     }
 
     #[test]
-    fn undominated_parent_child_trust_makes_child_required() {
-        // Once a parent_child trust is enumerated, the child is a known
-        // distinct domain with its own krbtgt. Dominating the parent does
-        // NOT compromise the child — completion must keep running until
-        // both krbtgts are extracted.
+    fn undominated_child_domain_not_separate_forest() {
+        // parent_child trust should NOT add a separate required forest
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(
             "child.contoso.local".to_string(),
@@ -821,62 +967,9 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
-        assert_eq!(result, vec!["child.contoso.local".to_string()]);
-    }
-
-    #[test]
-    fn undominated_parent_and_child_both_dominated_empty() {
-        // Mirror of the case above: once the child's krbtgt is also captured
-        // the required-set drains and completion is allowed to fire.
-        let mut trusted = std::collections::HashMap::new();
-        trusted.insert(
-            "child.contoso.local".to_string(),
-            make_trust("child.contoso.local", "parent_child"),
-        );
-
-        let mut dominated = HashSet::new();
-        dominated.insert("contoso.local".to_string());
-        dominated.insert("child.contoso.local".to_string());
-        let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(
-            Some("contoso.local"),
-            Some("contoso.local"),
-            &trusted,
-            &dominated,
-            &dcs,
-            None,
-        );
+        // parent_child is NOT cross-forest, so child.contoso.local is not required
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn undominated_child_dc_keeps_child_required_even_without_trust() {
-        // Replays the live bug pattern: forest roots fall via direct PtH
-        // on each root DC, child DC is known via recon, but no `raise_child`
-        // ran so the child's krbtgt is still missing. Before the fix this
-        // returned empty (completion fired with the child uncompromised).
-        let trusted = std::collections::HashMap::new();
-        let mut dominated = HashSet::new();
-        dominated.insert("contoso.local".to_string());
-        dominated.insert("fabrikam.local".to_string());
-        let mut dcs = std::collections::HashMap::new();
-        dcs.insert("contoso.local".to_string(), "192.168.58.10".to_string());
-        dcs.insert(
-            "child.contoso.local".to_string(),
-            "192.168.58.11".to_string(),
-        );
-        dcs.insert("fabrikam.local".to_string(), "192.168.58.12".to_string());
-        let result = compute_undominated_forests(
-            Some("contoso.local"),
-            Some("contoso.local"),
-            &trusted,
-            &dominated,
-            &dcs,
-            None,
-        );
-        assert_eq!(result, vec!["child.contoso.local".to_string()]);
     }
 
     #[test]
@@ -894,7 +987,6 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         // Child DA does not satisfy the forest root requirement
         assert_eq!(result, vec!["contoso.local"]);
@@ -913,7 +1005,6 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert!(result.is_empty());
     }
@@ -921,8 +1012,8 @@ mod tests {
     #[test]
     fn undominated_dc_discovered_before_trust_enum() {
         // fabrikam.local DC discovered via recon but trust not yet enumerated.
-        // The DC should be included as required even before trust details land,
-        // and so should child.contoso.local because its DC was discovered too.
+        // The DC should be included in required_forests to prevent premature
+        // completion.
         let trusted = std::collections::HashMap::new();
         let mut dominated = HashSet::new();
         dominated.insert("contoso.local".to_string());
@@ -935,19 +1026,26 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
-        // child.contoso.local appears via first_domain, fabrikam.local via the
-        // DC map. Order is HashSet-derived so sort before comparing.
-        let mut sorted = result;
-        sorted.sort();
-        assert_eq!(
-            sorted,
-            vec![
-                "child.contoso.local".to_string(),
-                "fabrikam.local".to_string(),
-            ]
-        );
+        // fabrikam.local DC is known but not dominated → should appear
+        assert_eq!(result, vec!["fabrikam.local"]);
+    }
+
+    #[test]
+    fn forest_root_of_case_insensitive() {
+        assert_eq!(forest_root_of("CONTOSO.LOCAL"), "contoso.local");
+        assert_eq!(forest_root_of("North.Contoso.Local"), "contoso.local");
+    }
+
+    #[test]
+    fn forest_root_of_single_label() {
+        // Single-label domain (unusual but should not panic)
+        assert_eq!(forest_root_of("localhost"), "localhost");
+    }
+
+    #[test]
+    fn forest_root_of_empty() {
+        assert_eq!(forest_root_of(""), "");
     }
 
     #[test]
@@ -956,7 +1054,7 @@ mod tests {
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(None, None, &trusted, &dominated, &dcs, None);
+        let result = compute_undominated_forests(None, None, &trusted, &dominated, &dcs);
         assert!(result.is_empty());
     }
 
@@ -966,7 +1064,7 @@ mod tests {
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(Some(""), None, &trusted, &dominated, &dcs, None);
+        let result = compute_undominated_forests(Some(""), None, &trusted, &dominated, &dcs);
         assert!(result.is_empty());
     }
 
@@ -976,14 +1074,8 @@ mod tests {
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(
-            None,
-            Some("contoso.local"),
-            &trusted,
-            &dominated,
-            &dcs,
-            None,
-        );
+        let result =
+            compute_undominated_forests(None, Some("contoso.local"), &trusted, &dominated, &dcs);
         assert_eq!(result, vec!["contoso.local"]);
     }
 
@@ -1003,18 +1095,14 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert!(result.contains(&"fabrikam.local".to_string()));
         assert!(result.contains(&"contoso.local".to_string()));
     }
 
     #[test]
-    fn undominated_trust_required_regardless_of_trust_type() {
-        // Any enumerated trust contributes a required domain — the trust_type
-        // (forest / parent_child / external / unknown) does not change the
-        // operator's success criterion: every discovered domain must be
-        // dominated before completion fires.
+    fn undominated_unknown_trust_not_cross_forest() {
+        // "unknown" trust type should NOT be treated as cross-forest
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(
             "fabrikam.local".to_string(),
@@ -1029,9 +1117,9 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
-        assert_eq!(result, vec!["fabrikam.local".to_string()]);
+        // "unknown" is not cross-forest, so fabrikam should NOT appear
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -1057,21 +1145,18 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert_eq!(result, vec!["tailspintoys.local"]);
     }
 
     #[test]
-    fn undominated_trust_domain_kept_verbatim_not_collapsed_to_root() {
-        // A trust entry pointing at a non-root domain (e.g. an external
-        // trust to "child.fabrikam.local") is required as-is — we do NOT
-        // collapse it to its forest root, because the child has its own
-        // krbtgt that the parent's compromise wouldn't yield.
+    fn undominated_child_trust_domain_maps_to_parent_forest() {
+        // Cross-forest trust with a child domain like "north.fabrikam.local"
+        // should map to forest root "fabrikam.local"
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(
-            "child.fabrikam.local".to_string(),
-            make_trust("child.fabrikam.local", "forest"),
+            "north.fabrikam.local".to_string(),
+            make_trust("north.fabrikam.local", "forest"),
         );
 
         let mut dominated = HashSet::new();
@@ -1083,9 +1168,8 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
-        assert_eq!(result, vec!["child.fabrikam.local".to_string()]);
+        assert_eq!(result, vec!["fabrikam.local"]);
     }
 
     #[test]
@@ -1095,14 +1179,13 @@ mod tests {
         let mut dominated = HashSet::new();
         dominated.insert("contoso.local".to_string());
         let mut dcs = std::collections::HashMap::new();
-        dcs.insert(String::new(), "192.168.58.1".to_string());
+        dcs.insert("".to_string(), "192.168.58.1".to_string());
         let result = compute_undominated_forests(
             Some("contoso.local"),
             Some("contoso.local"),
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert!(result.is_empty());
     }
@@ -1114,24 +1197,15 @@ mod tests {
         let mut dominated = HashSet::new();
         dominated.insert("contoso.local".to_string());
         let dcs = std::collections::HashMap::new();
-        let result = compute_undominated_forests(
-            Some("CONTOSO.LOCAL"),
-            None,
-            &trusted,
-            &dominated,
-            &dcs,
-            None,
-        );
+        let result =
+            compute_undominated_forests(Some("CONTOSO.LOCAL"), None, &trusted, &dominated, &dcs);
         // target "CONTOSO.LOCAL" lowercases to "contoso.local" which is dominated
         assert!(result.is_empty());
     }
 
     #[test]
-    fn undominated_target_and_first_same_forest_are_distinct_domains() {
-        // target_domain (parent) and first_domain (child of same forest)
-        // are two distinct AD domains, each with its own krbtgt — both must
-        // appear in the required set. Sort before comparing because the
-        // result is HashSet-derived.
+    fn undominated_target_and_first_same_forest() {
+        // target and first_domain in the same forest should only produce one entry
         let trusted = std::collections::HashMap::new();
         let dominated = HashSet::new();
         let dcs = std::collections::HashMap::new();
@@ -1141,17 +1215,9 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
-        let mut sorted = result;
-        sorted.sort();
-        assert_eq!(
-            sorted,
-            vec![
-                "child.contoso.local".to_string(),
-                "contoso.local".to_string(),
-            ]
-        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "contoso.local");
     }
 
     #[test]
@@ -1165,7 +1231,6 @@ mod tests {
             &trusted,
             &dominated,
             &dcs,
-            None,
         );
         assert_eq!(result.len(), 2);
         let mut sorted = result;
@@ -1201,6 +1266,9 @@ mod tests {
     fn ten_min() -> Duration {
         Duration::from_secs(600)
     }
+    fn twenty_min() -> Duration {
+        Duration::from_secs(1200)
+    }
     fn three_min() -> Duration {
         Duration::from_secs(180)
     }
@@ -1210,7 +1278,15 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.completed = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("operation marked completed")
         );
     }
@@ -1223,6 +1299,7 @@ mod tests {
                 &snap,
                 Duration::from_secs(601),
                 ten_min(),
+                twenty_min(),
                 false,
                 false,
                 three_min()
@@ -1235,7 +1312,15 @@ mod tests {
     fn completion_no_da_continues() {
         let snap = empty_snapshot();
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
     }
@@ -1245,7 +1330,15 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), true, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                true,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("domain admin achieved (stop_on_domain_admin)")
         );
     }
@@ -1255,12 +1348,28 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, true, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                true,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
         snap.has_golden_ticket = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, true, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                true,
+                three_min()
+            ),
             CompletionDecision::Stop("golden ticket forged (stop_on_golden_ticket)")
         );
     }
@@ -1271,7 +1380,15 @@ mod tests {
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = false;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
     }
@@ -1281,9 +1398,16 @@ mod tests {
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = true;
-        // Grace timer not set yet → BeginGracePeriod.
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::BeginGracePeriod
         );
     }
@@ -1294,9 +1418,16 @@ mod tests {
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = true;
         snap.all_dominated_for = Some(Duration::from_secs(60));
-        // 60s elapsed, grace is 180s → still continuing.
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Continue
         );
     }
@@ -1308,26 +1439,42 @@ mod tests {
         snap.undominated_forests_empty = true;
         snap.all_dominated_for = Some(Duration::from_secs(181));
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("all forests dominated (post-exploitation complete)")
         );
     }
 
     #[test]
     fn completion_stop_on_da_beats_completed_priority() {
-        // `completed` runs first; even with stop_on_da configured, the
-        // external completed flag wins because it's priority 1.
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         snap.completed = true;
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), true, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                true,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("operation marked completed")
         );
     }
 
     #[test]
-    fn completion_max_runtime_beats_da_grace() {
+    fn completion_soft_cap_stops_when_all_forests_done() {
+        // DA achieved and all forests dominated → the soft cap fires; no
+        // reason to extend beyond it once there's nothing left to compromise.
         let mut snap = empty_snapshot();
         snap.has_domain_admin = true;
         snap.undominated_forests_empty = true;
@@ -1336,11 +1483,56 @@ mod tests {
                 &snap,
                 Duration::from_secs(601),
                 ten_min(),
+                twenty_min(),
                 false,
                 false,
                 three_min(),
             ),
             CompletionDecision::Stop("max runtime exceeded")
+        );
+    }
+
+    #[test]
+    fn completion_soft_cap_extends_when_forest_still_owed() {
+        // DA on one domain but a trusted forest is still uncompromised — this
+        // is the case that used to lose the second forest to the guillotine.
+        // The soft cap must yield to Continue so the op keeps working the
+        // remaining forest until it lands DA or hits the hard cap.
+        let mut snap = empty_snapshot();
+        snap.has_domain_admin = true;
+        snap.undominated_forests_empty = false;
+        assert_eq!(
+            evaluate_completion(
+                &snap,
+                Duration::from_secs(601),
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min(),
+            ),
+            CompletionDecision::Continue
+        );
+    }
+
+    #[test]
+    fn completion_hard_cap_stops_even_with_forest_owed() {
+        // The hard cap is the strict upper bound — even if a forest is still
+        // uncompromised, the op must terminate rather than run forever.
+        let mut snap = empty_snapshot();
+        snap.has_domain_admin = true;
+        snap.undominated_forests_empty = false;
+        assert_eq!(
+            evaluate_completion(
+                &snap,
+                Duration::from_secs(1201),
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min(),
+            ),
+            CompletionDecision::Stop("hard max runtime exceeded")
         );
     }
 
@@ -1351,7 +1543,15 @@ mod tests {
         snap.undominated_forests_empty = true;
         snap.all_dominated_for = Some(three_min());
         assert_eq!(
-            evaluate_completion(&snap, Duration::ZERO, ten_min(), false, false, three_min()),
+            evaluate_completion(
+                &snap,
+                Duration::ZERO,
+                ten_min(),
+                twenty_min(),
+                false,
+                false,
+                three_min()
+            ),
             CompletionDecision::Stop("all forests dominated (post-exploitation complete)")
         );
     }

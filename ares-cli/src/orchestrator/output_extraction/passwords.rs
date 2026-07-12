@@ -27,8 +27,33 @@ static RE_SMB_LINE_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Netexec [+] success line: `SMB IP PORT HOST [+] DOMAIN\user:password`
+///
+/// Kept for the hash-echo suppression path (`is_hash_auth`) and for use as a
+/// fallback when the tool name confirms an authenticating tool. Prefer
+/// `RE_NETEXEC_AUTH_ANCHORED` when the invoking tool is unknown — a bare `[+]`
+/// anywhere in the buffer is not sufficient auth-context proof.
 static RE_NETEXEC_SUCCESS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[\+\]\s+([A-Za-z0-9_.\-]+)\\([A-Za-z0-9_.\-$]+):([^\s(]+)").unwrap()
+});
+
+/// Netexec success line anchored to the protocol-header prefix that only
+/// netexec/crackmapexec itself prints:
+///
+///   `SMB   192.168.58.11  445  DC01  [+] contoso.local\jdoe:P@ss (Pwn3d!)`
+///   `LDAP  192.168.58.11  636  DC01  [+] contoso.local\jdoe:P@ss`
+///   `WINRM 192.168.58.11  5985 DC01  [+] contoso.local\jdoe:P@ss`
+///
+/// Requiring `<PROTO> <ip> <port> <host>` before the `[+]` block is what
+/// distinguishes a real netexec auth event from an attacker-planted
+/// `[+] u:p` sitting inside an AD `description`, a `type C:\...` dump,
+/// or an `xp_cmdshell 'echo ...'` result. The former only ever comes out
+/// of a tool that actually authenticated; the latter can be forged by
+/// anyone who controls an AD field or a readable file.
+static RE_NETEXEC_AUTH_ANCHORED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:SMB|LDAP|LDAPS|WINRM|MSSQL|RDP|WMI|SSH|FTP|NFS|VNC)\s+\S+\s+\d+\s+\S+\s+\[\+\]\s+([A-Za-z0-9_.\-]+)\\([A-Za-z0-9_.\-$]+):([^\s(]+)",
+    )
+    .unwrap()
 });
 
 /// Regex for rpcclient `queryuser` output: `User Name   :\tjdoe`
@@ -75,7 +100,7 @@ fn extract_rpcclient_description_passwords(
                         .trim_matches('"')
                         .to_string();
                     if is_valid_credential(username, &password) {
-                        let key = format!("{default_domain}\\{username}:{password}");
+                        let key = format!("{}\\{}:{}", default_domain, username, password);
                         if seen.insert(key) {
                             credentials.push(make_credential(
                                 username,
@@ -131,9 +156,19 @@ pub fn extract_plaintext_passwords(
     // back, not a discovered plaintext password. Without this gate, every
     // successful pass-the-hash sweep ingests the hash a second time as a fake
     // credential row (`frank:6dccf1c567c56a40e56691a723a49664`).
-    let skip_netexec_auth = ctx.is_hash_auth();
+    //
+    // Skip the pattern entirely for read-only enumeration tools whose stdout
+    // reflects attacker-controllable data (AD `description`/`info`, file cats,
+    // xp_cmdshell echoes). A `[+] DOMAIN\user:Pass (Pwn3d!)` sitting inside
+    // an AD description would otherwise be ingested as a Domain Admin cred.
+    let skip_netexec_auth = ctx.is_hash_auth() || !ctx.is_authenticating_tool();
 
     if !skip_netexec_auth {
+        // When we know the tool actually authenticates (or when provenance is
+        // unknown but the buffer carries the anchored netexec protocol header),
+        // use the anchored regex — a `[+]` bare-anchor anywhere in the buffer
+        // is not enough to trust the following `user:pass` as an auth event.
+        let use_anchored = ctx.tool_name_normalized().is_none();
         for line in output.lines() {
             let stripped = line.trim();
             if !stripped.contains("[+]") {
@@ -143,7 +178,12 @@ pub fn extract_plaintext_passwords(
             if FAILURE_MARKERS.iter().any(|m| upper.contains(m)) {
                 continue;
             }
-            if let Some(caps) = RE_NETEXEC_SUCCESS.captures(stripped) {
+            let caps = if use_anchored {
+                RE_NETEXEC_AUTH_ANCHORED.captures(stripped)
+            } else {
+                RE_NETEXEC_SUCCESS.captures(stripped)
+            };
+            if let Some(caps) = caps {
                 let domain = caps.get(1).unwrap().as_str().to_string();
                 let user = caps.get(2).unwrap().as_str().to_string();
                 let pass = caps
@@ -154,7 +194,7 @@ pub fn extract_plaintext_passwords(
                     .trim()
                     .to_string();
                 if is_valid_credential(&user, &pass) {
-                    let key = format!("{domain}\\{user}:{pass}");
+                    let key = format!("{}\\{}:{}", domain, user, pass);
                     if seen.insert(key) {
                         credentials.push(make_credential(&user, &pass, &domain, "netexec_auth"));
                     }
@@ -182,7 +222,7 @@ pub fn extract_plaintext_passwords(
                 let user = caps.get(2).unwrap().as_str().to_string();
                 let pass = caps.get(3).unwrap().as_str().to_string();
                 if is_valid_credential(&user, &pass) {
-                    let key = format!("{domain}\\{user}:{pass}");
+                    let key = format!("{}\\{}:{}", domain, user, pass);
                     if seen.insert(key) {
                         credentials.push(make_credential(
                             &user,
@@ -250,7 +290,7 @@ pub fn extract_plaintext_passwords(
             };
 
             if !username.is_empty() && is_valid_credential(&username, &password) {
-                let key = format!("{current_domain}\\{username}:{password}");
+                let key = format!("{}\\{}:{}", current_domain, username, password);
                 if seen.insert(key) {
                     credentials.push(make_credential(
                         &username,

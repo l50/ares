@@ -6,6 +6,12 @@
 # resulting in CONSTRAINT_MEMCG OOM-kills regardless of OOMScoreAdjust.
 set -euo pipefail
 
+# Pick up static box config (SESSION_LOG_DIR, OTEL endpoints, etc.) and
+# runtime-resolved secrets (ARES_DATABASE_URL from Secrets Manager) before
+# any per-op overrides below.
+if [ -f /etc/ares/env ]; then set -a; . /etc/ares/env; set +a; fi
+if [ -f /run/ares/env ]; then set -a; . /run/ares/env; set +a; fi
+
 export ARES_REDIS_URL=redis://127.0.0.1:6379
 export NATS_URL=nats://127.0.0.1:4222
 export RUST_LOG=info
@@ -24,7 +30,8 @@ _llm_model='__ARES_LLM_MODEL__'
 if [ -n "$_llm_model" ] && [ "$_llm_model" = "${_llm_model#__}" ]; then
   export ARES_LLM_MODEL="$_llm_model"
 fi
-export ARES_TOOL_DISPATCH=local
+# ARES_TOOL_DISPATCH intentionally unset: tools route via NATS to ares@<role>.service
+# so hashcat/netexec spawn under the worker's 3G cgroup, not the orchestrator's.
 export ARES_BLUE_ENABLED='__ARES_BLUE_ENABLED__'
 _blue_model='__ARES_BLUE_LLM_MODEL__'
 if [ -n "$_blue_model" ] && [ "$_blue_model" = "${_blue_model#__}" ]; then
@@ -57,6 +64,7 @@ exec systemd-run \
   --description="Ares Orchestrator (transient)" \
   --collect \
   --setenv=ARES_REDIS_URL \
+  --setenv=ARES_DATABASE_URL \
   --setenv=RUST_LOG \
   --setenv=ARES_OPERATION_ID \
   --setenv=OPENAI_API_KEY \
@@ -70,7 +78,6 @@ exec systemd-run \
   --setenv=GRAFANA_URL \
   --setenv=LOKI_URL \
   --setenv=ARES_LLM_MODEL \
-  --setenv=ARES_TOOL_DISPATCH \
   --setenv=ARES_BLUE_ENABLED \
   --setenv=ARES_BLUE_LLM_MODEL \
   --setenv=ARES_DEPLOYMENT \

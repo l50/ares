@@ -9,7 +9,7 @@
 //! a "zerologon" vulnerability that other modules can act on.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
@@ -46,10 +46,6 @@ fn collect_zerologon_work(state: &StateInner) -> Vec<ZerologonWork> {
 pub async fn auto_zerologon(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(45));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Suppress re-dispatch of items the throttler just deferred, so the tick
-    // doesn't flood the deferred queue with duplicates (dedup only commits on
-    // success). See super::DeferCooldown.
-    let mut cooldown = super::DeferCooldown::new(super::RECON_DEFER_COOLDOWN);
 
     loop {
         tokio::select! {
@@ -69,27 +65,12 @@ pub async fn auto_zerologon(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Re
             collect_zerologon_work(&state)
         };
 
-        let now = Instant::now();
         for item in work {
-            if cooldown.active(&item.dc_ip, now) {
-                continue;
-            }
             let payload = json!({
                 "technique": "zerologon_check",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
                 "hostname": item.hostname,
-                "instructions": format!(
-                    "Make EXACTLY ONE call to `zerologon_check` with `dc_ip=\"{}\"`. \
-                     The tool itself caps the netexec probe at 60s. As soon as the \
-                     call returns — vulnerable OR not — call `task_complete` with \
-                     a one-line summary. Do NOT retry, do NOT call any other \
-                     tool, do NOT perform generic recon — re-dispatching wastes \
-                     the operation budget (this DC is already deduped). The \
-                     parser extracts the vulnerability from the tool output \
-                     automatically.",
-                    item.dc_ip
-                ),
             });
 
             let priority = dispatcher.effective_priority("zerologon");
@@ -105,7 +86,6 @@ pub async fn auto_zerologon(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Re
                         "ZeroLogon check dispatched (CVE-2020-1472)"
                     );
 
-                    cooldown.clear(&item.dc_ip);
                     dispatcher
                         .state
                         .write()
@@ -117,7 +97,6 @@ pub async fn auto_zerologon(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Re
                         .await;
                 }
                 Ok(None) => {
-                    cooldown.record(&item.dc_ip, now);
                     debug!(dc = %item.dc_ip, "ZeroLogon check deferred by throttler");
                 }
                 Err(e) => {

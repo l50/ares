@@ -62,6 +62,16 @@ pub struct Strategy {
     pub continue_after_da: bool,
     /// LLM temperature override. None = provider default.
     pub llm_temperature: Option<f32>,
+    /// Queue selection temperature. 0.0 = deterministic argmin (current behaviour).
+    pub selection_temperature: f32,
+    /// Cross-run novelty memory: bias away from previously walked path prefixes.
+    pub novelty_enabled: bool,
+    /// Scope key for novelty memory (which runs share/reset diversity bias).
+    pub novelty_scope: String,
+    /// Randomize the entry foothold per run.
+    pub randomize_entry_foothold: bool,
+    /// Emit structured per-run path records for coverage measurement (Phase 0).
+    pub emit_path_records: bool,
 }
 
 impl Default for Strategy {
@@ -78,6 +88,11 @@ impl Strategy {
             exclude_techniques: HashSet::new(),
             include_techniques: HashSet::new(),
             llm_temperature: None,
+            selection_temperature: 0.0,
+            novelty_enabled: false,
+            novelty_scope: "per-campaign".to_string(),
+            randomize_entry_foothold: false,
+            emit_path_records: false,
             preset,
         }
     }
@@ -203,10 +218,44 @@ impl Strategy {
             })
             .or_else(|| yaml.and_then(|c| c.operation.llm_temperature));
 
+        // 7. Attack-path diversity knobs: env > json > yaml. All default to
+        //    today's deterministic behaviour (see docs/attack-path-diversity.md).
+        if let Some(t) = std::env::var("ARES_SELECTION_TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .or_else(|| {
+                json.and_then(|v| v.get("selection_temperature"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+            })
+            .or_else(|| yaml.map(|c| c.operation.selection_temperature))
+        {
+            strategy.selection_temperature = t.max(0.0);
+        }
+
+        if let Some(cfg) = yaml {
+            strategy.novelty_enabled = cfg.operation.novelty.enabled;
+            if !cfg.operation.novelty.scope.is_empty() {
+                strategy.novelty_scope = cfg.operation.novelty.scope.clone();
+            }
+            strategy.randomize_entry_foothold = cfg.operation.randomize_entry_foothold;
+            strategy.emit_path_records = cfg.operation.emit_path_records;
+        }
+        if let Ok(v) = std::env::var("ARES_NOVELTY_ENABLED") {
+            strategy.novelty_enabled = v == "1" || v.to_lowercase() == "true";
+        }
+        if let Ok(v) = std::env::var("ARES_EMIT_PATH_RECORDS") {
+            strategy.emit_path_records = v == "1" || v.to_lowercase() == "true";
+        }
+
         info!(
             preset = ?strategy.preset,
             continue_after_da = strategy.continue_after_da,
             llm_temperature = ?strategy.llm_temperature,
+            selection_temperature = strategy.selection_temperature,
+            novelty_enabled = strategy.novelty_enabled,
+            randomize_entry_foothold = strategy.randomize_entry_foothold,
+            emit_path_records = strategy.emit_path_records,
             exclude_count = strategy.exclude_techniques.len(),
             include_count = strategy.include_techniques.len(),
             weight_overrides = strategy.weights.len(),
@@ -264,16 +313,10 @@ fn fast_weights() -> HashMap<String, i32> {
     [
         ("dc_secretsdump", 1),
         ("golden_ticket", 1),
-        ("golden_cert", 1),
         ("forest_trust_escalation", 1),
         ("child_to_parent", 1),
         ("domain_admin", 1),
         ("secretsdump", 2),
-        // SeImpersonate -> SYSTEM is a decisive local escalation, not a
-        // "fallback" technique. Recon in fast dispatches as low as priority 2
-        // (acl_discovery, group_enumeration); seimpersonate must sit ABOVE that
-        // (=1) or the deferred queue serves recon first and starves it.
-        ("seimpersonate", 1),
         ("credential_reuse", 3),
         ("mssql_access", 4),
         ("mssql_linked_server", 4),
@@ -370,11 +413,9 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("certifried", 1),
         ("krbrelayup", 1),
         ("printnightmare", 1),
-        ("seimpersonate", 1),
         // --- Tier 2: Credential pipeline + lateral + persistence ---
         ("dc_secretsdump", 2),
         ("golden_ticket", 2),
-        ("golden_cert", 2),
         ("forest_trust_escalation", 2),
         ("child_to_parent", 2),
         ("domain_admin", 2),
@@ -429,8 +470,6 @@ fn stealth_weights() -> HashMap<String, i32> {
     [
         ("dc_secretsdump", 6),
         ("golden_ticket", 4),
-        ("golden_cert", 2),
-        ("seimpersonate", 3),
         ("forest_trust_escalation", 4),
         ("child_to_parent", 4),
         ("domain_admin", 3),
@@ -608,38 +647,6 @@ mod tests {
         assert_eq!(s.effective_priority("dns_enum"), 3);
     }
 
-    /// Regression: every technique submitted as an `exploit`/`privesc` task
-    /// must outrank recon (tier 3 = 3) in comprehensive mode. A missing weights
-    /// entry falls through to `unwrap_or(5)`, which is *worse* than recon, so
-    /// the deferred queue (lowest-score-first) lets recon perpetually preempt
-    /// the exploit — observed live as `seimpersonate` (SeImpersonate→SYSTEM)
-    /// and `golden_cert` stalling at priority 5 behind priority-3 recon.
-    #[test]
-    fn comprehensive_exploit_techniques_outrank_recon() {
-        let s = Strategy::from_preset(StrategyPreset::Comprehensive);
-        const RECON_TIER: i32 = 3;
-        // Keys passed to effective_priority() at an exploit/privesc submit site.
-        for key in [
-            "seimpersonate",
-            "golden_cert",
-            "nopac",
-            "rbcd",
-            "printnightmare",
-            "shadow_credentials",
-            "unconstrained_delegation",
-            "mssql_access",
-            "adcs_esc1",
-            "adcs_esc8",
-        ] {
-            let p = s.effective_priority(key);
-            assert!(
-                p < RECON_TIER,
-                "exploit technique {key:?} has priority {p}, must be < recon tier {RECON_TIER} \
-                 or recon will starve it in the deferred queue"
-            );
-        }
-    }
-
     #[test]
     fn preset_from_str_loose() {
         assert_eq!(StrategyPreset::from_str_loose("fast"), StrategyPreset::Fast);
@@ -750,6 +757,49 @@ mod tests {
     }
 
     #[test]
+    fn diversity_defaults_are_deterministic() {
+        // A config with no diversity keys must reproduce today's behaviour.
+        let cfg = yaml_config("fast", false, vec![], vec![], vec![]);
+        let s = Strategy::resolve(None, Some(&cfg));
+        assert_eq!(s.selection_temperature, 0.0);
+        assert!(!s.novelty_enabled);
+        assert_eq!(s.novelty_scope, "per-campaign");
+        assert!(!s.randomize_entry_foothold);
+        assert!(!s.emit_path_records);
+    }
+
+    #[test]
+    fn diversity_knobs_flow_from_yaml() {
+        let yaml_str = serde_yaml::to_string(&serde_json::json!({
+            "operation": {
+                "name": "test",
+                "namespace": "ns",
+                "selection_temperature": 0.7,
+                "novelty": {"enabled": true, "scope": "per-lab"},
+                "randomize_entry_foothold": true,
+                "emit_path_records": true,
+            },
+            "agents": {},
+            "timeouts": {},
+            "recovery": {},
+            "phase_detection": {},
+            "context_management": {},
+            "vulnerability_priorities": {},
+            "logging": {},
+            "resources": {},
+            "security": {},
+        }))
+        .unwrap();
+        let cfg: ares_core::config::AresConfig = serde_yaml::from_str(&yaml_str).unwrap();
+        let s = Strategy::resolve(None, Some(&cfg));
+        assert_eq!(s.selection_temperature, 0.7);
+        assert!(s.novelty_enabled);
+        assert_eq!(s.novelty_scope, "per-lab");
+        assert!(s.randomize_entry_foothold);
+        assert!(s.emit_path_records);
+    }
+
+    #[test]
     fn json_overrides_yaml() {
         let cfg = yaml_config("stealth", false, vec![], vec![("esc1", 5)], vec![]);
 
@@ -833,7 +883,8 @@ mod tests {
             for tech in &new_techniques {
                 assert!(
                     s.weights.contains_key(*tech),
-                    "Preset {preset:?} missing weight for {tech}"
+                    "Preset {:?} missing weight for {tech}",
+                    preset
                 );
             }
         }
