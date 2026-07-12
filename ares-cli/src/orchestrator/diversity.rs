@@ -259,7 +259,10 @@ mod tests {
 
     #[test]
     fn step_key_lowercases_type() {
-        assert_eq!(step_key("ADCS_ESC1", "10.0.0.1"), "adcs_esc1:10.0.0.1");
+        assert_eq!(
+            step_key("ADCS_ESC1", "192.168.58.1"),
+            "adcs_esc1:192.168.58.1"
+        );
     }
 
     #[test]
@@ -274,7 +277,7 @@ mod tests {
         let s = PathStep {
             foothold: "svc@contoso.local".into(),
             technique: "esc1".into(),
-            target: "10.0.0.5".into(),
+            target: "192.168.58.5".into(),
         };
         let j = serde_json::to_string(&s).unwrap();
         let back: PathStep = serde_json::from_str(&j).unwrap();

@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn is_ip_accepts_dotted_quad() {
         assert!(is_ip("192.168.58.10"));
-        assert!(is_ip("10.0.0.1"));
+        assert!(is_ip("192.168.58.240"));
     }
 
     #[test]

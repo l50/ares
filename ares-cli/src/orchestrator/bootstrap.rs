@@ -509,16 +509,16 @@ mod tests {
     #[test]
     fn infer_target_subnets_clusters_by_24() {
         let ips = vec![
-            "10.1.10.10".into(),
-            "10.1.10.11".into(),
-            "10.1.10.12".into(),
-            "10.1.10.22".into(),
-            "10.1.10.23".into(),
+            "192.168.58.10".into(),
+            "192.168.58.11".into(),
+            "192.168.58.12".into(),
+            "192.168.58.22".into(),
+            "192.168.58.23".into(),
             // Isolated standalone — should NOT produce a sweep target.
-            "172.16.5.50".into(),
+            "192.168.60.50".into(),
         ];
         let subnets = super::infer_target_subnets(&ips);
-        assert_eq!(subnets, vec!["10.1.10.0/24".to_string()]);
+        assert_eq!(subnets, vec!["192.168.58.0/24".to_string()]);
     }
 
     #[test]
@@ -531,15 +531,15 @@ mod tests {
     #[test]
     fn infer_target_subnets_two_clusters() {
         let ips = vec![
-            "10.1.10.10".into(),
-            "10.1.10.11".into(),
-            "10.1.20.5".into(),
-            "10.1.20.6".into(),
+            "192.168.58.10".into(),
+            "192.168.58.11".into(),
+            "192.168.59.5".into(),
+            "192.168.59.6".into(),
         ];
         let subnets = super::infer_target_subnets(&ips);
         assert_eq!(
             subnets,
-            vec!["10.1.10.0/24".to_string(), "10.1.20.0/24".to_string()]
+            vec!["192.168.58.0/24".to_string(), "192.168.59.0/24".to_string()]
         );
     }
 
@@ -547,13 +547,13 @@ mod tests {
     fn infer_target_subnets_ignores_non_ipv4() {
         let ips = vec![
             "dc01.contoso.local".into(),
-            "10.1.10.10".into(),
-            "10.1.10.0/24".into(), // CIDR — ignored, not an IPv4
-            "10.1.10.11".into(),
+            "192.168.58.10".into(),
+            "192.168.58.0/24".into(), // CIDR — ignored, not an IPv4
+            "192.168.58.11".into(),
         ];
         assert_eq!(
             super::infer_target_subnets(&ips),
-            vec!["10.1.10.0/24".to_string()]
+            vec!["192.168.58.0/24".to_string()]
         );
     }
 

@@ -508,25 +508,25 @@ mod tests {
     #[test]
     fn dynamic_context_block_includes_forests_for_orchestrator() {
         let snap = StateSnapshot {
-            target_dc_ip: "10.0.0.10".into(),
-            undominated_forests: vec!["evil.corp".into()],
+            target_dc_ip: "192.168.58.10".into(),
+            undominated_forests: vec!["fabrikam.local".into()],
             ..Default::default()
         };
         let block = dynamic_context_block(AgentRole::Orchestrator, &snap);
-        assert!(block.contains("Target DC IP: 10.0.0.10"));
+        assert!(block.contains("Target DC IP: 192.168.58.10"));
         assert!(block.contains("Multi-Forest Status"));
-        assert!(block.contains("evil.corp"));
+        assert!(block.contains("fabrikam.local"));
     }
 
     #[test]
     fn dynamic_context_block_omits_forests_for_non_orchestrator() {
         let snap = StateSnapshot {
-            undominated_forests: vec!["evil.corp".into()],
+            undominated_forests: vec!["fabrikam.local".into()],
             ..Default::default()
         };
         let block = dynamic_context_block(AgentRole::Recon, &snap);
         assert!(!block.contains("Multi-Forest Status"));
-        assert!(!block.contains("evil.corp"));
+        assert!(!block.contains("fabrikam.local"));
     }
 
     #[test]

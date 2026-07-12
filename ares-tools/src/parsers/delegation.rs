@@ -291,8 +291,8 @@ DC02$   Computer     Unconstrained                        N/A                   
         // classify as rbcd, not constrained (which would misroute to S4U).
         let output = "\
 AccountName  AccountType  DelegationType                          DelegationRightsTo
-svc$         Computer     Resource-Based Constrained Delegation   kingslanding$";
-        let params = json!({"domain": "contoso.local", "target_ip": "10.0.0.1"});
+svc$         Computer     Resource-Based Constrained Delegation   dc01$";
+        let params = json!({"domain": "contoso.local", "target_ip": "192.168.58.1"});
         let vulns = parse_delegation(output, &params);
         assert_eq!(vulns.len(), 1);
         assert_eq!(vulns[0]["vuln_type"], "rbcd");
@@ -302,9 +302,9 @@ svc$         Computer     Resource-Based Constrained Delegation   kingslanding$"
     fn parse_delegation_protocol_transition_flag() {
         let output = "\
 AccountName  AccountType  DelegationType                       DelegationRightsTo
-jon.snow     Person       Constrained w/ Protocol Transition   HTTP/winterfell
-castelblack$ Computer     Constrained w/o Protocol Transition  HTTP/winterfell";
-        let params = json!({"domain": "north.local", "target_ip": "10.0.0.2"});
+alice        Person       Constrained w/ Protocol Transition   HTTP/web01
+ws01$        Computer     Constrained w/o Protocol Transition  HTTP/web01";
+        let params = json!({"domain": "child.contoso.local", "target_ip": "192.168.58.2"});
         let vulns = parse_delegation(output, &params);
         assert_eq!(vulns.len(), 2);
         assert_eq!(vulns[0]["details"]["protocol_transition"], true);

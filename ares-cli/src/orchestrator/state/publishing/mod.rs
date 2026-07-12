@@ -589,7 +589,7 @@ mod tests {
         assert!(looks_like_real_domain("contoso.local"));
         assert!(looks_like_real_domain("child.contoso.local"));
         assert!(looks_like_real_domain("eu.contoso.local"));
-        assert!(looks_like_real_domain("contoso.com"));
+        assert!(looks_like_real_domain("fabrikam.local"));
     }
 
     #[test]

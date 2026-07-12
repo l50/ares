@@ -234,7 +234,7 @@ impl OrchestratorConfig {
     /// 2+ existing target IPs. Returns the count of IPs added.
     ///
     /// Bootstrap launches in CTF / lab scenarios typically pass just the
-    /// known DC IPs (`10.1.10.10,11,12,22,23`). The interesting attack
+    /// known DC IPs (`192.168.58.10,11,12,22,23`). The interesting attack
     /// surface lives elsewhere in the same /24 — SQL server, web server,
     /// CA web enrollment, workstation. With `target_ips` limited to the
     /// 5 DCs, [`crate::orchestrator::dispatcher::Dispatcher::request_recon`]
@@ -518,7 +518,7 @@ mod tests {
         // Env unset → no expansion even when targets are clustered.
         {
             let mut cfg = make_config(8);
-            cfg.target_ips = vec!["10.1.10.10".into(), "10.1.10.11".into()];
+            cfg.target_ips = vec!["192.168.58.10".into(), "192.168.58.11".into()];
             assert_eq!(cfg.expand_scope_to_subnets(), 0);
             assert_eq!(cfg.target_ips.len(), 2);
         }
@@ -527,7 +527,7 @@ mod tests {
         std::env::set_var("ARES_SCOPE_EXPAND_SUBNETS", "1");
         {
             let mut cfg = make_config(8);
-            cfg.target_ips = vec!["10.1.10.10".into(), "10.1.20.10".into()];
+            cfg.target_ips = vec!["192.168.58.10".into(), "192.168.59.10".into()];
             assert_eq!(cfg.expand_scope_to_subnets(), 0);
         }
 
@@ -535,16 +535,16 @@ mod tests {
         {
             let mut cfg = make_config(8);
             cfg.target_ips = vec![
-                "10.1.10.10".into(),
-                "10.1.10.11".into(),
-                "10.1.10.12".into(),
+                "192.168.58.10".into(),
+                "192.168.58.11".into(),
+                "192.168.58.12".into(),
             ];
             assert_eq!(cfg.expand_scope_to_subnets(), 251);
             assert_eq!(cfg.target_ips.len(), 254);
-            assert!(cfg.target_ips.contains(&"10.1.10.50".to_string()));
-            assert!(cfg.target_ips.contains(&"10.1.10.254".to_string()));
-            assert!(!cfg.target_ips.contains(&"10.1.10.0".to_string()));
-            assert!(!cfg.target_ips.contains(&"10.1.10.255".to_string()));
+            assert!(cfg.target_ips.contains(&"192.168.58.50".to_string()));
+            assert!(cfg.target_ips.contains(&"192.168.58.254".to_string()));
+            assert!(!cfg.target_ips.contains(&"192.168.58.0".to_string()));
+            assert!(!cfg.target_ips.contains(&"192.168.58.255".to_string()));
         }
 
         std::env::remove_var("ARES_SCOPE_EXPAND_SUBNETS");
