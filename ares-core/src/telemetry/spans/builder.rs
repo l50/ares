@@ -178,6 +178,14 @@ impl AgentSpanBuilder {
             .unwrap_or("");
 
         let tool_status = if self.is_error { "error" } else { "success" };
+        // Canonical OTel span status. `tracing-opentelemetry` recognises the
+        // `otel.status_code` field and maps its string value onto the OTLP
+        // `Span.Status.Code` enum. The OTel Collector's spanmetrics processor
+        // then emits it as the `status_code = "STATUS_CODE_OK"` /
+        // `"STATUS_CODE_ERROR"` label on `traces_spanmetrics_calls_total`,
+        // which the demo dashboard's Red Success Rate panel filters on. The
+        // existing free-text `tool.status` field is kept for older queries.
+        let otel_status_code = if self.is_error { "ERROR" } else { "OK" };
 
         // Derive hostname from FQDN if not explicitly set.
         let hostname = self.target.hostname.clone().or_else(|| {
@@ -205,6 +213,8 @@ impl AgentSpanBuilder {
             "ares.agent",
             otel.name = %span_name,
             otel.kind = self.span_kind.as_str(),
+            otel.status_code = otel_status_code,
+            otel.status_message = self.error_message.as_deref().unwrap_or(""),
             // Core identity
             attack_team = self.team.as_str(),
             "agent.role" = %self.role,

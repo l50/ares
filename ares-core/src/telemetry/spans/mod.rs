@@ -183,4 +183,29 @@ mod tests {
             .build();
         assert!(!span.is_disabled());
     }
+
+    #[test]
+    fn success_and_error_spans_carry_otel_status_code() {
+        // The demo dashboard's Red Success Rate panel filters
+        // `traces_spanmetrics_calls_total` on `status_code = "STATUS_CODE_OK"`.
+        // That label is derived by the OTel Collector's spanmetrics processor
+        // from the OTLP span Status enum, which tracing-opentelemetry sets
+        // from the `otel.status_code` sentinel field on the tracing span.
+        // Both branches (success and error) must build cleanly with the
+        // sentinel present — otherwise the label never leaves the collector
+        // and the panel reads zero.
+        init_test_subscriber();
+        let ok = AgentSpanBuilder::new("tool_call", "recon", Team::Red)
+            .tool("nmap_scan")
+            .target_ip("192.168.58.10")
+            .build();
+        assert!(!ok.is_disabled());
+
+        let err = AgentSpanBuilder::new("tool_call", "lateral", Team::Red)
+            .tool("psexec")
+            .target_ip("192.168.58.10")
+            .error("STATUS_LOGON_FAILURE")
+            .build();
+        assert!(!err.is_disabled());
+    }
 }
