@@ -127,6 +127,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "flate2",
  "futures",
  "hickory-resolver",
  "local-ip-address",
