@@ -11,6 +11,7 @@ mod capture;
 pub(crate) mod manifest;
 mod replay;
 pub(crate) mod snapshot_s3;
+mod tempo_push;
 pub(crate) mod versions;
 
 use anyhow::Result;
