@@ -8,6 +8,7 @@
 //! discoveries that arrive outside the task result flow.
 
 pub mod admin_checks;
+pub mod containment_recovery;
 pub mod discovery_polling;
 pub mod impacket_recovery;
 pub mod parsing;
@@ -561,6 +562,58 @@ pub async fn process_completed_task(
     // scoreboard credits the primitive.
     let task_technique = task_technique_from_pending(dispatcher, task_id).await;
 
+    // Blue containment classification (Option A actuators). When a red tool
+    // call fails in a way that looks like blue took action, surface it as a
+    // state event so the exploitation queue can drop dependent work and the
+    // LLM prompt reflects "this credential/host/cert/realm is dead". See
+    // docs/blue-response-actuators.md § Red side — required changes.
+    {
+        use containment_recovery::ContainmentSignal;
+        let signals = containment_recovery::classify_containment_signals(
+            &result.result,
+            task_technique.as_deref(),
+            cred_key.as_deref(),
+            task_domain.as_deref(),
+            task_target_ip.as_deref(),
+        );
+        for signal in signals {
+            match signal {
+                ContainmentSignal::CredentialRevoked {
+                    username,
+                    domain,
+                    source,
+                } => {
+                    dispatcher
+                        .state
+                        .publish_credential_revoked(&username, &domain, &source)
+                        .await;
+                }
+                ContainmentSignal::HostIsolated {
+                    ip,
+                    hostname,
+                    source,
+                } => {
+                    dispatcher
+                        .state
+                        .publish_host_isolated(&ip, &hostname, &source)
+                        .await;
+                }
+                ContainmentSignal::KrbtgtRotated { domain, source } => {
+                    dispatcher
+                        .state
+                        .publish_krbtgt_rotated(&domain, &source)
+                        .await;
+                }
+                ContainmentSignal::CertificateRevoked { serial, ca, source } => {
+                    dispatcher
+                        .state
+                        .publish_certificate_revoked(&serial, &ca, &source)
+                        .await;
+                }
+            }
+        }
+    }
+
     // Bug E: AES kerberoast retry on KDC_ERR_ETYPE_NOSUPP. When a kerberoast
     // dispatch hits an AES-only SPN account, the default-etype TGS-REQ is
     // rejected pre-TGS-REP. Re-dispatch with an AES etype hint so we extract
@@ -778,7 +831,7 @@ async fn task_relay_target_from_pending(
 /// authentication. Recognises both the explicit "NTLMv1 allowed" / "NTLM
 /// downgrade" prose forms and the canonical `LmCompatibilityLevel: <0..2>`
 /// registry probe output.
-fn collect_result_text_parts(payload: &Value) -> Vec<String> {
+pub(crate) fn collect_result_text_parts(payload: &Value) -> Vec<String> {
     let mut texts: Vec<String> = Vec::new();
     if let Some(arr) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
         for item in arr {

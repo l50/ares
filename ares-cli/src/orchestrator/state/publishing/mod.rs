@@ -1,6 +1,7 @@
 //! Publishing methods — add credentials, hashes, hosts, and vulnerabilities
 //! to both in-memory state and Redis.
 
+mod containment;
 mod credentials;
 mod domains;
 mod entities;

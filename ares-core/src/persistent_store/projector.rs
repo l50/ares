@@ -86,6 +86,20 @@ impl OpStateProjector {
                 // stream draining.
                 debug!(op_id = %event.op_id, "skipping timeline event projection (schema pending)");
             }
+            OpStateEventPayload::CredentialRevoked { .. }
+            | OpStateEventPayload::HostIsolated { .. }
+            | OpStateEventPayload::KrbtgtRotated { .. }
+            | OpStateEventPayload::CertificateRevoked { .. } => {
+                // Containment observations drive in-op queue invalidation and
+                // Prometheus counters; Postgres projection lands with the
+                // scoring schema. Draining without a Postgres write is safe —
+                // the JetStream log is still the source of truth.
+                debug!(
+                    op_id = %event.op_id,
+                    kind = event.subject_suffix(),
+                    "skipping containment event projection (scoring schema pending)",
+                );
+            }
         }
         Ok(())
     }

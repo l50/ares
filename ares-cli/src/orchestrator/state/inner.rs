@@ -213,6 +213,32 @@ pub struct StateInner {
     pub coercion_phase_state:
         HashMap<String, crate::orchestrator::automation::coercion::CoercionPhaseState>,
 
+    /// Blue-side containment observations — a credential we hold started
+    /// consistently returning `STATUS_LOGON_FAILURE` or LDAP
+    /// `INVALID_CREDENTIALS`. Keyed by `user@domain` (lowercase). Read by
+    /// the exploitation queue to drop attempts that depend on the principal
+    /// and by the LLM prompt formatter to signal "this cred is dead".
+    /// Semantically distinct from [`Self::quarantined_principals`], which
+    /// carries the short 5-min lockout signal — a revocation persists for
+    /// the remainder of the op unless an operator rolls it back.
+    pub revoked_principals: HashMap<String, DateTime<Utc>>,
+
+    /// Hosts blue firewalled off. Keyed by IP string. Populated when SMB,
+    /// WinRM and LDAP to a previously-reachable host all start returning
+    /// network-unreachable inside a short window. Consumers skip vulns
+    /// and lateral targets pointing at these IPs.
+    pub isolated_hosts: HashMap<String, DateTime<Utc>>,
+
+    /// Domains where blue rotated krbtgt. Keyed by lowercase realm.
+    /// Populated on forest-wide `KRB_AP_ERR_MODIFIED`. Consumers drop
+    /// cached TGTs and forged tickets for the realm.
+    pub krbtgt_rotated_at: HashMap<String, DateTime<Utc>>,
+
+    /// Certificates blue revoked. Keyed by serial (hex, lowercase).
+    /// Populated on PKINIT `KDC_ERR_CLIENT_REVOKED`. Consumers drop
+    /// ADCS-based exploit paths pinned to the revoked serial.
+    pub revoked_certificates: HashMap<String, DateTime<Utc>>,
+
     /// IPv4 addresses bound to the orchestrator's own network interfaces.
     /// Populated once at orchestrator startup via `SharedState::initialize_self_ips`
     /// from `local_ip_address::list_afinet_netifas`. `publish_host` skips any
@@ -272,8 +298,36 @@ impl StateInner {
             completed: false,
             all_forests_dominated_at: None,
             coercion_phase_state: HashMap::new(),
+            revoked_principals: HashMap::new(),
+            isolated_hosts: HashMap::new(),
+            krbtgt_rotated_at: HashMap::new(),
+            revoked_certificates: HashMap::new(),
             self_ips: HashSet::new(),
         }
+    }
+
+    /// Whether blue has revoked a credential for the given principal.
+    /// Comparison is case-insensitive on both fields.
+    pub fn is_credential_revoked(&self, username: &str, domain: &str) -> bool {
+        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+        self.revoked_principals.contains_key(&key)
+    }
+
+    /// Whether blue has firewalled off the given IP.
+    pub fn is_host_isolated(&self, ip: &str) -> bool {
+        self.isolated_hosts.contains_key(ip)
+    }
+
+    /// Whether blue has rotated krbtgt in the given realm (case-insensitive).
+    pub fn is_krbtgt_rotated(&self, domain: &str) -> bool {
+        self.krbtgt_rotated_at.contains_key(&domain.to_lowercase())
+    }
+
+    /// Whether blue has revoked the certificate with the given serial.
+    /// Comparison is case-insensitive on the serial (hex).
+    pub fn is_certificate_revoked(&self, serial: &str) -> bool {
+        self.revoked_certificates
+            .contains_key(&serial.to_lowercase())
     }
 
     /// Check if a username is the delegating account for a constrained
