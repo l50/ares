@@ -144,9 +144,16 @@ tasks:
           # `._*` metadata files; the matching --exclude is belt+suspenders for
           # any `._*` already on disk from prior Finder access — sqlx::migrate!
           # rejects them as malformed migration names.
-          SRC_TAR=$(mktemp /tmp/ares-src-XXXXXX.tar.gz)
+          # BSD mktemp (macOS) only substitutes XXXXXX when it's the trailing
+          # chars of the template; `mktemp /tmp/foo-XXXXXX.tar.gz` created a
+          # LITERAL /tmp/foo-XXXXXX.tar.gz once and then failed every subsequent
+          # run with "mkstemp failed: File exists". Create the base, then rename
+          # with the suffix so we keep mktemp's atomic collision-free property.
+          SRC_TAR=$(mktemp /tmp/ares-src-XXXXXX)
+          mv "$SRC_TAR" "${SRC_TAR}.tar.gz"
+          SRC_TAR="${SRC_TAR}.tar.gz"
           trap "rm -f $SRC_TAR" EXIT
-          SRC_PATHS="Cargo.toml Cargo.lock Cross.toml tools.yaml ares-core/ ares-cli/ ares-llm/ ares-tools/"
+          SRC_PATHS="Cargo.toml Cargo.lock Cross.toml tools.yaml ares-core/ ares-cli/ ares-llm/ ares-tools/ benchmarks/"
           [ -d .cargo ] && SRC_PATHS="$SRC_PATHS .cargo/"
           COPYFILE_DISABLE=1 tar -czf "$SRC_TAR" \
             --exclude='target' --exclude='.git' --exclude='*.o' --exclude='*.d' --exclude='._*' \
@@ -1038,7 +1045,11 @@ tasks:
     silent: true
     vars:
       DOMAIN: '{{.DOMAIN | default "sevenkingdoms.local"}}'
-      TARGETS: '{{.TARGETS | default "10.1.2.150,10.1.2.220,10.1.2.58,10.1.2.254,10.1.2.51"}}'
+      # EC2 dreadgoad range (private IPs, from `aws ec2 describe-instances` tags):
+      #   10.4.6.17=DC01, 10.4.6.133=DC02, 10.4.6.125=DC03, 10.4.6.164=SRV02, 10.4.6.126=SRV03
+      # The old default was the Ludus proxmox range (10.1.2.x) which isn't
+      # reachable from any AWS-hosted attacker — every tool call timed out.
+      TARGETS: '{{.TARGETS | default "10.4.6.17,10.4.6.133,10.4.6.125,10.4.6.164,10.4.6.126"}}'
       CRED_USER: '{{.CRED_USER | default "samwell.tarly"}}'
       CRED_PASS: '{{.CRED_PASS | default "Heartsbane"}}'
       CRED_DOMAIN: '{{.CRED_DOMAIN | default "north.sevenkingdoms.local"}}'
@@ -1449,6 +1460,62 @@ tasks:
             --query "StandardErrorContent" --output text >&2
           exit 1
         fi
+
+  logrotate:
+    desc: "Install /etc/logrotate.d/ares on live EC2 via ansible+SSM (usage: task ec2:logrotate [EC2_NAME=kali-ares] S3_BUCKET=...)"
+    silent: true
+    preconditions:
+      - sh: test -n "{{.S3_BUCKET}}"
+        msg: "S3_BUCKET required (community.aws.aws_ssm connection stages transfers via S3). Export S3_BUCKET or pass it inline."
+      - sh: command -v ansible-playbook >/dev/null
+        msg: "ansible-playbook not found in PATH — install ansible-core (e.g. `pipx install ansible-core`)."
+    cmds:
+      - |
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+        echo -e "{{.INFO}} Installing logrotate config on $INSTANCE_ID via ansible+SSM..."
+
+        # The community.aws.aws_ssm plugin uses a botocore session that can't
+        # refresh SSO tokens the way the CLI can — it just errors with
+        # "Token has expired and refresh failed". Sidestep that by baking
+        # freshly-exported creds from the profile into env vars, then
+        # unsetting AWS_PROFILE so boto3 doesn't complain about both being set.
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+              AWS_SESSION_EXPIRATION AWS_CREDENTIAL_EXPIRATION
+        if [ -n "$AWS_PROFILE" ]; then
+          if ! eval "$(aws configure export-credentials --profile "$AWS_PROFILE" --format env 2>/dev/null)"; then
+            echo -e "{{.ERROR}} Could not export creds from profile '$AWS_PROFILE'. Try 'aws sso login --profile $AWS_PROFILE'." >&2
+            exit 1
+          fi
+          unset AWS_PROFILE
+        fi
+
+        # Idempotent: skips collections already at the pinned version.
+        ansible-galaxy collection install -r ansible/requirements.yml >/dev/null
+
+        # Extension matters — mktemp without .yml makes ansible fall back to
+        # the ini inventory plugin, which chokes on the yaml `all:` key.
+        INV_DIR=$(mktemp -d)
+        trap 'rm -rf "$INV_DIR"' EXIT
+        INV="$INV_DIR/inv.yml"
+        cat > "$INV" <<EOF
+        all:
+          hosts:
+            ares_attack_box:
+              ansible_host: $INSTANCE_ID
+              ansible_connection: community.aws.aws_ssm
+              ansible_aws_ssm_bucket_name: {{.S3_BUCKET}}
+              ansible_aws_ssm_region: {{.AWS_REGION}}
+              ansible_python_interpreter: /usr/bin/python3
+        EOF
+
+        ANSIBLE_CONFIG=ansible/ansible.cfg \
+          ansible-playbook -i "$INV" ansible/playbooks/ares/logrotate.yml
+
+        echo -e "{{.SUCCESS}} logrotate config installed on $INSTANCE_ID"
 
   # ============================================================================
   # Arbitrary Command Execution
