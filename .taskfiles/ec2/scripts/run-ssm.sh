@@ -38,6 +38,28 @@ resolve_instance() {
 	printf '%s' "$instance_id"
 }
 
+# resolve_targets <name-tag-glob>
+#   Prints a comma-separated list of private IPs for running instances whose
+#   Name tag matches *<name>* — e.g. `resolve_targets dreadgoad` returns the
+#   dreadgoad DCs/SRVs but naturally excludes `kali-ares`. Returns non-zero
+#   if nothing matches.
+resolve_targets() {
+	local name="$1"
+	local ips
+	ips=$(aws ec2 describe-instances \
+		--profile "$AWS_PROFILE" \
+		--region "$AWS_REGION" \
+		--filters "Name=instance-state-name,Values=running" \
+		"Name=tag:Name,Values=*${name}*" \
+		--query "Reservations[*].Instances[*].PrivateIpAddress" \
+		--output text | tr '[:space:]' '\n' | grep -v '^$' | sort -V | paste -sd, -)
+	if [ -z "$ips" ]; then
+		printf '\033[0;31m[ERROR]\033[0m No running instances found for range: %s\n' "$name" >&2
+		return 1
+	fi
+	printf '%s' "$ips"
+}
+
 # run_ssm_cmd <instance_id> <payload> [timeout_seconds]
 #   Ships <payload> to <instance_id> via AWS-RunShellScript, polls once/sec
 #   until the command reaches a terminal state or <timeout_seconds> (default
