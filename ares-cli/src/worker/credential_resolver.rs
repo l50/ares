@@ -211,6 +211,30 @@ pub async fn resolve_credentials(
         }
     }
 
+    // Last-resort fallback: peel the realm off a UPN-form username
+    // (`alice@contoso.local` → `contoso.local`). Without this, an LLM that
+    // names the principal as a UPN but omits `domain` leaves primary_domain
+    // None, the `(Some, Some)` guard below skips credential lookup entirely,
+    // and the tool dispatches with a missing password. `find_credential` does
+    // the same UPN peel internally, but only fires when the outer guard
+    // passes.
+    if primary_domain.is_none() {
+        if let Some(realm) = primary_username
+            .as_deref()
+            .and_then(|u| split_user_realm(u).1)
+        {
+            if string_field(args_obj, "domain").is_none() {
+                args_obj.insert("domain".to_string(), Value::String(realm.clone()));
+            }
+            debug!(
+                tool = %tool_name,
+                domain = %realm,
+                "credential_resolver: inferred missing domain from UPN suffix"
+            );
+            primary_domain = Some(realm);
+        }
+    }
+
     // If the resolved domain is a NetBIOS short-form ("CONTOSO"), collapse to
     // FQDN before the lookup. Stored creds (above) are already normalized in
     // memory; this normalizes the *query* side so both shapes converge. Runs
@@ -763,6 +787,21 @@ fn keep_latest<'a, T>(slot: &mut Option<&'a T>, cand: &'a T, step: impl Fn(&T) -
     }
 }
 
+/// True when `a` and `b` are the same domain or one is a descendant of the
+/// other (same AD forest). Cross-forest returns false. Inputs must already be
+/// lowercased.
+fn same_forest(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let is_child = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .and_then(|s| s.strip_suffix('.'))
+            .is_some()
+    };
+    is_child(a, b) || is_child(b, a)
+}
+
 fn find_credential<'a>(
     credentials: &'a [Credential],
     username: &str,
@@ -779,6 +818,7 @@ fn find_credential<'a>(
     let domain_empty = domain_l.is_empty();
 
     let mut exact: Option<&Credential> = None;
+    let mut same_forest_cred: Option<&Credential> = None;
     let mut any_user: Option<&Credential> = None;
     for cred in credentials {
         if cred.username.to_lowercase() != user_l {
@@ -787,17 +827,22 @@ fn find_credential<'a>(
         if cred.password.is_empty() || is_placeholder_str(&cred.password) {
             continue;
         }
-        let domain_match = domain_empty || cred.domain.to_lowercase() == domain_l;
+        let stored_l = cred.domain.to_lowercase();
+        let domain_match = domain_empty || stored_l == domain_l;
         if domain_match {
             keep_latest(&mut exact, cred, |c| c.attack_step);
+        } else if same_forest(&stored_l, &domain_l) {
+            keep_latest(&mut same_forest_cred, cred, |c| c.attack_step);
         }
         keep_latest(&mut any_user, cred, |c| c.attack_step);
     }
-    // Realm-strict callers (LDAP/RPC direct bind) MUST get an exact-realm
-    // match or nothing. A foreign-realm cred just produces 52e/775 at bind
-    // time and burns the dispatch.
+    // Realm-strict callers (LDAP/RPC direct bind) get an exact-realm match
+    // when available, or a same-forest parent/child match (referrals handle
+    // that inside a single forest). Cross-forest still returns None — a
+    // foreign-realm cred against an LDAP bind produces 52e/775 and burns
+    // the dispatch.
     if realm_strict {
-        return exact;
+        return exact.or(same_forest_cred);
     }
     // Username-only fallback: when the LLM passes the *target* domain (the
     // tool's destination) instead of the credential's home realm, exact match
@@ -988,6 +1033,8 @@ fn find_hash<'a>(
 
     let mut exact: Option<&Hash> = None;
     let mut exact_aes: Option<&Hash> = None;
+    let mut same_forest_hash: Option<&Hash> = None;
+    let mut same_forest_aes: Option<&Hash> = None;
     let mut any_user: Option<&Hash> = None;
     let mut any_user_aes: Option<&Hash> = None;
     for h in hashes {
@@ -1008,6 +1055,11 @@ fn find_hash<'a>(
             if has_aes {
                 keep_latest(&mut exact_aes, h, |x| x.attack_step);
             }
+        } else if same_forest(&h_domain_l, &domain_l) {
+            keep_latest(&mut same_forest_hash, h, |x| x.attack_step);
+            if has_aes {
+                keep_latest(&mut same_forest_aes, h, |x| x.attack_step);
+            }
         }
         keep_latest(&mut any_user, h, |x| x.attack_step);
         if has_aes {
@@ -1015,8 +1067,9 @@ fn find_hash<'a>(
         }
     }
     let exact_pick = exact_aes.or(exact);
+    let same_forest_pick = same_forest_aes.or(same_forest_hash);
     if realm_strict {
-        return exact_pick;
+        return exact_pick.or(same_forest_pick);
     }
     if exact_pick.is_some() || !is_common_per_domain_account(&user_l) {
         exact_pick.or(any_user_aes).or(any_user)
@@ -1534,6 +1587,51 @@ mod tests {
     }
 
     #[test]
+    fn find_credential_realm_strict_allows_child_cred_for_parent_query() {
+        let creds = vec![cred("alice", "child.contoso.local", "P@ss1")];
+        let found = find_credential(&creds, "alice", "contoso.local", true).unwrap();
+        assert_eq!(found.password, "P@ss1");
+        assert_eq!(found.domain, "child.contoso.local");
+    }
+
+    #[test]
+    fn find_credential_realm_strict_allows_parent_cred_for_child_query() {
+        let creds = vec![cred("admin", "contoso.local", "P@ss1")];
+        let found = find_credential(&creds, "admin", "child.contoso.local", true).unwrap();
+        assert_eq!(found.password, "P@ss1");
+    }
+
+    #[test]
+    fn find_credential_realm_strict_blocks_sibling_forest() {
+        // LDAP referral does not cross a forest boundary.
+        let creds = vec![cred("bob", "contoso.local", "P@ss1")];
+        let found = find_credential(&creds, "bob", "fabrikam.local", true);
+        assert!(found.is_none(), "cross-forest strict must still block");
+    }
+
+    #[test]
+    fn find_credential_realm_strict_prefers_exact_over_same_forest() {
+        let creds = vec![
+            cred("admin", "child.contoso.local", "wrong"),
+            cred("admin", "contoso.local", "right"),
+        ];
+        let found = find_credential(&creds, "admin", "contoso.local", true).unwrap();
+        assert_eq!(found.password, "right");
+    }
+
+    #[test]
+    fn same_forest_recognizes_parent_child_and_rejects_siblings() {
+        assert!(same_forest("contoso.local", "contoso.local"));
+        assert!(same_forest("child.contoso.local", "contoso.local"));
+        assert!(same_forest("contoso.local", "child.contoso.local"));
+        assert!(same_forest("a.b.contoso.local", "contoso.local"));
+        assert!(!same_forest("contoso.local", "fabrikam.local"));
+        assert!(!same_forest("child.contoso.local", "fabrikam.local"));
+        // Suffix substring but not a subdomain (no dot boundary) must not match.
+        assert!(!same_forest("evilcontoso.local", "contoso.local"));
+    }
+
+    #[test]
     fn find_credential_netbios_form_matches_after_normalize() {
         // Cred stored with NetBIOS short-form domain ("CONTOSO"); after
         // `normalize_credential_domains` runs over the slice, the FQDN-form
@@ -1585,6 +1683,25 @@ mod tests {
         ];
         let found = find_hash(&hashes, "admin", "contoso.local", true).unwrap();
         assert_eq!(found.hash_value, "conhash");
+    }
+
+    #[test]
+    fn find_hash_realm_strict_allows_child_hash_for_parent_query() {
+        let hashes = vec![hash(
+            "alice",
+            "child.contoso.local",
+            "aad3b435b51404eeaad3b435b51404ee:1234",
+            None,
+        )];
+        let found = find_hash(&hashes, "alice", "contoso.local", true).unwrap();
+        assert_eq!(found.hash_value, "aad3b435b51404eeaad3b435b51404ee:1234");
+    }
+
+    #[test]
+    fn find_hash_realm_strict_blocks_sibling_forest() {
+        let hashes = vec![hash("bob", "contoso.local", "deadbeef", None)];
+        let found = find_hash(&hashes, "bob", "fabrikam.local", true);
+        assert!(found.is_none(), "cross-forest strict must still block");
     }
 
     #[test]
@@ -2690,5 +2807,25 @@ mod tests {
             found_upn.is_some(),
             "resolver must handle UPN-form username for injected cleartext cred"
         );
+    }
+
+    /// Regression guard for the UPN-suffix domain fallback: when the LLM
+    /// passes `username=alice@contoso.local` with no `domain` arg, both
+    /// `split_user_realm` (used by the resolver's new fallback) and
+    /// `find_credential`'s internal peel must converge on the same stored
+    /// cred. If either regresses, the tool dispatches with a missing password.
+    #[test]
+    fn upn_suffix_extraction_matches_stored_cred_via_empty_domain_path() {
+        let creds = vec![cred("alice", "contoso.local", "P@ss1")];
+        let (_, realm) = split_user_realm("alice@contoso.local");
+        assert_eq!(realm.as_deref(), Some("contoso.local"));
+        let found = find_credential(
+            &creds,
+            "alice@contoso.local",
+            realm.as_deref().unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(found.password, "P@ss1");
     }
 }
