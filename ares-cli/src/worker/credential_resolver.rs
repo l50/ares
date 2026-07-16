@@ -2030,7 +2030,7 @@ mod tests {
         // credential exists for the dispatched principal — otherwise
         // ldap_search's `ticket_path > password` preference shadows a working
         // simple bind with a doomed GSSAPI bind against the foreign DC.
-        let credentials = [cred("carol", "fabrikam.local", "fr3edom")];
+        let credentials = [cred("carol", "fabrikam.local", "P@ssw0rd!")];
         let hashes: [Hash; 0] = [];
         let domain_l = "fabrikam.local";
         let user_l = "carol";
@@ -2655,7 +2655,7 @@ mod tests {
         let injected = Credential {
             id: "injected".to_string(),
             username: "carol".to_string(),
-            password: "fr3edom".to_string(),
+            password: "P@ssw0rd!".to_string(),
             domain: "fabrikam.local".to_string(),
             source: "manual-inject".to_string(),
             discovered_at: None,
@@ -2679,7 +2679,7 @@ mod tests {
         // (fabrikam.local, carol).
         let found = find_credential(&credentials, "carol", "fabrikam.local", true);
         let cred = found.expect("resolver must find injected cleartext cred by (domain, username)");
-        assert_eq!(cred.password, "fr3edom");
+        assert_eq!(cred.password, "P@ssw0rd!");
         assert_eq!(cred.domain, "fabrikam.local");
 
         // UPN form must resolve to the same cred (the LLM frequently passes

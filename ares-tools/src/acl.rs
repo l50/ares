@@ -1387,7 +1387,7 @@ mod tests {
         let args = json!({
             "domain": "fabrikam.local",
             "username": "carol",
-            "password": "fr3edom",
+            "password": "P@ssw0rd!",
             "dc_ip": "192.168.58.20",
             "target_user": "sql_svc",
             "etype_hint": ["aes256-cts-hmac-sha1-96", "aes128-cts-hmac-sha1-96"],

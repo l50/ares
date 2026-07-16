@@ -269,13 +269,13 @@ $krb5tgs$17$svc_sql$CONTOSO.LOCAL$abc1230000000000000000ab$def4567890abcdef12345
     #[test]
     fn parse_hashcat_asrep_cracked() {
         let output = r#"--- hashcat --show ---
-$krb5asrep$23$michelle@FABRIKAM.LOCAL:8a7a0b3264590ef6:fr3edom
+$krb5asrep$23$michelle@FABRIKAM.LOCAL:8a7a0b3264590ef6:P@ssw0rd!
 "#;
         let params = json!({"domain": "fabrikam.local"});
         let creds = parse_cracker_output(output, &params);
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0]["username"], "michelle");
-        assert_eq!(creds[0]["password"], "fr3edom");
+        assert_eq!(creds[0]["password"], "P@ssw0rd!");
         assert_eq!(creds[0]["domain"], "FABRIKAM.LOCAL");
     }
 

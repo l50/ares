@@ -2016,7 +2016,7 @@ mod tests {
     fn pick_kerberoast_credential_rejects_cross_forest() {
         let mut s = StateInner::new("op-test".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "contoso.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "contoso.local"));
         assert!(pick_kerberoast_credential(&s, "fabrikam.local").is_none());
     }
 
@@ -2024,7 +2024,7 @@ mod tests {
     fn pick_kerberoast_credential_skips_quarantined() {
         let mut s = StateInner::new("op-test".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "fabrikam.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "fabrikam.local"));
         s.quarantine_principal("carol", "fabrikam.local");
         assert!(pick_kerberoast_credential(&s, "fabrikam.local").is_none());
     }
@@ -2042,7 +2042,7 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.20".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "fabrikam.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "fabrikam.local"));
         let work = select_kerberoast_vuln_work(&s, 10);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].vuln_id, "v-spn-fabrikam");
@@ -2086,7 +2086,7 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.20".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "contoso.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "contoso.local"));
         let work = select_kerberoast_vuln_work(&s, 10);
         assert!(work.is_empty());
     }
@@ -2101,7 +2101,7 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.20".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "fabrikam.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "fabrikam.local"));
         s.mark_processed(DEDUP_CRACK_REQUESTS, "krb_vuln:v-spn-1".into());
         assert!(select_kerberoast_vuln_work(&s, 10).is_empty());
     }
@@ -2117,7 +2117,7 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.20".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "fabrikam.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "fabrikam.local"));
         assert!(select_kerberoast_vuln_work(&s, 10).is_empty());
     }
 
@@ -2134,21 +2134,21 @@ mod tests {
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.20".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "fabrikam.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "fabrikam.local"));
         assert_eq!(select_kerberoast_vuln_work(&s, 2).len(), 2);
         assert_eq!(select_kerberoast_vuln_work(&s, 10).len(), 5);
     }
 
     #[test]
     fn build_vuln_kerberoast_payload_carries_target_user_and_credential() {
-        let cred = make_cred("carol", "fr3edom", "fabrikam.local");
+        let cred = make_cred("carol", "P@ssw0rd!", "fabrikam.local");
         let p = build_vuln_kerberoast_payload("fabrikam.local", "192.168.58.20", &cred, "sql_svc");
         assert_eq!(p["technique"], "kerberoast");
         assert_eq!(p["target_ip"], "192.168.58.20");
         assert_eq!(p["domain"], "fabrikam.local");
         assert_eq!(p["target_user"], "sql_svc");
         assert_eq!(p["credential"]["username"], "carol");
-        assert_eq!(p["credential"]["password"], "fr3edom");
+        assert_eq!(p["credential"]["password"], "P@ssw0rd!");
         assert_eq!(p["credential"]["domain"], "fabrikam.local");
         assert_eq!(p["reason"], "kerberoastable_account_vuln");
     }

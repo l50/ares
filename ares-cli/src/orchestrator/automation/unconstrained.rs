@@ -1824,7 +1824,7 @@ mod tests {
         // referral ticket.
         let mut s = StateInner::new("op-test".into());
         s.credentials
-            .push(make_cred("carol", "fr3edom", "contoso.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "contoso.local"));
         assert!(pick_unconstrained_credential(&s, "fabrikam.local").is_none());
     }
 
@@ -1887,7 +1887,7 @@ mod tests {
         let v = make_uc_vuln("v-uc-cross", "alice.smith", "fabrikam.local");
         s.discovered_vulnerabilities.insert(v.vuln_id.clone(), v);
         s.credentials
-            .push(make_cred("carol", "fr3edom", "contoso.local"));
+            .push(make_cred("carol", "P@ssw0rd!", "contoso.local"));
         s.domain_controllers
             .insert("fabrikam.local".into(), "192.168.58.20".into());
         s.kerberos_tickets.push(ares_core::models::KerberosTicket {

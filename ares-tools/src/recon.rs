@@ -1255,14 +1255,14 @@ mod tests {
     #[test]
     fn ldap_search_invocation_passes_password_to_w_flag() {
         // The op-time bug: the orchestrator supplied
-        // `username=carol@fabrikam.local` + `password=fr3edom` and
+        // `username=carol@fabrikam.local` + `password=P@ssw0rd!` and
         // expected a simple bind. Without ticket_path the tool MUST issue
-        // `-x -D carol@fabrikam.local -w fr3edom`.
+        // `-x -D carol@fabrikam.local -w P@ssw0rd!`.
         let args = json!({
             "target": "dc02.fabrikam.local",
             "domain": "fabrikam.local",
             "username": "carol",
-            "password": "fr3edom",
+            "password": "P@ssw0rd!",
             "filter": "(objectClass=user)",
         });
         let cmd = super::build_ldap_search(&args).unwrap();
@@ -1275,7 +1275,10 @@ mod tests {
             .iter()
             .position(|a| a == "-w")
             .expect("password must reach -w flag");
-        assert_eq!(args_vec.get(w_idx + 1).map(String::as_str), Some("fr3edom"));
+        assert_eq!(
+            args_vec.get(w_idx + 1).map(String::as_str),
+            Some("P@ssw0rd!")
+        );
         let d_idx = args_vec
             .iter()
             .position(|a| a == "-D")

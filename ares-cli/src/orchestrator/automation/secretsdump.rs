@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn build_krbtgt_extraction_args_with_password() {
-        let auth = KrbtgtAuth::Password("_L0ngCl@w_".into());
+        let auth = KrbtgtAuth::Password("P@ssw0rd!".into());
         let args = build_krbtgt_extraction_args(
             "192.168.58.20",
             "contoso.local",
@@ -915,7 +915,7 @@ mod tests {
             Some("krbtgt"),
         );
         assert_eq!(args["username"], "alice");
-        assert_eq!(args["password"], "_L0ngCl@w_");
+        assert_eq!(args["password"], "P@ssw0rd!");
         assert!(args.get("hash").is_none());
         assert_eq!(args["just_dc_user"], "krbtgt");
     }
