@@ -1045,11 +1045,11 @@ tasks:
     silent: true
     vars:
       DOMAIN: '{{.DOMAIN | default "sevenkingdoms.local"}}'
-      # EC2 dreadgoad range (private IPs, from `aws ec2 describe-instances` tags):
-      #   10.4.6.17=DC01, 10.4.6.133=DC02, 10.4.6.125=DC03, 10.4.6.164=SRV02, 10.4.6.126=SRV03
-      # The old default was the Ludus proxmox range (10.1.2.x) which isn't
-      # reachable from any AWS-hosted attacker — every tool call timed out.
-      TARGETS: '{{.TARGETS | default "10.4.6.17,10.4.6.133,10.4.6.125,10.4.6.164,10.4.6.126"}}'
+      # Either a range name (e.g. `dreadgoad`, resolved via EC2 Name tag glob
+      # `*<name>*` — see resolve_targets in run-ssm.sh) or a literal
+      # comma-separated IP list. The name form is preferred because it stays
+      # correct when the range is redeployed and its IPs change.
+      TARGETS: '{{.TARGETS | default "dreadgoad"}}'
       CRED_USER: '{{.CRED_USER | default "samwell.tarly"}}'
       CRED_PASS: '{{.CRED_PASS | default "Heartsbane"}}'
       CRED_DOMAIN: '{{.CRED_DOMAIN | default "north.sevenkingdoms.local"}}'
@@ -1103,8 +1103,17 @@ tasks:
         fi
         echo -e "{{.INFO}} Operation ID: $OP_ID"
 
-        # Build target IPs JSON array
-        TARGET_ARRAY=$(echo '{{.TARGETS}}' | tr ',' '\n' | jq -R . | jq -sc .)
+        # Resolve TARGETS: literal IP list stays as-is; anything else is treated
+        # as an EC2 Name-tag range (e.g. `dreadgoad`) and expanded via
+        # resolve_targets so redeployed ranges Just Work.
+        TARGETS_RAW='{{.TARGETS}}'
+        if echo "$TARGETS_RAW" | grep -qE '^[0-9., ]+$'; then
+          TARGETS_RESOLVED="$TARGETS_RAW"
+        else
+          TARGETS_RESOLVED=$(resolve_targets "$TARGETS_RAW") || exit 1
+          echo -e "{{.INFO}} Resolved TARGETS=$TARGETS_RAW → $TARGETS_RESOLVED"
+        fi
+        TARGET_ARRAY=$(echo "$TARGETS_RESOLVED" | tr ',' '\n' | jq -R . | jq -sc .)
 
         # Optional per-op strategy overrides. Empty vars are omitted so the
         # orchestrator's Strategy::resolve falls through to YAML/preset defaults.
