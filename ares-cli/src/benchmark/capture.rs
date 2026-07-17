@@ -189,20 +189,27 @@ pub(crate) async fn run_capture(
     let metrics_end = completed_at + Duration::minutes(30);
 
     eprint!(
-        "[3/5] Exporting Grafana surface (alerts, metrics, dashboards, annotations) in parallel..."
+        "[3/5] Exporting Grafana surface (alerts, metrics, dashboards, annotations, traces) in parallel..."
     );
     let _ = std::io::stderr().flush();
-    // All four exports hit independent Grafana endpoints — run them concurrently
+    // All five exports hit independent Grafana endpoints — run them concurrently
     // instead of the sequential [3/8]..[6/8] the old code did.
-    let (alerts_res, metrics_series, dashboards_captured, annotations_captured) = tokio::join!(
+    let (
+        alerts_res,
+        metrics_series,
+        dashboards_captured,
+        annotations_captured,
+        tempo_traces_captured,
+    ) = tokio::join!(
         export_grafana_alerts(export_start, export_end),
         export_prometheus_metrics(&snapshot_dir, metrics_start, metrics_end),
         export_dashboards(&snapshot_dir),
         export_all_annotations(&snapshot_dir, export_start, export_end),
+        export_tempo_traces(&snapshot_dir, &op_id, metrics_start, metrics_end),
     );
     let fired_alerts = alerts_res?;
     eprintln!(
-        " done ({} alerts, {metrics_series} series, {dashboards_captured} dashboards, {annotations_captured} annotations)",
+        " done ({} alerts, {metrics_series} series, {dashboards_captured} dashboards, {annotations_captured} annotations, {tempo_traces_captured} traces)",
         fired_alerts.len()
     );
     let alerts_path = snapshot_dir.join("fired-alerts.json");
@@ -255,6 +262,7 @@ pub(crate) async fn run_capture(
         metrics_series,
         dashboards_captured,
         annotations_captured,
+        tempo_traces_captured,
         techniques: state.all_techniques.clone(),
         has_domain_admin: state.has_domain_admin,
         credential_count: state.all_credentials.len(),
@@ -313,6 +321,7 @@ pub(crate) async fn run_capture(
     println!("  Metrics:      {}", manifest.metrics_series);
     println!("  Dashboards:   {}", manifest.dashboards_captured);
     println!("  Annotations:  {}", manifest.annotations_captured);
+    println!("  Tempo traces: {}", manifest.tempo_traces_captured);
     println!("  Techniques:   {}", manifest.techniques.len());
     println!("  Domain admin: {}", manifest.has_domain_admin);
     println!("  Credentials:  {}", manifest.credential_count);
@@ -1264,4 +1273,227 @@ async fn export_all_annotations(
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0)
+}
+
+/// Export the operation's Tempo traces via the Grafana datasource proxy.
+///
+/// Mirrors [`export_prometheus_metrics`] — in-cluster Tempo is not directly
+/// reachable, so we resolve the datasource with `type=="tempo"` and go through
+/// `/api/datasources/proxy/uid/{uid}/api/search` + `/api/traces/{id}`. Traces
+/// are written to `{snapshot_dir}/tempo/traces.jsonl.gz` — one full OTLP-JSON
+/// trace per gzipped line — so the visual-replay path
+/// (`benchmarks/replay-stack` → `ares benchmark replay`) can push them back
+/// into an ephemeral Tempo without a live agent stack.
+///
+/// Best-effort: any failure logs, returns 0, and never aborts the surrounding
+/// capture. The manifest field `tempo_traces_captured` records the count so
+/// downstream consumers can tell "no Tempo data" from "no traces existed".
+async fn export_tempo_traces(
+    snapshot_dir: &Path,
+    operation_id: &str,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let Some((grafana_url, api_key)) = grafana_env("Tempo trace export") else {
+        return 0;
+    };
+
+    let client = http();
+
+    let Some(uid) = resolve_tempo_datasource_uid(client, &grafana_url, &api_key).await else {
+        return 0;
+    };
+
+    let trace_ids = match search_tempo_trace_ids(
+        client,
+        &grafana_url,
+        &api_key,
+        &uid,
+        operation_id,
+        start,
+        end,
+    )
+    .await
+    {
+        Ok(ids) if ids.is_empty() => {
+            info!(op_id = %operation_id, "Tempo returned zero traces for attack_operation_id — skipping trace export");
+            return 0;
+        }
+        Ok(ids) => ids,
+        Err(e) => {
+            info!(op_id = %operation_id, err = %e, "Tempo search failed — skipping trace export");
+            return 0;
+        }
+    };
+
+    let tempo_dir = snapshot_dir.join("tempo");
+    if let Err(e) = fs::create_dir_all(&tempo_dir) {
+        info!("failed to create {}: {e}", tempo_dir.display());
+        return 0;
+    }
+    let out_path = tempo_dir.join("traces.jsonl.gz");
+    let file = match fs::File::create(&out_path) {
+        Ok(f) => f,
+        Err(e) => {
+            info!("failed to open {} for write: {e}", out_path.display());
+            return 0;
+        }
+    };
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+
+    let mut written = 0usize;
+    let mut fetch_failures = 0usize;
+    for trace_id in &trace_ids {
+        let trace_json =
+            match fetch_tempo_trace(client, &grafana_url, &api_key, &uid, trace_id).await {
+                Ok(body) => body,
+                Err(e) => {
+                    fetch_failures += 1;
+                    info!(trace_id = %trace_id, err = %e, "Tempo trace fetch failed");
+                    continue;
+                }
+            };
+        // Store a single-line JSON blob per trace so the replay side can read
+        // the file line by line and re-post each trace independently.
+        let compacted = match serde_json::from_str::<serde_json::Value>(&trace_json)
+            .and_then(|v| serde_json::to_string(&v))
+        {
+            Ok(s) => s,
+            Err(_) => trace_json.replace('\n', " "),
+        };
+        if let Err(e) = encoder
+            .write_all(compacted.as_bytes())
+            .and_then(|_| encoder.write_all(b"\n"))
+        {
+            info!("write to {} failed: {e}", out_path.display());
+            return written;
+        }
+        written += 1;
+    }
+    if let Err(e) = encoder.finish() {
+        info!("gzip finish on {} failed: {e}", out_path.display());
+        return written;
+    }
+
+    if fetch_failures > 0 {
+        eprintln!(
+            "  warning: {fetch_failures}/{} Tempo trace fetches failed — traces.jsonl.gz is incomplete",
+            trace_ids.len()
+        );
+    }
+    info!(
+        traces = written,
+        path = %out_path.display(),
+        "captured Tempo traces"
+    );
+    written
+}
+
+/// Find the UID of the first Grafana datasource with `type == "tempo"`.
+/// Unlike Prometheus, we do not pin by name — Tempo deployments commonly use
+/// the single default "Tempo" datasource, and pinning by name would silently
+/// drop traces when someone renames the datasource in Grafana.
+async fn resolve_tempo_datasource_uid(
+    client: &reqwest::Client,
+    grafana_url: &str,
+    api_key: &Option<String>,
+) -> Option<String> {
+    let ds_url = format!("{grafana_url}/api/datasources");
+    let resp = match with_grafana_auth(client.get(&ds_url), api_key).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            info!("Grafana datasources request failed (Tempo lookup): {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        info!(
+            "Grafana datasources API returned {} on Tempo lookup",
+            resp.status()
+        );
+        return None;
+    }
+    let datasources: Vec<serde_json::Value> = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            info!("failed to parse Grafana datasources on Tempo lookup: {e}");
+            return None;
+        }
+    };
+    datasources.iter().find_map(|ds| {
+        if ds.get("type").and_then(|v| v.as_str()) == Some("tempo") {
+            ds.get("uid").and_then(|v| v.as_str()).map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+/// Run a TraceQL search filtered by `attack_operation_id` over the capture
+/// window and return the list of matching trace IDs.
+async fn search_tempo_trace_ids(
+    client: &reqwest::Client,
+    grafana_url: &str,
+    api_key: &Option<String>,
+    uid: &str,
+    operation_id: &str,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>> {
+    let search_url = format!("{grafana_url}/api/datasources/proxy/uid/{uid}/api/search");
+    // Tempo's TraceQL search expects Unix-second `start` / `end`, `q` for the
+    // TraceQL query, and `limit` to cap results. attack_operation_id is the
+    // load-bearing span attribute here — every ares worker span carries it.
+    let q = format!(r#"{{ .attack_operation_id = "{operation_id}" }}"#);
+    let start_str = start.timestamp().to_string();
+    let end_str = end.timestamp().to_string();
+    let params = [
+        ("q", q.as_str()),
+        ("start", start_str.as_str()),
+        ("end", end_str.as_str()),
+        ("limit", "1000"),
+    ];
+    let resp = with_grafana_auth(client.get(&search_url).query(&params), api_key)
+        .send()
+        .await
+        .context("tempo search request")?;
+    if !resp.status().is_success() {
+        bail!("tempo search returned {}", resp.status());
+    }
+    let body: serde_json::Value = resp.json().await.context("parse tempo search response")?;
+    Ok(body
+        .get("traces")
+        .and_then(|t| t.as_array())
+        .map(|traces| {
+            traces
+                .iter()
+                .filter_map(|t| {
+                    t.get("traceID")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default())
+}
+
+/// Fetch a single trace by ID as OTLP-derived JSON. Tempo's
+/// `/api/traces/{id}` returns a `{"batches":[...]}` object mirroring the OTLP
+/// resource-spans structure — the replay side re-POSTs it to `/v1/traces`.
+async fn fetch_tempo_trace(
+    client: &reqwest::Client,
+    grafana_url: &str,
+    api_key: &Option<String>,
+    uid: &str,
+    trace_id: &str,
+) -> Result<String> {
+    let trace_url = format!("{grafana_url}/api/datasources/proxy/uid/{uid}/api/traces/{trace_id}");
+    let resp = with_grafana_auth(client.get(&trace_url), api_key)
+        .send()
+        .await
+        .context("tempo trace request")?;
+    if !resp.status().is_success() {
+        bail!("tempo trace {trace_id} returned {}", resp.status());
+    }
+    resp.text().await.context("read tempo trace body")
 }

@@ -49,6 +49,15 @@ pub struct ReplaySnapshot {
     pub users: Vec<User>,
     pub discovered_vulnerabilities: HashMap<String, VulnerabilityInfo>,
     pub exploited_vulnerabilities: HashSet<String>,
+    /// Principals blue revoked, keyed by `user@domain`. Value is the recorded_at
+    /// timestamp of the containment event.
+    pub revoked_principals: HashMap<String, DateTime<Utc>>,
+    /// Hosts blue firewalled, keyed by IP.
+    pub isolated_hosts: HashMap<String, DateTime<Utc>>,
+    /// Realms where blue rotated krbtgt, keyed by lowercase domain.
+    pub krbtgt_rotated_at: HashMap<String, DateTime<Utc>>,
+    /// Certificates blue revoked, keyed by lowercase serial.
+    pub revoked_certificates: HashMap<String, DateTime<Utc>>,
 }
 
 impl ReplaySnapshot {
@@ -87,6 +96,23 @@ impl ReplaySnapshot {
             }
             OpStateEventPayload::VulnExploited { vuln_id, .. } => {
                 self.exploited_vulnerabilities.insert(vuln_id.clone());
+            }
+            OpStateEventPayload::CredentialRevoked {
+                username, domain, ..
+            } => {
+                let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+                self.revoked_principals.insert(key, event.recorded_at);
+            }
+            OpStateEventPayload::HostIsolated { ip, .. } => {
+                self.isolated_hosts.insert(ip.clone(), event.recorded_at);
+            }
+            OpStateEventPayload::KrbtgtRotated { domain, .. } => {
+                self.krbtgt_rotated_at
+                    .insert(domain.to_lowercase(), event.recorded_at);
+            }
+            OpStateEventPayload::CertificateRevoked { serial, .. } => {
+                self.revoked_certificates
+                    .insert(serial.to_lowercase(), event.recorded_at);
             }
             OpStateEventPayload::TimelineEvent { .. } => {}
         }
@@ -224,6 +250,25 @@ pub fn apply_event_to_state(state: &mut StateInner, event: &OpStateEvent) {
         }
         OpStateEventPayload::VulnExploited { vuln_id, .. } => {
             state.exploited_vulnerabilities.insert(vuln_id.clone());
+        }
+        OpStateEventPayload::CredentialRevoked {
+            username, domain, ..
+        } => {
+            let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+            state.revoked_principals.insert(key, event.recorded_at);
+        }
+        OpStateEventPayload::HostIsolated { ip, .. } => {
+            state.isolated_hosts.insert(ip.clone(), event.recorded_at);
+        }
+        OpStateEventPayload::KrbtgtRotated { domain, .. } => {
+            state
+                .krbtgt_rotated_at
+                .insert(domain.to_lowercase(), event.recorded_at);
+        }
+        OpStateEventPayload::CertificateRevoked { serial, .. } => {
+            state
+                .revoked_certificates
+                .insert(serial.to_lowercase(), event.recorded_at);
         }
         OpStateEventPayload::TimelineEvent { .. } => {
             // Red-team timeline replay is deferred until the timeline entries

@@ -146,6 +146,73 @@ ares --ec2 kali-ares --ec2-profile personal --ec2-region us-east-1 ops tasks --l
 
 Failed tasks include the worker's error message and the role that failed. Cross-reference against Loki by role + timestamp.
 
+## Step 2.5 — attribute a specific tool call to the worker that ran it
+
+Use this when the question is "did tool X actually run for task Y, on which worker, and did it succeed?" The canonical case is verifying cross-role routing (e.g. `credential_access`-originated `password_spray` / `username_as_password` / `laps_dump` calls must land on a `recon` worker because netexec lives there — see `RECON_ROUTED_TOOLS` in `orchestrator/tool_dispatcher/mod.rs`).
+
+**Ground truth is the OTel span line each worker emits at INFO level when it starts a tool:**
+
+```
+Executing tool tool=<T> call_id=<T>_<hex> task_id=<origin_role>_<hex>
+```
+
+The span attributes on that same line are what you actually want:
+
+- `agent.role` = the worker that executed the tool. Cross-routing fired if this differs from the role prefix of `task_id`.
+- `attack_operation_id` / `op.id` = the op — scope every grep to this to avoid conflating past ops.
+- The follow-up line for the same `call_id` carries `Tool execution failed tool=<T> err=<message>` on failure.
+
+**The three canonical failure strings** and where they come from — memorize these because they distinguish "binary missing" from "tool ran and errored":
+
+| String | Source | Meaning |
+|---|---|---|
+| `failed to spawn '<binary>' — is it installed?` | `ares-tools/src/executor.rs:219` | ENOENT: the binary isn't on this worker's `$PATH` |
+| `failed to spawn impacket-ntlmrelayx (is it installed?)` | `ares-tools/src/coercion.rs:586` | Same, special-cased (no single quote — do not narrow greps to require one) |
+| `Tool '<T>' is not installed on this worker.` | `worker/tool_executor.rs::unavailable_tool_response` | Cached unavailability — a prior call ENOENT'd and future calls return this without re-spawning |
+
+Everything else in `err=...` means the binary ran and the tool logic failed (timeout, KDC error, no creds, etc.).
+
+**Query patterns.** Prefer Loki when the label narrow is easy; SSM `grep -a` when you need cross-file correlation on the box.
+
+```
+# Loki: every executor span for tool X in this op
+mcp__grafana__query_loki_logs
+  datasourceUid: "loki"
+  logql: '{app="ares", deployment="alpha-operator-range-kali-ares"} |= "Executing tool" |= "tool=<T>" |= "<OP>"'
+  limit: 50
+```
+
+```bash
+# SSM: same thing, plus the failure line for the same call_id
+task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+  CMD='sudo grep -a "<OP>" /var/log/ares/recon.log /var/log/ares/credential_access.log | grep -a "tool=<T>" | head -20'
+
+# End-to-end trace of one call_id across every worker log
+task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+  CMD='sudo grep -a "<call_id>" /var/log/ares/*.log'
+
+# Sanity: is the binary the caller expects actually on the box right now?
+task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+  CMD='which netexec; ls -la /usr/local/bin/netexec /usr/bin/netexec 2>/dev/null; netexec --version 2>&1 | head -3'
+```
+
+**Gotchas (do not skip):**
+
+1. `task ec2:exec` runs `CMD` through go-task's template engine. `{{ ... }}`, backticks, and some quoting silently fail with `"CMD required"` — that means the template ate the arg, not that `CMD` was empty. Workarounds: bind `Q="…"` locally and pass `CMD="$Q"`; keep single quotes on the outside; avoid `{{`. If you see `"CMD required"`, simplify quoting before assuming the file is empty.
+2. Per-role log files are **ANSI-color-coded** on disk. `grep 'tool.name="X"'` returns 0 hits even when the tool ran because the bytes are `tool.name<ESC>[0m<ESC>[2m=<ESC>[0m"X"`. Anchor on invariant plain-text substrings: `Executing tool`, `tool=<T> call_id=`, `err=failed to spawn`, `attack_operation_id="<OP>"`. `grep -a` (force text mode) is required — the escapes make grep treat these files as binary and go silent otherwise.
+3. Per-role log files stay near-empty in steady state (see the intro's "worker per-role log mtimes are not a signal") — but executor OTel spans DO land there. `recon.log` and `credential_access.log` are the right files for tool-attribution greps even though they look sparse.
+4. `ingest.log` is a firehose (multi-GB); do not grep it without a `--max-count` or a very narrow anchor.
+
+**Case study — was cross-routing broken on op-20260716-181136?** credential_access called `username_as_password`, the runner pruned it after "spawn failed". The trace resolved it in three greps:
+
+```
+agent.role=recon
+task_id=credential_access_de9f5fa0be53
+err=failed to spawn 'netexec' — is it installed?
+```
+
+`agent.role=recon` proved routing fired (a recon worker picked up a credential_access-originated call — cross-routing correct). The `err=` matched `executor.rs:219` verbatim, pinning the root cause on netexec missing from the box at that moment. Fix was ansible provisioning drift, not code. **Without the span attributes there was no way to distinguish "routing bug" from "environment drift" — every hypothesis based on just the runner's `WARN` line would have been wrong.**
+
 ## Step 3 — wedge detection (objective state frozen)
 
 **The canonical wedge is NOT "tokens flatlined" — tokens almost always keep climbing during a wedge because the LLM re-evaluates the same frozen state every tick.** The canonical wedge is "objective state frozen while tokens climb." Probe state, not tokens:

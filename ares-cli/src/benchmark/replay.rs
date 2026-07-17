@@ -175,6 +175,26 @@ pub(crate) async fn run_replay(p: ReplayParams) -> Result<()> {
         p.stack_ip,
     );
 
+    // Push captured Tempo traces into the ephemeral stack so the demo
+    // dashboard's attack-graph panel renders on this replay. Best-effort:
+    // a snapshot captured before D1 landed carries no bundle and this is
+    // an Ok(0) no-op; a live-Tempo failure is logged but does not abort
+    // the investigation.
+    if manifest.tempo_traces_captured > 0 {
+        let otlp_url = super::tempo_push::otlp_url_for_stack(&p.stack_ip);
+        match super::tempo_push::push_traces_bundle(&snapshot_path, &otlp_url, None).await {
+            Ok(n) => info!(
+                pushed = n,
+                expected = manifest.tempo_traces_captured,
+                url = %otlp_url,
+                "pushed captured Tempo traces to replay stack"
+            ),
+            Err(e) => {
+                tracing::warn!(err = %e, "Tempo trace push failed — attack-graph panel will be empty")
+            }
+        }
+    }
+
     run_replay_inner(
         &p,
         &manifest,

@@ -187,6 +187,12 @@ pub(crate) fn maybe_exec_k8s() -> Option<i32> {
 
 /// Resolve EC2 instance ID from a Name tag pattern.
 fn resolve_ec2_instance(name: &str, profile: &str, region: &str) -> Result<String, String> {
+    // Pass-through: if the caller already provided an instance ID (`i-…`),
+    // skip the tag lookup. Lets operators pin a specific box when the Name
+    // tag is ambiguous.
+    if name.starts_with("i-") && name.len() >= 10 {
+        return Ok(name.to_string());
+    }
     let output = Command::new("aws")
         .args([
             "ec2",

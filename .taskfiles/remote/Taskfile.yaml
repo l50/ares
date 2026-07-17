@@ -427,7 +427,8 @@ tasks:
         fi
 
         # Check Redis
-        REDIS_POD=$(kubectl get pods -n {{.K8S_NAMESPACE}} -l app=redis -o name 2>/dev/null | head -1)
+        . .taskfiles/k8s/scripts/resolve.sh
+        REDIS_POD=$(resolve_pod "{{.K8S_NAMESPACE}}" "app=redis" 2>/dev/null || true)
         if [ -n "$REDIS_POD" ]; then
           if kubectl exec -n {{.K8S_NAMESPACE}} $REDIS_POD -- redis-cli ping >/dev/null 2>&1; then
             echo -e "{{.SUCCESS}} Redis responding"

@@ -62,6 +62,13 @@ pub struct SnapshotManifest {
     #[serde(default)]
     pub annotations_captured: usize,
 
+    /// Number of full Tempo traces captured for this operation (see
+    /// `tempo/traces.jsonl.gz`). Populated when the capture pipeline was able
+    /// to query Tempo via the Grafana datasource proxy; zero on older
+    /// snapshots or when the proxy was unavailable at capture time.
+    #[serde(default)]
+    pub tempo_traces_captured: usize,
+
     /// MITRE ATT&CK technique IDs used in this operation.
     pub techniques: Vec<String>,
 
@@ -145,4 +152,68 @@ pub struct BenchmarkResult {
 
     /// Gap analysis report in markdown format.
     pub gap_analysis: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tempo_traces_captured_defaults_when_absent_on_older_manifests() {
+        // A snapshot captured before the Tempo capture path landed will
+        // have no `tempo_traces_captured` key at all. That must not break
+        // `load_manifest` — the visual-replay path is additive on top of
+        // the existing blue-eval replay stack.
+        let json = serde_json::json!({
+            "version": 1,
+            "operation_id": "op-20260705-101128",
+            "target_domain": "contoso.local",
+            "target_ip": "192.168.58.10",
+            "started_at": "2026-07-05T10:11:28Z",
+            "completed_at": "2026-07-05T10:18:08Z",
+            "capture_window_start": "2026-07-05T09:11:28Z",
+            "capture_window_end": "2026-07-05T10:48:08Z",
+            "loki_source": "s3-chunks",
+            "loki_chunks": 42u64,
+            "loki_index_files": 3u64,
+            "alerts_captured": 9usize,
+            "techniques": ["T1078.002", "T1558.001"],
+            "has_domain_admin": true,
+            "credential_count": 4usize,
+            "host_count": 6usize,
+            "captured_at": "2026-07-05T10:48:12Z",
+        });
+        let m: SnapshotManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(m.tempo_traces_captured, 0);
+    }
+
+    #[test]
+    fn tempo_traces_captured_survives_roundtrip() {
+        let m = SnapshotManifest {
+            version: MANIFEST_VERSION,
+            operation_id: "op-1".into(),
+            target_domain: "contoso.local".into(),
+            target_ip: "192.168.58.10".into(),
+            started_at: chrono::Utc::now(),
+            completed_at: chrono::Utc::now(),
+            capture_window_start: chrono::Utc::now(),
+            capture_window_end: chrono::Utc::now(),
+            loki_source: "s3-chunks".into(),
+            loki_chunks: 0,
+            loki_index_files: 0,
+            alerts_captured: 0,
+            metrics_series: 0,
+            dashboards_captured: 0,
+            annotations_captured: 0,
+            tempo_traces_captured: 123,
+            techniques: vec![],
+            has_domain_admin: false,
+            credential_count: 0,
+            host_count: 0,
+            captured_at: chrono::Utc::now(),
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        let back: SnapshotManifest = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.tempo_traces_captured, 123);
+    }
 }

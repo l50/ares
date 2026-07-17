@@ -66,7 +66,20 @@ pub(super) fn resolve_netbios_domain(
 /// reaches over LDAP) were silently dropped from the report because the state
 /// store is first-writer-wins by (domain, username): a later netexec run
 /// cannot re-tag a user already recorded as `ldap_extraction`.
-const TRUSTED_USER_SOURCES: &[&str] = &["kerberos_enum", "netexec_user_enum", "ldap_extraction"];
+///
+/// `secretsdump_implicit` IS trusted: it is the User backfill written by
+/// `publish_hash` when a hash lands for a non-machine principal (see
+/// `orchestrator/state/publishing/credentials.rs`). NTDS/LSA secrets are
+/// KDC-authoritative — the presence of the hash is proof the account exists —
+/// so dropping the backfill here made hashes appear for users the loot view
+/// silently omitted (e.g. cross-forest accounts recovered only via secretsdump
+/// when LDAP enum was blocked).
+const TRUSTED_USER_SOURCES: &[&str] = &[
+    "kerberos_enum",
+    "netexec_user_enum",
+    "ldap_extraction",
+    "secretsdump_implicit",
+];
 
 pub(crate) fn dedup_users(users: &[User], netbios_to_fqdn: &HashMap<String, String>) -> Vec<User> {
     use std::collections::HashSet;
