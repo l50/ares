@@ -87,13 +87,22 @@ tasks:
   # Binary Deployment
   # ============================================================================
   deploy:
-    desc: "Cross-compile Rust binaries and deploy to EC2 via S3 staging (usage: task ec2:deploy [EC2_NAME=ares-tools])"
+    desc: "Cross-compile Rust binaries and deploy to EC2 via S3 staging (usage: task ec2:deploy [EC2_NAME=ares-tools] [SKIP_RESTART=true])"
     silent: true
     vars:
       RUST_TARGET: '{{.RUST_TARGET | default "x86_64-unknown-linux-gnu"}}'
       MAX_OPEN_FILES: '{{.MAX_OPEN_FILES | default "65536"}}'
       CARGO_BUILD_JOBS: '{{.CARGO_BUILD_JOBS | default "0"}}'
       S3_DEPLOY_PREFIX: 'ares-deploy'
+      # After the binary lands, bounce ares@<role>.service units so the new
+      # code is what services NATS. Set SKIP_RESTART=true to opt out (e.g.,
+      # long-running op in flight, hotfix you don't want to interrupt) —
+      # the deploy will print a loud warning telling you to run ec2:restart
+      # manually when the op finishes. This is on by default because the
+      # tool-pruning cache poison persists across the worker's lifetime,
+      # so a deploy that lands new classifier logic without a restart lands
+      # nothing (see the ares-debug skill, Step 3.5).
+      SKIP_RESTART: '{{.SKIP_RESTART | default "false"}}'
     preconditions:
       - sh: aws sts get-caller-identity --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" >/dev/null 2>&1
         msg: "Not logged into AWS (profile: {{.AWS_PROFILE}}). Run: aws sso login --profile {{.AWS_PROFILE}}"
@@ -195,6 +204,31 @@ tasks:
           # polling loop so we don't bail mid-build with a "InProgress" report.
           OUTPUT=$(run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 1800) || exit 1
           echo "$OUTPUT" | tail -20
+
+          # Restart every ares@<role> worker unit so the freshly-installed
+          # binary is actually the code servicing NATS. Without this the
+          # remote-build path silently ships a new /usr/local/bin/ares while
+          # systemd keeps the pre-deploy process alive and executing the old
+          # binary against the same NATS subscription — the exact
+          # "workers stuck on 34h-old in-memory ares" wedge that hid the
+          # tool-pruning cache poison across deploys. Uses a glob so
+          # newly-added roles come along for free; each unit's
+          # Restart=on-failure handles the transient window.
+          #
+          # Set SKIP_RESTART=true to opt out (e.g., an op is mid-flight and
+          # you're pushing a hotfix you don't want to interrupt). Prints a
+          # loud warning so it can't be forgotten.
+          if [ "{{.SKIP_RESTART}}" = "true" ]; then
+            echo -e "{{.WARN}} SKIP_RESTART=true — workers NOT restarted."
+            echo -e "{{.WARN}} The old in-memory ares binary is still servicing NATS."
+            echo -e "{{.WARN}} Run 'task ec2:restart EC2_NAME={{.EC2_NAME}}' when the current op finishes."
+          else
+            RESTART_CMD='set -e; UNITS=$(systemctl list-units --type=service --state=active --no-legend "ares@*.service" 2>/dev/null | awk "{print \$1}" | sort -u); '
+            RESTART_CMD+='if [ -z "$UNITS" ]; then echo "no ares@ worker units active — skipping restart"; else echo "restarting: $UNITS"; systemctl restart $UNITS; sleep 2; systemctl is-active $UNITS | sort -u; fi'
+            echo -e "{{.INFO}} Restarting ares@ worker units so they load the new binary..."
+            run_ssm_cmd "$INSTANCE_ID" "$RESTART_CMD" 60 || exit 1
+          fi
+
           echo -e "{{.SUCCESS}} Remote build + deploy complete"
           exit 0
         fi
@@ -364,10 +398,20 @@ tasks:
         # wedge (see PR discussion). Uses a glob so newly-added roles come
         # along for free; each unit's Restart=on-failure handles the
         # transient window.
-        RESTART_CMD='set -e; UNITS=$(systemctl list-units --type=service --state=active --no-legend "ares@*.service" 2>/dev/null | awk "{print \$1}" | sort -u); '
-        RESTART_CMD+='if [ -z "$UNITS" ]; then echo "no ares@ worker units active — skipping restart"; else echo "restarting: $UNITS"; systemctl restart $UNITS; sleep 2; systemctl is-active $UNITS | sort -u; fi'
-        echo -e "{{.INFO}} Restarting ares@ worker units so they load the new binary..."
-        run_ssm_cmd "$INSTANCE_ID" "$RESTART_CMD" 60 || exit 1
+        #
+        # Set SKIP_RESTART=true to opt out (e.g., an op is mid-flight and
+        # you're pushing a hotfix you don't want to interrupt). Prints a
+        # loud warning so it can't be forgotten.
+        if [ "{{.SKIP_RESTART}}" = "true" ]; then
+          echo -e "{{.WARN}} SKIP_RESTART=true — workers NOT restarted."
+          echo -e "{{.WARN}} The old in-memory ares binary is still servicing NATS."
+          echo -e "{{.WARN}} Run 'task ec2:restart EC2_NAME={{.EC2_NAME}}' when the current op finishes."
+        else
+          RESTART_CMD='set -e; UNITS=$(systemctl list-units --type=service --state=active --no-legend "ares@*.service" 2>/dev/null | awk "{print \$1}" | sort -u); '
+          RESTART_CMD+='if [ -z "$UNITS" ]; then echo "no ares@ worker units active — skipping restart"; else echo "restarting: $UNITS"; systemctl restart $UNITS; sleep 2; systemctl is-active $UNITS | sort -u; fi'
+          echo -e "{{.INFO}} Restarting ares@ worker units so they load the new binary..."
+          run_ssm_cmd "$INSTANCE_ID" "$RESTART_CMD" 60 || exit 1
+        fi
 
         echo -e "{{.SUCCESS}} Deploy complete"
 

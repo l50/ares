@@ -73,6 +73,7 @@ impl ToolDispatcher for MockDispatcher {
                 output: "default mock output".into(),
                 error: None,
                 discoveries: None,
+                failure_kind: None,
             })
         })
     }
@@ -184,6 +185,7 @@ async fn multi_turn_tool_use_then_task_complete() {
             .into(),
         error: None,
         discoveries: None,
+        failure_kind: None,
     })]));
 
     let config = default_config(10);
@@ -239,6 +241,7 @@ async fn max_steps_limit() {
                 output: "scan complete".into(),
                 error: None,
                 discoveries: None,
+                failure_kind: None,
             })
         })
         .collect();
@@ -338,6 +341,7 @@ async fn tool_dispatch_error_fed_back() {
         output: "partial scan data".into(),
         error: Some("Connection timed out after 30s".into()),
         discoveries: None,
+        failure_kind: None,
     })]));
 
     let config = default_config(10);
@@ -507,6 +511,7 @@ async fn token_usage_accumulates() {
         output: "scan done".into(),
         error: None,
         discoveries: None,
+        failure_kind: None,
     })]));
 
     let config = default_config(10);

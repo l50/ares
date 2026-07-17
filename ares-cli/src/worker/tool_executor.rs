@@ -17,9 +17,10 @@
 //!
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -64,6 +65,13 @@ struct ToolExecResponse {
     /// Structured discoveries parsed from the tool output.
     #[serde(skip_serializing_if = "Option::is_none")]
     discoveries: Option<serde_json::Value>,
+    /// Typed classification of the failure, when the worker can determine
+    /// one. The orchestrator's dispatcher copies this into the runner's
+    /// [`ares_llm::ToolExecResult`] so pruning / cache decisions key off
+    /// a variant instead of substring-matching. Absent on success and on
+    /// failures where no discriminator is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<ares_llm::ToolFailureKind>,
 }
 
 // ─── Tool executor loop ─────────────────────────────────────────────────────
@@ -177,7 +185,8 @@ pub async fn run_tool_exec_loop(
         "Starting tool executor loop (NATS queue subscribe)"
     );
 
-    let unavailable_tools: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let unavailable_tools: Arc<Mutex<HashMap<String, UnavailableEntry>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let worker_permits = Arc::new(Semaphore::new(worker_concurrency_from_env()));
     let inflight = Arc::new(AtomicUsize::new(0));
     let worker_role = config.worker_role.clone();
@@ -314,7 +323,9 @@ pub async fn run_tool_exec_loop(
 
 /// Build the error response for a tool marked unavailable on this worker
 /// (binary missing). Surfaced as a free function so the wording stays in
-/// lock-step with tests.
+/// lock-step with tests. Sets [`ares_llm::ToolFailureKind::BinaryNotFound`]
+/// on the typed field so the runner can prune without falling back to
+/// substring matching.
 fn unavailable_tool_response(tool_name: &str, call_id: &str) -> ToolExecResponse {
     ToolExecResponse {
         call_id: call_id.to_string(),
@@ -324,13 +335,83 @@ fn unavailable_tool_response(tool_name: &str, call_id: &str) -> ToolExecResponse
              Do not call this tool again — it failed to spawn previously."
         )),
         discoveries: None,
+        failure_kind: Some(ares_llm::ToolFailureKind::BinaryNotFound),
     }
 }
 
-/// Tool execution failures that indicate the binary is not present should
-/// be marked unavailable so we don't keep retrying it.
+/// Exponential-backoff schedule for a tool that fails to spawn with ENOENT.
+/// Deploys don't restart workers, so a flat TTL either re-probes far too
+/// often for a genuinely-missing binary (burning LLM steps) or holds a
+/// transient miss in the cache long past when the binary would have shown
+/// up. This schedule self-heals fast on the first miss and backs off
+/// exponentially on repeated misses: 1 min → 5 min → 30 min → 4 h.
+/// The final rung acts as a cap: an operator who never `apt install`s the
+/// tool will still see one probe every 4 hours per worker.
+const UNAVAILABLE_BACKOFF: &[Duration] = &[
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(1800),
+    Duration::from_secs(4 * 3600),
+];
+
+/// One entry in the `unavailable_tools` cache. `failures` indexes into
+/// `UNAVAILABLE_BACKOFF` to pick the current cooldown; `marked_at` is
+/// when the most-recent failure was recorded.
+#[derive(Debug, Clone, Copy)]
+struct UnavailableEntry {
+    marked_at: Instant,
+    failures: u32,
+}
+
+fn cooldown_for(failures: u32) -> Duration {
+    let idx = failures
+        .saturating_sub(1)
+        .min(UNAVAILABLE_BACKOFF.len() as u32 - 1) as usize;
+    UNAVAILABLE_BACKOFF[idx]
+}
+
+/// Tool execution failures that indicate the binary is genuinely absent
+/// from PATH (ENOENT). The executor emits this exact phrasing only for
+/// `io::ErrorKind::NotFound`; every other spawn error (EAGAIN, ENOMEM,
+/// EMFILE, transient EACCES, /proc I/O hiccups) is reported as a
+/// "transient spawn error" and must NOT poison the cache.
+///
+/// This is the string-only fallback for callers that don't have the
+/// original `anyhow::Error` in hand. Prefer [`classify_dispatch_error`]
+/// when you do — it downcasts to the typed [`ares_tools::SpawnErrorKind`]
+/// marker and is not sensitive to wording drift.
+///
+/// Matching both `"failed to spawn"` AND `"is it installed?"` (not just
+/// one) keeps arbitrary tool output that happens to contain the substring
+/// from ever tripping the classifier.
 fn is_tool_unavailable_error(err_str: &str) -> bool {
-    err_str.contains("failed to spawn") || err_str.contains("not installed")
+    err_str.contains("failed to spawn") && err_str.contains("is it installed?")
+}
+
+/// Classify a dispatch error into an optional
+/// [`ares_llm::ToolFailureKind`]. Prefers the typed
+/// [`ares_tools::SpawnErrorKind`] marker attached by
+/// [`ares_tools::executor::CommandBuilder::execute`]; falls back to the
+/// string classifier if the marker is missing (e.g., an error path in a
+/// non-`CommandBuilder` code path). Returns `None` when neither signal
+/// fires — the failure is a wrapper-level arg error, timeout, or other
+/// non-spawn condition and the runner should not treat it as a spawn
+/// failure.
+fn classify_dispatch_error(err: &anyhow::Error) -> Option<ares_llm::ToolFailureKind> {
+    if let Some(kind) = ares_tools::spawn_error_kind(err) {
+        return Some(if kind.is_not_found() {
+            ares_llm::ToolFailureKind::BinaryNotFound
+        } else {
+            ares_llm::ToolFailureKind::TransientSpawn
+        });
+    }
+    // No typed marker — fall back to the string classifier so an in-flight
+    // rollout where the worker binary has the classifier update but the
+    // ares-tools library predates the marker still classifies ENOENT.
+    if is_tool_unavailable_error(&err.to_string()) {
+        return Some(ares_llm::ToolFailureKind::BinaryNotFound);
+    }
+    None
 }
 
 /// Convert a parsed-discoveries value into `Some(_)` only when it carries
@@ -381,27 +462,42 @@ fn build_success_response(
     combined: String,
     discoveries: Option<serde_json::Value>,
 ) -> ToolExecResponse {
-    let error = if success {
-        None
+    let (error, failure_kind) = if success {
+        (None, None)
     } else {
-        Some(tool_exit_error(exit_code))
+        // Ran to completion but exited non-zero — a tool-level error, not a
+        // spawn failure. Classify explicitly so the runner never confuses
+        // it with the ENOENT path.
+        (
+            Some(tool_exit_error(exit_code)),
+            Some(ares_llm::ToolFailureKind::ToolError),
+        )
     };
     ToolExecResponse {
         call_id: call_id.to_string(),
         output: combined,
         error,
         discoveries,
+        failure_kind,
     }
 }
 
 /// Build the error-path [`ToolExecResponse`] (dispatch failed before the
-/// tool produced any output).
-fn build_error_response(call_id: &str, err_str: String) -> ToolExecResponse {
+/// tool produced any output). `failure_kind` is the typed discriminator
+/// resolved from the ares-tools error chain (via
+/// [`ares_tools::spawn_error_kind`]) — `None` when the failure is neither
+/// ENOENT nor a transient spawn error (e.g., wrapper-level arg validation).
+fn build_error_response(
+    call_id: &str,
+    err_str: String,
+    failure_kind: Option<ares_llm::ToolFailureKind>,
+) -> ToolExecResponse {
     ToolExecResponse {
         call_id: call_id.to_string(),
         output: String::new(),
         error: Some(err_str),
         discoveries: None,
+        failure_kind,
     }
 }
 
@@ -420,23 +516,33 @@ async fn execute_and_respond(
     client: async_nats::Client,
     reply_to: Option<async_nats::Subject>,
     request: &ToolExecRequest,
-    unavailable_tools: &Arc<Mutex<HashSet<String>>>,
+    unavailable_tools: &Arc<Mutex<HashMap<String, UnavailableEntry>>>,
     mut conn: redis::aio::ConnectionManager,
 ) {
-    // Cheap contains-check under a briefly-held std::sync::Mutex — no await
-    // point holds this lock, so it can't deadlock with concurrent spawned
-    // tasks that also read/write the same shared HashSet.
-    let is_unavailable = {
+    // Check the backoff cache under a briefly-held std::sync::Mutex — no
+    // await point holds this lock, so it can't deadlock with concurrent
+    // spawned tasks. If the entry exists but its cooldown has expired we
+    // *don't* remove it here: the ENOENT handler below will refresh
+    // `marked_at` and bump `failures` if the re-probe fails, and the
+    // success branch clears the entry outright so a working tool
+    // self-heals the cache.
+    let skip_reason = {
         let g = unavailable_tools
             .lock()
             .expect("unavailable_tools mutex poisoned");
-        g.contains(&request.tool_name)
+        g.get(&request.tool_name).and_then(|entry| {
+            let cooldown = cooldown_for(entry.failures);
+            let elapsed = Instant::now().duration_since(entry.marked_at);
+            (elapsed < cooldown).then(|| (entry.failures, cooldown - elapsed))
+        })
     };
-    if is_unavailable {
-        debug!(
+    if let Some((failures, remaining)) = skip_reason {
+        info!(
             tool = %request.tool_name,
             call_id = %request.call_id,
-            "Skipping unavailable tool (previously failed to spawn)"
+            failures,
+            remaining_secs = remaining.as_secs(),
+            "Skipping tool cached as ENOENT — next re-probe once cooldown expires"
         );
         let response = unavailable_tool_response(&request.tool_name, &request.call_id);
         send_reply(&client, reply_to.as_ref(), &response).await;
@@ -492,6 +598,20 @@ async fn execute_and_respond(
 
     let response = match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
         Ok(output) => {
+            // Dispatch returned Ok — the binary spawned. Clear any prior
+            // ENOENT entry for this tool so a working tool self-heals the
+            // cache without waiting for the backoff window to expire.
+            {
+                let mut g = unavailable_tools
+                    .lock()
+                    .expect("unavailable_tools mutex poisoned");
+                if g.remove(effective_tool_name.as_ref()).is_some() {
+                    info!(
+                        tool = %effective_tool_name,
+                        "Tool spawn succeeded — clearing prior ENOENT cache entry"
+                    );
+                }
+            }
             let raw = output.combined_raw();
             let mut combined = output.combined();
             let success = output.success;
@@ -537,24 +657,46 @@ async fn execute_and_respond(
             build_success_response(&request.call_id, success, exit_code, combined, discoveries)
         }
         Err(e) => {
-            let err_str = e.to_string();
-            if is_tool_unavailable_error(&err_str) {
+            let failure_kind = classify_dispatch_error(&e);
+            // Only ENOENT-class failures poison the cache. TransientSpawn
+            // (EAGAIN/ENOMEM/EMFILE) MUST NOT cache — that was the whole
+            // point of the split; a transient at t=0 used to blacklist the
+            // tool for the worker's lifetime. The runner still won't prune
+            // on a TransientSpawn either (`ToolExecResult.failure_kind`
+            // carries the discriminator; runner keys off BinaryNotFound
+            // only), so a transient just surfaces the error to the LLM.
+            if matches!(
+                failure_kind,
+                Some(ares_llm::ToolFailureKind::BinaryNotFound)
+            ) {
+                let mut g = unavailable_tools
+                    .lock()
+                    .expect("unavailable_tools mutex poisoned");
+                let entry = g
+                    .entry(effective_tool_name.to_string())
+                    .and_modify(|e| {
+                        e.failures = e.failures.saturating_add(1);
+                        e.marked_at = Instant::now();
+                    })
+                    .or_insert(UnavailableEntry {
+                        marked_at: Instant::now(),
+                        failures: 1,
+                    });
                 warn!(
                     tool = %effective_tool_name,
-                    "Tool binary not found — marking as unavailable for this session"
+                    failures = entry.failures,
+                    cooldown_secs = cooldown_for(entry.failures).as_secs(),
+                    "Tool binary not found (ENOENT) — backing off before next re-probe"
                 );
-                unavailable_tools
-                    .lock()
-                    .expect("unavailable_tools mutex poisoned")
-                    .insert(effective_tool_name.to_string());
             }
             warn!(
                 tool = %effective_tool_name,
                 call_id = %request.call_id,
                 err = %e,
+                failure_kind = ?failure_kind,
                 "Tool execution failed"
             );
-            build_error_response(&request.call_id, err_str)
+            build_error_response(&request.call_id, e.to_string(), failure_kind)
         }
     };
 
@@ -766,19 +908,23 @@ mod tests {
     async fn unavailable_tools_read_write_across_tasks_no_deadlock() {
         // Contract: `unavailable_tools` is shared across concurrently
         // spawned dispatch tasks. The std::sync::Mutex is held only for
-        // the duration of a HashSet contains/insert — never across an
+        // the duration of a HashMap contains/insert — never across an
         // await — so many concurrent tasks can safely serialize on it
         // without deadlocking each other or the outer loop's
         // `sub.next().await`.
-        let set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let set: Arc<Mutex<HashMap<String, UnavailableEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // First writer marks "hashcat" as unavailable.
         let writer_set = set.clone();
         let writer = tokio::spawn(async move {
-            writer_set
-                .lock()
-                .expect("mutex poisoned")
-                .insert("hashcat".to_string());
+            writer_set.lock().expect("mutex poisoned").insert(
+                "hashcat".to_string(),
+                UnavailableEntry {
+                    marked_at: Instant::now(),
+                    failures: 1,
+                },
+            );
         });
 
         // Concurrent readers race the writer; either observation is valid,
@@ -787,7 +933,10 @@ mod tests {
         for _ in 0..8 {
             let r_set = set.clone();
             readers.push(tokio::spawn(async move {
-                r_set.lock().expect("mutex poisoned").contains("hashcat")
+                r_set
+                    .lock()
+                    .expect("mutex poisoned")
+                    .contains_key("hashcat")
             }));
         }
 
@@ -797,7 +946,53 @@ mod tests {
         }
 
         // After all tasks settle, the writer's mutation is visible.
-        assert!(set.lock().unwrap().contains("hashcat"));
+        assert!(set.lock().unwrap().contains_key("hashcat"));
+    }
+
+    #[test]
+    fn cooldown_for_walks_the_backoff_schedule() {
+        // failures=1 → schedule[0]; failures=2 → schedule[1]; and so on.
+        // Anything beyond the last rung is clamped to the final entry so
+        // an operator who never installs the tool still sees one re-probe
+        // per max cooldown, not one per second.
+        assert_eq!(cooldown_for(1), UNAVAILABLE_BACKOFF[0]);
+        assert_eq!(cooldown_for(2), UNAVAILABLE_BACKOFF[1]);
+        assert_eq!(cooldown_for(3), UNAVAILABLE_BACKOFF[2]);
+        assert_eq!(cooldown_for(4), UNAVAILABLE_BACKOFF[3]);
+        assert_eq!(cooldown_for(99), *UNAVAILABLE_BACKOFF.last().unwrap());
+        // failures=0 shouldn't occur in practice (entries are inserted
+        // with failures=1), but must not panic on underflow.
+        assert_eq!(cooldown_for(0), UNAVAILABLE_BACKOFF[0]);
+    }
+
+    #[test]
+    fn unavailable_entry_probe_eligibility_uses_backoff_cooldown() {
+        // A stale entry (older than its cooldown) is eligible for re-probe.
+        // A fresh entry inside its cooldown window is still skipped.
+        let now = Instant::now();
+        let cooldown = cooldown_for(1);
+
+        let stale = UnavailableEntry {
+            marked_at: now
+                .checked_sub(cooldown * 2)
+                .expect("clock underflow in test"),
+            failures: 1,
+        };
+        let elapsed = now.duration_since(stale.marked_at);
+        assert!(
+            elapsed >= cooldown,
+            "stale entry ({elapsed:?}) should be past cooldown ({cooldown:?})"
+        );
+
+        let fresh = UnavailableEntry {
+            marked_at: now,
+            failures: 1,
+        };
+        let elapsed = now.duration_since(fresh.marked_at);
+        assert!(
+            elapsed < cooldown,
+            "fresh entry ({elapsed:?}) should be inside cooldown ({cooldown:?})"
+        );
     }
 
     #[test]
@@ -821,6 +1016,7 @@ mod tests {
             output: "Found 5 hosts".into(),
             error: None,
             discoveries: None,
+            failure_kind: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("nmap_scan_abc123"));
@@ -836,6 +1032,7 @@ mod tests {
             output: String::new(),
             error: Some("Connection refused".into()),
             discoveries: None,
+            failure_kind: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -851,6 +1048,7 @@ mod tests {
             discoveries: Some(serde_json::json!({
                 "hosts": [{"ip": "192.168.58.10", "services": ["445/tcp"]}]
             })),
+            failure_kind: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("discoveries"));
@@ -931,6 +1129,7 @@ mod tests {
             output: "some output".into(),
             error: None,
             discoveries: None,
+            failure_kind: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("discoveries"));
@@ -951,6 +1150,7 @@ mod tests {
                     {"port": 445, "protocol": "tcp", "service": "microsoft-ds"}
                 ]
             })),
+            failure_kind: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -967,6 +1167,7 @@ mod tests {
             output: "output with special chars: <>&\"'".into(),
             error: Some("exit code 1".into()),
             discoveries: Some(serde_json::json!({"credentials": []})),
+            failure_kind: Some(ares_llm::ToolFailureKind::ToolError),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -997,17 +1198,22 @@ mod tests {
 
     #[test]
     fn unavailable_tool_detection_keywords() {
-        // Verify the keywords used to detect unavailable tools
+        // Only the executor's ENOENT-specific wording counts. Transient
+        // spawn errors (EAGAIN/ENOMEM/EMFILE/etc.) come through as
+        // "transient spawn error for '...'" and must NOT trip the cache.
         let test_errors = [
             ("failed to spawn 'nmap' — is it installed?", true),
-            ("tool not installed: certipy", true),
+            (
+                "transient spawn error for 'nmap' (WouldBlock): Resource temporarily unavailable",
+                false,
+            ),
+            ("tool not installed: certipy", false),
             ("command not found", false),
             ("permission denied", false),
         ];
 
         for (err_str, expected_unavailable) in test_errors {
-            let is_unavailable =
-                err_str.contains("failed to spawn") || err_str.contains("not installed");
+            let is_unavailable = is_tool_unavailable_error(err_str);
             assert_eq!(
                 is_unavailable,
                 expected_unavailable,
@@ -1064,12 +1270,14 @@ mod tests {
 
     #[test]
     fn is_tool_unavailable_error_classifies_spawn_failures() {
+        // Only the executor's ENOENT-specific wording — with the em-dash
+        // and question mark — counts. That phrasing is unlikely to appear
+        // in any real tool output naturally.
         assert!(is_tool_unavailable_error(
             "failed to spawn 'nmap' — is it installed?"
         ));
-        assert!(is_tool_unavailable_error("tool not installed: certipy"));
         assert!(is_tool_unavailable_error(
-            "failed to spawn process: No such file"
+            "failed to spawn 'certipy' — is it installed?"
         ));
     }
 
@@ -1078,7 +1286,22 @@ mod tests {
         assert!(!is_tool_unavailable_error("connection refused"));
         assert!(!is_tool_unavailable_error("permission denied"));
         assert!(!is_tool_unavailable_error("invalid arguments"));
-        assert!(!is_tool_unavailable_error("command not found")); // different wording
+        assert!(!is_tool_unavailable_error("command not found"));
+        // The tighter classifier rejects these — they lack the specific
+        // em-dash + question-mark tail. The old, looser matcher tripped
+        // on "not installed" appearing anywhere in tool output.
+        assert!(!is_tool_unavailable_error("tool not installed: certipy"));
+        assert!(!is_tool_unavailable_error(
+            "failed to spawn process: No such file"
+        ));
+        // The executor's transient-spawn wording MUST NOT poison the cache
+        // — that was the whole bug this fix was written to close.
+        assert!(!is_tool_unavailable_error(
+            "transient spawn error for 'nmap' (WouldBlock): Resource temporarily unavailable"
+        ));
+        assert!(!is_tool_unavailable_error(
+            "transient spawn error for 'nmap' (OutOfMemory): Cannot allocate memory"
+        ));
     }
 
     #[test]
@@ -1168,7 +1391,7 @@ mod tests {
 
     #[test]
     fn build_error_response_zeroes_output_and_no_discoveries() {
-        let resp = build_error_response("call-6", "spawn failure".into());
+        let resp = build_error_response("call-6", "spawn failure".into(), None);
         assert_eq!(resp.call_id, "call-6");
         assert!(resp.output.is_empty());
         assert!(resp.discoveries.is_none());
@@ -1177,7 +1400,7 @@ mod tests {
 
     #[test]
     fn build_error_response_serializes_without_discoveries_field() {
-        let resp = build_error_response("call-7", "bad".into());
+        let resp = build_error_response("call-7", "bad".into(), None);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("discoveries"));
         assert!(json.contains("bad"));
@@ -1247,7 +1470,7 @@ mod tests {
     #[test]
     fn build_success_and_error_responses_share_call_id_field() {
         let s = build_success_response("xyz", true, Some(0), "ok".into(), None);
-        let e = build_error_response("xyz", "bad".into());
+        let e = build_error_response("xyz", "bad".into(), None);
         let sj: serde_json::Value = serde_json::to_value(&s).unwrap();
         let ej: serde_json::Value = serde_json::to_value(&e).unwrap();
         assert_eq!(sj["call_id"], "xyz");

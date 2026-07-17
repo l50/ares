@@ -44,6 +44,9 @@ Run Step 0, then **before drawing any conclusion** grep the tail of `orchestrato
 | `tool exited with code Some\(0\)` followed by stderr content | Zero-exit-with-error: wrapper treats stderr-on-zero-exit as transient and re-tries |
 | Same `task_id` shape (e.g. `trust_raise_child_<hex>`) repeated with distinct hex per tick | Dedup key churning instead of blacklisting |
 | `Processing real-time discoveries count=1` ticking every 5s with no other state change | Orchestrator stuck in discovery-replay loop |
+| `Waiting for blue team to finish\.\.\. active_investigations=[0-9]+` ticking every 10s | **Not a wedge — red is DONE.** Op is holding open until blue investigations drain. Check `red_completed_at` / `red_completion_reason` in meta (see Step 0). |
+| `Loki request error \(retryable\)` / `Retrying Loki query after transient failure` flooding the tail | Blue team's external Loki (`loki.dev.plundr.ai`) is flapping; blue investigations grind to a crawl and starve out post-red op close. Not a red bug. |
+| `Tool binary not found \(spawn failed\) — removing from available tools` firing across many recon tools (nmap_scan, enumerate_users, enumerate_shares, smb_signing_check, username_as_password) in the first seconds of the op | Tool-pruning cascade — a prior spawn failure poisoned the worker's per-process `unavailable_tools` HashSet. Deploys don't clear it (workers don't restart); fix is `task ec2:restart EC2_NAME=kali-ares`. Full mechanism + confirmation queries in Step 3.5. |
 
 If you don't see these but the op is slow vs. baseline, escalate to Loki / Tempo for cross-tick LLM latency or tool-call stalls.
 
@@ -51,27 +54,16 @@ If you don't see these but the op is slow vs. baseline, escalate to Loki / Tempo
 
 | Source            | Latency  | Coverage                                        | How to query                                             |
 |-------------------|----------|-------------------------------------------------|----------------------------------------------------------|
-| `task ec2:status` (with `AWS_PROFILE=personal AWS_REGION=us-east-1`) | seconds  | Worker process state, Redis ping                | Bash                                                     |
-| `task ec2:runtime` (same prefix)                                     | seconds  | Per-op token/cost/domain banner                 | Bash                                                     |
-| Loki (Grafana)                                                       | seconds  | Historical `/var/log/ares/*.log` + syslog/auth  | `mcp__grafana__query_loki_logs` (datasourceUid `loki`)   |
-| Tempo (Grafana)                                                      | seconds  | OTEL traces of LLM calls + tool dispatch        | `mcp__grafana__*` Tempo proxy tools                      |
-| SSM `task ec2:exec` (same prefix)                                    | ~5-15s   | Anything on the host (redis-cli, journalctl)    | Bash, never `tail -f`                                    |
-| `task ec2:logs`                                                      | streaming| Live tail of one role's log                     | **DO NOT use in Claude** — it's an interactive SSM session |
+| `task ec2:status` | seconds  | Worker process state, Redis ping                | Bash                                                     |
+| `task ec2:runtime`| seconds  | Per-op token/cost/domain banner                 | Bash                                                     |
+| Loki (Grafana)    | seconds  | Historical `/var/log/ares/*.log` + syslog/auth  | `mcp__grafana__query_loki_logs` (datasourceUid `loki`)   |
+| Tempo (Grafana)   | seconds  | OTEL traces of LLM calls + tool dispatch        | `mcp__grafana__*` Tempo proxy tools                      |
+| SSM `task ec2:exec` | ~5-15s | Anything on the host (redis-cli, journalctl)    | Bash, never `tail -f`                                    |
+| `task ec2:logs`   | streaming| Live tail of one role's log                     | **DO NOT use in Claude** — it's an interactive SSM session |
 
-**Rule:** never run `task ec2:logs` from an agent — it opens an interactive SSM session that won't terminate. Always use Loki (preferred) or `task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 CMD='tail -n 200 /var/log/ares/<role>.log'`.
+**Rule:** never run `task ec2:logs` from an agent — it opens an interactive SSM session that won't terminate. Always use Loki (preferred) or `task ec2:exec EC2_NAME=kali-ares CMD='tail -n 200 /var/log/ares/<role>.log'`.
 
-**AWS auth:** every `task ec2:*` command in this skill must run against the `personal` profile in `us-east-1`. The `lab` SSO profile is unreliable and the EC2 box lives in `us-east-1` under `personal`.
-
-Either export once per shell:
-
-```bash
-export AWS_PROFILE=personal
-export AWS_DEFAULT_REGION=us-east-1
-export TARGET_PROFILE=personal
-export TARGET_REGION=us-east-1
-```
-
-…or prefix every invocation with `AWS_PROFILE=personal AWS_REGION=us-east-1`. The commands below use the prefix form so they're copy-paste-safe in a fresh shell.
+**AWS auth:** use whatever ambient AWS profile has SSM access to the box — do not hard-code one. Ownership of the `kali-ares` instance has moved between profiles/accounts multiple times; a stale prefix (`AWS_PROFILE=personal AWS_REGION=us-east-1`) will produce `No running instance found matching: kali-ares` even when the box is up. Verify resolution with `task ec2:ops EC2_NAME=kali-ares` first; if it fails, try flipping between `lab` and `personal` and between `us-east-1` and `us-west-2`. The command examples below run against the ambient profile — set it explicitly only if the ambient one doesn't resolve the box.
 
 ## Step 0 — mandatory baseline triage (run all in parallel, on every invocation)
 
@@ -79,32 +71,43 @@ Do not skip any of these. Do not respond to the user with a verdict until you've
 
 ```bash
 # 0a. Current op id + status
-task ec2:ops AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares LATEST=true
+task ec2:ops EC2_NAME=kali-ares LATEST=true
 
 # 0b. Current op objective state + tokens
-task ec2:runtime AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares LATEST=true
+task ec2:runtime EC2_NAME=kali-ares LATEST=true
 
 # 0c. Process / Redis / NATS health
-task ec2:status AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares
+task ec2:status EC2_NAME=kali-ares
 
 # 0d. The single most important probe — orchestrator tail. Grep it for the wedge signatures listed above.
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+task ec2:exec EC2_NAME=kali-ares \
   CMD='tail -n 300 /var/log/ares/orchestrator.log'
 
 # 0e. Historical baseline — last several ops, to compare runtime-to-milestone
-ares --ec2 kali-ares --ec2-profile personal --ec2-region us-east-1 ops list | head -20
+ares --ec2 kali-ares ops list | head -20
 
 # 0f. Failed tasks for the current op
-ares --ec2 kali-ares --ec2-profile personal --ec2-region us-east-1 ops tasks --latest --status failed | head -80
+ares --ec2 kali-ares ops tasks --latest --status failed | head -80
 ```
 
 Pull `op-YYYYMMDD-HHMMSS` from 0a/0b and use that as `$OP` below. After collecting:
 
-1. Grep the 0d output for each pattern in the "Tight-loop / wedge signatures" table. **If any hits ≥3 times, you have your root cause; jump to reporting.**
-2. Compare 0b's `Domains compromised` and `Vulns exploited` against the runtime banner of recent ops in 0e. If the prior 3 ops compromised more domains in less time at this point, the current op is regressed regardless of how healthy 0a/0c look.
-3. Read 0f — the failure mode of the first 5-10 failed tasks usually points at the role/tool that's flailing.
+1. **Is red already done?** Before anything else, check `red_completed_at`, `red_completion_reason`, and `red_blocked_on_blue` in the op's meta. If `red_completed_at` is set, red is NOT wedged — it ended (either by success, `"all forests dominated (post-exploitation complete)"`, or by hitting `"max runtime exceeded"`). The op status will still show `running` because the operation as a whole is holding open for blue investigations to drain; that's the "Waiting for blue team to finish" pattern in the wedge table. Don't misdiagnose an ended-red as wedged. One command:
+
+   ```bash
+   task ec2:exec EC2_NAME=kali-ares CMD="sudo redis-cli hmget ares:op:$OP:meta red_completed_at red_completion_reason red_blocked_on_blue has_domain_admin has_golden_ticket"
+   ```
+
+2. Grep the 0d output for each pattern in the "Tight-loop / wedge signatures" table. **If any hits ≥3 times, you have your root cause; jump to reporting.**
+3. Compare 0b's `Domains compromised` and `Vulns exploited` against the runtime banner of recent ops in 0e. If the prior 3 ops compromised more domains in less time at this point, the current op is regressed regardless of how healthy 0a/0c look.
+4. Read 0f — the failure mode of the first 5-10 failed tasks usually points at the role/tool that's flailing.
 
 Only proceed past Step 0 to deeper probes (Loki, Tempo, SSM journals) if none of the above lands a verdict.
+
+**Two footguns in the Step 0 commands themselves — read before you file a "Redis broken" bug:**
+
+- `ares --ec2 kali-ares ops list` (0e/0f) connects to **local** Redis on the machine you're running from, not to the box's Redis over SSM. From an agent host with no `redis-server` and no `ec2:redis:forward` running, it will exit with `Failed to connect to Redis: Connection refused`. That's not "the box is broken" — it's the CLI wanting a live connection. When you see it, fall back to `task ec2:exec EC2_NAME=kali-ares CMD='sudo redis-cli ...'` for anything you'd have asked the CLI for.
+- `redis-cli scard "ares:op:$OP:creds"` (and `:hashes`, `:users`) will return `WRONGTYPE Operation against a key holding the wrong kind of value`. These aren't sets — `:creds` and `:hashes` are lists (`LLEN`), `:users` is a hash (`HLEN`), `:hosts` and `:completed_tasks` are actual sets (`SCARD`). Check with `redis-cli type <key>` first if unsure. This is baked into the Step 3 snapshot script — swap in the right command per key type.
 
 ## Step 1 — fast triage (Loki, last hour)
 
@@ -141,7 +144,7 @@ Use `query_loki_stats` first when you're guessing the selector — it tells you 
 
 ```bash
 task red:multi:tasks:list LATEST=true STATUS=failed   # K8s
-ares --ec2 kali-ares --ec2-profile personal --ec2-region us-east-1 ops tasks --latest --status failed   # EC2
+ares --ec2 kali-ares ops tasks --latest --status failed   # EC2
 ```
 
 Failed tasks include the worker's error message and the role that failed. Cross-reference against Loki by role + timestamp.
@@ -184,15 +187,15 @@ mcp__grafana__query_loki_logs
 
 ```bash
 # SSM: same thing, plus the failure line for the same call_id
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+task ec2:exec EC2_NAME=kali-ares \
   CMD='sudo grep -a "<OP>" /var/log/ares/recon.log /var/log/ares/credential_access.log | grep -a "tool=<T>" | head -20'
 
 # End-to-end trace of one call_id across every worker log
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+task ec2:exec EC2_NAME=kali-ares \
   CMD='sudo grep -a "<call_id>" /var/log/ares/*.log'
 
 # Sanity: is the binary the caller expects actually on the box right now?
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
+task ec2:exec EC2_NAME=kali-ares \
   CMD='which netexec; ls -la /usr/local/bin/netexec /usr/bin/netexec 2>/dev/null; netexec --version 2>&1 | head -3'
 ```
 
@@ -218,9 +221,10 @@ err=failed to spawn 'netexec' — is it installed?
 **The canonical wedge is NOT "tokens flatlined" — tokens almost always keep climbing during a wedge because the LLM re-evaluates the same frozen state every tick.** The canonical wedge is "objective state frozen while tokens climb." Probe state, not tokens:
 
 ```bash
-# Snapshot 1
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares \
-  CMD='redis-cli hmget "ares:op:'"$OP"':meta" has_domain_admin has_golden_ticket target_ips initialized; echo ---; redis-cli scard "ares:op:'"$OP"':creds" 2>/dev/null; redis-cli scard "ares:op:'"$OP"':hashes" 2>/dev/null; redis-cli scard "ares:op:'"$OP"':hosts" 2>/dev/null'
+# Snapshot 1 — mind the type-per-key gotcha in Step 0: :creds/:hashes are LISTs, :users is a HASH,
+# :hosts/:completed_tasks are SETs. Wrong command → WRONGTYPE, which reads as "0" if you don't check.
+task ec2:exec EC2_NAME=kali-ares \
+  CMD='redis-cli hmget "ares:op:'"$OP"':meta" has_domain_admin has_golden_ticket target_ips initialized red_completed_at red_blocked_on_blue; echo ---; redis-cli llen "ares:op:'"$OP"':creds" 2>/dev/null; redis-cli llen "ares:op:'"$OP"':hashes" 2>/dev/null; redis-cli hlen "ares:op:'"$OP"':users" 2>/dev/null; redis-cli scard "ares:op:'"$OP"':hosts" 2>/dev/null; redis-cli scard "ares:op:'"$OP"':completed_tasks" 2>/dev/null'
 # wait 60s
 # Snapshot 2 — same command. Diff the two. Identical = wedge.
 ```
@@ -231,7 +235,7 @@ If wedged, two further probes pinpoint where:
 
 ```bash
 # Outbound HTTPS from orchestrator — zero connections = LLM API stall
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='ORCH=$(pgrep -f "ares orchestrator" | head -1); echo "orch_pid=$ORCH"; sudo ss -tnp 2>/dev/null | grep "pid=$ORCH" | grep -v 127.0.0.1 | wc -l'
+task ec2:exec EC2_NAME=kali-ares CMD='ORCH=$(pgrep -f "ares orchestrator" | head -1); echo "orch_pid=$ORCH"; sudo ss -tnp 2>/dev/null | grep "pid=$ORCH" | grep -v 127.0.0.1 | wc -l'
 ```
 
 ```
@@ -245,16 +249,55 @@ mcp__grafana__query_loki_logs
 Remedy depends on root cause:
 
 - Hot retry loop on a tool (`clearing dedup for retry`) → fix the dedup/blacklist logic in the relevant `automation/auto_*.rs`; in the meantime `task ec2:stop-op ... LATEST=true` to stop the burn.
-- LLM API stall → restart workers, check the model provider's status: `task ec2:restart AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares` (preserves Redis state).
+- LLM API stall → restart workers, check the model provider's status: `task ec2:restart EC2_NAME=kali-ares` (preserves Redis state).
 - State frozen but no signature → escalate to Tempo (Step 7) to find the slow span.
+
+## Step 3.5 — tool-pruning cascade (recon suddenly does nothing)
+
+Distinct failure class from "wedge" and "crash." Signature: the LLM issues a normal task, workers stay `active`, but every recon/credential-access tool the LLM tries is immediately marked `Tool binary not found (spawn failed) — removing from available tools` and the LLM burns through its 24-tool list in seconds without any external effect. The op then presents as slow-vs-baseline with 0 creds / 0 hashes / 0 hosts.
+
+**Grep the LLM runner side for the pattern:**
+
+```bash
+task ec2:exec EC2_NAME=kali-ares CMD="sudo grep -aE 'Tool binary not found \(spawn failed\)' /var/log/ares/orchestrator.log | grep -a '$OP' | grep -oE 'tool=[a-z_]+' | sort | uniq -c | sort -rn"
+```
+
+If a bunch of nxc/netexec-backed tools (`nmap_scan`, `enumerate_users`, `enumerate_shares`, `smb_signing_check`, `check_rdp_reachability`, `check_winrm_reachability`, `username_as_password`, `smb_sweep`) all show up, that's the cascade.
+
+**Mechanism** (three separate files):
+
+1. `ares-tools/src/executor.rs:219` — real spawn failure emits `failed to spawn '<binary>' — is it installed?`.
+2. `ares-cli/src/worker/tool_executor.rs:332-333` (`is_tool_unavailable_error`) — classifies that string as "unavailable" and inserts the tool name into a **per-process `unavailable_tools: HashSet<String>`**. Every subsequent call to that tool on that worker skips the spawn entirely and returns the cached `"Tool 'X' is not installed on this worker. Do not call this tool again — it failed to spawn previously."` response (`tool_executor.rs:318-328`).
+3. `ares-llm/src/agent_loop/runner.rs:60` — `dispatch_one` flattens the worker's `error` field into `output` (`"Error: {err}\n\nPartial output:\n{output}"`), then `runner.rs:532` detects `output.contains("failed to spawn")` and yanks the tool from the LLM's active list for the rest of this task, plus injects a `[SYSTEM]` message telling the LLM to stop trying.
+
+The trap: **one transient spawn failure poisons the tool for the worker's lifetime** — no TTL, no re-probe. Runs whose spawn genuinely failed (a mid-deploy race, an apt lock, an ephemeral cgroup hiccup) leave dead tool entries that persist across every subsequent op the same worker handles.
+
+**And deploys don't restart workers**, so `task ec2:deploy` won't clear the poison. `/proc/<worker-pid>/exe` will point at the pre-deploy inode with `(deleted)` on it (see the Step 8 deploy note).
+
+**Confirmation & fix:**
+
+```bash
+# Check worker uptime — anything > a few hours across multiple ops is suspicious
+task ec2:exec EC2_NAME=kali-ares CMD='systemctl show ares@recon.service -p ActiveEnterTimestamp,MainPID; ps -o pid,etime,cmd -C ares | head -10'
+
+# Verify the binaries actually work from the shell (rules out "genuinely uninstalled")
+task ec2:exec EC2_NAME=kali-ares CMD='which netexec nxc nmap; nxc --version 2>&1 | head -1; nmap --version 2>&1 | head -1'
+
+# If binaries work but pruning still fires → bounce the workers (keeps Redis)
+task ec2:restart EC2_NAME=kali-ares
+```
+
+If the pruning cascade repeats on the very next op with **fresh** workers, the spawn failure is reproducible — probe from inside the worker's cgroup for AppArmor denials, broken Python venvs (nxc/netexec is a pipx shim; `python3 -c 'from nxc.netexec import main'` is a direct test), or `system-ares.slice` restrictions.
+
+Note: `sprayhound`-backed tools (`password_spray`, `asrep_roast`) use a different binary and are unaffected — seeing those still `Executing tool` in the recon.log while nxc-backed tools are pruned is the signature that isolates this to the netexec side.
 
 ## Step 4 — worker crash loop
 
 A specific role keeps respawning. Check systemd journal via SSM:
 
 ```bash
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='systemctl status ares@recon --no-pager | head -30'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='journalctl -u ares@recon -n 100 --no-pager'
+task ec2:exec EC2_NAME=kali-ares CMD='systemctl status ares@recon --no-pager | head -30'
+task ec2:exec EC2_NAME=kali-ares CMD='journalctl -u ares@recon -n 100 --no-pager'
 ```
 
 (Substitute `recon` with the failing role: `credential_access`, `cracker`, `acl`, `privesc`, `lateral`, `coercion`.)
@@ -262,7 +305,7 @@ task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='
 If OOM-killed, check the cgroup:
 
 ```bash
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='dmesg -T | grep -iE "killed process|oom" | tail -20'
+task ec2:exec EC2_NAME=kali-ares CMD='dmesg -T | grep -iE "killed process|oom" | tail -20'
 ```
 
 The system-ares.slice caps memory at 12G global, ~2G per worker (see `.taskfiles/ec2/scripts/setup.sh:160`). Worker OOM = a tool process (netexec, hashcat, etc.) blew up inside the worker's cgroup.
@@ -270,24 +313,24 @@ The system-ares.slice caps memory at 12G global, ~2G per worker (see `.taskfiles
 ## Step 5 — Redis state introspection
 
 ```bash
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='redis-cli ping'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='redis-cli info keyspace'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='redis-cli keys "ares:operation:*" | head -20'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='redis-cli get ares:operation:active'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='redis-cli hgetall "ares:op:'"$OP"':meta"'
+task ec2:exec EC2_NAME=kali-ares CMD='redis-cli ping'
+task ec2:exec EC2_NAME=kali-ares CMD='redis-cli info keyspace'
+task ec2:exec EC2_NAME=kali-ares CMD='redis-cli keys "ares:operation:*" | head -20'
+task ec2:exec EC2_NAME=kali-ares CMD='redis-cli get ares:operation:active'
+task ec2:exec EC2_NAME=kali-ares CMD='redis-cli hgetall "ares:op:'"$OP"':meta"'
 ```
 
 For loot or shared state, prefer the typed CLI over raw Redis:
 
 ```bash
-task ec2:loot AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares LATEST=true        # users, creds, hashes, hosts
-task ec2:loot AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares LATEST=true DIFF=true  # only what changed since last call
+task ec2:loot EC2_NAME=kali-ares LATEST=true        # users, creds, hashes, hosts
+task ec2:loot EC2_NAME=kali-ares LATEST=true DIFF=true  # only what changed since last call
 ```
 
 To run blue-team queries or arbitrary `ares` commands against EC2 Redis locally, port-forward:
 
 ```bash
-task ec2:redis:forward AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares   # blocks in foreground — DO NOT run from an agent
+task ec2:redis:forward EC2_NAME=kali-ares   # blocks in foreground — DO NOT run from an agent
 ```
 
 If you need local access from an agent, use `ec2:exec` with `redis-cli` instead.
@@ -297,9 +340,9 @@ If you need local access from an agent, use `ec2:exec` with `redis-cli` instead.
 NATS is the task/RPC broker. If workers are alive but no tasks dispatch:
 
 ```bash
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='curl -s http://127.0.0.1:8222/varz | jq ".connections, .in_msgs, .out_msgs, .slow_consumers"'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='curl -s http://127.0.0.1:8222/connz | jq ".num_connections, [.connections[].name]"'
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='systemctl status nats-server --no-pager | head -15'
+task ec2:exec EC2_NAME=kali-ares CMD='curl -s http://127.0.0.1:8222/varz | jq ".connections, .in_msgs, .out_msgs, .slow_consumers"'
+task ec2:exec EC2_NAME=kali-ares CMD='curl -s http://127.0.0.1:8222/connz | jq ".num_connections, [.connections[].name]"'
+task ec2:exec EC2_NAME=kali-ares CMD='systemctl status nats-server --no-pager | head -15'
 ```
 
 ## Step 7 — OTEL traces (LLM + tool call timing)
@@ -315,7 +358,7 @@ Useful when:
 If Tempo search returns nothing, the orchestrator may not be exporting — verify with:
 
 ```bash
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='grep OTEL_EXPORTER /etc/ares/env'
+task ec2:exec EC2_NAME=kali-ares CMD='grep OTEL_EXPORTER /etc/ares/env'
 ```
 
 ## Step 8 — verify deploy state (binary mismatch)
@@ -324,8 +367,8 @@ A common false positive: the local CLI and the EC2 binary diverge.
 
 ```bash
 ares --version                                                                                                          # local
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='/usr/local/bin/ares --version'          # remote
-task ec2:exec AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares CMD='stat -c "%y %s" /usr/local/bin/ares'    # mtime + size
+task ec2:exec EC2_NAME=kali-ares CMD='/usr/local/bin/ares --version'          # remote
+task ec2:exec EC2_NAME=kali-ares CMD='stat -c "%y %s" /usr/local/bin/ares'    # mtime + size
 ```
 
 If you just landed code, re-deploy before continuing to debug. Canonical "upload updated code, then run a fresh op against dreadgoad" one-liner (Apple-Silicon-safe — `DOCKER_DEFAULT_PLATFORM` forces an x86 build, the S3 bucket is the alpha-operator-range artifact store):
@@ -335,12 +378,18 @@ DOCKER_DEFAULT_PLATFORM=linux/amd64 task -y ec2:deploy EC2_NAME=kali-ares S3_BUC
   && task -y red:ec2:multi TARGET=dreadgoad EC2_NAME=kali-ares
 ```
 
-(Both halves rely on `AWS_PROFILE=personal AWS_REGION=us-east-1` being exported or prefixed. Drop the `&&` and run just the first half for a deploy-only.)
+(Both halves rely on the ambient AWS profile resolving `kali-ares` — see the "AWS auth" note above. Drop the `&&` and run just the first half for a deploy-only.)
+
+**After every deploy, restart the workers** — `task ec2:deploy` writes the new binary to `/usr/local/bin/ares` but does NOT restart `ares@<role>.service`. Workers keep running the old in-memory binary (`/proc/<pid>/exe` will show `(deleted)`), and any per-process state (like `unavailable_tools`, see Step 3) survives the deploy. Follow every deploy with:
+
+```bash
+task ec2:restart EC2_NAME=kali-ares   # bounces all ares@<role>.service units, keeps Redis
+```
 
 Faster deploy-only when you don't need to publish to S3 (builds natively on EC2):
 
 ```bash
-task ec2:deploy AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares BUILD_TOOL=remote
+task ec2:deploy EC2_NAME=kali-ares BUILD_TOOL=remote
 ```
 
 ## Step 9 — kill, clear, retry (last resort)
@@ -348,15 +397,15 @@ task ec2:deploy AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares BUI
 Don't do this until you've captured logs and runtime — these are destructive.
 
 ```bash
-task ec2:stop-op AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares LATEST=true   # graceful stop of one op
-task ec2:stop    AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares                # stop all workers (keeps Redis)
-task ec2:restart AWS_PROFILE=personal AWS_REGION=us-east-1 EC2_NAME=kali-ares                # restart workers (keeps Redis state)
+task ec2:stop-op EC2_NAME=kali-ares LATEST=true   # graceful stop of one op
+task ec2:stop    EC2_NAME=kali-ares                # stop all workers (keeps Redis)
+task ec2:restart EC2_NAME=kali-ares                # restart workers (keeps Redis state)
 ```
 
 To actually wipe state, use the CLI cleanup command instead of FLUSHALL:
 
 ```bash
-ares --ec2 kali-ares --ec2-profile personal --ec2-region us-east-1 ops cleanup --max-age-hours 0
+ares --ec2 kali-ares ops cleanup --max-age-hours 0
 ```
 
 ## K8s deployment notes

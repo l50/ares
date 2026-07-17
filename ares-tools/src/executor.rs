@@ -1,12 +1,57 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::process::Command;
 
 use crate::ToolOutput;
 
 /// Default timeout for tool execution (2 minutes).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Typed marker attached to the `anyhow::Error` chain when
+/// [`CommandBuilder::execute`] fails at `Command::spawn` time. Callers that
+/// need to distinguish "binary genuinely absent" from "transient OS refusal"
+/// downcast the error via [`spawn_error_kind`] instead of string-matching
+/// the human-readable message — the wording is asserted in `executor::tests`
+/// but the typed variant is the authoritative signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnErrorKind {
+    /// Raw `io::ErrorKind` from the failed `spawn()` call. `NotFound`
+    /// means ENOENT and is the only kind that warrants long-term caching
+    /// as "tool unavailable"; everything else is transient.
+    pub io_kind: std::io::ErrorKind,
+}
+
+impl SpawnErrorKind {
+    /// True iff the kernel returned ENOENT — i.e. the binary is genuinely
+    /// absent from the worker's PATH. Safe to cache and prune on.
+    pub fn is_not_found(self) -> bool {
+        self.io_kind == std::io::ErrorKind::NotFound
+    }
+}
+
+impl std::fmt::Display for SpawnErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "spawn error kind: {:?}", self.io_kind)
+    }
+}
+
+impl std::error::Error for SpawnErrorKind {}
+
+/// Return the [`SpawnErrorKind`] attached to an `anyhow::Error` by
+/// [`CommandBuilder::execute`], if any.
+///
+/// Consumers of tool-dispatch errors (worker classifier, runner pruning
+/// check) should prefer this over string-matching. The string wording is
+/// preserved for backward compatibility with in-flight rollouts.
+///
+/// Uses `anyhow::Error::downcast_ref` — which walks every attached
+/// context and the root cause — rather than `err.chain()`, which only
+/// exposes the source chain via `std::error::Error::source()` and misses
+/// values attached with `.context(...)`.
+pub fn spawn_error_kind(err: &anyhow::Error) -> Option<SpawnErrorKind> {
+    err.downcast_ref::<SpawnErrorKind>().copied()
+}
 
 /// Map a program name to a prioritized list of candidate executables that
 /// satisfy the same role. Used to recover when an image ships a broken or
@@ -214,9 +259,36 @@ impl CommandBuilder {
         // (tokio's default is to leave the child running on drop).
         cmd.kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn '{}' — is it installed?", self.program))?;
+        // Only ENOENT (binary genuinely absent from PATH) uses the permanent
+        // "failed to spawn ... is it installed?" wording that downstream code
+        // caches on. Every other spawn error — EAGAIN (fork resource
+        // pressure), ENOMEM, EMFILE (fd exhaustion), EACCES (transient
+        // AppArmor/SELinux denial), I/O errors reading /proc — is transient
+        // and must NOT poison the tool for the worker's lifetime or prune it
+        // from the LLM's tool set. The executor is the single source of truth
+        // for this distinction; upstream classifiers prefer the typed
+        // [`SpawnErrorKind`] attached below and fall back to string matching
+        // for backward compatibility with in-flight rollouts.
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let io_kind = e.kind();
+                let msg = if io_kind == std::io::ErrorKind::NotFound {
+                    format!("failed to spawn '{}' — is it installed?", self.program)
+                } else {
+                    format!(
+                        "transient spawn error for '{}' ({io_kind:?}): {e}",
+                        self.program
+                    )
+                };
+                // Attach the typed marker before the human-readable context so
+                // `spawn_error_kind()` on the returned error can recover the
+                // discriminator without ever inspecting the message string.
+                return Err(anyhow::Error::new(e)
+                    .context(SpawnErrorKind { io_kind })
+                    .context(msg));
+            }
+        };
 
         if let Some(data) = &self.stdin_data {
             use tokio::io::AsyncWriteExt;
@@ -530,6 +602,96 @@ mod tests {
         assert!(
             !alive,
             "child pid {pid} is still alive after timeout — abort/kill path is broken"
+        );
+    }
+
+    // ── ENOENT wording contract ──────────────────────────────────────────────
+    //
+    // Three separate call sites in three separate crates key off the exact
+    // phrasing this code emits when `Command::spawn()` returns
+    // `io::ErrorKind::NotFound`:
+    //
+    //   1. `ares-cli/src/worker/tool_executor.rs::is_tool_unavailable_error`
+    //      requires both "failed to spawn" AND "is it installed?".
+    //   2. `ares-llm/src/agent_loop/runner.rs`'s pruning check uses the same
+    //      pair as a string-fallback alongside the typed `ToolFailureKind`.
+    //   3. Log-grep patterns in `.claude/skills/ares-debug/SKILL.md` (Step 3.5)
+    //      match on this phrase to identify the tool-pruning cascade.
+    //
+    // If the wording drifts, the classifier silently stops firing and one
+    // ENOENT quietly stops nuking recon primitives — but transient spawn
+    // errors also stop being distinguishable. Lock the wording here.
+
+    #[tokio::test]
+    async fn spawn_of_missing_binary_uses_enoent_wording() {
+        let result = CommandBuilder::new("definitely-not-a-real-binary-xyz-9999")
+            .execute()
+            .await;
+
+        let err = result.expect_err("spawn of a non-existent binary must fail");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("failed to spawn"),
+            "ENOENT wording missing 'failed to spawn': {msg}"
+        );
+        assert!(
+            msg.contains("is it installed?"),
+            "ENOENT wording missing 'is it installed?': {msg}"
+        );
+        assert!(
+            msg.contains("definitely-not-a-real-binary-xyz-9999"),
+            "ENOENT wording must include the program name: {msg}"
+        );
+        assert!(
+            !msg.contains("transient spawn error"),
+            "ENOENT must NOT be classified as transient: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_of_missing_binary_attaches_typed_kind() {
+        // The typed SpawnErrorKind is the authoritative classifier signal
+        // for downstream callers. If this ever fails, the string wording
+        // above is the ONLY thing keeping the worker cache honest — and
+        // the whole point of the enum was to stop relying on string
+        // matching. So both the wording AND the typed kind must pass.
+        let err = CommandBuilder::new("still-not-a-real-binary-xyz-5555")
+            .execute()
+            .await
+            .expect_err("spawn of a non-existent binary must fail");
+
+        let kind = spawn_error_kind(&err)
+            .expect("SpawnErrorKind must be attached to the anyhow chain on spawn failure");
+        assert_eq!(
+            kind.io_kind,
+            std::io::ErrorKind::NotFound,
+            "ENOENT must be reported as NotFound, got {:?}",
+            kind.io_kind
+        );
+        assert!(
+            kind.is_not_found(),
+            "SpawnErrorKind::is_not_found() must be true for ENOENT"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_of_missing_binary_is_not_labeled_transient() {
+        // Belt-and-suspenders: the transient branch is exercised only for
+        // non-NotFound `io::ErrorKind`s, which are hard to synthesise
+        // portably (EAGAIN needs fork exhaustion). But we CAN assert the
+        // negative: an ENOENT must never be labelled transient, or the
+        // worker cache stops poisoning genuinely-missing binaries and the
+        // LLM burns steps re-calling them every task.
+        let err = CommandBuilder::new("another-definitely-fake-binary-abc-1234")
+            .execute()
+            .await
+            .expect_err("spawn must fail");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is it installed?") && !msg.contains("transient"),
+            "ENOENT must land in the permanent branch: {msg}"
         );
     }
 }

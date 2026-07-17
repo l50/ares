@@ -1392,6 +1392,7 @@ mod tests {
             output: "Msg 18456 Login failed".into(),
             error: Some("exit 1".into()),
             discoveries: None,
+            failure_kind: None,
         });
         let outcome = classify_probe_result(&result);
         match outcome {
@@ -1410,6 +1411,7 @@ mod tests {
                 .into(),
             error: None,
             discoveries: None,
+            failure_kind: None,
         });
         assert!(matches!(
             classify_probe_result(&result),
@@ -1423,6 +1425,7 @@ mod tests {
             output: "SQL> EXEC (...)\n(0 rows affected)".into(),
             error: None,
             discoveries: None,
+            failure_kind: None,
         });
         assert!(matches!(
             classify_probe_result(&result),

@@ -167,13 +167,32 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                     output: combined,
                     error,
                     discoveries,
+                    failure_kind: if output.success {
+                        None
+                    } else {
+                        Some(ares_llm::ToolFailureKind::ToolError)
+                    },
                 })
             }
-            Err(e) => Ok(ToolExecResult {
-                output: String::new(),
-                error: Some(e.to_string()),
-                discoveries: None,
-            }),
+            Err(e) => {
+                // Classify the spawn error via the typed marker so the
+                // in-process LocalToolDispatcher matches the NATS path's
+                // pruning behavior exactly (BinaryNotFound → prune,
+                // TransientSpawn → do not prune).
+                let failure_kind = ares_tools::spawn_error_kind(&e).map(|kind| {
+                    if kind.is_not_found() {
+                        ares_llm::ToolFailureKind::BinaryNotFound
+                    } else {
+                        ares_llm::ToolFailureKind::TransientSpawn
+                    }
+                });
+                Ok(ToolExecResult {
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                    discoveries: None,
+                    failure_kind,
+                })
+            }
         }
     }
 }

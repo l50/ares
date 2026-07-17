@@ -14,6 +14,8 @@ pub mod cracker;
 pub mod credential_access;
 pub mod credentials;
 pub mod executor;
+
+pub use executor::{spawn_error_kind, SpawnErrorKind};
 pub mod filter;
 pub mod lateral;
 pub mod parsers;

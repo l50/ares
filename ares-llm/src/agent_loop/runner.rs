@@ -33,13 +33,26 @@ use super::retry::call_with_retry;
 use super::session_log::SessionLog;
 use super::types::{
     AgentLoopOutcome, CallbackHandler, CallbackResult, LoopEndReason, ToolDispatcher,
-    ToolExecResult,
+    ToolExecResult, ToolFailureKind,
 };
 
 /// Result of dispatching a single tool call.
 struct DispatchResult {
     call_id: String,
     output: String,
+    /// Worker-reported error, preserved separately from `output` so the
+    /// spawn-failure pruning check keys off the typed error field rather
+    /// than substring-matching the LLM-visible combined text. Flattening
+    /// used to let a legitimate tool trace that mentioned "failed to spawn"
+    /// (e.g. an nxc report of a service failing to start on the target)
+    /// silently prune the tool from the LLM's active set.
+    error: Option<String>,
+    /// Typed classification of the failure carried through from the
+    /// worker's `ToolExecResponse`. Load-bearing for the pruning check:
+    /// `Some(BinaryNotFound)` prunes, `Some(TransientSpawn)` does NOT,
+    /// `None` falls back to the string classifier for backward
+    /// compatibility with in-flight rollouts.
+    failure_kind: Option<ToolFailureKind>,
     discoveries: Option<serde_json::Value>,
 }
 
@@ -56,15 +69,20 @@ async fn dispatch_one(
                 output,
                 error,
                 discoveries,
+                failure_kind,
             } = result;
-            let output = if let Some(err) = error {
+            // Preserve `error` for the pruning classifier while still
+            // surfacing it to the LLM in the tool-result body.
+            let combined = if let Some(ref err) = error {
                 format!("Error: {err}\n\nPartial output:\n{output}")
             } else {
                 output
             };
             DispatchResult {
                 call_id: call.id,
-                output,
+                output: combined,
+                error,
+                failure_kind,
                 discoveries,
             }
         }
@@ -74,12 +92,46 @@ async fn dispatch_one(
                 err = %e,
                 "Tool dispatch failed"
             );
+            let err_str = e.to_string();
             DispatchResult {
                 call_id: call.id,
-                output: format!("Tool execution failed: {e}"),
+                output: format!("Tool execution failed: {err_str}"),
+                error: Some(err_str),
+                // Dispatch itself failed (transport error, timeout, panic) —
+                // we don't have a worker-side classification. String fallback
+                // in the pruning site will decide.
+                failure_kind: None,
                 discoveries: None,
             }
         }
+    }
+}
+
+/// Return `true` iff a `DispatchResult` should prune the tool from the
+/// LLM's active set for the rest of the current task. Prefers the typed
+/// `failure_kind` variant; falls back to substring-matching the error
+/// string so an in-flight rollout where the runner has the new logic but
+/// the worker predates the typed field still handles ENOENT correctly.
+///
+/// Extracted so the contract can be unit-tested without spinning up an
+/// entire agent loop. Locks in the invariant that:
+/// - `Some(BinaryNotFound)` prunes.
+/// - `Some(TransientSpawn)` does NOT — one transient spawn error used to
+///   nuke recon primitives for the rest of the op; that's the whole
+///   reason `ToolFailureKind` exists.
+/// - `Some(ToolError)` does NOT — tool ran and returned non-zero, that's
+///   a tool-logic issue for the LLM to reason about, not a missing binary.
+/// - `None` falls back to the string classifier, which requires BOTH the
+///   `"failed to spawn"` prefix AND the `"is it installed?"` tail (per
+///   `ares-tools/src/executor.rs` ENOENT wording, locked by its tests).
+fn should_prune_for_spawn_failure(dr: &DispatchResult) -> bool {
+    match dr.failure_kind {
+        Some(ToolFailureKind::BinaryNotFound) => true,
+        Some(ToolFailureKind::TransientSpawn) | Some(ToolFailureKind::ToolError) => false,
+        None => dr
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("failed to spawn") && e.contains("is it installed?")),
     }
 }
 
@@ -525,16 +577,31 @@ async fn run_agent_loop_inner(p: RunAgentLoopInnerParams<'_>) -> AgentLoopOutcom
                 *count += 1;
 
                 if let Some(dr) = results.iter().find(|r| r.call_id == call.id) {
-                    // Detect spawn failures (binary not found) and mark tool for removal.
-                    // Only match the executor's own error message pattern — NOT arbitrary
-                    // tool output that happens to contain "not installed" (e.g., a target
-                    // host saying some service is "not installed" in its response).
-                    let is_spawn_failure = dr.output.contains("failed to spawn");
-                    if is_spawn_failure {
+                    // Only remove the tool on a confirmed ENOENT (worker reports
+                    // `ToolFailureKind::BinaryNotFound`, or its error string
+                    // carries the executor's `failed to spawn ... is it installed?`
+                    // wording as a legacy-worker fallback). Transient spawn
+                    // errors (EAGAIN/ENOMEM/EMFILE, /proc I/O hiccups, transient
+                    // AppArmor/SELinux denials) surface as `TransientSpawn` and
+                    // MUST NOT prune — one transient failure at t=0 used to nuke
+                    // the tool for the rest of the op, taking every worker-backed
+                    // recon primitive down with it.
+                    //
+                    // The typed `failure_kind` is authoritative; the string
+                    // fallback exists so a runner that landed the new logic
+                    // ahead of a matching worker rebuild still handles ENOENT.
+                    // Anchor on the em-dash `— is it installed?` tail — unlikely
+                    // to appear in real tool output — and require BOTH substrings
+                    // so legitimate tool traces mentioning "failed to spawn"
+                    // (e.g. an nxc report of a service failing to start on the
+                    // target) do not silently prune the tool.
+                    if should_prune_for_spawn_failure(dr) {
                         warn!(
                             tool = %call.name,
                             task_id = task_id,
-                            "Tool binary not found (spawn failed) — removing from available tools"
+                            reason = %dr.error.as_deref().unwrap_or(""),
+                            failure_kind = ?dr.failure_kind,
+                            "Tool binary not found (ENOENT from worker) — removing from available tools for the rest of this task"
                         );
                         tools_to_remove.push(call.name.clone());
                     }
@@ -1114,5 +1181,116 @@ mod runner_tests {
         assert!(!should_inject_wrapup_nudge(0, 5, false));
         // Boundary: max_steps == threshold+1 → first valid case.
         assert!(should_inject_wrapup_nudge(1, 6, false));
+    }
+
+    // ── should_prune_for_spawn_failure: pruning contract ─────────────────────
+    //
+    // The whole point of the ToolFailureKind split. These tests lock in the
+    // invariant that ONLY confirmed ENOENT prunes a tool from the LLM's
+    // active set. Transient spawn errors (EAGAIN/ENOMEM/EMFILE, transient
+    // AppArmor/SELinux denials) and non-spawn errors (timeouts, arg
+    // validation, tool exited non-zero) must NOT prune — one transient at
+    // t=0 used to kill recon primitives for the rest of the op.
+
+    fn dr_with(error: Option<&str>, failure_kind: Option<ToolFailureKind>) -> DispatchResult {
+        DispatchResult {
+            call_id: "call-1".into(),
+            output: String::new(),
+            error: error.map(str::to_string),
+            failure_kind,
+            discoveries: None,
+        }
+    }
+
+    #[test]
+    fn prune_only_on_binary_not_found_typed_kind() {
+        assert!(
+            should_prune_for_spawn_failure(&dr_with(
+                Some("failed to spawn 'nmap' — is it installed?"),
+                Some(ToolFailureKind::BinaryNotFound),
+            )),
+            "ENOENT with typed BinaryNotFound must prune"
+        );
+    }
+
+    #[test]
+    fn do_not_prune_on_transient_spawn_kind() {
+        // The exact scenario that was silently killing recon: EAGAIN /
+        // ENOMEM / EMFILE at spawn time. Worker reports TransientSpawn;
+        // the runner MUST leave the tool available for the next task step.
+        let dr = dr_with(
+            Some("transient spawn error for 'nmap' (WouldBlock): Resource temporarily unavailable"),
+            Some(ToolFailureKind::TransientSpawn),
+        );
+        assert!(
+            !should_prune_for_spawn_failure(&dr),
+            "TransientSpawn must NEVER prune — one bad spawn used to nuke the tool for the whole op"
+        );
+    }
+
+    #[test]
+    fn do_not_prune_on_tool_error_kind() {
+        // Tool ran to completion but exited non-zero. That's a tool-logic
+        // failure the LLM should reason about (bad args, target down,
+        // Kerberos error). Not a spawn failure.
+        let dr = dr_with(
+            Some("tool exited with code Some(2)"),
+            Some(ToolFailureKind::ToolError),
+        );
+        assert!(!should_prune_for_spawn_failure(&dr));
+    }
+
+    #[test]
+    fn do_not_prune_on_success() {
+        // failure_kind absent + no error → success. Never prunes.
+        assert!(!should_prune_for_spawn_failure(&dr_with(None, None)));
+    }
+
+    #[test]
+    fn legacy_worker_string_fallback_still_prunes_enoent() {
+        // Backward-compat window: a runner that landed the new logic
+        // ahead of a matching worker rebuild sees `failure_kind: None`
+        // but the worker's error string still carries the executor's
+        // ENOENT wording. Must still prune, otherwise ENOENT tools
+        // silently keep getting re-called.
+        let dr = dr_with(Some("failed to spawn 'netexec' — is it installed?"), None);
+        assert!(
+            should_prune_for_spawn_failure(&dr),
+            "string-fallback must catch legacy-worker ENOENT wording"
+        );
+    }
+
+    #[test]
+    fn string_fallback_requires_both_substrings() {
+        // Guard against tool output that mentions "failed to spawn" for
+        // an unrelated reason (nxc reporting a service that failed to
+        // spawn ON THE TARGET, for example). The em-dash tail is the
+        // authoritative disambiguator.
+        assert!(!should_prune_for_spawn_failure(&dr_with(
+            Some("nxc trace: service 'CIFS' failed to spawn on the target"),
+            None,
+        )));
+        // And require both — the tail alone in a random tool trace also
+        // shouldn't trip.
+        assert!(!should_prune_for_spawn_failure(&dr_with(
+            Some("is it installed? Yes, the CA is installed."),
+            None,
+        )));
+    }
+
+    #[test]
+    fn typed_kind_authoritative_over_error_string() {
+        // If the worker reports TransientSpawn but the error string
+        // happens to contain the ENOENT phrasing (shouldn't happen in
+        // practice, but the classifier must not be tricked), the typed
+        // variant wins and we don't prune.
+        let dr = dr_with(
+            Some("failed to spawn 'nmap' — is it installed?"),
+            Some(ToolFailureKind::TransientSpawn),
+        );
+        assert!(
+            !should_prune_for_spawn_failure(&dr),
+            "typed TransientSpawn must override any misleading error string"
+        );
     }
 }

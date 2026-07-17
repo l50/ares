@@ -53,6 +53,12 @@ pub struct ToolExecResponse {
     /// Structured discoveries parsed by the worker from tool output.
     #[serde(default)]
     pub discoveries: Option<serde_json::Value>,
+    /// Typed classification of a failure, when the worker resolved one.
+    /// `None` on success and for legacy workers that predate the field —
+    /// the runner's pruning check falls back to string matching in that
+    /// case (see `runner.rs` around the ENOENT prune site).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<ares_llm::ToolFailureKind>,
 }
 
 /// Default timeout waiting for a tool result (95 minutes).

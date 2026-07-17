@@ -650,6 +650,7 @@ mod tests {
                 output: "mock result".to_string(),
                 error: None,
                 discoveries: None,
+                failure_kind: None,
             })
         }
     }

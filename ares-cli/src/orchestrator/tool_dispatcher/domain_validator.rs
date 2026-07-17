@@ -114,6 +114,8 @@ pub(super) async fn check_domain_arg(
         output: String::new(),
         error: Some(message),
         discoveries: None,
+        // Pre-dispatch rejection — no spawn attempted, so no spawn kind.
+        failure_kind: None,
     })
 }
 
@@ -225,6 +227,8 @@ pub(super) async fn check_cross_realm_auth(
         output: String::new(),
         error: Some(message),
         discoveries: None,
+        // Pre-dispatch rejection — no spawn attempted, so no spawn kind.
+        failure_kind: None,
     })
 }
 
