@@ -854,7 +854,7 @@ tasks:
           export AWS_PROFILE="{{.AWS_PROFILE}}"
           export AWS_REGION="{{.AWS_REGION}}"
           . .taskfiles/ec2/scripts/run-ssm.sh
-          INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+          INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
           echo "EC2 instance: $INSTANCE_ID"
 
           # Set active operation pointer in Redis via SSM
@@ -877,7 +877,7 @@ tasks:
           export AWS_PROFILE="{{.AWS_PROFILE}}"
           export AWS_REGION="{{.AWS_REGION}}"
           . .taskfiles/ec2/scripts/run-ssm.sh
-          INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+          INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
 
           echo "Submitting operation to EC2 orchestrator..."
 

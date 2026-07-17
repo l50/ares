@@ -584,7 +584,7 @@ tasks:
         export AWS_PROFILE="{{.AWS_PROFILE}}"
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
-        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+        INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
         if [ -z "$INSTANCE_ID" ]; then
           echo -e "{{.ERROR}} no running EC2 matching {{.EC2_NAME}}"; exit 1
         fi
@@ -613,7 +613,7 @@ tasks:
         export AWS_PROFILE="{{.AWS_PROFILE}}"
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
-        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+        INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
         echo -e "{{.INFO}} wiping novelty memory (all scopes)"
         run_ssm_cmd "$INSTANCE_ID" \
           'redis-cli --scan --pattern "ares:novelty:*:steps" | xargs -r redis-cli del' \
@@ -655,7 +655,7 @@ tasks:
         export AWS_PROFILE="{{.AWS_PROFILE}}"
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
-        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+        INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
         while read -r op; do
           op=${op%% *}
           [ -z "$op" ] && continue

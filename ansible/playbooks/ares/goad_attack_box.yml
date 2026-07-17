@@ -26,6 +26,10 @@
   gather_facts: true
   become: true
 
+  vars_files:
+    # Shared with logrotate.yml so bake-time and runtime hot-apply cannot drift.
+    - vars/logrotate.yml
+
   vars:
     # Environment configuration
     alloy_env: "{{ lookup('env', 'ENVIRONMENT') | default('goad', true) }}"
@@ -261,6 +265,11 @@
               url = "{{ alloy_loki_endpoint }}"
             }
           }
+
+    # Rotate /var/log/ares/*.log so ingest.log (JSONL firehose) and the
+    # per-role worker logs don't fill the root FS between AMI rebakes.
+    # Rotation vars come from vars/logrotate.yml (shared with logrotate.yml).
+    - role: cowdogmoo.workstation.logging
 
   post_tasks:
     - name: Setup shell history file permissions for Alloy

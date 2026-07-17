@@ -184,7 +184,7 @@ tasks:
         export AWS_PROFILE="{{.AWS_PROFILE}}"
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
-        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
+        INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
         ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true

@@ -3,7 +3,7 @@
 #
 # Source from a task cmd block, then call the functions:
 #     . .taskfiles/ec2/scripts/run-ssm.sh
-#     INSTANCE_ID=$(resolve_instance "$EC2_NAME")
+#     INSTANCE_ID=$(resolve_instance_id "$EC2_NAME")
 #     run_ssm_cmd "$INSTANCE_ID" "redis-cli ping" 30
 #
 # Required in the caller's environment: AWS_PROFILE, AWS_REGION.
@@ -18,51 +18,16 @@
 
 set -o pipefail
 
-# resolve_instance <name-tag-glob>
-#   Prints a single running InstanceId whose Name tag matches *<name>*.
-#   When multiple instances match, picks the most recently launched (with
-#   InstanceId as a deterministic tiebreaker) and warns to stderr so the
+# _resolve_ec2 <name-tag-glob>
+#   Prints the newest matching "<LaunchTime>\t<InstanceId>\t<PrivateIpAddress>"
+#   row on stdout. Sort is LaunchTime desc, InstanceId tiebreaker, so repeated
+#   calls always return the same box. On multi-match, warns to stderr so the
 #   ambiguity is surfaced instead of silently swallowed by `head -1`.
-#   Set EC2_INSTANCE_ID to bypass the tag lookup entirely.
-#   Returns non-zero if nothing matches.
-resolve_instance() {
+#   Returns non-zero if nothing matches. Internal helper for resolve_instance_id
+#   / resolve_instance_ip.
+_resolve_ec2() {
 	local name="$1"
-	local candidates instance_id count
-	if [ -n "${EC2_INSTANCE_ID:-}" ]; then
-		printf '%s' "$EC2_INSTANCE_ID"
-		return 0
-	fi
-	# Rows are `<LaunchTime>\t<InstanceId>`; sort by launch time desc, then
-	# InstanceId as tiebreaker so repeated calls always return the same box.
-	candidates=$(aws ec2 describe-instances \
-		--profile "$AWS_PROFILE" \
-		--region "$AWS_REGION" \
-		--filters "Name=instance-state-name,Values=running" \
-		"Name=tag:Name,Values=*${name}*" \
-		--query "Reservations[*].Instances[*].[LaunchTime,InstanceId]" \
-		--output text | awk 'NF==2' | sort -k1,1r -k2,2)
-	if [ -z "$candidates" ]; then
-		printf '\033[0;31m[ERROR]\033[0m No running instance found matching: %s\n' "$name" >&2
-		return 1
-	fi
-	instance_id=$(printf '%s\n' "$candidates" | head -1 | awk '{print $2}')
-	count=$(printf '%s\n' "$candidates" | wc -l | tr -d ' ')
-	if [ "$count" -gt 1 ]; then
-		printf '\033[1;33m[WARN]\033[0m %s instances match "*%s*"; picking newest (%s). Set EC2_INSTANCE_ID or use a more specific name to pin.\n' \
-			"$count" "$name" "$instance_id" >&2
-		printf '%s\n' "$candidates" | awk '{printf "  %s  %s\n", $2, $1}' >&2
-	fi
-	printf '%s' "$instance_id"
-}
-
-# resolve_instance_ip <name-tag-glob>
-#   Prints the PrivateIpAddress of a single running instance whose Name tag
-#   matches *<name>*. Same determinism/WARN semantics as resolve_instance:
-#   sorted by LaunchTime desc, InstanceId tiebreaker, WARN on multi-match.
-#   Returns non-zero if nothing matches.
-resolve_instance_ip() {
-	local name="$1"
-	local candidates picked_id picked_ip count
+	local candidates picked count _launch picked_id picked_ip
 	candidates=$(aws ec2 describe-instances \
 		--profile "$AWS_PROFILE" \
 		--region "$AWS_REGION" \
@@ -74,14 +39,39 @@ resolve_instance_ip() {
 		printf '\033[0;31m[ERROR]\033[0m No running instance found matching: %s\n' "$name" >&2
 		return 1
 	fi
-	read -r _launch picked_id picked_ip <<<"$(printf '%s\n' "$candidates" | head -1)"
+	picked=$(printf '%s\n' "$candidates" | head -1)
 	count=$(printf '%s\n' "$candidates" | wc -l | tr -d ' ')
 	if [ "$count" -gt 1 ]; then
-		printf '\033[1;33m[WARN]\033[0m %s instances match "*%s*"; picking newest (%s / %s). Use a more specific name to pin.\n' \
+		read -r _launch picked_id picked_ip <<<"$picked"
+		printf '\033[1;33m[WARN]\033[0m %s instances match "*%s*"; picking newest (%s / %s). Set EC2_INSTANCE_ID or use a more specific name to pin.\n' \
 			"$count" "$name" "$picked_id" "$picked_ip" >&2
 		printf '%s\n' "$candidates" | awk '{printf "  %s  %s  %s\n", $2, $3, $1}' >&2
 	fi
-	printf '%s' "$picked_ip"
+	printf '%s' "$picked"
+}
+
+# resolve_instance_id <name-tag-glob>
+#   Prints a single running InstanceId whose Name tag matches *<name>*.
+#   Set EC2_INSTANCE_ID to bypass the tag lookup entirely.
+#   Returns non-zero if nothing matches.
+resolve_instance_id() {
+	if [ -n "${EC2_INSTANCE_ID:-}" ]; then
+		printf '%s' "$EC2_INSTANCE_ID"
+		return 0
+	fi
+	local row
+	row=$(_resolve_ec2 "$1") || return 1
+	awk '{printf "%s", $2}' <<<"$row"
+}
+
+# resolve_instance_ip <name-tag-glob>
+#   Prints the PrivateIpAddress of a single running instance whose Name tag
+#   matches *<name>*. Same determinism/WARN semantics as resolve_instance_id.
+#   Returns non-zero if nothing matches.
+resolve_instance_ip() {
+	local row
+	row=$(_resolve_ec2 "$1") || return 1
+	awk '{printf "%s", $3}' <<<"$row"
 }
 
 # resolve_targets <name-tag-glob>
