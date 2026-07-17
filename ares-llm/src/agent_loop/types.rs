@@ -3,6 +3,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{TokenUsage, ToolCall};
 
+/// Typed classification of a tool failure, so pruning / cache decisions
+/// key off a variant instead of substring-matching an error string across
+/// three crates. Absent (`None`) means either the tool succeeded, or the
+/// producing worker predates this field — string-fallback still applies
+/// in the runner for backward compatibility with an in-flight rollout.
+///
+/// The two spawn-time kinds are the load-bearing distinction:
+///
+/// - [`BinaryNotFound`] (ENOENT from `Command::spawn`) — the binary is
+///   genuinely absent from the worker's PATH. Safe to cache and prune;
+///   won't self-heal until the operator installs the tool or the cache
+///   backoff expires.
+/// - [`TransientSpawn`] (EAGAIN/ENOMEM/EMFILE/EACCES/other `io::ErrorKind`s
+///   at spawn time) — the OS refused *this* spawn attempt for reasons
+///   that will very likely clear on the next tick. MUST NOT cache or
+///   prune; one bad spawn used to nuke recon primitives for the rest of
+///   the op.
+///
+/// [`ToolError`] is the catch-all for non-spawn failures (tool ran to
+/// completion but exited non-zero, wrapper-level arg validation, timeout,
+/// KDC error, etc.). Not currently used by the classifier — kept as an
+/// explicit "not a spawn failure" signal so future callers don't have to
+/// guess.
+///
+/// [`BinaryNotFound`]: ToolFailureKind::BinaryNotFound
+/// [`TransientSpawn`]: ToolFailureKind::TransientSpawn
+/// [`ToolError`]: ToolFailureKind::ToolError
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailureKind {
+    /// ENOENT on `Command::spawn` — binary genuinely absent from PATH.
+    BinaryNotFound,
+    /// Any other spawn-time OS error (EAGAIN, ENOMEM, EMFILE, EACCES,
+    /// transient /proc I/O, sandbox denial). Do NOT cache; do NOT prune.
+    TransientSpawn,
+    /// Tool ran but failed (non-zero exit, wrapper arg error, timeout,
+    /// tool-level error). Reserved for future callers.
+    ToolError,
+}
+
 /// Result of executing an external tool on a worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecResult {
@@ -11,6 +51,11 @@ pub struct ToolExecResult {
     /// Structured discoveries parsed from the tool output (hosts, creds, hashes, vulns).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discoveries: Option<serde_json::Value>,
+    /// Typed classification of the failure, when known. See
+    /// [`ToolFailureKind`] for the load-bearing spawn-vs-transient split.
+    /// `None` on success and for legacy workers that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<ToolFailureKind>,
 }
 
 /// Raw stdout from a single tool dispatch, paired with the tool name and

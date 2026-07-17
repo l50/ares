@@ -110,11 +110,13 @@ impl ToolDispatcher for MockDispatcher {
                         "open_ports": [88, 135, 389, 445, 3268]
                     }]
                 })),
+                failure_kind: None,
             }),
             other => Ok(ToolExecResult {
                 output: format!("Mock output for {other}"),
                 error: None,
                 discoveries: None,
+                failure_kind: None,
             }),
         }
     }

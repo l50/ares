@@ -71,6 +71,9 @@ pub(super) fn dispatch_error_result(
         output: String::new(),
         error: Some(format!("Tool '{tool_name}' dispatch error: {err}")),
         discoveries: None,
+        // Transport-level failure (broker disconnect / no responders) — not
+        // a spawn failure, don't prune.
+        failure_kind: None,
     }
 }
 
@@ -84,6 +87,9 @@ pub(super) fn dispatch_timeout_result(tool_name: &str, timeout: Duration) -> Too
             timeout.as_secs()
         )),
         discoveries: None,
+        // Timeout ≠ spawn failure; the tool may have been running fine.
+        // Do not prune.
+        failure_kind: None,
     }
 }
 
@@ -113,12 +119,15 @@ pub(super) fn build_tool_exec_request(
 }
 
 /// Convert a deserialized worker reply into the [`ToolExecResult`] returned
-/// to the LLM agent loop.
+/// to the LLM agent loop. Preserves `failure_kind` end-to-end so the
+/// runner's pruning check keys off the typed variant instead of
+/// substring-matching the error string.
 pub(super) fn tool_exec_result_from_response(response: ToolExecResponse) -> ToolExecResult {
     ToolExecResult {
         output: response.output,
         error: response.error,
         discoveries: response.discoveries,
+        failure_kind: response.failure_kind,
     }
 }
 

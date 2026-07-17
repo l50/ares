@@ -51,12 +51,30 @@ impl ToolDispatcher for BlueToolDispatcher {
                         Some(format!("tool exited with code {:?}", output.exit_code))
                     },
                     discoveries: None,
+                    failure_kind: if output.success {
+                        None
+                    } else {
+                        Some(ares_llm::ToolFailureKind::ToolError)
+                    },
                 }),
-                Ok(Err(e)) => Ok(ToolExecResult {
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                    discoveries: None,
-                }),
+                Ok(Err(e)) => {
+                    // Classify via the ares-tools spawn marker so blue
+                    // sub-agents match the red path's ENOENT/transient
+                    // discrimination.
+                    let failure_kind = ares_tools::spawn_error_kind(&e).map(|kind| {
+                        if kind.is_not_found() {
+                            ares_llm::ToolFailureKind::BinaryNotFound
+                        } else {
+                            ares_llm::ToolFailureKind::TransientSpawn
+                        }
+                    });
+                    Ok(ToolExecResult {
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                        discoveries: None,
+                        failure_kind,
+                    })
+                }
                 Err(_elapsed) => {
                     warn!(
                         tool = %call.name,
@@ -70,6 +88,7 @@ impl ToolDispatcher for BlueToolDispatcher {
                         ),
                         error: Some("timeout".to_string()),
                         discoveries: None,
+                        failure_kind: None,
                     })
                 }
             }

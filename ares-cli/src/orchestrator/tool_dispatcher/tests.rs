@@ -682,11 +682,13 @@ fn tool_exec_result_from_response_passes_through_all_fields() {
         output: "out".into(),
         error: None,
         discoveries: Some(serde_json::json!({"hosts": [{"ip": "192.168.58.10"}]})),
+        failure_kind: None,
     };
     let r = tool_exec_result_from_response(resp);
     assert_eq!(r.output, "out");
     assert!(r.error.is_none());
     assert_eq!(r.discoveries.unwrap()["hosts"][0]["ip"], "192.168.58.10");
+    assert!(r.failure_kind.is_none());
 }
 
 #[test]
@@ -697,8 +699,31 @@ fn tool_exec_result_from_response_preserves_error_string() {
         output: String::new(),
         error: Some("connection refused".into()),
         discoveries: None,
+        failure_kind: None,
     };
     let r = tool_exec_result_from_response(resp);
     assert_eq!(r.error.as_deref(), Some("connection refused"));
     assert!(r.discoveries.is_none());
+}
+
+#[test]
+fn tool_exec_result_from_response_preserves_failure_kind() {
+    // Locks the plumbing: the runner's pruning check keys off
+    // `ToolExecResult.failure_kind`, which is populated *only* by this
+    // Response→Result bridge. If this ever silently drops the field,
+    // ENOENT pruning falls back to string matching for every worker
+    // reply and the whole point of the typed enum is lost.
+    use redis_dispatcher::tool_exec_result_from_response;
+    let resp = ToolExecResponse {
+        call_id: "c".into(),
+        output: String::new(),
+        error: Some("failed to spawn 'nmap' — is it installed?".into()),
+        discoveries: None,
+        failure_kind: Some(ares_llm::ToolFailureKind::BinaryNotFound),
+    };
+    let r = tool_exec_result_from_response(resp);
+    assert_eq!(
+        r.failure_kind,
+        Some(ares_llm::ToolFailureKind::BinaryNotFound)
+    );
 }

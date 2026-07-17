@@ -379,29 +379,44 @@ impl ToolDispatcher for BlueLocalToolDispatcher {
         if ares_tools::blue::is_blue_tool(&call.name) {
             match ares_tools::blue::dispatch_blue(&call.name, &call.arguments).await {
                 Ok(output) => {
-                    let error = if output.success {
-                        None
+                    let (error, failure_kind) = if output.success {
+                        (None, None)
                     } else {
-                        Some(output.stderr.clone())
+                        (
+                            Some(output.stderr.clone()),
+                            Some(ares_llm::ToolFailureKind::ToolError),
+                        )
                     };
                     Ok(ares_llm::ToolExecResult {
                         output: output.stdout,
                         error,
                         discoveries: None,
+                        failure_kind,
                     })
                 }
-                Err(e) => Ok(ares_llm::ToolExecResult {
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                    discoveries: None,
-                }),
+                Err(e) => {
+                    let failure_kind = ares_tools::spawn_error_kind(&e).map(|kind| {
+                        if kind.is_not_found() {
+                            ares_llm::ToolFailureKind::BinaryNotFound
+                        } else {
+                            ares_llm::ToolFailureKind::TransientSpawn
+                        }
+                    });
+                    Ok(ares_llm::ToolExecResult {
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                        discoveries: None,
+                        failure_kind,
+                    })
+                }
             }
         } else {
-            // Unknown tool
+            // Unknown tool — arg-level rejection, not a spawn failure.
             Ok(ares_llm::ToolExecResult {
                 output: String::new(),
                 error: Some(format!("Unknown blue team tool: {}", call.name)),
                 discoveries: None,
+                failure_kind: None,
             })
         }
     }

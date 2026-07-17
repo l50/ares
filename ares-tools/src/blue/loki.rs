@@ -154,6 +154,22 @@ pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
 }
 
+/// Format an error with its full source chain.
+/// reqwest's Display for send errors only prints "error sending request for
+/// url (…)" and drops the actual cause (DNS/TLS/timeout). Walking `.source()`
+/// surfaces the underlying reason so the operator can tell "DNS failed" from
+/// "cert expired" from "connection refused".
+fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+        cur = src.source();
+    }
+    out
+}
+
 /// TTL for cached query results (5 minutes). Historical log data is immutable,
 /// so a short TTL is safe and eliminates duplicate queries within a single
 /// investigation that re-query the same time range / event IDs.
@@ -297,7 +313,10 @@ pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
                 // fast and point the operator at the config instead of burning
                 // MAX_RETRIES rounds of backoff.
                 if e.is_builder() {
-                    warn!(error = %e, "Loki request construction failed (non-retryable)");
+                    warn!(
+                        error = err_chain(&e),
+                        "Loki request construction failed (non-retryable)"
+                    );
                     return Ok(make_error(&format!(
                         "Loki request could not be constructed \
                          (check GRAFANA_URL / LOKI_URL and auth token for invalid \
@@ -306,15 +325,16 @@ pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
                 }
                 // Only genuine transport failures are worth retrying.
                 if e.is_connect() || e.is_timeout() {
-                    let msg = format!("Loki request failed: {e}");
-                    warn!(attempt, error = %e, "Loki request error (retryable)");
-                    last_err = Some(msg);
+                    let chain = err_chain(&e);
+                    warn!(attempt, error = %chain, "Loki request error (retryable)");
+                    last_err = Some(format!("Loki request failed: {chain}"));
                     continue;
                 }
                 // Anything else (redirect loops, decode, etc.) is not
                 // transient — surface it without wasting retry attempts.
-                warn!(error = %e, "Loki request error (non-retryable)");
-                return Ok(make_error(&format!("Loki request failed: {e}")));
+                let chain = err_chain(&e);
+                warn!(error = %chain, "Loki request error (non-retryable)");
+                return Ok(make_error(&format!("Loki request failed: {chain}")));
             }
         };
 
@@ -330,9 +350,9 @@ pub async fn query_logs(args: &Value) -> Result<ToolOutput> {
         let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
-                let msg = format!("Loki response body read failed: {e}");
-                warn!(attempt, error = %e, "Loki body read error (retryable)");
-                last_err = Some(msg);
+                let chain = err_chain(&e);
+                warn!(attempt, error = %chain, "Loki body read error (retryable)");
+                last_err = Some(format!("Loki response body read failed: {chain}"));
                 continue;
             }
         };
