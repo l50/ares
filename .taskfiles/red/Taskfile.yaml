@@ -635,23 +635,20 @@ tasks:
     silent: true
     vars:
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
-      # Resolve essos host IPs from AWS EC2 at runtime
+      # Resolve essos host IPs from AWS EC2 at runtime (deterministic — newest
+      # instance wins if the tag glob matches more than one).
       MEEREEN_IP:
         sh: |
-          aws ec2 describe-instances \
-            --profile "{{.TARGET_PROFILE}}" \
-            --region "{{.TARGET_REGION}}" \
-            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=*meereen*" \
-            --query "Reservations[*].Instances[*].PrivateIpAddress" \
-            --output text 2>/dev/null | head -1
+          export AWS_PROFILE="{{.TARGET_PROFILE}}"
+          export AWS_REGION="{{.TARGET_REGION}}"
+          . .taskfiles/ec2/scripts/run-ssm.sh
+          resolve_instance_ip meereen || true
       BRAAVOS_IP:
         sh: |
-          aws ec2 describe-instances \
-            --profile "{{.TARGET_PROFILE}}" \
-            --region "{{.TARGET_REGION}}" \
-            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=*braavos*" \
-            --query "Reservations[*].Instances[*].PrivateIpAddress" \
-            --output text 2>/dev/null | head -1
+          export AWS_PROFILE="{{.TARGET_PROFILE}}"
+          export AWS_REGION="{{.TARGET_REGION}}"
+          . .taskfiles/ec2/scripts/run-ssm.sh
+          resolve_instance_ip braavos || true
     preconditions:
       - sh: test -n "{{.OPERATION_ID}}"
         msg: "OPERATION_ID variable is required"
@@ -854,50 +851,19 @@ tasks:
       - cmd: |
           set -euo pipefail
 
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --filters "Name=instance-state-name,Values=running" \
-                      "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-            --query "Reservations[*].Instances[*].InstanceId" \
-            --output text | head -1)
-
-          if [ -z "$INSTANCE_ID" ]; then
-            echo "ERROR: No running instance found matching: {{.EC2_NAME}}"
-            exit 1
-          fi
+          export AWS_PROFILE="{{.AWS_PROFILE}}"
+          export AWS_REGION="{{.AWS_REGION}}"
+          . .taskfiles/ec2/scripts/run-ssm.sh
+          INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
           echo "EC2 instance: $INSTANCE_ID"
 
           # Set active operation pointer in Redis via SSM
           echo "Setting active operation pointer in Redis..."
-          PARAMS_FILE=$(mktemp)
-          jq -n --arg cmd "redis-cli set ares:operation:active {{.OPERATION_ID_COMPUTED}}" '{"commands": [$cmd]}' > "$PARAMS_FILE"
-          CMD_ID=$(aws ssm send-command \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "file://$PARAMS_FILE" \
-            --query "Command.CommandId" --output text)
-          rm -f "$PARAMS_FILE"
-
-          for i in $(seq 1 15); do
-            STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null) || true
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 1
-          done
-
-          if [ "$STATUS" != "Success" ]; then
+          run_ssm_cmd "$INSTANCE_ID" \
+            "redis-cli set ares:operation:active {{.OPERATION_ID_COMPUTED}}" 30 >/dev/null || {
             echo "ERROR: Failed to set active operation in Redis"
             exit 1
-          fi
+          }
           echo "Set ares:operation:active -> {{.OPERATION_ID_COMPUTED}}"
         silent: false
 
@@ -908,13 +874,10 @@ tasks:
           . ./.env
           set +a
 
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --filters "Name=instance-state-name,Values=running" \
-                      "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-            --query "Reservations[*].Instances[*].InstanceId" \
-            --output text | head -1)
+          export AWS_PROFILE="{{.AWS_PROFILE}}"
+          export AWS_REGION="{{.AWS_REGION}}"
+          . .taskfiles/ec2/scripts/run-ssm.sh
+          INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
 
           echo "Submitting operation to EC2 orchestrator..."
 
@@ -925,7 +888,7 @@ tasks:
 
           # Build orchestrator launch script from template
           ORCH_SCRIPT=$(mktemp)
-          ORCH_PARAMS=$(mktemp)
+          trap 'rm -f "$ORCH_SCRIPT"' EXIT
           sed -e "s|__ARES_PAYLOAD__|${ORCH_PAYLOAD}|" \
               -e "s|__OPENAI_API_KEY__|${OPENAI_API_KEY:-}|" \
               -e "s|__ANTHROPIC_API_KEY__|${ANTHROPIC_API_KEY:-}|" \
@@ -943,56 +906,11 @@ tasks:
               -e "s|__ARES_DEPLOYMENT__|{{.EC2_DEPLOYMENT}}|" \
               -e "s|__OTEL_TRACES_ENDPOINT__|{{.OTEL_TRACES_ENDPOINT}}|" \
               .taskfiles/ec2/scripts/launch-orchestrator.sh.tmpl > "$ORCH_SCRIPT"
-          jq -Rs '{"commands": [.]}' < "$ORCH_SCRIPT" > "$ORCH_PARAMS"
 
-          CMD_ID=$(aws ssm send-command \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "file://$ORCH_PARAMS" \
-            --query "Command.CommandId" --output text)
-          rm -f "$ORCH_SCRIPT" "$ORCH_PARAMS"
-
-          for i in $(seq 1 15); do
-            STATUS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null) || true
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 1
-          done
-
-          OUTPUT=$(aws ssm get-command-invocation \
-            --profile "{{.AWS_PROFILE}}" \
-            --region "{{.AWS_REGION}}" \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text)
-          echo "$OUTPUT" | tee -a "{{.LOGFILE}}"
-
-          if [ "$STATUS" != "Success" ]; then
-            DETAILS=$(aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StatusDetails" --output text 2>/dev/null)
-            echo "ERROR: Failed to start orchestrator (status: $STATUS, details: $DETAILS)"
-            if [ "$DETAILS" = "Undeliverable" ]; then
-              echo "ERROR: SSM could not deliver the command to $INSTANCE_ID (PingStatus likely ConnectionLost)."
-              echo "ERROR: Recovery: reboot the instance ('aws ec2 reboot-instances --instance-ids $INSTANCE_ID')."
-            fi
-            aws ssm get-command-invocation \
-              --profile "{{.AWS_PROFILE}}" \
-              --region "{{.AWS_REGION}}" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardErrorContent" --output text
+          if OUTPUT=$(run_ssm_cmd "$INSTANCE_ID" "$(cat "$ORCH_SCRIPT")" 30); then
+            echo "$OUTPUT" | tee -a "{{.LOGFILE}}"
+          else
+            echo "ERROR: Failed to start orchestrator on $INSTANCE_ID" | tee -a "{{.LOGFILE}}" >&2
             exit 1
           fi
 

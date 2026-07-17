@@ -123,7 +123,7 @@ vars:
   # Infrastructure
   K8S_NAMESPACE: '{{.K8S_NAMESPACE | default "attack-simulation"}}'
   TARGET_PROFILE: '{{.TARGET_PROFILE | default "lab"}}'
-  TARGET_REGION: '{{.TARGET_REGION | default "us-west-1"}}'
+  TARGET_REGION: '{{.TARGET_REGION | default (env "AWS_DEFAULT_REGION") | default "us-east-1"}}'
   # Red team defaults
   TARGET: '{{.TARGET | default "dreadgoad"}}'
   DOMAIN: '{{.DOMAIN | default "sevenkingdoms.local"}}'
@@ -132,9 +132,9 @@ vars:
   ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
   # EC2 deployment (alternative to K8s)
   EC2_NAME: '{{.EC2_NAME | default "ares-tools"}}'
-  # AWS profile/region: honor standard AWS_PROFILE / AWS_REGION / AWS_DEFAULT_REGION env vars.
+  # AWS profile/region: honor standard AWS_PROFILE / AWS_DEFAULT_REGION env vars.
   AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
-  AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
+  AWS_REGION: '{{.AWS_REGION | default (env "AWS_DEFAULT_REGION") | default "us-east-1"}}'
   # Blue team on by default (BLUE_ENABLED=0 to skip). The default deployment
   # target is kali-ares on EC2, where the box can reach plundr obs directly;
   # running with blue off there just wastes a launch.
@@ -181,9 +181,10 @@ tasks:
           echo "capture: could not resolve latest op id — run 'ares benchmark capture --latest --wait-for-flush' manually"
           exit 1
         fi
-        INSTANCE_ID=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
-          --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
-          --query "Reservations[*].Instances[*].InstanceId" --output text | head -1)
+        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+        INSTANCE_ID=$(resolve_instance "{{.EC2_NAME}}") || exit 1
         ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
           --instance-ids "$INSTANCE_ID" \
           --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true
