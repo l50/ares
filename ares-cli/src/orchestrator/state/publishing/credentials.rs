@@ -232,6 +232,24 @@ impl SharedState {
         )
         .await;
 
+        // Convergence timestamp: a `$`-suffixed NTLM hash is a machine-account
+        // or trust key — the input the cross-forest pivot needs to fire. Log
+        // once on first landing so we can measure "op start → trust key in
+        // state" against the trust-info and pivot-dispatch stages.
+        if hash.username.trim_end_matches(' ').ends_with('$')
+            && hash.hash_type.to_lowercase().contains("ntlm")
+        {
+            tracing::info!(
+                convergence_stage = 2,
+                event = "trust_key_hash_first_landing",
+                op_id = %operation_id,
+                account = %hash.username,
+                domain = %hash.domain,
+                has_aes = hash.aes_key.is_some(),
+                "convergence: first machine/trust-key NTLM hash landing"
+            );
+        }
+
         // Capture identity fields before `hash` is moved into state.hashes —
         // they drive the implicit-user backfill below.
         let backfill_username = hash.username.clone();

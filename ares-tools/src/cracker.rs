@@ -253,6 +253,66 @@ fn hash_kind(hash_value: &str) -> &'static str {
     }
 }
 
+/// Normalize a single-line NTLM hash into a form hashcat mode 1000 accepts at
+/// parse time.
+///
+/// Reproduced against hashcat v7.1.2:
+///
+/// | input                                              | -m 1000 verdict |
+/// |----------------------------------------------------|-----------------|
+/// | `<32-hex NT>`                                      | ✓ Exhausted     |
+/// | `<32-hex LM>:<32-hex NT>` (colon-pair, no user)    | ✗ Token length  |
+/// | `NTLM:<32-hex LM>:<32-hex NT>` (Redis storage)     | ✗ Token length  |
+/// | `User:RID:<LM>:<NT>:::` (full pwdump)              | ✓ Exhausted     |
+/// | `DOMAIN\User:RID:<LM>:<NT>:::`                     | ✓ Exhausted     |
+///
+/// The Redis prefix `NTLM:` and the bare LM:NT colon-pair are exactly the two
+/// forms `crack_with_hashcat` receives on the LLM path — secretsdump output
+/// gets serialized as `NTLM:aad3b435...:<NT>` and forwarded verbatim. Mode
+/// 1000 rejects the LM:NT pair because it can't tell where the username ends
+/// and the LM begins. Reduce to the bare 32-hex NT so hashcat parses it.
+fn normalize_ntlm_line_for_mode_1000(line: &str) -> String {
+    let trimmed = line.trim();
+    let stripped = trimmed.strip_prefix("NTLM:").unwrap_or(trimmed);
+    let parts: Vec<&str> = stripped.split(':').collect();
+    let is_hex32 = |s: &str| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit());
+    if parts.len() == 2 && is_hex32(parts[0]) && is_hex32(parts[1]) {
+        return parts[1].to_string();
+    }
+    stripped.to_string()
+}
+
+/// Line-wise apply [`normalize_ntlm_line_for_mode_1000`] to a possibly-batched
+/// `hash_value`. Empty lines are dropped so the batch count in the structured
+/// log matches what hashcat actually loaded.
+fn normalize_ntlm_hash_value_for_mode_1000(hash_value: &str) -> String {
+    let mut out = String::with_capacity(hash_value.len());
+    let mut first = true;
+    for line in hash_value.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(&normalize_ntlm_line_for_mode_1000(line));
+    }
+    out
+}
+
+/// A `$`-suffixed AD account is a machine (workstation/server/DC) or trust
+/// key. Its password is a randomly generated ~120-char UTF-16 string that a
+/// wordlist attack has zero chance of recovering, so every second on
+/// hashcat/john against one is wasted runtime that starves crackable hashes
+/// of budget. The orchestrator's `is_uncrackable` filter
+/// (`ares-cli/src/orchestrator/automation/crack.rs`) drops these on the
+/// automation path, but the LLM cracker agent dispatches `crack_with_hashcat`
+/// directly and bypasses that filter — this is the safety net.
+fn is_machine_account_username(username: Option<&str>) -> bool {
+    username.map(|u| u.trim().ends_with('$')).unwrap_or(false)
+}
+
 /// Build a dynamic wordlist from known usernames.
 ///
 /// Generates username-derived password candidates: lowercase, capitalized, uppercased,
@@ -328,6 +388,60 @@ fn default_hashcat_potfile() -> Option<PathBuf> {
         }
         candidates.into_iter().find(|p| p.is_file())
     }
+}
+
+/// Path to an operator-staged known-plaintexts wordlist — a small file with
+/// one plaintext per line that the operator has seen the target environment
+/// use (range-specific default passwords, service-account passwords already
+/// harvested from prior ops, common corporate patterns). Merged into the
+/// known-plaintext reuse pass so the crack cascade tries them BEFORE
+/// rockyou at negligible runtime cost.
+///
+/// The file lives on the operator's box, NOT in this repo — its contents are
+/// engagement-specific loot / lab passwords that must not be committed. The
+/// tree carries only the resolver and the mechanism. Default path is
+/// `/opt/ares/wordlists/operator-known.txt`; override with the
+/// `ARES_OPERATOR_KNOWN_WORDLIST` env var for range-specific lists. Set the
+/// env var to the empty string to disable the mechanism entirely.
+fn operator_known_wordlist_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        const DEFAULT: &str = "/opt/ares/wordlists/operator-known.txt";
+        let path = match std::env::var("ARES_OPERATOR_KNOWN_WORDLIST") {
+            Ok(s) if s.is_empty() => return None,
+            Ok(s) => s,
+            Err(_) => DEFAULT.to_string(),
+        };
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read every non-empty, non-comment line from the operator-known-plaintexts
+/// file (see [`operator_known_wordlist_path`]). Silent on any I/O error so a
+/// missing/unreadable file cannot fail a crack job — the mechanism is an
+/// opt-in bonus, not a required input.
+fn operator_known_plaintexts() -> Vec<String> {
+    let Some(path) = operator_known_wordlist_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Environment gate for [`PotfileResetGuard`]. `ARES_KEEP_POTFILE=1|true` opts
@@ -477,6 +591,7 @@ fn build_known_password_wordlist(known_passwords: &[&str]) -> Option<tempfile::N
             raw.extend(parse_potfile_plaintexts(&contents));
         }
     }
+    raw.extend(operator_known_plaintexts());
 
     let mut seen = std::collections::HashSet::new();
     let mut file: Option<tempfile::NamedTempFile> = None;
@@ -522,11 +637,51 @@ fn capitalize(s: &str) -> String {
 /// Tries multiple wordlists in order (rockyou, seclists). When `use_dynamic_wordlist`
 /// is true (default), also prepends a username-derived candidate list.
 pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
-    let hash_value = required_str(args, "hash_value")?;
+    let hash_value_raw = required_str(args, "hash_value")?;
+    let username = optional_str(args, "username");
     let explicit_wordlist = optional_str(args, "wordlist_path");
     let explicit_rules = optional_str(args, "rules_file");
 
-    let mode = resolve_hashcat_mode(optional_i64(args, "hashcat_mode"), hash_value);
+    let mode = resolve_hashcat_mode(optional_i64(args, "hashcat_mode"), hash_value_raw);
+
+    // Machine accounts have random 120-char UTF-16 passwords — a wordlist run
+    // is a guaranteed miss and burns a crack slot. Bypass here catches the
+    // LLM cracker path, which skips the orchestrator-side `is_uncrackable`
+    // filter and would otherwise dispatch these to hashcat.
+    if is_machine_account_username(username) && hash_value_raw.lines().count() <= 1 {
+        info!(
+            tool = "crack_with_hashcat",
+            mode,
+            hashes = 1,
+            hash_kind = hash_kind(hash_value_raw),
+            cracked_count = 0,
+            signal = "machine_account_skip",
+            status = "no_plaintext",
+            "skipping crack: machine-account NTLM has ~120-char random password, wordlist attack cannot recover it"
+        );
+        return Ok(ToolOutput {
+            stdout: "crack_with_hashcat skipped: machine-account (`$`-suffixed) NTLM is \
+                     uncrackable against wordlists — its password is a randomly generated \
+                     ~120-char UTF-16 string.\n"
+                .to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        });
+    }
+
+    // Normalize the Redis storage form (`NTLM:<LM>:<NT>`) and the bare
+    // LM:NT colon-pair — both of which hashcat -m 1000 rejects at parse time
+    // with "Token length exception" — down to the bare 32-hex NT hashcat
+    // accepts. Kerberos/NetNTLMv2 hashes have their own well-formed shapes;
+    // only touch NTLM.
+    let hash_value_owned;
+    let hash_value: &str = if mode == 1000 {
+        hash_value_owned = normalize_ntlm_hash_value_for_mode_1000(hash_value_raw);
+        &hash_value_owned
+    } else {
+        hash_value_raw
+    };
 
     // Expensive AES kerberoast modes get a larger wall-clock floor so a throttled
     // sweep still reaches a deep-in-rockyou plaintext before each pass's
@@ -812,6 +967,26 @@ pub async fn crack_with_hashcat(args: &Value) -> Result<ToolOutput> {
 /// `john --show` to retrieve cracked results.
 pub async fn crack_with_john(args: &Value) -> Result<ToolOutput> {
     let hash_value = required_str(args, "hash_value")?;
+    let username = optional_str(args, "username");
+
+    if is_machine_account_username(username) && hash_value.lines().count() <= 1 {
+        info!(
+            tool = "crack_with_john",
+            hash_kind = hash_kind(hash_value),
+            signal = "machine_account_skip",
+            status = "no_plaintext",
+            "skipping crack: machine-account hash has ~120-char random password, wordlist attack cannot recover it"
+        );
+        return Ok(ToolOutput {
+            stdout: "crack_with_john skipped: machine-account (`$`-suffixed) hash is \
+                     uncrackable against wordlists — its password is a randomly generated \
+                     ~120-char UTF-16 string.\n"
+                .to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        });
+    }
 
     // John's krb5tgs format is RC4-only. An AES kerberoast ticket (etype 17/18)
     // makes john load nothing ("No password hashes loaded") — a guaranteed miss
@@ -1373,5 +1548,104 @@ $HEX[6c65742069743a676f]:ignored_only_first_field
             "known_usernames": ["admin"]
         });
         assert!(crack_with_john(&args).await.is_ok());
+    }
+
+    // Reproduces the on-box test against hashcat v7.1.2, mode 1000:
+    // bare 32-hex NT and pwdump lines parse; the LM:NT colon-pair (with or
+    // without the `NTLM:` Redis prefix) does not. The normalizer collapses
+    // the rejected shapes to the bare 32-hex NT hashcat accepts.
+
+    const LM_EMPTY: &str = "aad3b435b51404eeaad3b435b51404ee";
+    const NT_ALICE: &str = "8a198b772b08073337e1d4e468a85ff7";
+
+    #[test]
+    fn normalize_bare_32hex_ntlm_passes_through() {
+        assert_eq!(normalize_ntlm_line_for_mode_1000(NT_ALICE), NT_ALICE);
+    }
+
+    #[test]
+    fn normalize_lm_nt_colon_pair_reduces_to_nt() {
+        let colon_pair = format!("{LM_EMPTY}:{NT_ALICE}");
+        assert_eq!(normalize_ntlm_line_for_mode_1000(&colon_pair), NT_ALICE);
+    }
+
+    #[test]
+    fn normalize_redis_ntlm_prefix_strips_and_reduces() {
+        let redis = format!("NTLM:{LM_EMPTY}:{NT_ALICE}");
+        assert_eq!(normalize_ntlm_line_for_mode_1000(&redis), NT_ALICE);
+    }
+
+    #[test]
+    fn normalize_pwdump_line_left_alone() {
+        // Full pwdump form parses in mode 1000 already (hashcat auto-triggers
+        // `--username`), so the normalizer must not touch it.
+        let pwdump = format!("Administrator:500:{LM_EMPTY}:{NT_ALICE}:::");
+        assert_eq!(normalize_ntlm_line_for_mode_1000(&pwdump), pwdump);
+
+        let domain_qualified = format!("CONTOSO\\Administrator:500:{LM_EMPTY}:{NT_ALICE}:::");
+        assert_eq!(
+            normalize_ntlm_line_for_mode_1000(&domain_qualified),
+            domain_qualified
+        );
+    }
+
+    #[test]
+    fn normalize_batched_hash_value_line_wise() {
+        // Batched input: mix of Redis-prefixed, colon-pair, and bare rows.
+        // Blank lines are dropped so the reported `hashes=` count matches
+        // what hashcat actually loads.
+        let batch = format!("NTLM:{LM_EMPTY}:{NT_ALICE}\n\n{LM_EMPTY}:{NT_ALICE}\n{NT_ALICE}\n",);
+        let out = normalize_ntlm_hash_value_for_mode_1000(&batch);
+        let expected = format!("{NT_ALICE}\n{NT_ALICE}\n{NT_ALICE}");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn normalize_short_or_non_hex_left_alone() {
+        // Not exactly 32-hex on both sides → not the malformed shape; leave
+        // alone rather than mangle something we don't understand.
+        let short = "aad3b435:8a198b77";
+        assert_eq!(normalize_ntlm_line_for_mode_1000(short), short);
+
+        let non_hex = "notahex1234567890abcdef1234567890:8a198b772b08073337e1d4e468a85ff7";
+        assert_eq!(normalize_ntlm_line_for_mode_1000(non_hex), non_hex);
+    }
+
+    #[test]
+    fn is_machine_account_username_detects_dollar_suffix() {
+        assert!(is_machine_account_username(Some("dc01$")));
+        assert!(is_machine_account_username(Some("WS01$")));
+        assert!(is_machine_account_username(Some("SQL01$ ")));
+        assert!(!is_machine_account_username(Some("alice")));
+        assert!(!is_machine_account_username(Some("svc_sql")));
+        assert!(!is_machine_account_username(Some("")));
+        assert!(!is_machine_account_username(None));
+    }
+
+    #[tokio::test]
+    async fn crack_with_hashcat_skips_machine_account() {
+        // `$`-suffixed username on a single-hash call → short-circuits before
+        // spawning hashcat. No mock needed. The current mock queue must stay
+        // untouched so a subsequent test sees an empty queue.
+        let args = json!({
+            "hash_value": NT_ALICE,
+            "username": "dc01$",
+        });
+        let out = crack_with_hashcat(&args).await.unwrap();
+        assert!(out.success);
+        assert!(out.stdout.contains("skipped"));
+        assert!(out.stdout.contains("machine-account"));
+    }
+
+    #[tokio::test]
+    async fn crack_with_john_skips_machine_account() {
+        let args = json!({
+            "hash_value": NT_ALICE,
+            "username": "sql01$",
+        });
+        let out = crack_with_john(&args).await.unwrap();
+        assert!(out.success);
+        assert!(out.stdout.contains("skipped"));
+        assert!(out.stdout.contains("machine-account"));
     }
 }

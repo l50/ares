@@ -400,6 +400,17 @@ impl SharedState {
         let added = reader.add_trusted_domain(&mut conn, &trust).await?;
         if added {
             let domain_key = trust.domain.to_lowercase();
+            let op_id = self.operation_id().await;
+            tracing::info!(
+                convergence_stage = 1,
+                event = "trust_info_first_insert",
+                op_id = %op_id,
+                trusted_domain = %trust.domain,
+                trust_type = %trust.trust_type,
+                is_cross_forest = trust.is_cross_forest(),
+                sid_known = trust.security_identifier.is_some(),
+                "convergence: first TrustInfo insertion for this trusted-partner domain"
+            );
             // Capture the SID *before* moving `trust` into the map. Upserting
             // domain_sids from trust-enum data is the load-bearing step that
             // lets `auto_trust_follow` pass its parent-SID gate on hardened

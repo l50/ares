@@ -280,6 +280,16 @@ Trigger the path by ensuring the prerequisite data lands in state:
   The `secretsdump_kerberos` step is auto-chained from the `.ccache` produced
   by the inter-realm ticket forge (via `auto_chain_s4u_secretsdump`).
 
+  **You do NOT need a plaintext credential in the target realm to run this
+  chain.** The trust key alone (the target realm's machine account NTLM,
+  captured from `secretsdump` on the source DC as `<SRC_REALM>\<TARGET>$`) is
+  sufficient. If the automation hasn't already fired, invoke it manually:
+  `create_inter_realm_ticket` with `trust_key=<hex>`, `source_domain`,
+  `target_domain`, `source_sid`, and (if you have it) `aes_key`, then
+  `secretsdump_kerberos` against the target-realm DC IP. Waiting to crack a
+  target-realm user password before pivoting burns hours — the trust-key
+  path is direct and deterministic.
+
 **Important:** SID filtering blocks RID<1000 across forest trusts. If inter-realm
 ticket path fails, look for organic paths: MSSQL links, ACL chains, or foreign
 security principals within the target forest. Note: silver ticket forging is

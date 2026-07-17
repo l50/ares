@@ -1613,6 +1613,8 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 .await;
 
             info!(
+                convergence_stage = 4,
+                event = "forge_inter_realm_and_dump_dispatched",
                 task_id = %task_id,
                 trust_account = %item.hash.username,
                 source_domain = %item.source_domain,
@@ -1620,7 +1622,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 has_source_sid = source_domain_sid.is_some(),
                 has_target_sid = target_domain_sid.is_some(),
                 has_aes = resolved_aes_key.is_some(),
-                "Cross-forest forge dispatched (direct tool, no LLM)"
+                "convergence: forge_inter_realm_and_dump dispatched (ticketer + secretsdump against target-realm DC, direct tool, no LLM)"
             );
 
             let dispatcher_bg = dispatcher.clone();
@@ -2386,6 +2388,16 @@ async fn dispatch_create_inter_realm_ticket(
     source_domain_sid: Option<&str>,
 ) {
     use ares_llm::ToolCall;
+
+    tracing::info!(
+        convergence_stage = 3,
+        event = "dispatch_create_inter_realm_ticket",
+        source_domain,
+        target_domain,
+        has_aes = aes_key.is_some(),
+        has_source_sid = source_domain_sid.is_some_and(|s| !s.is_empty()),
+        "convergence: dispatching inter-realm TGT forge for target realm"
+    );
 
     let ticket_username = "Administrator";
 
