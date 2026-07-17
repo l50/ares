@@ -114,6 +114,20 @@ jobs:
           rm -f /tmp/install-task.sh
           task --version
 
+      - name: Prefetch remote Taskfile includes
+        # Root Taskfile.yaml pulls includes from raw.githubusercontent.com; task's
+        # default 10s download timeout occasionally trips on transient CDN latency
+        # and fails the job before any hook runs. Cache with retries + longer
+        # timeout so the pre-commit step below can then work offline.
+        run: |
+          for i in 1 2 3 4 5; do
+            task --download --timeout=60s && exit 0
+            echo "Attempt $i/5 failed, retrying in $((i * 10))s..."
+            sleep $((i * 10))
+          done
+          echo "All prefetch attempts failed"
+          exit 1
+
       - name: Run pre-commit
         id: precommit
         env:
@@ -121,7 +135,7 @@ jobs:
           # the dedicated 🦀 Rust workflow with their own caches. Skipping them
           # here trims ~11 minutes off this job without losing coverage.
           SKIP: cargo-fmt,cargo-clippy,cargo-check,cargo-test
-        run: task -y run-pre-commit
+        run: task -y --timeout=60s run-pre-commit
 
       - name: Capture autofix patch
         id: capture
