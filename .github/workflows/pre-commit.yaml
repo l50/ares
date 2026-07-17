@@ -121,7 +121,7 @@ jobs:
         # timeout so the pre-commit step below can then work offline.
         run: |
           for i in 1 2 3 4 5; do
-            task --download --timeout=60s && exit 0
+            task -y --download --timeout=60s && exit 0
             echo "Attempt $i/5 failed, retrying in $((i * 10))s..."
             sleep $((i * 10))
           done
