@@ -2093,7 +2093,7 @@ mod reconcile_low_trust_credential_domain {
         Credential {
             id: "c1".to_string(),
             username: username.to_string(),
-            password: "_L0ngCl@w_".to_string(),
+            password: "P@ssw0rd!".to_string(),
             domain: domain.to_string(),
             source: source.to_string(),
             discovered_at: None,
@@ -2390,7 +2390,7 @@ fn build_aes_kerberoast_retry_payload_includes_etype_hint() {
     let cred = ares_core::models::Credential {
         id: "c1".into(),
         username: "carol".into(),
-        password: "fr3edom".into(), // pragma: allowlist secret
+        password: "P@ssw0rd!".into(), // pragma: allowlist secret
         domain: "fabrikam.local".into(),
         source: "test".into(),
         discovered_at: None,
