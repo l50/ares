@@ -187,7 +187,13 @@ fn is_inter_forest(source: &str, target: &str) -> bool {
 /// - No `TrustInfo` but the names are inter-forest: false (try the forge —
 ///   missing metadata means we can't be sure SID filtering is on, and the
 ///   ~30s cost of an unnecessary attempt is cheaper than silently dropping
-///   a valid attack path on a misconfigured trust)
+///   a valid attack path on a misconfigured or not-yet-enumerated trust).
+///   Empirically (op-20260618 vs op-20260718 on GOAD-DG), the forge with a
+///   plain Administrator ticket (no ExtraSid — cross-forest never injects
+///   ExtraSid; see `needs_target_sid = is_child_to_parent` below) gets the
+///   third domain when trust-enum hasn't populated `trusted_domains` in
+///   time. Suppressing here silently drops that path and leaves the ccache
+///   sitting on disk with no DCSync ever chained.
 fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str) -> bool {
     let target_l = target.to_lowercase();
     let inter_forest = is_inter_forest(source, target);
@@ -240,32 +246,29 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
         // explicit metadata (e.g. unusual same-forest cross-DNS-suffix setup).
         return false;
     }
-    // No metadata — assume SID filtering is on and skip the speculative forge.
-    //
-    // Previously this returned `false` ("try the forge"), under the reasoning
-    // that the false-positive cost was only ~30s. In practice the speculative
-    // forge against a SID-filtered target produces:
-    //   - one `Cross-forest forge dispatched` task that always returns 0 hashes
-    //   - then the post-failure fallback at the bottom of the spawn dispatches
-    //     `create_inter_realm_ticket` and calls `wake_cross_forest_fallbacks` —
-    //     exactly the same work the suppression branch does.
-    // So the doomed forge is pure waste plus a noisy `rpc_s_access_denied`
-    // trace that doesn't move the operation forward. The handful of labs
-    // where SID filtering is genuinely off can still be exploited via the
-    // ACL / foreign-group / cross-forest enum fallbacks that the suppression
-    // branch wakes, or via the LLM-driven attack paths that aren't gated on
-    // this function.
+    // No metadata — try the forge. False positives (SID filtering actually
+    // on) cost ~30s for a doomed DCSync; false negatives (refusing a valid
+    // forge on a not-yet-enumerated or misconfigured trust) cost the entire
+    // foreign domain. Op-20260718-160416 hit 2/3 DA because this branch was
+    // returning `true` when trusted_domains had no essos.local entry yet —
+    // the suppression left the forged ccache on disk with no secretsdump
+    // chained, and the pre-2026-07-12 "try the forge" behavior was the
+    // mechanism that reliably got the third domain on GOAD-DG. The current
+    // code path doesn't inject ExtraSid for cross-forest (see
+    // `needs_target_sid = is_child_to_parent` in `auto_trust_follow`), so
+    // the "SID filtering strips ExtraSid" concern doesn't apply to what
+    // the forge tool actually sends.
     debug!(
         source = %source,
         target = %target,
         inter_forest = true,
         metadata_present = false,
-        decision = true,
-        reason = "no_metadata_assume_filtered",
+        decision = false,
+        reason = "no_metadata_try_forge",
         trusted_domains_keys = ?known_keys,
         "trust filter predicate"
     );
-    true
+    false
 }
 
 /// Clear cross-forest fallback dedup keys for `target_domain` so the next
@@ -2845,15 +2848,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_trust_follow_skips_forge_when_sid_filter_known() {
-        // Bug A: when trust metadata is missing for an inter-forest target,
-        // suppress the speculative forge. The post-failure path runs the same
-        // `dispatch_create_inter_realm_ticket` + `wake_cross_forest_fallbacks`
-        // work, so an unguarded forge against a SID-filtered target is pure
-        // waste. Returning true here drives trust-follow into the suppression
-        // branch which short-circuits straight to the equivalent fallback.
+    fn auto_trust_follow_tries_forge_when_metadata_missing() {
+        // No TrustInfo for the target → try the forge. Op-20260718 showed
+        // that suppressing here silently drops the third domain when
+        // trust-enum hasn't populated `trusted_domains` before the tick
+        // fires. False positives cost ~30s; false negatives cost a full
+        // domain.
         let s = StateInner::new("op-test".into());
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -2864,9 +2866,9 @@ mod tests {
     fn filtered_inter_forest_ignores_unrelated_source_metadata() {
         // A child-realm parent_child TrustInfo on the source must NOT answer
         // an unrelated cross-forest path: that would misclassify it as
-        // intra-forest. With no metadata for the actual target we now suppress
-        // (post Bug A fix) — the speculative forge would have produced the
-        // same fallback work as the suppression branch anyway.
+        // intra-forest and let a doomed forge fire under the source's own
+        // parent_child relationship. With no metadata for the actual target
+        // we fall through to the no-metadata default (try the forge).
         let parent_trust = ares_core::models::TrustInfo {
             domain: "contoso.local".into(),
             flat_name: "CONTOSO".into(),
@@ -2876,7 +2878,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("contoso.local", parent_trust);
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
