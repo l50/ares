@@ -390,6 +390,60 @@ fn default_hashcat_potfile() -> Option<PathBuf> {
     }
 }
 
+/// Path to an operator-staged known-plaintexts wordlist — a small file with
+/// one plaintext per line that the operator has seen the target environment
+/// use (range-specific default passwords, service-account passwords already
+/// harvested from prior ops, common corporate patterns). Merged into the
+/// known-plaintext reuse pass so the crack cascade tries them BEFORE
+/// rockyou at negligible runtime cost.
+///
+/// The file lives on the operator's box, NOT in this repo — its contents are
+/// engagement-specific loot / lab passwords that must not be committed. The
+/// tree carries only the resolver and the mechanism. Default path is
+/// `/opt/ares/wordlists/operator-known.txt`; override with the
+/// `ARES_OPERATOR_KNOWN_WORDLIST` env var for range-specific lists. Set the
+/// env var to the empty string to disable the mechanism entirely.
+fn operator_known_wordlist_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        const DEFAULT: &str = "/opt/ares/wordlists/operator-known.txt";
+        let path = match std::env::var("ARES_OPERATOR_KNOWN_WORDLIST") {
+            Ok(s) if s.is_empty() => return None,
+            Ok(s) => s,
+            Err(_) => DEFAULT.to_string(),
+        };
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read every non-empty, non-comment line from the operator-known-plaintexts
+/// file (see [`operator_known_wordlist_path`]). Silent on any I/O error so a
+/// missing/unreadable file cannot fail a crack job — the mechanism is an
+/// opt-in bonus, not a required input.
+fn operator_known_plaintexts() -> Vec<String> {
+    let Some(path) = operator_known_wordlist_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Environment gate for [`PotfileResetGuard`]. `ARES_KEEP_POTFILE=1|true` opts
 /// out of the per-op wipe. Realistic tradecraft (attacker carries cracked
 /// plaintexts between engagements against the same target) and the local
@@ -537,6 +591,7 @@ fn build_known_password_wordlist(known_passwords: &[&str]) -> Option<tempfile::N
             raw.extend(parse_potfile_plaintexts(&contents));
         }
     }
+    raw.extend(operator_known_plaintexts());
 
     let mut seen = std::collections::HashSet::new();
     let mut file: Option<tempfile::NamedTempFile> = None;
