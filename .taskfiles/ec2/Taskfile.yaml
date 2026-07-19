@@ -39,15 +39,17 @@ vars:
   AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
   AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
   # S3 bucket for file staging (required; pass S3_BUCKET=your-bucket or set as env var)
-  S3_BUCKET: '{{.S3_BUCKET | default ""}}'
+  S3_BUCKET: '{{.S3_BUCKET | default (env "S3_BUCKET") | default ""}}'
   # Remote paths on EC2
   ARES_REMOTE_BIN: '/usr/local/bin'
   ARES_REMOTE_CONFIG: '/etc/ares/config.yaml'
   ARES_LOG_DIR: '/var/log/ares'
-  # Build tool: auto (cross on macOS due to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo
-  # `remote` (native EC2 build) is also accepted but currently undocumented —
-  # tokio OOMs the linker on the kali-ares instance size. Bump RAM/swap before using it.
-  BUILD_TOOL: '{{.BUILD_TOOL | default "auto"}}'
+  # Build tool: remote (native build on EC2, default), auto (cross on macOS due
+  # to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo.
+  # `remote` is the default because arm64 Mac hosts crash rustc under qemu-user
+  # emulation during the local cross build. If the EC2 linker OOMs on remote,
+  # bump instance RAM/swap or set BUILD_TOOL=auto.
+  BUILD_TOOL: '{{.BUILD_TOOL | default (env "BUILD_TOOL") | default "remote"}}'
   # Build profile: release (optimized) or dev-deploy (fast compile, less optimized)
   BUILD_PROFILE: '{{.BUILD_PROFILE | default "dev-deploy"}}'
   REMOTE_BUILD_DIR: '/tmp/ares-build'
@@ -270,7 +272,16 @@ tasks:
         # cross's host-side `rustc` version probe ("couldn't fetch the rustc
         # version"). sccache stays a genuine optional accelerator: the build
         # works with or without it.
-        if command -v sccache >/dev/null 2>&1; then
+        #
+        # Skip on arm64-host + cross: sccache's `rustc -vV` probe runs inside
+        # the emulated x86_64 container and rustc SIGSEGVs under qemu. Set
+        # ARES_FORCE_SCCACHE=1 to override.
+        SKIP_SCCACHE=""
+        if [ "$BUILD_TOOL" = "cross" ] && [ "$(uname -m)" = "arm64" ] && [ -z "${ARES_FORCE_SCCACHE:-}" ]; then
+          SKIP_SCCACHE=1
+          echo -e "{{.INFO}} Skipping sccache (arm64→x86_64 cross under qemu segfaults rustc probe; set ARES_FORCE_SCCACHE=1 to override)"
+        fi
+        if [ -z "$SKIP_SCCACHE" ] && command -v sccache >/dev/null 2>&1; then
           export RUSTC_WRAPPER=sccache
           export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
           mkdir -p "$SCCACHE_DIR"
@@ -284,6 +295,10 @@ tasks:
         if [ "$BUILD_TOOL" = "cross" ] && [ "$(uname -m)" = "arm64" ]; then
           export DOCKER_DEFAULT_PLATFORM=linux/amd64
           echo -e "{{.INFO}} arm64 host — building amd64 cross image under emulation (DOCKER_DEFAULT_PLATFORM=linux/amd64)"
+          # qemu-user segfaults rustc's default 8 MiB stack on `rustc -vV` and
+          # other short-lived invocations. Bump per rustc's own suggestion.
+          # Cross.toml passes this through to the container.
+          export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
         fi
 
         case "$BUILD_TOOL" in

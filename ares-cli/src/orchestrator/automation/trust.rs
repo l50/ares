@@ -172,22 +172,10 @@ fn is_inter_forest(source: &str, target: &str) -> bool {
     true
 }
 
-/// Returns true if the trust source→target is inter-forest with SID filtering
-/// active — meaning `forge_inter_realm_and_dump` will be rejected at DCSync
-/// regardless of trust key validity. Caller should suppress the doomed
-/// dispatch and accelerate cross-forest fallback paths instead.
-///
-/// Decision tree:
-/// - Intra-forest (child↔parent or same domain): false (forge runs with
-///   `extra_sid=<parent_sid>-519` for child→parent; SID filtering is a
-///   cross-forest concept only)
-/// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=true`: true
-/// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=false`:
-///   false (someone disabled SID filtering — try the forge)
-/// - No `TrustInfo` but the names are inter-forest: false (try the forge —
-///   missing metadata means we can't be sure SID filtering is on, and the
-///   ~30s cost of an unnecessary attempt is cheaper than silently dropping
-///   a valid attack path on a misconfigured trust)
+/// Returns false — the dispatch never injects ExtraSid for cross-forest
+/// (see `needs_target_sid = is_child_to_parent` in `auto_trust_follow`), so
+/// SID filtering doesn't reject what the tool actually sends. A doomed
+/// forge costs one dispatch; a suppressed forge costs the domain.
 fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str) -> bool {
     let target_l = target.to_lowercase();
     let inter_forest = is_inter_forest(source, target);
@@ -217,8 +205,6 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
     // (c) `is_cross_forest()` returned false on the entry.
     let known_keys: Vec<&str> = state.trusted_domains.keys().map(String::as_str).collect();
     if let Some(t) = state.trusted_domains.get(&target_l) {
-        let cross = t.is_cross_forest();
-        let decision = cross && t.sid_filtering;
         debug!(
             source = %source,
             target = %target,
@@ -226,46 +212,25 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
             metadata_present = true,
             trust_type = %t.trust_type,
             trust_direction = %t.direction,
-            is_cross_forest = cross,
+            is_cross_forest = t.is_cross_forest(),
             sid_filtering = t.sid_filtering,
-            decision = decision,
-            reason = if cross { "metadata_cross_forest" } else { "metadata_not_cross_forest" },
+            decision = false,
             trusted_domains_keys = ?known_keys,
             "trust filter predicate"
         );
-        if cross {
-            return t.sid_filtering;
-        }
-        // Trust enumeration disagrees with name-based heuristic — trust the
-        // explicit metadata (e.g. unusual same-forest cross-DNS-suffix setup).
         return false;
     }
-    // No metadata — assume SID filtering is on and skip the speculative forge.
-    //
-    // Previously this returned `false` ("try the forge"), under the reasoning
-    // that the false-positive cost was only ~30s. In practice the speculative
-    // forge against a SID-filtered target produces:
-    //   - one `Cross-forest forge dispatched` task that always returns 0 hashes
-    //   - then the post-failure fallback at the bottom of the spawn dispatches
-    //     `create_inter_realm_ticket` and calls `wake_cross_forest_fallbacks` —
-    //     exactly the same work the suppression branch does.
-    // So the doomed forge is pure waste plus a noisy `rpc_s_access_denied`
-    // trace that doesn't move the operation forward. The handful of labs
-    // where SID filtering is genuinely off can still be exploited via the
-    // ACL / foreign-group / cross-forest enum fallbacks that the suppression
-    // branch wakes, or via the LLM-driven attack paths that aren't gated on
-    // this function.
     debug!(
         source = %source,
         target = %target,
         inter_forest = true,
         metadata_present = false,
-        decision = true,
-        reason = "no_metadata_assume_filtered",
+        decision = false,
+        reason = "no_metadata_try_forge",
         trusted_domains_keys = ?known_keys,
         "trust filter predicate"
     );
-    true
+    false
 }
 
 /// Clear cross-forest fallback dedup keys for `target_domain` so the next
@@ -2809,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_inter_forest_explicit_filtering_on() {
+    fn filtered_inter_forest_explicit_filtering_on_still_tries_forge() {
         let trust = ares_core::models::TrustInfo {
             domain: "fabrikam.local".into(),
             flat_name: "FABRIKAM".into(),
@@ -2819,7 +2784,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("fabrikam.local", trust);
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -2845,15 +2810,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_trust_follow_skips_forge_when_sid_filter_known() {
-        // Bug A: when trust metadata is missing for an inter-forest target,
-        // suppress the speculative forge. The post-failure path runs the same
-        // `dispatch_create_inter_realm_ticket` + `wake_cross_forest_fallbacks`
-        // work, so an unguarded forge against a SID-filtered target is pure
-        // waste. Returning true here drives trust-follow into the suppression
-        // branch which short-circuits straight to the equivalent fallback.
+    fn auto_trust_follow_tries_forge_when_metadata_missing() {
         let s = StateInner::new("op-test".into());
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -2864,9 +2823,9 @@ mod tests {
     fn filtered_inter_forest_ignores_unrelated_source_metadata() {
         // A child-realm parent_child TrustInfo on the source must NOT answer
         // an unrelated cross-forest path: that would misclassify it as
-        // intra-forest. With no metadata for the actual target we now suppress
-        // (post Bug A fix) — the speculative forge would have produced the
-        // same fallback work as the suppression branch anyway.
+        // intra-forest and let a doomed forge fire under the source's own
+        // parent_child relationship. With no metadata for the actual target
+        // we fall through to the no-metadata default (try the forge).
         let parent_trust = ares_core::models::TrustInfo {
             domain: "contoso.local".into(),
             flat_name: "CONTOSO".into(),
@@ -2876,7 +2835,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("contoso.local", parent_trust);
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -2884,9 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_inter_forest_target_metadata_authoritative() {
-        // When the target's TrustInfo says cross-forest with SID filtering,
-        // suppress the forge regardless of any source-side parent_child entry.
+    fn filtered_inter_forest_target_metadata_never_suppresses_cross_forest() {
         let target_trust = ares_core::models::TrustInfo {
             domain: "fabrikam.local".into(),
             flat_name: "FABRIKAM".into(),
@@ -2896,7 +2853,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("fabrikam.local", target_trust);
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
