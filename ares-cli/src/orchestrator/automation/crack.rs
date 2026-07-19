@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -194,30 +194,43 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
         // a backlog of NTLM machine-account hashes from secretsdump (already
         // PtH-usable) would starve the lone kerberoast/asrep hash that
         // unlocks a service-account password.
-        let (mut work, attempts): (
-            Vec<(String, ares_core::models::Hash)>,
-            std::collections::HashMap<String, u32>,
-        ) = {
+        let mut work: Vec<(String, ares_core::models::Hash)> = Vec::new();
+        let mut uncracked_hashes = 0usize;
+        let mut crackable_hashes = 0usize;
+        let mut dropped_reasons: Vec<String> = Vec::new();
+        let (attempts, total_hashes) = {
             let state = dispatcher.state.read().await;
-            let work = state
-                .hashes
-                .iter()
-                .filter(|h| h.cracked_password.is_none())
-                .filter(|h| !is_uncrackable(h))
-                .filter_map(|h| {
-                    let dedup = crack_dedup_key(h);
-                    if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup)
-                        || inflight_crack_dedup.contains_key(&dedup)
-                    {
-                        None
-                    } else {
-                        Some((dedup, h.clone()))
-                    }
-                })
-                .collect();
-            (work, state.crack_attempts.clone())
+            let total_hashes = state.hashes.len();
+            for h in state.hashes.iter() {
+                if h.cracked_password.is_some() {
+                    continue;
+                }
+                uncracked_hashes += 1;
+                if is_uncrackable(h) {
+                    continue;
+                }
+                crackable_hashes += 1;
+                let dedup = crack_dedup_key(h);
+                if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
+                    dropped_reasons.push(format!("{}:{}:dedup_processed", h.username, h.hash_type));
+                    continue;
+                }
+                if inflight_crack_dedup.contains_key(&dedup) {
+                    dropped_reasons.push(format!("{}:{}:inflight", h.username, h.hash_type));
+                    continue;
+                }
+                work.push((dedup, h.clone()));
+            }
+            (state.crack_attempts.clone(), total_hashes)
         };
         sort_crack_work(&mut work, &attempts);
+        info!(
+            state_hashes_total = total_hashes,
+            state_hashes_uncracked = uncracked_hashes,
+            state_hashes_crackable = crackable_hashes,
+            dropped = ?dropped_reasons,
+            "crack_tick: filter stats"
+        );
 
         // Allow multiple distinct crack tasks up to the configured cap. Same-mode
         // roastables are still batched into one task, and in-flight dedup keys
