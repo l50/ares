@@ -14,5 +14,5 @@ rm -rf /tmp/sccache.tgz /tmp/sccache-v0.10.0-x86_64-unknown-linux-musl
 """]
 
 [target.x86_64-unknown-linux-gnu.env]
-passthrough = ["AWS_LC_SYS_CMAKE_BUILDER", "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE"]
+passthrough = ["AWS_LC_SYS_CMAKE_BUILDER", "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "RUST_MIN_STACK"]
 volumes = ["SCCACHE_DIR"]
