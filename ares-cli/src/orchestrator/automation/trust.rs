@@ -181,19 +181,19 @@ fn is_inter_forest(source: &str, target: &str) -> bool {
 /// - Intra-forest (child↔parent or same domain): false (forge runs with
 ///   `extra_sid=<parent_sid>-519` for child→parent; SID filtering is a
 ///   cross-forest concept only)
-/// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=true`: true
-/// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=false`:
-///   false (someone disabled SID filtering — try the forge)
-/// - No `TrustInfo` but the names are inter-forest: false (try the forge —
-///   missing metadata means we can't be sure SID filtering is on, and the
-///   ~30s cost of an unnecessary attempt is cheaper than silently dropping
-///   a valid attack path on a misconfigured or not-yet-enumerated trust).
-///   Empirically (op-20260618 vs op-20260718 on GOAD-DG), the forge with a
-///   plain Administrator ticket (no ExtraSid — cross-forest never injects
-///   ExtraSid; see `needs_target_sid = is_child_to_parent` below) gets the
-///   third domain when trust-enum hasn't populated `trusted_domains` in
-///   time. Suppressing here silently drops that path and leaves the ccache
-///   sitting on disk with no DCSync ever chained.
+/// - Cross-forest (any of: explicit `TrustInfo` with `is_cross_forest()`, or
+///   no `TrustInfo` but the names are inter-forest): false (try the forge).
+///   The cross-forest dispatch in `auto_trust_follow` doesn't inject
+///   ExtraSid (see `needs_target_sid = is_child_to_parent` below) — it
+///   sends a plain Administrator ticket. So the "SID filtering strips
+///   ExtraSid" concern doesn't apply to what the tool actually sends, and
+///   we shouldn't suppress on `sid_filtering=true` metadata. Empirically
+///   (op-20260618 hit 3/3 on GOAD-DG; op-20260718 hit 2/3 while this gate
+///   was suppressing on both no-metadata and metadata-with-filter paths),
+///   the plain-Administrator forge is the mechanism that reliably gets the
+///   third domain. A doomed forge on a real SID-filtered production trust
+///   costs ~30s of wasted dispatch; silently dropping the whole attack
+///   path costs the domain.
 fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str) -> bool {
     let target_l = target.to_lowercase();
     let inter_forest = is_inter_forest(source, target);
@@ -224,7 +224,6 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
     let known_keys: Vec<&str> = state.trusted_domains.keys().map(String::as_str).collect();
     if let Some(t) = state.trusted_domains.get(&target_l) {
         let cross = t.is_cross_forest();
-        let decision = cross && t.sid_filtering;
         debug!(
             source = %source,
             target = %target,
@@ -234,16 +233,24 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
             trust_direction = %t.direction,
             is_cross_forest = cross,
             sid_filtering = t.sid_filtering,
-            decision = decision,
-            reason = if cross { "metadata_cross_forest" } else { "metadata_not_cross_forest" },
+            decision = false,
+            reason = if cross {
+                "metadata_cross_forest_try_forge"
+            } else {
+                "metadata_not_cross_forest"
+            },
             trusted_domains_keys = ?known_keys,
             "trust filter predicate"
         );
-        if cross {
-            return t.sid_filtering;
-        }
-        // Trust enumeration disagrees with name-based heuristic — trust the
-        // explicit metadata (e.g. unusual same-forest cross-DNS-suffix setup).
+        // Cross-forest: try the forge regardless of `sid_filtering`. The
+        // dispatch doesn't inject ExtraSid for cross-forest, so a
+        // sid_filtering=true entry doesn't reflect the mechanism we
+        // actually use. The plain Administrator ticket succeeds on GOAD-DG
+        // (op-20260618 3/3) and costs ~30s if it fails on a real filtered
+        // trust — cheaper than dropping the whole path.
+        //
+        // Same-forest cross-DNS-suffix (cross=false with intra-forest
+        // trust): also fall through to false.
         return false;
     }
     // No metadata — try the forge. False positives (SID filtering actually
@@ -2812,7 +2819,12 @@ mod tests {
     }
 
     #[test]
-    fn filtered_inter_forest_explicit_filtering_on() {
+    fn filtered_inter_forest_explicit_filtering_on_still_tries_forge() {
+        // `sid_filtering=true` metadata no longer suppresses the forge —
+        // the dispatch doesn't inject ExtraSid for cross-forest, so the
+        // filter concern doesn't apply to the tool call we actually make.
+        // Verified empirically on GOAD-DG (op-20260618 3/3 vs op-20260718
+        // 2/3 while this gate was active).
         let trust = ares_core::models::TrustInfo {
             domain: "fabrikam.local".into(),
             flat_name: "FABRIKAM".into(),
@@ -2822,7 +2834,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("fabrikam.local", trust);
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
@@ -2886,9 +2898,13 @@ mod tests {
     }
 
     #[test]
-    fn filtered_inter_forest_target_metadata_authoritative() {
-        // When the target's TrustInfo says cross-forest with SID filtering,
-        // suppress the forge regardless of any source-side parent_child entry.
+    fn filtered_inter_forest_target_metadata_never_suppresses_cross_forest() {
+        // Cross-forest metadata (even sid_filtering=true) no longer
+        // suppresses. The cross-forest dispatch doesn't inject ExtraSid, so
+        // the filter's rejection surface doesn't apply — the plain
+        // Administrator ticket is a legitimate DA principal in the target
+        // realm. Ops that ran with this gate active dropped 1/3 domains;
+        // ops without it hit 3/3 on GOAD-DG.
         let target_trust = ares_core::models::TrustInfo {
             domain: "fabrikam.local".into(),
             flat_name: "FABRIKAM".into(),
@@ -2898,7 +2914,7 @@ mod tests {
             security_identifier: None,
         };
         let s = state_with_trust("fabrikam.local", target_trust);
-        assert!(is_filtered_inter_forest_trust(
+        assert!(!is_filtered_inter_forest_trust(
             &s,
             "contoso.local",
             "fabrikam.local"
