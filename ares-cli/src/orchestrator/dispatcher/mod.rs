@@ -5,7 +5,7 @@
 //! like `request_crack()`, `request_recon()` etc. build the correct payloads.
 
 mod submission;
-mod task_builders;
+pub(crate) mod task_builders;
 
 use std::collections::HashMap;
 use std::sync::Arc;

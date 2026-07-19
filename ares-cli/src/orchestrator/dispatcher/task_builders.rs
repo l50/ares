@@ -147,7 +147,7 @@ fn is_acl_style_vuln_type(vtype: &str) -> bool {
 /// accounts (`$`-suffixed) are dropped from the username seed — their passwords
 /// are un-guessable and only bloat the candidate list. Both are bounded so the
 /// task payload (and the Redis message that carries it) stays small.
-fn collect_crack_seed(state: &StateInner) -> (Vec<String>, Vec<String>) {
+pub(crate) fn collect_crack_seed(state: &StateInner) -> (Vec<String>, Vec<String>) {
     const MAX_USERNAMES: usize = 512;
     const MAX_PASSWORDS: usize = 256;
 

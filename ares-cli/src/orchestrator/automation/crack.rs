@@ -262,25 +262,70 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                 vec![(crack_dedup_key(&primary), primary.clone())]
             };
 
-            let hashes: Vec<ares_core::models::Hash> =
-                batch.iter().map(|(_, h)| h.clone()).collect();
-            match dispatcher.request_crack_batch(&hashes).await {
-                Ok(Some(task_id)) => {
-                    debug!(
-                        task_id = %task_id,
-                        hash_type = %primary.hash_type,
-                        batch = hashes.len(),
-                        "Crack task dispatched"
-                    );
-                    let now = Instant::now();
-                    for (dedup, hash) in &batch {
-                        inflight_crack_dedup.insert(dedup.clone(), now);
-                        record_crack_attempt(&dispatcher, dedup, &hash.hash_type).await;
+            // Direct-tool dispatch: the LLM cracker path (gpt-5-mini) hits
+            // MaxTokens on step 1 when a $krb5tgs$18 hash (2000+ chars) sits
+            // in the prompt — the model runs out of output budget before it
+            // can emit the crack_with_hashcat tool call, so kerberoast AES
+            // TGS never actually reaches hashcat. crack_with_hashcat's
+            // `resolve_hashcat_mode` auto-detects the mode from the hash
+            // value; no LLM reasoning is required. Dispatch straight to the
+            // worker.
+            let joined = batch
+                .iter()
+                .map(|(_, h)| h.hash_value.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let task_id = format!(
+                "crack_direct_{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+            let (known_usernames, known_passwords) = {
+                let state = dispatcher.state.read().await;
+                super::super::dispatcher::task_builders::collect_crack_seed(&state)
+            };
+            let call = ares_llm::ToolCall {
+                id: format!("crack_with_hashcat_{}", uuid::Uuid::new_v4().simple()),
+                name: "crack_with_hashcat".to_string(),
+                arguments: serde_json::json!({
+                    "hash_value": joined,
+                    "username": primary.username,
+                    "known_usernames": known_usernames,
+                    "known_passwords": known_passwords,
+                }),
+            };
+            info!(
+                task_id = %task_id,
+                hash_type = %primary.hash_type,
+                pick_user = %primary.username,
+                batch = batch.len(),
+                "crack_tick: dispatching crack_with_hashcat directly (bypass LLM)"
+            );
+            let dispatcher_bg = dispatcher.clone();
+            let batch_bg = batch.clone();
+            let now = Instant::now();
+            for (dedup, hash) in &batch {
+                inflight_crack_dedup.insert(dedup.clone(), now);
+                record_crack_attempt(&dispatcher, dedup, &hash.hash_type).await;
+            }
+            tokio::spawn(async move {
+                match dispatcher_bg
+                    .llm_runner
+                    .tool_dispatcher()
+                    .dispatch_tool("cracker", &task_id, &call)
+                    .await
+                {
+                    Ok(_result) => {
+                        info!(
+                            task_id = %task_id,
+                            batch = batch_bg.len(),
+                            "crack_tick: direct crack task completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(err = %e, task_id = %task_id, "crack_tick: direct crack dispatch failed");
                     }
                 }
-                Ok(None) => {} // deferred or throttled
-                Err(e) => warn!(err = %e, "Failed to dispatch crack task"),
-            }
+            });
         }
     }
 }
