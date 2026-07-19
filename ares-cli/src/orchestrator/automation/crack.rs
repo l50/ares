@@ -302,6 +302,8 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             );
             let dispatcher_bg = dispatcher.clone();
             let batch_bg = batch.clone();
+            let call_args = call.arguments.clone();
+            let primary_domain = primary.domain.clone();
             let now = Instant::now();
             for (dedup, hash) in &batch {
                 inflight_crack_dedup.insert(dedup.clone(), now);
@@ -314,12 +316,20 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                     .dispatch_tool("cracker", &task_id, &call)
                     .await
                 {
-                    Ok(_result) => {
+                    Ok(result) => {
                         info!(
                             task_id = %task_id,
                             batch = batch_bg.len(),
                             "crack_tick: direct crack task completed"
                         );
+                        process_direct_crack_result(
+                            &dispatcher_bg,
+                            &task_id,
+                            &call_args,
+                            &primary_domain,
+                            result,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         warn!(err = %e, task_id = %task_id, "crack_tick: direct crack dispatch failed");
@@ -328,6 +338,57 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             });
         }
     }
+}
+
+/// Fold a direct-dispatch `crack_with_hashcat` result back into state.
+///
+/// The LLM cracker path pushes tool discoveries + raw stdout through
+/// `submission::execute_task` → result queue → `process_completed_task`, which
+/// runs `extract_discoveries` and `extract_from_raw_text` to publish cracked
+/// credentials and stamp the source hashes cracked. The direct path bypasses
+/// that pipeline, so replay the same two extractors inline: without this the
+/// worker cracks the ticket, prints the plaintext, and the orchestrator never
+/// notices — leaving `state.hashes[<user>].cracked_password` at `None`.
+async fn process_direct_crack_result(
+    dispatcher: &Arc<Dispatcher>,
+    task_id: &str,
+    call_args: &serde_json::Value,
+    primary_domain: &str,
+    result: ares_llm::ToolExecResult,
+) {
+    use crate::orchestrator::result_processing;
+
+    if let Some(ref disc) = result.discoveries {
+        if let Err(e) = result_processing::extract_discoveries(disc, dispatcher, None, None).await {
+            warn!(task_id = %task_id, err = %e, "crack_tick: extract_discoveries failed");
+        }
+    }
+
+    let default_domain = if !primary_domain.is_empty() {
+        primary_domain.to_string()
+    } else {
+        dispatcher
+            .state
+            .read()
+            .await
+            .domains
+            .first()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Wrap in the `{tool_outputs: [{name, arguments, output}]}` shape
+    // `extract_from_raw_text` expects — the same shape submission.rs builds
+    // from `outcome.tool_outputs` on the LLM path.
+    let payload = serde_json::json!({
+        "tool_outputs": [{
+            "name": "crack_with_hashcat",
+            "arguments": call_args,
+            "output": result.output,
+        }],
+    });
+    result_processing::extract_from_raw_text(&payload, dispatcher, &default_domain, None, None)
+        .await;
 }
 
 /// All uncracked roastable hashes in `work` that share `primary`'s hashcat mode

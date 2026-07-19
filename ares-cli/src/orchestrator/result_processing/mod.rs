@@ -1742,7 +1742,7 @@ async fn auto_chain_s4u_secretsdump(
 /// Collects text from raw tool output fields ("tool_output", "output", "tool_outputs")
 /// and runs regex-based extraction on the combined text. Safety net that catches
 /// discoveries the per-tool parsers or LLM-reported structured data may have missed.
-async fn extract_from_raw_text(
+pub(crate) async fn extract_from_raw_text(
     payload: &Value,
     dispatcher: &Arc<Dispatcher>,
     default_domain: &str,
@@ -1958,7 +1958,7 @@ async fn extract_from_raw_text(
 }
 
 /// Extract credentials, hashes, hosts, vulns, and shares from a result payload.
-async fn extract_discoveries(
+pub(crate) async fn extract_discoveries(
     payload: &Value,
     dispatcher: &Arc<Dispatcher>,
     task_target_ip: Option<&str>,

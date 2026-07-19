@@ -38,6 +38,27 @@ vars:
   # AWS_PROFILE=foo AWS_REGION=us-east-1 explicitly on the task command line.
   AWS_PROFILE: '{{.AWS_PROFILE | default (env "AWS_PROFILE") | default "lab"}}'
   AWS_REGION: '{{.AWS_REGION | default (env "AWS_REGION") | default (env "AWS_DEFAULT_REGION") | default "us-west-1"}}'
+  # If temporary env credentials are present (e.g. from `assume`, `aws-vault`,
+  # instance metadata), skip --profile so the AWS CLI uses them. Otherwise pass
+  # --profile <name> and rely on ~/.aws/config. Resolved lazily per task run.
+  AWS_PROFILE_ARG:
+    sh: |
+      if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+        printf ''
+      else
+        printf -- '--profile %s' '{{.AWS_PROFILE}}'
+      fi
+  # Shell snippet the tasks eval before sourcing run-ssm.sh: if env creds are
+  # already present, unset AWS_PROFILE so boto3/aws-sdk don't try to refresh
+  # a (possibly expired) SSO token instead of using the env session; otherwise
+  # export AWS_PROFILE=<name> for the profile-based path.
+  AWS_PROFILE_EXPORT:
+    sh: |
+      if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+        printf 'unset AWS_PROFILE'
+      else
+        printf 'export AWS_PROFILE=%s' '{{.AWS_PROFILE}}'
+      fi
   # S3 bucket for file staging (required; pass S3_BUCKET=your-bucket or set as env var)
   S3_BUCKET: '{{.S3_BUCKET | default (env "S3_BUCKET") | default ""}}'
   # Remote paths on EC2
@@ -66,7 +87,7 @@ tasks:
     cmds:
       - |
         INSTANCE_INFO=$(aws ec2 describe-instances \
-          --profile "{{.AWS_PROFILE}}" \
+          {{.AWS_PROFILE_ARG}} \
           --region "{{.AWS_REGION}}" \
           --filters "Name=instance-state-name,Values=running" \
                     "Name=tag:Name,Values=*{{.EC2_NAME}}*" \
@@ -106,8 +127,8 @@ tasks:
       # nothing (see the ares-debug skill, Step 3.5).
       SKIP_RESTART: '{{.SKIP_RESTART | default "false"}}'
     preconditions:
-      - sh: aws sts get-caller-identity --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" >/dev/null 2>&1
-        msg: "Not logged into AWS (profile: {{.AWS_PROFILE}}). Run: aws sso login --profile {{.AWS_PROFILE}}"
+      - sh: aws sts get-caller-identity {{.AWS_PROFILE_ARG}} --region "{{.AWS_REGION}}" >/dev/null 2>&1
+        msg: "Not logged into AWS. Either export env creds (e.g. `assume {{.AWS_PROFILE}}`) or run `aws sso login --profile {{.AWS_PROFILE}}`."
       - sh: test -n "{{.S3_BUCKET}}"
         msg: "S3_BUCKET not set. Pass S3_BUCKET=your-bucket or export it as an env var."
     cmds:
@@ -141,7 +162,7 @@ tasks:
         if [ "$BUILD_TOOL" = "remote" ]; then
           echo -e "{{.INFO}} Building natively on EC2..."
 
-          export AWS_PROFILE="{{.AWS_PROFILE}}"
+          {{.AWS_PROFILE_EXPORT}}
           export AWS_REGION="{{.AWS_REGION}}"
           . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -173,7 +194,7 @@ tasks:
           # Upload source to S3
           echo -e "{{.INFO}} Uploading source to S3..."
           aws s3 cp "$SRC_TAR" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/ares-src.tar.gz" \
-            --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
+            {{.AWS_PROFILE_ARG}} --region "{{.AWS_REGION}}"
 
           # Build on EC2 via SSM
           echo -e "{{.INFO}} Building on $INSTANCE_ID (this may take a few minutes on first run)..."
@@ -364,7 +385,7 @@ tasks:
 
         echo -e "{{.INFO}} Uploading binary to s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/..."
         aws s3 cp "$BIN_PATH" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/ares" \
-          --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
+          {{.AWS_PROFILE_ARG}} --region "{{.AWS_REGION}}"
 
         echo -e "{{.SUCCESS}} Binary staged in S3 (sha=$BUILD_SHA)"
 
@@ -372,7 +393,7 @@ tasks:
       - |
         if [ "{{.BUILD_TOOL}}" = "remote" ]; then exit 0; fi
 
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -448,7 +469,7 @@ tasks:
         msg: "S3_BUCKET not set. Pass S3_BUCKET=your-bucket or export it as an env var."
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -456,7 +477,7 @@ tasks:
 
         echo -e "{{.INFO}} Uploading config to S3..."
         aws s3 cp "{{.ARES_CONFIG}}" "s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml" \
-          --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}"
+          {{.AWS_PROFILE_ARG}} --region "{{.AWS_REGION}}"
 
         echo -e "{{.INFO}} Pulling config to $INSTANCE_ID..."
         PAYLOAD="mkdir -p /etc/ares && aws s3 cp s3://{{.S3_BUCKET}}/{{.S3_DEPLOY_PREFIX}}/config.yaml /etc/ares/config.yaml && echo Config deployed: && cat /etc/ares/config.yaml | head -5"
@@ -473,7 +494,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -496,7 +517,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -515,7 +536,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -556,7 +577,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -568,7 +589,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -583,7 +604,7 @@ tasks:
       LINES: '{{.LINES | default "50"}}'
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -592,7 +613,7 @@ tasks:
         echo -e "{{.INFO}} Tailing $LOG_FILE on $INSTANCE_ID (Ctrl+C to stop)..."
 
         aws ssm start-session \
-          --profile "{{.AWS_PROFILE}}" \
+          {{.AWS_PROFILE_ARG}} \
           --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartInteractiveCommand" \
@@ -609,7 +630,7 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./logs"}}'
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -695,7 +716,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -710,7 +731,7 @@ tasks:
         echo ""
 
         aws ssm start-session \
-          --profile "{{.AWS_PROFILE}}" \
+          {{.AWS_PROFILE_ARG}} \
           --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartPortForwardingSession" \
@@ -721,7 +742,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -735,7 +756,7 @@ tasks:
         echo ""
 
         aws ssm start-session \
-          --profile "{{.AWS_PROFILE}}" \
+          {{.AWS_PROFILE_ARG}} \
           --region "{{.AWS_REGION}}" \
           --target "$INSTANCE_ID" \
           --document-name "AWS-StartPortForwardingSession" \
@@ -783,7 +804,7 @@ tasks:
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -878,7 +899,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -1011,7 +1032,7 @@ tasks:
       CONTINUE_AFTER_DA: '{{.CONTINUE_AFTER_DA | default ""}}'
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -1075,7 +1096,7 @@ tasks:
 
         # Fetch API keys from Secrets Manager
         SECRETS=$(aws secretsmanager get-secret-value \
-          --profile "{{.AWS_PROFILE}}" \
+          {{.AWS_PROFILE_ARG}} \
           --region "{{.AWS_REGION}}" \
           --secret-id "{{.SECRETS_ID}}" \
           --query SecretString --output text 2>/dev/null) || true
@@ -1118,7 +1139,7 @@ tasks:
         ARES_DATABASE_URL_VAL="{{.ARES_DATABASE_URL}}"
         if [ -z "$ARES_DATABASE_URL_VAL" ] && [ -n "{{.RDS_SECRET_ID}}" ]; then
           DB_PASSWORD=$(aws secretsmanager get-secret-value \
-            --profile "{{.AWS_PROFILE}}" \
+            {{.AWS_PROFILE_ARG}} \
             --region "{{.AWS_REGION}}" \
             --secret-id "{{.RDS_SECRET_ID}}" \
             --query SecretString --output text 2>/dev/null) || true
@@ -1247,11 +1268,11 @@ tasks:
           # attack window to S3. Non-fatal — the op is finalized regardless.
           if [ "{{.CAPTURE}}" = "true" ]; then
             echo -e "{{.INFO}} CAPTURE=true — auto-capturing benchmark snapshot for $OP_ID (waits for Loki flush)"
-            ATTACKER_IP=$(aws ec2 describe-instances --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" \
+            ATTACKER_IP=$(aws ec2 describe-instances {{.AWS_PROFILE_ARG}} --region "{{.AWS_REGION}}" \
               --instance-ids "$INSTANCE_ID" \
               --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null) || true
             lsof -ti:16379 | xargs kill 2>/dev/null || true; sleep 1
-            aws ssm start-session --profile "{{.AWS_PROFILE}}" --region "{{.AWS_REGION}}" --target "$INSTANCE_ID" \
+            aws ssm start-session {{.AWS_PROFILE_ARG}} --region "{{.AWS_REGION}}" --target "$INSTANCE_ID" \
               --document-name AWS-StartPortForwardingSession \
               --parameters '{"portNumber":["6379"],"localPortNumber":["16379"]}' >/tmp/ares-capture-fwd.log 2>&1 &
             PF_PID=$!
@@ -1272,7 +1293,7 @@ tasks:
     silent: true
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
         INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
@@ -1291,7 +1312,7 @@ tasks:
         msg: "ansible-playbook not found in PATH — install ansible-core (e.g. `pipx install ansible-core`)."
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
@@ -1350,7 +1371,7 @@ tasks:
         msg: "CMD required. Usage: task ec2:exec CMD='redis-cli info keyspace'"
     cmds:
       - |
-        export AWS_PROFILE="{{.AWS_PROFILE}}"
+        {{.AWS_PROFILE_EXPORT}}
         export AWS_REGION="{{.AWS_REGION}}"
         . .taskfiles/ec2/scripts/run-ssm.sh
 
