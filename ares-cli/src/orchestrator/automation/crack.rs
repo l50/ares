@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -194,30 +194,43 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
         // a backlog of NTLM machine-account hashes from secretsdump (already
         // PtH-usable) would starve the lone kerberoast/asrep hash that
         // unlocks a service-account password.
-        let (mut work, attempts): (
-            Vec<(String, ares_core::models::Hash)>,
-            std::collections::HashMap<String, u32>,
-        ) = {
+        let mut work: Vec<(String, ares_core::models::Hash)> = Vec::new();
+        let mut uncracked_hashes = 0usize;
+        let mut crackable_hashes = 0usize;
+        let mut dropped_reasons: Vec<String> = Vec::new();
+        let (attempts, total_hashes) = {
             let state = dispatcher.state.read().await;
-            let work = state
-                .hashes
-                .iter()
-                .filter(|h| h.cracked_password.is_none())
-                .filter(|h| !is_uncrackable(h))
-                .filter_map(|h| {
-                    let dedup = crack_dedup_key(h);
-                    if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup)
-                        || inflight_crack_dedup.contains_key(&dedup)
-                    {
-                        None
-                    } else {
-                        Some((dedup, h.clone()))
-                    }
-                })
-                .collect();
-            (work, state.crack_attempts.clone())
+            let total_hashes = state.hashes.len();
+            for h in state.hashes.iter() {
+                if h.cracked_password.is_some() {
+                    continue;
+                }
+                uncracked_hashes += 1;
+                if is_uncrackable(h) {
+                    continue;
+                }
+                crackable_hashes += 1;
+                let dedup = crack_dedup_key(h);
+                if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
+                    dropped_reasons.push(format!("{}:{}:dedup_processed", h.username, h.hash_type));
+                    continue;
+                }
+                if inflight_crack_dedup.contains_key(&dedup) {
+                    dropped_reasons.push(format!("{}:{}:inflight", h.username, h.hash_type));
+                    continue;
+                }
+                work.push((dedup, h.clone()));
+            }
+            (state.crack_attempts.clone(), total_hashes)
         };
         sort_crack_work(&mut work, &attempts);
+        info!(
+            state_hashes_total = total_hashes,
+            state_hashes_uncracked = uncracked_hashes,
+            state_hashes_crackable = crackable_hashes,
+            dropped = ?dropped_reasons,
+            "crack_tick: filter stats"
+        );
 
         // Allow multiple distinct crack tasks up to the configured cap. Same-mode
         // roastables are still batched into one task, and in-flight dedup keys
@@ -249,27 +262,133 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                 vec![(crack_dedup_key(&primary), primary.clone())]
             };
 
-            let hashes: Vec<ares_core::models::Hash> =
-                batch.iter().map(|(_, h)| h.clone()).collect();
-            match dispatcher.request_crack_batch(&hashes).await {
-                Ok(Some(task_id)) => {
-                    debug!(
-                        task_id = %task_id,
-                        hash_type = %primary.hash_type,
-                        batch = hashes.len(),
-                        "Crack task dispatched"
-                    );
-                    let now = Instant::now();
-                    for (dedup, hash) in &batch {
-                        inflight_crack_dedup.insert(dedup.clone(), now);
-                        record_crack_attempt(&dispatcher, dedup, &hash.hash_type).await;
+            // Direct-tool dispatch: the LLM cracker path (gpt-5-mini) hits
+            // MaxTokens on step 1 when a $krb5tgs$18 hash (2000+ chars) sits
+            // in the prompt — the model runs out of output budget before it
+            // can emit the crack_with_hashcat tool call, so kerberoast AES
+            // TGS never actually reaches hashcat. crack_with_hashcat's
+            // `resolve_hashcat_mode` auto-detects the mode from the hash
+            // value; no LLM reasoning is required. Dispatch straight to the
+            // worker.
+            let joined = batch
+                .iter()
+                .map(|(_, h)| h.hash_value.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let task_id = format!(
+                "crack_direct_{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+            let (known_usernames, known_passwords) = {
+                let state = dispatcher.state.read().await;
+                super::super::dispatcher::task_builders::collect_crack_seed(&state)
+            };
+            let call = ares_llm::ToolCall {
+                id: format!("crack_with_hashcat_{}", uuid::Uuid::new_v4().simple()),
+                name: "crack_with_hashcat".to_string(),
+                arguments: serde_json::json!({
+                    "hash_value": joined,
+                    "username": primary.username,
+                    "known_usernames": known_usernames,
+                    "known_passwords": known_passwords,
+                }),
+            };
+            info!(
+                task_id = %task_id,
+                hash_type = %primary.hash_type,
+                pick_user = %primary.username,
+                batch = batch.len(),
+                "crack_tick: dispatching crack_with_hashcat directly (bypass LLM)"
+            );
+            let dispatcher_bg = dispatcher.clone();
+            let batch_bg = batch.clone();
+            let call_args = call.arguments.clone();
+            let primary_domain = primary.domain.clone();
+            let now = Instant::now();
+            for (dedup, hash) in &batch {
+                inflight_crack_dedup.insert(dedup.clone(), now);
+                record_crack_attempt(&dispatcher, dedup, &hash.hash_type).await;
+            }
+            tokio::spawn(async move {
+                match dispatcher_bg
+                    .llm_runner
+                    .tool_dispatcher()
+                    .dispatch_tool("cracker", &task_id, &call)
+                    .await
+                {
+                    Ok(result) => {
+                        info!(
+                            task_id = %task_id,
+                            batch = batch_bg.len(),
+                            "crack_tick: direct crack task completed"
+                        );
+                        process_direct_crack_result(
+                            &dispatcher_bg,
+                            &task_id,
+                            &call_args,
+                            &primary_domain,
+                            result,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(err = %e, task_id = %task_id, "crack_tick: direct crack dispatch failed");
                     }
                 }
-                Ok(None) => {} // deferred or throttled
-                Err(e) => warn!(err = %e, "Failed to dispatch crack task"),
-            }
+            });
         }
     }
+}
+
+/// Fold a direct-dispatch `crack_with_hashcat` result back into state.
+///
+/// The LLM cracker path pushes tool discoveries + raw stdout through
+/// `submission::execute_task` → result queue → `process_completed_task`, which
+/// runs `extract_discoveries` and `extract_from_raw_text` to publish cracked
+/// credentials and stamp the source hashes cracked. The direct path bypasses
+/// that pipeline, so replay the same two extractors inline: without this the
+/// worker cracks the ticket, prints the plaintext, and the orchestrator never
+/// notices — leaving `state.hashes[<user>].cracked_password` at `None`.
+async fn process_direct_crack_result(
+    dispatcher: &Arc<Dispatcher>,
+    task_id: &str,
+    call_args: &serde_json::Value,
+    primary_domain: &str,
+    result: ares_llm::ToolExecResult,
+) {
+    use crate::orchestrator::result_processing;
+
+    if let Some(ref disc) = result.discoveries {
+        if let Err(e) = result_processing::extract_discoveries(disc, dispatcher, None, None).await {
+            warn!(task_id = %task_id, err = %e, "crack_tick: extract_discoveries failed");
+        }
+    }
+
+    let default_domain = if !primary_domain.is_empty() {
+        primary_domain.to_string()
+    } else {
+        dispatcher
+            .state
+            .read()
+            .await
+            .domains
+            .first()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Wrap in the `{tool_outputs: [{name, arguments, output}]}` shape
+    // `extract_from_raw_text` expects — the same shape submission.rs builds
+    // from `outcome.tool_outputs` on the LLM path.
+    let payload = serde_json::json!({
+        "tool_outputs": [{
+            "name": "crack_with_hashcat",
+            "arguments": call_args,
+            "output": result.output,
+        }],
+    });
+    result_processing::extract_from_raw_text(&payload, dispatcher, &default_domain, None, None)
+        .await;
 }
 
 /// All uncracked roastable hashes in `work` that share `primary`'s hashcat mode

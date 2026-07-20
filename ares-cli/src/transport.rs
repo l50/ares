@@ -186,6 +186,18 @@ pub(crate) fn maybe_exec_k8s() -> Option<i32> {
 // ============================================================================
 
 /// Resolve EC2 instance ID from a Name tag pattern.
+/// Return `["--profile", profile]` unless session env credentials are already
+/// exported (assume, aws-vault, instance metadata) — in that case the AWS CLI
+/// should use the env session, and passing `--profile` would send it looking
+/// for a named profile in `~/.aws/config` instead.
+fn profile_args(profile: &str) -> Vec<&str> {
+    if std::env::var_os("AWS_ACCESS_KEY_ID").is_some() {
+        Vec::new()
+    } else {
+        vec!["--profile", profile]
+    }
+}
+
 fn resolve_ec2_instance(name: &str, profile: &str, region: &str) -> Result<String, String> {
     // Pass-through: if the caller already provided an instance ID (`i-…`),
     // skip the tag lookup. Lets operators pin a specific box when the Name
@@ -193,22 +205,22 @@ fn resolve_ec2_instance(name: &str, profile: &str, region: &str) -> Result<Strin
     if name.starts_with("i-") && name.len() >= 10 {
         return Ok(name.to_string());
     }
-    let output = Command::new("aws")
+    let filter = format!("Name=tag:Name,Values=*{name}*");
+    let mut cmd = Command::new("aws");
+    cmd.args(["ec2", "describe-instances"])
+        .args(profile_args(profile))
         .args([
-            "ec2",
-            "describe-instances",
-            "--profile",
-            profile,
             "--region",
             region,
             "--filters",
             "Name=instance-state-name,Values=running",
-            &format!("Name=tag:Name,Values=*{name}*"),
+            &filter,
             "--query",
             "Reservations[*].Instances[*].InstanceId",
             "--output",
             "text",
-        ])
+        ]);
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run aws: {e}"))?;
 
@@ -284,12 +296,11 @@ fn ssm_send_command(
     std::fs::write(&params_path, &params_json)
         .map_err(|e| format!("Failed to write params file: {e}"))?;
 
-    let output = Command::new("aws")
+    let parameters = format!("file://{params_path}");
+    let mut cmd = Command::new("aws");
+    cmd.args(["ssm", "send-command"])
+        .args(profile_args(profile))
         .args([
-            "ssm",
-            "send-command",
-            "--profile",
-            profile,
             "--region",
             region,
             "--instance-ids",
@@ -297,13 +308,13 @@ fn ssm_send_command(
             "--document-name",
             "AWS-RunShellScript",
             "--parameters",
-            &format!("file://{params_path}"),
+            &parameters,
             "--query",
             "Command.CommandId",
             "--output",
             "text",
-        ])
-        .output();
+        ]);
+    let output = cmd.output();
 
     // Clean up temp file regardless of outcome
     let _ = std::fs::remove_file(&params_path);
@@ -325,12 +336,10 @@ fn ssm_poll(cmd_id: &str, instance_id: &str, profile: &str, region: &str, max_se
     // still return the instant they reach a terminal state.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs as u64);
     while std::time::Instant::now() < deadline {
-        if let Ok(output) = Command::new("aws")
+        let mut cmd = Command::new("aws");
+        cmd.args(["ssm", "get-command-invocation"])
+            .args(profile_args(profile))
             .args([
-                "ssm",
-                "get-command-invocation",
-                "--profile",
-                profile,
                 "--region",
                 region,
                 "--command-id",
@@ -341,9 +350,8 @@ fn ssm_poll(cmd_id: &str, instance_id: &str, profile: &str, region: &str, max_se
                 "Status",
                 "--output",
                 "text",
-            ])
-            .output()
-        {
+            ]);
+        if let Ok(output) = cmd.output() {
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
             match status.as_str() {
                 "Success" | "Failed" | "Cancelled" | "TimedOut" => return status,
@@ -363,12 +371,10 @@ fn ssm_get_output(
     region: &str,
     query_field: &str,
 ) -> Result<String, String> {
-    let output = Command::new("aws")
+    let mut cmd = Command::new("aws");
+    cmd.args(["ssm", "get-command-invocation"])
+        .args(profile_args(profile))
         .args([
-            "ssm",
-            "get-command-invocation",
-            "--profile",
-            profile,
             "--region",
             region,
             "--command-id",
@@ -379,7 +385,8 @@ fn ssm_get_output(
             query_field,
             "--output",
             "text",
-        ])
+        ]);
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run aws: {e}"))?;
 

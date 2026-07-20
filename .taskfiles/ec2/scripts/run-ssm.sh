@@ -6,7 +6,8 @@
 #     INSTANCE_ID=$(resolve_instance_id "$EC2_NAME")
 #     run_ssm_cmd "$INSTANCE_ID" "redis-cli ping" 30
 #
-# Required in the caller's environment: AWS_PROFILE, AWS_REGION.
+# Required in the caller's environment: AWS_REGION, plus either AWS_PROFILE
+# or exported session credentials (AWS_ACCESS_KEY_ID/…).
 #
 # run_ssm_cmd contract:
 #   - On success: writes StandardOutputContent to stdout, returns 0.
@@ -17,6 +18,17 @@
 #     the local loop.
 
 set -o pipefail
+
+# If temporary env credentials are already exported (assume, aws-vault, instance
+# metadata), skip --profile so the AWS CLI uses them. Otherwise fall back to
+# --profile "$AWS_PROFILE" and let the CLI resolve the named profile from
+# ~/.aws/config. Use a bash array so the flag can expand to zero args cleanly
+# without shellcheck word-splitting warnings.
+if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+	AWS_PROFILE_ARG=()
+else
+	AWS_PROFILE_ARG=(--profile "${AWS_PROFILE:-lab}")
+fi
 
 # _resolve_ec2 <name-tag-glob>
 #   Prints the newest matching "<LaunchTime>\t<InstanceId>\t<PrivateIpAddress>"
@@ -29,7 +41,7 @@ _resolve_ec2() {
 	local name="$1"
 	local candidates picked count _launch picked_id picked_ip
 	candidates=$(aws ec2 describe-instances \
-		--profile "$AWS_PROFILE" \
+		"${AWS_PROFILE_ARG[@]}" \
 		--region "$AWS_REGION" \
 		--filters "Name=instance-state-name,Values=running" \
 		"Name=tag:Name,Values=*${name}*" \
@@ -83,7 +95,7 @@ resolve_targets() {
 	local name="$1"
 	local ips
 	ips=$(aws ec2 describe-instances \
-		--profile "$AWS_PROFILE" \
+		"${AWS_PROFILE_ARG[@]}" \
 		--region "$AWS_REGION" \
 		--filters "Name=instance-state-name,Values=running" \
 		"Name=tag:Name,Values=*${name}*" \
@@ -111,7 +123,7 @@ run_ssm_cmd() {
 	jq -n --arg cmd "$payload" '{"commands": [$cmd]}' >"$params_file"
 
 	cmd_id=$(aws ssm send-command \
-		--profile "$AWS_PROFILE" \
+		"${AWS_PROFILE_ARG[@]}" \
 		--region "$AWS_REGION" \
 		--instance-ids "$instance_id" \
 		--document-name "AWS-RunShellScript" \
@@ -124,7 +136,7 @@ run_ssm_cmd() {
 	status=""
 	for _ in $(seq 1 "$timeout"); do
 		status=$(aws ssm get-command-invocation \
-			--profile "$AWS_PROFILE" \
+			"${AWS_PROFILE_ARG[@]}" \
 			--region "$AWS_REGION" \
 			--command-id "$cmd_id" \
 			--instance-id "$instance_id" \
@@ -136,7 +148,7 @@ run_ssm_cmd() {
 	done
 
 	output=$(aws ssm get-command-invocation \
-		--profile "$AWS_PROFILE" \
+		"${AWS_PROFILE_ARG[@]}" \
 		--region "$AWS_REGION" \
 		--command-id "$cmd_id" \
 		--instance-id "$instance_id" \
@@ -144,7 +156,7 @@ run_ssm_cmd() {
 
 	if [ "$status" != "Success" ]; then
 		details=$(aws ssm get-command-invocation \
-			--profile "$AWS_PROFILE" \
+			"${AWS_PROFILE_ARG[@]}" \
 			--region "$AWS_REGION" \
 			--command-id "$cmd_id" \
 			--instance-id "$instance_id" \
@@ -158,7 +170,7 @@ run_ssm_cmd() {
 			printf '%s\n' "$output" >&2
 		fi
 		aws ssm get-command-invocation \
-			--profile "$AWS_PROFILE" \
+			"${AWS_PROFILE_ARG[@]}" \
 			--region "$AWS_REGION" \
 			--command-id "$cmd_id" \
 			--instance-id "$instance_id" \

@@ -117,6 +117,24 @@ fn extract_hosts_banner_fqdn_construction() {
 }
 
 #[test]
+fn extract_from_output_text_strips_ansi_before_extracting_hosts() {
+    // Real netexec banner shape (wide-column padding, trailing SMBv1 tag),
+    // wrapped in ANSI color escapes. Without the pre-extract strip, the SMB
+    // regex `\s+` between columns fails on `\x1b[32m` and the row silently
+    // drops — leaving state with only the seeded IP and no hostname/OS.
+    let output = "\x1b[32mSMB                      192.168.58.20   445    \
+        WS01             [*] Windows 10 / Server 2019 Build 17763 x64 \
+        (name:WS01) (domain:contoso.local) (signing:False) \
+        (SMBv1:None)\x1b[0m";
+    let extracted = extract_from_output_text(output, "");
+    assert_eq!(extracted.hosts.len(), 1);
+    assert_eq!(extracted.hosts[0].ip, "192.168.58.20");
+    assert_eq!(extracted.hosts[0].hostname, "ws01.contoso.local");
+    assert!(extracted.hosts[0].os.contains("Windows 10"));
+    assert!(!extracted.hosts[0].is_dc); // signing:False
+}
+
+#[test]
 fn extract_hosts_banner_domain_trailing_zero() {
     // netexec sometimes appends "0." to domain — verify it's stripped
     let output = "SMB  192.168.58.11  445  DC02  [*] Windows Server 2019 (name:DC02) (domain:contoso.local0.) (signing:True)";

@@ -204,12 +204,24 @@ pub fn extract_from_output_text(ctx: &ToolOutputCtx<'_>, default_domain: &str) -
         return result;
     }
 
+    // Strip color/formatting escapes before every regex extractor. netexec /
+    // rich-based tools sometimes force ANSI on their piped output; the SMB
+    // banner regex uses `\s+` between columns which will not match a
+    // `\x1b[32m` sequence, silently dropping the host row (leaving state with
+    // only the seeded IP and no hostname/OS/services).
+    let cleaned = strip_ansi(ctx.output);
+    let ctx = ToolOutputCtx {
+        name: ctx.name,
+        arguments: ctx.arguments,
+        output: cleaned.as_str(),
+    };
+
     result.hosts = extract_hosts(ctx.output);
     result.users = extract_users(ctx.output, default_domain);
     result.shares = extract_shares(ctx.output);
 
     if ctx.stdout_is_extraction_trustworthy() {
-        result.credentials = extract_plaintext_passwords(ctx, default_domain);
+        result.credentials = extract_plaintext_passwords(&ctx, default_domain);
         result.hashes = extract_hashes(ctx.output, default_domain);
         let cracked = extract_cracked_passwords(ctx.output, default_domain);
         result.credentials.extend(cracked);
