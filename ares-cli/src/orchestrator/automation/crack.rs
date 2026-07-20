@@ -180,14 +180,17 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             break;
         }
 
+        // Age out inflight guards by TTL only. The direct dispatch path
+        // (tokio::spawn → tool_dispatcher::dispatch_tool) is not registered with
+        // `dispatcher.tracker`, so `count_for_role("cracker")` returns 0 while
+        // hashcat is running in the background. Using that as a "clear inflight"
+        // trigger deleted the guard every tick, letting the same hash be
+        // re-selected, re-dispatched, and burn all MAX_CRACK_ATTEMPTS retries in
+        // ~45s before the first hashcat run had a chance to finish.
         let active_crack_tasks = dispatcher.tracker.count_for_role("cracker").await;
-        if active_crack_tasks == 0 {
-            inflight_crack_dedup.clear();
-        } else {
-            let now = Instant::now();
-            inflight_crack_dedup
-                .retain(|_, submitted_at| now.duration_since(*submitted_at) < CRACK_INFLIGHT_TTL);
-        }
+        let now = Instant::now();
+        inflight_crack_dedup
+            .retain(|_, submitted_at| now.duration_since(*submitted_at) < CRACK_INFLIGHT_TTL);
 
         // Collect unprocessed hashes, then sort by crack priority so the
         // hashcat pool serves roastable hashes first. Without this,
@@ -305,17 +308,16 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             let call_args = call.arguments.clone();
             let primary_domain = primary.domain.clone();
             let now = Instant::now();
-            for (dedup, hash) in &batch {
+            for (dedup, _hash) in &batch {
                 inflight_crack_dedup.insert(dedup.clone(), now);
-                record_crack_attempt(&dispatcher, dedup, &hash.hash_type).await;
             }
             tokio::spawn(async move {
-                match dispatcher_bg
+                let dispatch_result = dispatcher_bg
                     .llm_runner
                     .tool_dispatcher()
                     .dispatch_tool("cracker", &task_id, &call)
-                    .await
-                {
+                    .await;
+                match dispatch_result {
                     Ok(result) => {
                         info!(
                             task_id = %task_id,
@@ -333,6 +335,25 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                     }
                     Err(e) => {
                         warn!(err = %e, task_id = %task_id, "crack_tick: direct crack dispatch failed");
+                    }
+                }
+                // Count attempts against completed hashcat runs, not tick
+                // re-selections. `record_crack_attempt` only marks
+                // DEDUP_CRACK_REQUESTS when a hash has actually taken
+                // MAX_CRACK_ATTEMPTS full runs and still isn't cracked; a hash
+                // that cracked on this run drops out of `work` naturally via
+                // `cracked_password.is_some()` on the next tick, so the counter
+                // bump here is harmless for the success case.
+                for (dedup, hash) in &batch_bg {
+                    let still_uncracked = {
+                        let state = dispatcher_bg.state.read().await;
+                        state
+                            .hashes
+                            .iter()
+                            .any(|h| crack_dedup_key(h) == *dedup && h.cracked_password.is_none())
+                    };
+                    if still_uncracked {
+                        record_crack_attempt(&dispatcher_bg, dedup, &hash.hash_type).await;
                     }
                 }
             });
