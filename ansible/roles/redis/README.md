@@ -23,6 +23,7 @@ Redis server for Ares worker message broker
 | `redis_ares_worker_binary` | str | <code>/usr/local/bin/ares</code> | Path to the ares binary the worker units execute. |
 | `redis_ares_log_dir` | str | <code>/var/log/ares</code> | Directory for Ares worker logs. |
 | `redis_ares_config_dir` | str | <code>/etc/ares</code> | Directory for Ares config and the optional worker EnvironmentFile. |
+| `redis_ares_worker_home` | str | <code>/root</code> | HOME for the worker units. systemd sets none for system services, |
 | `redis_ares_worker_memory_high` | str | <code>1500M</code> | Per-worker soft memory limit (MemoryHigh); throttles before the hard cap. |
 | `redis_ares_worker_memory_max` | str | <code>2G</code> | Per-worker hard memory cap (MemoryMax); the cgroup OOM-kills the worker past this. |
 | `redis_ares_worker_tasks_max` | int | <code>256</code> | Per-worker max task (thread/process) count (TasksMax). |

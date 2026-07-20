@@ -97,7 +97,9 @@
     mode: '0644'
   become: true
   when: redis_install_ares_worker_unit
-  notify: Reload systemd
+  notify:
+    - Reload systemd
+    - Restart ares workers
 
 - name: Enable and start Ares worker instances
   ansible.builtin.systemd:
