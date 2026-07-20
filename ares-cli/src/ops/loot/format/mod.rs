@@ -45,6 +45,7 @@ pub(crate) fn print_loot(state: &SharedRedTeamState, json_output: bool) {
         &state.all_hosts,
         target_domain,
     );
+    let domains = display::canonicalize_display_domains(&domains, &state.netbios_to_fqdn);
 
     if json_output {
         json::print_loot_json(state, &credentials, &hashes, &domains);
@@ -106,6 +107,7 @@ pub(crate) fn print_runtime_summary(state: &SharedRedTeamState) {
         &state.all_hosts,
         target_domain,
     );
+    let domains = display::canonicalize_display_domains(&domains, &state.netbios_to_fqdn);
 
     display::print_runtime_summary(state, &credentials, &hashes, &domains);
 }

@@ -454,6 +454,46 @@ fn normalize_state_domains_strips_trailing_dots() {
 }
 
 #[test]
+fn normalize_state_domains_drops_workgroup_pseudo_domain() {
+    // WORKGROUP arrives as a user domain (so it would otherwise pass the
+    // valid-domain gate), but must be dropped as a pseudo-domain so it can't
+    // inflate the `(N/M domains, X/Y forests)` counts downstream.
+    let users = vec![
+        make_user("contoso.local", "admin"),
+        make_user("WORKGROUP", "localuser"),
+    ];
+    let mut creds = vec![];
+    let mut hashes = vec![];
+    let mut domains = vec!["contoso.local".to_string(), "WORKGROUP".to_string()];
+    let hosts = vec![];
+
+    normalize_state_domains(&users, &mut creds, &mut hashes, &mut domains, &hosts, None);
+
+    assert_eq!(domains, vec!["contoso.local".to_string()]);
+}
+
+#[test]
+fn normalize_state_domains_drops_win_computer_name_pseudo_domain() {
+    // A WIN-<11> computer-name FQDN leaked in as a user domain (the classic
+    // kali workgroup leak) must not survive as a phantom realm.
+    let users = vec![
+        make_user("contoso.local", "admin"),
+        make_user("WIN-ABCDEFGHIJK.leak.local", "svc"),
+    ];
+    let mut creds = vec![];
+    let mut hashes = vec![];
+    let mut domains = vec![
+        "contoso.local".to_string(),
+        "WIN-ABCDEFGHIJK.leak.local".to_string(),
+    ];
+    let hosts = vec![];
+
+    normalize_state_domains(&users, &mut creds, &mut hashes, &mut domains, &hosts, None);
+
+    assert_eq!(domains, vec!["contoso.local".to_string()]);
+}
+
+#[test]
 fn normalize_state_domains_hash_dedup_same_user_same_hash_different_domains() {
     // Same user+hash appears with two different domain labels; user is known in one domain.
     // The unknown-domain hash should be corrected then deduped away.

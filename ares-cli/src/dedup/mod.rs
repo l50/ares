@@ -36,7 +36,7 @@ pub(crate) fn is_ghost_machine_account(username: &str) -> bool {
 }
 
 pub(crate) use credentials::{dedup_credentials, sanitize_credentials};
-pub(crate) use domains::normalize_state_domains;
+pub(crate) use domains::{looks_like_workgroup_pseudo_domain, normalize_state_domains};
 pub(crate) use hashes::dedup_hashes;
 pub(crate) use labels::normalize_source_label;
 pub(crate) use users::dedup_users;
