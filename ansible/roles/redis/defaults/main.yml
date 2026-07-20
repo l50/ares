@@ -26,6 +26,10 @@ redis_ares_worker_binary: "/usr/local/bin/ares"
 redis_ares_log_dir: "/var/log/ares"
 # description: Directory for Ares config and the optional worker EnvironmentFile.
 redis_ares_config_dir: "/etc/ares"
+# description: HOME for the worker units. systemd sets none for system services,
+# but ares reads $HOME to locate hashcat's potfile for the per-op wipe; the
+# workers run as root, so this must match root's home.
+redis_ares_worker_home: "/root"
 
 # Worker cgroup resource limits (per-role instance).
 # Workers spawn tool subprocesses (netexec, hashcat, nmap) that inherit the
