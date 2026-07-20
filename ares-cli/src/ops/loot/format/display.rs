@@ -4,7 +4,10 @@ use ares_core::models::{Credential, Hash, SharedRedTeamState, VulnerabilityInfo}
 
 use super::format_duration;
 use super::hosts::{clean_os_string, dedup_hosts, is_real_service};
-use crate::dedup::{dedup_credentials, dedup_hashes, dedup_users, normalize_source_label};
+use crate::dedup::{
+    dedup_credentials, dedup_hashes, dedup_users, looks_like_workgroup_pseudo_domain,
+    normalize_source_label,
+};
 
 /// Draw the DA/GT achievement banner box. Shared by `print_loot_human` and
 /// `print_runtime_summary` so both views render identically.
@@ -933,33 +936,29 @@ fn resolve_domain_fqdn(domain: &str, netbios_to_fqdn: &HashMap<String, String>) 
     lower
 }
 
-/// Defensive filter for domains that originated from a Windows workgroup or
-/// auto-generated computer name rather than a real Kerberos realm.
+/// Canonicalise a raw `state.all_domains` list for topology and headline
+/// counting: resolve NetBIOS short names to their FQDN, drop empties and
+/// workgroup/computer-name pseudo-domains, then sort + dedup.
 ///
-/// Upstream parsers (`smb.rs`, `output_extraction::users`) drop these at
-/// ingest, but old loot already in state may still carry them. Without this
-/// filter, a stray `krbtgt@win-xxx.wgrp.local` row would flip the pseudo-domain
-/// to "compromised" in the achievements rollup.
-///
-/// Heuristic operates on a single domain string (no `(name:...)` context here):
-/// matches literal `WORKGROUP`/`MSHOME`, and the Windows default computer-name
-/// prefix `WIN-` followed by 11 alphanumerics as the first label.
-fn looks_like_workgroup_pseudo_domain(domain: &str) -> bool {
-    let domain = domain.trim().trim_end_matches('.');
-    if domain.is_empty() {
-        return false;
-    }
-    if domain.eq_ignore_ascii_case("WORKGROUP") || domain.eq_ignore_ascii_case("MSHOME") {
-        return true;
-    }
-    let first_label = domain.split('.').next().unwrap_or("");
-    if first_label.len() == 15 && first_label[..4].eq_ignore_ascii_case("WIN-") {
-        let suffix = &first_label[4..];
-        if suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return true;
-        }
-    }
-    false
+/// Applied before `compute_forest_topology` so the `(N/M domains, X/Y forests)`
+/// denominators use the same FQDN-resolved, pseudo-filtered set as the
+/// compromised-domain numerator in `build_domain_achievements`. Without it a
+/// stray host-FQDN suffix or a NetBIOS duplicate that survived
+/// `normalize_state_domains` counts toward the totals but can never count as
+/// compromised, inflating the banner (e.g. `1/4 domains, 1/3 forests` against a
+/// 3-domain / 2-forest target).
+pub(super) fn canonicalize_display_domains(
+    domains: &[String],
+    netbios_to_fqdn: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = domains
+        .iter()
+        .map(|d| resolve_domain_fqdn(d, netbios_to_fqdn))
+        .filter(|d| !d.is_empty() && !looks_like_workgroup_pseudo_domain(d))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Per-domain achievement status.
@@ -1409,6 +1408,65 @@ mod tests {
     fn resolve_domain_fqdn_case_normalization() {
         let map = HashMap::new();
         assert_eq!(resolve_domain_fqdn("CONTOSO.LOCAL", &map), "contoso.local");
+    }
+
+    // canonicalize_display_domains
+
+    #[test]
+    fn canonicalize_display_domains_drops_workgroup_pseudo() {
+        // A stray WIN-<11> pseudo-domain and a WORKGROUP entry must not survive
+        // into the topology/count denominators.
+        let raw = vec![
+            "contoso.local".to_string(),
+            "child.contoso.local".to_string(),
+            "fabrikam.local".to_string(),
+            "WIN-ABCDEFGHIJK.wgrp.local".to_string(),
+            "WORKGROUP".to_string(),
+        ];
+        let out = canonicalize_display_domains(&raw, &HashMap::new());
+        assert_eq!(
+            out,
+            vec![
+                "child.contoso.local".to_string(),
+                "contoso.local".to_string(),
+                "fabrikam.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn canonicalize_display_domains_collapses_netbios_duplicate() {
+        // A NetBIOS short name that resolves to an already-present FQDN must
+        // collapse, not double-count as its own (parentless) forest root.
+        let mut map = HashMap::new();
+        map.insert("contoso".to_string(), "contoso.local".to_string());
+        let raw = vec![
+            "contoso.local".to_string(),
+            "CONTOSO".to_string(),
+            "fabrikam.local".to_string(),
+        ];
+        let out = canonicalize_display_domains(&raw, &map);
+        assert_eq!(
+            out,
+            vec!["contoso.local".to_string(), "fabrikam.local".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonicalize_display_domains_fixes_inflated_forest_count() {
+        // Regression: raw list carrying a phantom parentless domain reported
+        // 4 domains / 3 forests against a 3-domain / 2-forest target. After
+        // canonicalisation the topology must be 3 domains / 2 forests.
+        let raw = vec![
+            "contoso.local".to_string(),
+            "child.contoso.local".to_string(),
+            "fabrikam.local".to_string(),
+            "WIN-ABCDEFGHIJK.leak.local".to_string(),
+        ];
+        let domains = canonicalize_display_domains(&raw, &HashMap::new());
+        let topology = compute_forest_topology(&domains);
+        assert_eq!(domains.len(), 3);
+        assert_eq!(topology.forest_roots.len(), 2);
     }
 
     // build_domain_achievements
