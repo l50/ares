@@ -170,6 +170,14 @@ pub struct StateInner {
     // still tolerating transient auth races.
     pub mssql_link_pivot_attempts: HashMap<String, u32>,
 
+    // Per-`user@domain` count of weak credential-reject observations seen by
+    // the containment classifier. A generic `STATUS_LOGON_FAILURE` /
+    // `invalidCredentials` only revokes the principal once it recurs
+    // `CREDENTIAL_REVOKE_MIN_OBSERVATIONS` times, so one benign auth miss can't
+    // starve the LLM's view of a still-valid credential. In-memory only — a
+    // restart resets the budget, which re-tries rather than over-revokes.
+    pub containment_reject_counts: HashMap<String, u32>,
+
     // Per-(dc, domain, principal) consecutive-`Transient` counter for
     // `auto_krbtgt_extraction`, keyed by `krbtgt_principal_attempt_key`. A
     // `Transient` outcome intentionally leaves state clean so genuine network
@@ -292,6 +300,7 @@ impl StateInner {
             forge_ntlm_fallback_attempts: HashMap::new(),
             forge_in_flight: HashMap::new(),
             mssql_link_pivot_attempts: HashMap::new(),
+            containment_reject_counts: HashMap::new(),
             krbtgt_transient_counts: HashMap::new(),
             crack_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),

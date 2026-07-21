@@ -28,6 +28,7 @@ use ares_llm::ToolCall;
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
+use crate::worker::credential_resolver::is_authenticating_hash_type;
 
 use super::mssql_exploitation::resolve_mssql_target_ip;
 
@@ -246,10 +247,18 @@ fn candidate_pivot_logins(state: &StateInner, domain: &str) -> Vec<(String, Stri
         .iter()
         .filter(|c| !c.password.is_empty())
         .map(|c| (c.username.as_str(), c.domain.as_str()));
+    // Only hashes that can actually authenticate an impacket-mssqlclient
+    // connection (NTLM / AES). Offline-crack ciphertext — kerberoast, AS-REP —
+    // has a non-empty `hash_value` but is useless as a live login: the
+    // credential resolver correctly injects nothing for it, so the probe
+    // dispatches with no `-hashes` and no password, and impacket falls back to
+    // an interactive getpass() that consumes the piped SQL query as the
+    // "password". Queuing those accounts spends the whole MAX_PIVOT_ATTEMPTS
+    // budget on guaranteed getpass failures. See FINDINGS.md Bug #2.
     let hashes = state
         .hashes
         .iter()
-        .filter(|h| !h.hash_value.is_empty())
+        .filter(|h| !h.hash_value.is_empty() && is_authenticating_hash_type(&h.hash_type))
         .map(|h| (h.username.as_str(), h.domain.as_str()));
 
     for (username, dom) in creds.chain(hashes) {
@@ -914,6 +923,26 @@ mod tests {
         }
     }
 
+    fn hash(username: &str, domain: &str, hash_type: &str) -> ares_core::models::Hash {
+        ares_core::models::Hash {
+            id: format!("h-{username}"),
+            username: username.into(),
+            hash_value: "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0".into(), // pragma: allowlist secret
+            hash_type: hash_type.into(),
+            domain: domain.into(),
+            cracked_password: None,
+            source: "test".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        }
+    }
+
     #[test]
     fn unusable_pivot_logins_are_filtered() {
         assert!(is_unusable_pivot_login("dc01$"));
@@ -949,6 +978,53 @@ mod tests {
         assert!(!got.iter().any(|(u, _)| u == "dc01$"));
         assert!(!got.iter().any(|(u, _)| u == "carol"));
         assert_eq!(got.iter().filter(|(u, _)| u == "alice").count(), 1);
+    }
+
+    #[test]
+    fn candidate_pivot_logins_excludes_roast_ciphertext_only_accounts() {
+        let mut state = StateInner::new("op-test".into());
+        // Authenticating hashes → usable as a pass-the-hash pivot login.
+        state.hashes.push(hash("svc_sql", "contoso.local", "NTLM"));
+        state
+            .hashes
+            .push(hash("svc_web", "contoso.local", "AES256"));
+        // Offline-crack ciphertext only → never a usable live login. These are
+        // the accounts that made the probe fall into impacket's getpass().
+        state
+            .hashes
+            .push(hash("svc_roast", "contoso.local", "Kerberoast"));
+        state
+            .hashes
+            .push(hash("svc_asrep", "contoso.local", "AS-REP"));
+
+        let got = candidate_pivot_logins(&state, "contoso.local");
+        assert!(got.iter().any(|(u, _)| u == "svc_sql"));
+        assert!(got.iter().any(|(u, _)| u == "svc_web"));
+        assert!(
+            !got.iter().any(|(u, _)| u == "svc_roast"),
+            "kerberoast-only account must not be a pivot candidate"
+        );
+        assert!(
+            !got.iter().any(|(u, _)| u == "svc_asrep"),
+            "AS-REP-only account must not be a pivot candidate"
+        );
+    }
+
+    #[test]
+    fn candidate_pivot_logins_prefers_plaintext_over_roast_for_same_user() {
+        // A user with both a plaintext cred and a stale roast hash is still a
+        // valid candidate (the plaintext half authenticates); the roast hash
+        // just doesn't add a second, doomed entry.
+        let mut state = StateInner::new("op-test".into());
+        state
+            .credentials
+            .push(cred("svc_link", "P@ssw0rd!", "contoso.local"));
+        state
+            .hashes
+            .push(hash("svc_link", "contoso.local", "AS-REP"));
+
+        let got = candidate_pivot_logins(&state, "contoso.local");
+        assert_eq!(got.iter().filter(|(u, _)| u == "svc_link").count(), 1);
     }
 
     #[test]

@@ -111,17 +111,43 @@ const NETWORK_UNREACHABLE_MARKERS: &[&str] = &[
     "ETIMEDOUT",
 ];
 
-/// Well-known "credential rejected" substrings. Includes the Kerberos
-/// `KDC_ERR_CLIENT_REVOKED` variant — the driver decides whether that
-/// belongs to a cert-revocation or account-disable path based on the
-/// invoking technique.
+/// Well-known "credential rejected" substrings that indicate the *acting*
+/// credential was refused. `KDC_ERR_C_PRINCIPAL_UNKNOWN` is deliberately NOT
+/// here: it means the KDC couldn't find the *queried* principal (a missing SPN
+/// or a non-existent user), which is a routine side-effect of kerberoast/AS-REP
+/// SPN enumeration — not evidence the acting account was disabled. Treating it
+/// as a revocation string revoked the op's own principal on benign recon. See
+/// FINDINGS.md Bug #3.
 const CREDENTIAL_REJECT_MARKERS: &[&str] = &[
     "STATUS_LOGON_FAILURE",
     "INVALID_CREDENTIALS",
     "invalidCredentials",
     "The user name or password is incorrect",
-    "KDC_ERR_C_PRINCIPAL_UNKNOWN",
 ];
+
+/// The KDC's explicit "this client principal is revoked" (account disabled,
+/// locked, or expired) status. Unlike the generic reject strings this is
+/// unambiguous — no benign enumeration path produces it — so a single
+/// observation under a password-backed technique is trusted immediately.
+pub(crate) const KDC_CLIENT_REVOKED_MARKER: &str = "KDC_ERR_CLIENT_REVOKED";
+
+/// Minimum number of weak credential-reject observations for the same principal
+/// before the driver believes blue revoked it. A lone `STATUS_LOGON_FAILURE` is
+/// far more often a stale hash or an LLM password guess than an account disable;
+/// requiring corroboration keeps benign auth noise from starving the LLM's view
+/// of a still-valid credential. The unambiguous [`KDC_CLIENT_REVOKED_MARKER`]
+/// bypasses this and revokes on first sight.
+pub(crate) const CREDENTIAL_REVOKE_MIN_OBSERVATIONS: u32 = 2;
+
+/// Techniques that emit credential-reject strings as a normal part of their
+/// operation rather than as evidence the acting account was disabled.
+/// `password_spray` logs `STATUS_LOGON_FAILURE` on every wrong guess by design,
+/// and brute-force variants do the same. A rejection under one of these is
+/// noise, so the weak-marker path never revokes for them.
+fn is_benign_reject_technique(technique: &str) -> bool {
+    let t = technique.to_lowercase();
+    t.contains("spray") || t.contains("brute")
+}
 
 /// Inspect a completed task and return any containment signals it surfaces.
 ///
@@ -157,10 +183,20 @@ pub(crate) fn classify_containment_signals(
     // 2. STATUS_LOGON_FAILURE / INVALID_CREDENTIALS on a task using a stored cred
     //    → credential revoked. Only fires when we know which principal was used
     //    (cred_key set) — otherwise we don't have a target for the observation.
+    //
+    //    Two paths with different confidence. `strong_revoked` is the KDC
+    //    explicitly declaring the client principal revoked under a
+    //    password-backed technique — unambiguous, published on first sight.
+    //    `weak_revoked` is a generic auth-reject string; it's genuine when an
+    //    auth-*using* technique is suddenly refused, but benign when a
+    //    spray/brute technique emits it by design, so those techniques are
+    //    gated out and the caller additionally requires corroboration (see
+    //    CREDENTIAL_REVOKE_MIN_OBSERVATIONS) before acting.
     if let Some(key) = cred_key {
-        let credential_rejected = any_text_contains_any(result, CREDENTIAL_REJECT_MARKERS)
-            || (client_revoked && !is_certificate_backed_technique(tech));
-        if credential_rejected {
+        let strong_revoked = client_revoked && !is_certificate_backed_technique(tech);
+        let weak_revoked = !is_benign_reject_technique(tech)
+            && any_text_contains_any(result, CREDENTIAL_REJECT_MARKERS);
+        if strong_revoked || weak_revoked {
             if let Some((username, domain)) = key.split_once('@') {
                 let marker =
                     credential_reject_marker_text(result).unwrap_or("STATUS_LOGON_FAILURE");
@@ -216,8 +252,8 @@ fn credential_reject_marker_text(result: &Option<Value>) -> Option<&'static str>
             return Some(*m);
         }
     }
-    if any_text_contains(result, "KDC_ERR_CLIENT_REVOKED") {
-        return Some("KDC_ERR_CLIENT_REVOKED");
+    if any_text_contains(result, KDC_CLIENT_REVOKED_MARKER) {
+        return Some(KDC_CLIENT_REVOKED_MARKER);
     }
     None
 }
@@ -302,6 +338,80 @@ mod tests {
         assert!(!s
             .iter()
             .any(|sig| matches!(sig, ContainmentSignal::CertificateRevoked { .. })));
+    }
+
+    #[test]
+    fn password_spray_logon_failure_does_not_revoke() {
+        // password_spray emits STATUS_LOGON_FAILURE on every wrong guess by
+        // design; the acting principal is fine. A benign technique must never
+        // produce a revocation signal even with a cred_key set.
+        let result = out("contoso.local\\alice:P@ssw0rd! STATUS_LOGON_FAILURE");
+        let s = classify_containment_signals(
+            &result,
+            Some("password_spray"),
+            Some("alice@contoso.local"),
+            Some("contoso.local"),
+            Some("192.168.58.10"),
+        );
+        assert!(!s
+            .iter()
+            .any(|sig| matches!(sig, ContainmentSignal::CredentialRevoked { .. })));
+    }
+
+    #[test]
+    fn kdc_principal_unknown_is_not_credential_revoked() {
+        // KDC_ERR_C_PRINCIPAL_UNKNOWN is a routine kerberoast/SPN-enumeration
+        // side-effect (the *queried* SPN doesn't exist), not evidence the
+        // acting credential was revoked. It must not be a reject marker.
+        let result = out("KDC_ERR_C_PRINCIPAL_UNKNOWN for MSSQLSvc/absent.contoso.local");
+        let s = classify_containment_signals(
+            &result,
+            Some("kerberoast"),
+            Some("svc_sql@contoso.local"),
+            Some("contoso.local"),
+            Some("192.168.58.10"),
+        );
+        assert!(!s
+            .iter()
+            .any(|sig| matches!(sig, ContainmentSignal::CredentialRevoked { .. })));
+    }
+
+    #[test]
+    fn weak_revoke_source_is_distinguishable_from_kdc_client_revoked() {
+        // The caller thresholds weak markers and publishes KDC-declared
+        // revocations immediately, keyed off the source string. A weak signal's
+        // source must NOT carry the strong marker; a strong one must.
+        let weak = classify_containment_signals(
+            &out("STATUS_LOGON_FAILURE"),
+            Some("nxc_smb"),
+            Some("alice@contoso.local"),
+            Some("contoso.local"),
+            Some("192.168.58.10"),
+        );
+        let weak_src = weak
+            .iter()
+            .find_map(|sig| match sig {
+                ContainmentSignal::CredentialRevoked { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .expect("weak revocation signal");
+        assert!(!weak_src.contains(KDC_CLIENT_REVOKED_MARKER));
+
+        let strong = classify_containment_signals(
+            &out("KDC_ERR_CLIENT_REVOKED"),
+            Some("nxc_smb"),
+            Some("alice@contoso.local"),
+            Some("contoso.local"),
+            Some("192.168.58.10"),
+        );
+        let strong_src = strong
+            .iter()
+            .find_map(|sig| match sig {
+                ContainmentSignal::CredentialRevoked { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .expect("strong revocation signal");
+        assert!(strong_src.contains(KDC_CLIENT_REVOKED_MARKER));
     }
 
     #[test]

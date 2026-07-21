@@ -62,20 +62,43 @@ const DEFAULT_RULES: &[&str] = &[
 /// plaintext is never reached before the pass's `--runtime` cap, so the crack
 /// "completes" `no_plaintext` even though the password is in the wordlist (0
 /// AES kerberoast cracks across 11 ops, while the same hash cracks in ~1 min on
-/// an idle box). Elevating hashcat's priority keeps the GPU fed. Overridable via
-/// `ARES_HASHCAT_NICE`. A negative value needs root (the fleet runs as root);
-/// without privilege GNU `nice` warns and still runs hashcat at normal priority,
-/// so this is safe everywhere and simply a no-op without privilege.
+/// an idle box). `nice` is complementary to the workload profile below (it helps
+/// the feeder thread get CPU); the batch-size fix is what actually saturates the
+/// GPU. Overridable via `ARES_HASHCAT_NICE`. A negative value needs root (the
+/// fleet runs as root); without privilege GNU `nice` warns and still runs
+/// hashcat at normal priority, so this is safe everywhere and a no-op unprivileged.
 const HASHCAT_NICE: &str = "-15";
 
-/// A hashcat `CommandBuilder` wrapped in `nice` for elevated CPU priority.
-/// Every hashcat pass goes through this so none of them get CPU-starved.
+/// hashcat `-w` workload profile. The default (`-w 2`) autotunes a tiny
+/// kernel-accel (Accel:3 measured for 19700 on a T4), so each GPU dispatch is
+/// small and the host must re-feed constantly — under fleet load the feeder
+/// stalls and the GPU sawtooths at ~30-80% (idle box) or collapses to <20%
+/// (loaded). A higher profile picks a much larger kernel-accel (Accel:28 at
+/// `-w 3`, 64-96 at `-w 4`), so each batch keeps the GPU busy long enough to
+/// ride through feeder stalls. Measured on the T4 cracker under synthetic
+/// fleet load: `-w 2` 205 kH/s (util dips to 17%), `-w 3` 279 kH/s (+36%),
+/// `-w 4` 308 kH/s (+50%, util pinned ~100%). Hand-tuning `-n/-u` instead
+/// backfired (Accel:256 → 88 kH/s). Default `3` is safe on any headless GPU;
+/// the dedicated cracker box sets `ARES_HASHCAT_WORKLOAD=4`. `-w 4` is only
+/// risky on a GPU that also drives a display (watchdog timeouts) — never the
+/// case for the cracker role.
+const HASHCAT_WORKLOAD: &str = "3";
+
+fn hashcat_workload() -> String {
+    std::env::var("ARES_HASHCAT_WORKLOAD").unwrap_or_else(|_| HASHCAT_WORKLOAD.to_string())
+}
+
+/// A hashcat `CommandBuilder` wrapped in `nice` for elevated CPU priority and
+/// carrying the `-w` workload profile. Every hashcat pass goes through this so
+/// none get CPU-starved and all keep the GPU saturated.
 fn niced_hashcat() -> CommandBuilder {
     let adj = std::env::var("ARES_HASHCAT_NICE").unwrap_or_else(|_| HASHCAT_NICE.to_string());
     CommandBuilder::new("nice")
         .arg("-n")
         .arg(adj)
         .arg("hashcat")
+        .arg("-w")
+        .arg(hashcat_workload())
 }
 
 /// Default wall-clock floor (minutes) for AES kerberoast crack jobs. AES256/128 TGS
@@ -382,9 +405,14 @@ fn default_hashcat_potfile() -> Option<PathBuf> {
         if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
             candidates.push(PathBuf::from(xdg).join("hashcat/hashcat.potfile"));
         }
-        if let Ok(home) = std::env::var("HOME") {
-            candidates.push(PathBuf::from(&home).join(".local/share/hashcat/hashcat.potfile"));
-            candidates.push(PathBuf::from(&home).join(".hashcat/hashcat.potfile"));
+        // `home::home_dir()` falls back to `getpwuid` when `$HOME` is unset —
+        // which it is for systemd system services. hashcat resolves its potfile
+        // the same way, so the per-op wipe finds the real file even without the
+        // env fix (plain `std::env::var("HOME")` here silently returned None and
+        // skipped the wipe, leaking prior ops' cracks).
+        if let Some(home) = home::home_dir() {
+            candidates.push(home.join(".local/share/hashcat/hashcat.potfile"));
+            candidates.push(home.join(".hashcat/hashcat.potfile"));
         }
         candidates.into_iter().find(|p| p.is_file())
     }
@@ -1129,6 +1157,30 @@ mod tests {
         // impacket AS-REP roasting emits the RC4 `$krb5asrep$` form regardless
         // of etype; mode 18200 is the only AS-REP mode that consumes it.
         assert_eq!(detect_hashcat_mode("$krb5asrep$23$user"), 18200);
+    }
+
+    #[test]
+    fn niced_hashcat_carries_workload_flag() {
+        // Every pass must ship `-w` (after the `hashcat` token, not eaten by
+        // `nice`) so the GPU gets a large enough kernel-accel to stay saturated
+        // under fleet load. Env-free so it can't race parallel crack tests.
+        let args = niced_hashcat().args_for_test().to_vec();
+        let hc = args
+            .iter()
+            .position(|a| a == "hashcat")
+            .expect("hashcat token");
+        let wpos = args
+            .iter()
+            .position(|a| a == "-w")
+            .expect("-w workload flag present");
+        assert!(
+            wpos > hc,
+            "-w must follow the hashcat program token, got {args:?}"
+        );
+        let n: u8 = args[wpos + 1]
+            .parse()
+            .expect("workload profile is an integer");
+        assert!((1..=4).contains(&n), "workload profile in 1..=4, got {n}");
     }
 
     #[test]

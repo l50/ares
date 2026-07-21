@@ -1081,11 +1081,22 @@ fn find_hash<'a>(
 /// True when this hash type can be used directly for authentication (NTLM,
 /// AES key). False for offline-cracking artifacts like kerberoast/asreproast
 /// TGS ciphertext.
-fn is_authenticating_hash_type(hash_type: &str) -> bool {
-    let t = hash_type.to_ascii_lowercase();
+///
+/// Hyphens/underscores are stripped before matching so the canonical stored
+/// spellings emitted by `dedup::normalize_hash_type` — `"AS-REP"`, `"TGS-REP"`
+/// — collapse onto the bare roast tokens. Without that, `"AS-REP"` lowercases
+/// to `"as-rep"` which never matched `"asrep"`, and AS-REP ciphertext was
+/// silently treated as an NTLM hash: injected as `-hashes` into impacket and
+/// counted as usable auth material by the linked-server pivot.
+pub(crate) fn is_authenticating_hash_type(hash_type: &str) -> bool {
+    let t: String = hash_type
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .collect();
     !matches!(
         t.as_str(),
-        "kerberoast" | "asreproast" | "asrep" | "tgs" | "krb5tgs" | "krb5asrep"
+        "kerberoast" | "asreproast" | "asrep" | "tgs" | "tgsrep" | "krb5tgs" | "krb5asrep"
     )
 }
 
@@ -2591,6 +2602,11 @@ mod tests {
             "Kerberoast",
             "asreproast",
             "asrep",
+            // Canonical stored spellings from dedup::normalize_hash_type — the
+            // hyphenated forms must collapse onto the bare roast tokens.
+            "AS-REP",
+            "as-rep",
+            "TGS-REP",
             "tgs",
             "krb5tgs",
             "KRB5ASREP",

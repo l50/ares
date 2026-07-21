@@ -420,6 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_binary_maps_to_the_invoked_binary_not_group_first() {
+        // Regression: the tools.yaml impacket groups bundle several binaries, and
+        // the generator used to label every fn with binaries[0] — so `secretsdump`
+        // spans reported `impacket-GetNPUsers` and `secretsdump_kerberos` reported
+        // `impacket-psexec`. Each fn must now resolve to the binary it runs.
+        assert_eq!(get_tool_binary("secretsdump"), Some("impacket-secretsdump"));
+        assert_eq!(
+            get_tool_binary("secretsdump_kerberos"),
+            Some("impacket-secretsdump")
+        );
+        assert_eq!(
+            get_tool_binary("ntds_dit_extract"),
+            Some("impacket-secretsdump")
+        );
+        assert_eq!(get_tool_binary("wmiexec"), Some("impacket-wmiexec"));
+        assert_eq!(get_tool_binary("smbexec"), Some("impacket-smbexec"));
+        // Unchanged: psexec was already correct (group-first), stays correct.
+        assert_eq!(get_tool_binary("psexec"), Some("impacket-psexec"));
+        // Single-binary group: still maps to its one binary.
+        assert_eq!(get_tool_binary("certipy_request"), Some("certipy"));
+    }
+
+    #[test]
     fn tool_to_technique() {
         assert_eq!(TOOL_TO_TECHNIQUE.get("nmap_scan"), Some(&"T1046"));
         assert_eq!(TOOL_TO_TECHNIQUE.get("secretsdump"), Some(&"T1003.006"));
