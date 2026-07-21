@@ -23,8 +23,20 @@ use super::crack_dedup_key;
 /// work and should never block roastable hashes from the single hashcat
 /// slot.
 fn crack_priority(hash_type: &str) -> u8 {
-    match hash_type.to_ascii_lowercase().as_str() {
-        "kerberoast" | "asrep" | "asreproast" => 0,
+    // Strip '-'/'_' before matching so the canonical stored spellings emitted by
+    // `dedup::normalize_hash_type` ("AS-REP", "TGS-REP") collapse onto the bare
+    // roast tokens. Without this, "AS-REP" lowercases to "as-rep" which never
+    // matched "asrep", so roastable tickets were misclassified as priority-1
+    // (NTLM-class), dropped from the roastable batch, and starved behind the
+    // secretsdump NTLM flood — a genuinely crackable AS-REP could sit forever.
+    // Mirrors `credential_resolver::is_authenticating_hash_type`.
+    let t: String = hash_type
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .collect();
+    match t.as_str() {
+        "kerberoast" | "asrep" | "asreproast" | "krb5asrep" | "krb5tgs" | "tgsrep" | "tgs" => 0,
         _ => 1,
     }
 }
@@ -546,6 +558,22 @@ mod tests {
     fn user_hashes_remain_crackable() {
         assert!(!is_uncrackable(&mk_hash("alice", "ntlm", false)));
         assert!(!is_uncrackable(&mk_hash("svc_sql", "kerberoast", false)));
+    }
+
+    #[test]
+    fn crack_priority_normalizes_canonical_roast_spellings() {
+        // dedup::normalize_hash_type stores tickets as the hyphenated canonical
+        // forms ("AS-REP"/"TGS-REP"). crack_priority must rank those as
+        // top-priority roastables (0). Before the fix, plain lowercase
+        // "as-rep" missed the "asrep" arm and fell to priority 1, starving a
+        // crackable ticket behind the secretsdump NTLM flood.
+        assert_eq!(crack_priority("AS-REP"), 0);
+        assert_eq!(crack_priority("as-rep"), 0);
+        assert_eq!(crack_priority("TGS-REP"), 0);
+        assert_eq!(crack_priority("kerberoast"), 0);
+        assert_eq!(crack_priority("krb5asrep"), 0);
+        assert_eq!(crack_priority("NTLM"), 1);
+        assert_eq!(crack_priority("ntlm"), 1);
     }
 
     #[test]
