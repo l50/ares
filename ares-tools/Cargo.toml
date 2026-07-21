@@ -19,6 +19,7 @@ redis = { workspace = true }
 tempfile = "3"
 flate2 = "1"
 base64 = "0.22"
+home = "0.5"
 
 [features]
 default = ["blue"]

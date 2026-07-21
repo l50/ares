@@ -336,6 +336,17 @@ pub async fn process_completed_task(
                 }
                 create_exploitation_timeline_event(dispatcher, &vuln_id, task_id).await;
 
+                // Fix D: an S4U / constrained-delegation success to cifs/<dc>
+                // leaves an Administrator ccache usable for DCSync. Convert the
+                // foothold into a Kerberos krbtgt dump here — this is the
+                // universal exploit-success path, so it fires no matter which
+                // dispatcher (auto_s4u OR the LLM exploitation workflow) ran the
+                // S4U. Gated + deduped inside; a no-op for non-delegation vulns.
+                crate::orchestrator::automation::maybe_dispatch_post_s4u_secretsdump(
+                    dispatcher, &vuln_id,
+                )
+                .await;
+
                 // Attack-path diversity: record the walked
                 // (foothold, technique, target) step for coverage measurement
                 // and cross-run novelty bias. Inert unless emit_path_records or
@@ -583,10 +594,36 @@ pub async fn process_completed_task(
                     domain,
                     source,
                 } => {
-                    dispatcher
-                        .state
-                        .publish_credential_revoked(&username, &domain, &source)
-                        .await;
+                    // The unambiguous KDC-declared revocation publishes on first
+                    // sight; a generic auth-reject string must recur for the same
+                    // principal before we believe blue disabled it, so one benign
+                    // logon failure can't strike a still-valid credential from the
+                    // LLM's view. See FINDINGS.md Bug #3.
+                    let publish = if source
+                        .contains(containment_recovery::KDC_CLIENT_REVOKED_MARKER)
+                    {
+                        true
+                    } else {
+                        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+                        let mut state = dispatcher.state.write().await;
+                        let count = state.containment_reject_counts.entry(key).or_insert(0);
+                        *count += 1;
+                        *count >= containment_recovery::CREDENTIAL_REVOKE_MIN_OBSERVATIONS
+                    };
+                    if publish {
+                        dispatcher
+                            .state
+                            .publish_credential_revoked(&username, &domain, &source)
+                            .await;
+                    } else {
+                        info!(
+                            user = %username,
+                            domain = %domain,
+                            source = %source,
+                            "containment: weak credential-reject below revocation \
+                             threshold — deferring (needs corroboration)"
+                        );
+                    }
                 }
                 ContainmentSignal::HostIsolated {
                     ip,

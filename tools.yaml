@@ -51,7 +51,7 @@ roles:
         binaries: [lsassy, gMSADumper]
         fn_names: [lsassy, ldap_search_descriptions]
       - category: Impacket
-        binaries: [impacket-GetNPUsers, impacket-GetUserSPNs, impacket-secretsdump]
+        binaries: [impacket-secretsdump, impacket-GetNPUsers, impacket-GetUserSPNs]
         fn_names: [secretsdump, ntds_dit_extract]
 
   cracker:

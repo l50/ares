@@ -119,6 +119,7 @@ pub use rbcd::auto_rbcd_exploitation;
 pub use rdp_lateral::auto_rdp_lateral;
 pub use refresh::state_refresh;
 pub use s4u::auto_s4u_exploitation;
+pub(crate) use s4u::maybe_dispatch_post_s4u_secretsdump;
 pub use searchconnector_coercion::auto_searchconnector_coercion;
 pub use secretsdump::auto_krbtgt_extraction;
 pub use secretsdump::auto_local_admin_secretsdump;

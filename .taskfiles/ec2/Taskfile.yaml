@@ -562,6 +562,18 @@ tasks:
       {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
       {{if eq .LATEST "true"}}--latest{{end}}
 
+  kill:
+    desc: "Kill (stop + delete) running operations on EC2 (usage: task ec2:kill [EC2_NAME=kali-ares] [OPERATION_ID=op-xxx] [ALL=true])"
+    silent: true
+    vars:
+      OPERATION_ID: '{{.OPERATION_ID | default ""}}'
+      ALL: '{{.ALL | default "false"}}'
+    cmd: >-
+      {{.ARES_CLI}} --ec2 {{.EC2_NAME}} --ec2-profile {{.AWS_PROFILE}} --ec2-region {{.AWS_REGION}}
+      ops kill
+      {{if ne .OPERATION_ID ""}}{{.OPERATION_ID}}{{end}}
+      {{if eq .ALL "true"}}--all{{end}}
+
   restart:
     desc: "Restart the ares orchestrator + infra services on EC2"
     silent: true
@@ -1191,6 +1203,16 @@ tasks:
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_DEPLOYMENT=%q\n' '{{.EC2_DEPLOYMENT}}' >> \$ENV_TMP"
         ENV_FILE_CMD="$ENV_FILE_CMD; printf 'NATS_URL=%q\n' 'nats://127.0.0.1:4222' >> \$ENV_TMP"
+        # hashcat -w workload profile (cracker.rs hashcat_workload()). The box is a
+        # headless g4dn T4; the default -w2 autotunes a tiny kernel-accel that
+        # starves the GPU under fleet load (measured ~8% util on 19700). -w4 pins
+        # the T4 ~100% and is +50% on AES kerberoast. Code default is 3 (portable);
+        # override to 4 here for the dedicated cracker box.
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_HASHCAT_WORKLOAD=%q\n' '4' >> \$ENV_TMP"
+        # systemd gives system services no HOME; ares reads \$HOME to locate hashcat's
+        # potfile for the per-op wipe (PotfileResetGuard). Without it the resolver
+        # returns None and the wipe silently no-ops, leaking prior ops' cracks.
+        ENV_FILE_CMD="$ENV_FILE_CMD; printf 'HOME=%q\n' '/root' >> \$ENV_TMP"
         # OTEL: send traces to Alloy OTLP gateway → Tempo via HTTP/protobuf
         ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=%q\n' '${OTEL_TRACES_ENDPOINT}' >> \$ENV_TMP"
         ENV_FILE_CMD="$ENV_FILE_CMD; printf 'OTEL_EXPORTER_OTLP_PROTOCOL=%q\n' 'http/protobuf' >> \$ENV_TMP"
