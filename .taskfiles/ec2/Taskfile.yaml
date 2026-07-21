@@ -46,7 +46,7 @@ vars:
       if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
         printf ''
       else
-        printf -- '--profile %s' '{{.AWS_PROFILE}}'
+        printf '%s' '--profile {{.AWS_PROFILE}}'
       fi
   # Shell snippet the tasks eval before sourcing run-ssm.sh: if env creds are
   # already present, unset AWS_PROFILE so boto3/aws-sdk don't try to refresh

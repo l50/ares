@@ -24,7 +24,7 @@ operation:
   # does not satisfy contoso.local; trust escalation must complete first.
   # See docs/red.md "Operation Completion" for details.
   # stop_on_domain_admin: true
-  stop_on_golden_ticket: false
+  stop_on_golden_ticket: true
 
   # Strategy controls which attack techniques the operator prioritises.
   # Presets: "fast" (default), "comprehensive", "stealth"

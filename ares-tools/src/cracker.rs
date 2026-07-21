@@ -91,6 +91,11 @@ fn hashcat_workload() -> String {
 /// A hashcat `CommandBuilder` wrapped in `nice` for elevated CPU priority and
 /// carrying the `-w` workload profile. Every hashcat pass goes through this so
 /// none get CPU-starved and all keep the GPU saturated.
+///
+/// `--potfile-disable` on every pass keeps hashcat from ever writing its
+/// persistent potfile: cracks are recovered from each pass's own stdout (the
+/// parser scans the full output, not just `--show`), so no plaintext is lost,
+/// and no cross-op state accumulates on disk.
 fn niced_hashcat() -> CommandBuilder {
     let adj = std::env::var("ARES_HASHCAT_NICE").unwrap_or_else(|_| HASHCAT_NICE.to_string());
     CommandBuilder::new("nice")
@@ -99,6 +104,7 @@ fn niced_hashcat() -> CommandBuilder {
         .arg("hashcat")
         .arg("-w")
         .arg(hashcat_workload())
+        .arg("--potfile-disable")
 }
 
 /// Default wall-clock floor (minutes) for AES kerberoast crack jobs. AES256/128 TGS
@@ -1181,6 +1187,10 @@ mod tests {
             .parse()
             .expect("workload profile is an integer");
         assert!((1..=4).contains(&n), "workload profile in 1..=4, got {n}");
+        assert!(
+            args.iter().any(|a| a == "--potfile-disable"),
+            "every hashcat pass must disable the potfile, got {args:?}"
+        );
     }
 
     #[test]
