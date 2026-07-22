@@ -438,6 +438,47 @@ fn keep_potfile_env() -> bool {
     )
 }
 
+/// Truncate this box's hashcat potfile unconditionally (respecting the
+/// `ARES_KEEP_POTFILE` opt-out), returning `true` if a potfile was found and
+/// cleared. Used by the orchestrator's pre-op workspace sanitizer
+/// ([`crate::sanitize`]); the per-request [`PotfileResetGuard`] still covers
+/// the distributed worker path.
+pub(crate) fn reset_hashcat_potfile() -> bool {
+    if keep_potfile_env() {
+        return false;
+    }
+    let Some(potfile) = default_hashcat_potfile() else {
+        return false;
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&potfile)
+    {
+        Ok(_) => {
+            info!(
+                target: "cracker.potfile_reset",
+                path = %potfile.display(),
+                "Truncated hashcat potfile (pre-op workspace sanitize)",
+            );
+            true
+        }
+        Err(e) => {
+            warn!(path = %potfile.display(), err = %e, "Pre-op potfile truncate failed");
+            false
+        }
+    }
+}
+
+/// Whether a remote crackd service is wired up (`HASHCAT_SERVICE_URL`). The
+/// sanitizer uses this to warn that crackd's server-side potfile is outside
+/// this process's reach.
+pub(crate) fn remote_crackd_configured() -> bool {
+    std::env::var("HASHCAT_SERVICE_URL")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
 /// Truncate hashcat's potfile the first time the cracker worker sees a new
 /// `operation_id`, so plaintexts cracked in a prior op don't leak into the
 /// next as free candidates in the known-password reuse pass

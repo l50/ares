@@ -16,6 +16,7 @@ mod automation_spawner;
 mod blue;
 mod bootstrap;
 pub(crate) mod callback_handler;
+pub(crate) mod cleanup;
 mod completion;
 mod config;
 mod cost_summary;
@@ -556,6 +557,17 @@ async fn run_inner() -> Result<()> {
             )
         };
 
+    // Wrap the tool dispatcher so every successful mutating tool call — whether
+    // LLM-driven or dispatched deterministically by an automation module — is
+    // recorded to the operation's mutation journal for later teardown. One wrap
+    // covers both paths because the LLM runner and every automation share this
+    // same Arc via `LlmTaskRunner::tool_dispatcher()`.
+    let tool_disp = cleanup::JournalingToolDispatcher::wrap(
+        tool_disp,
+        config.operation_id.clone(),
+        queue.connection(),
+    );
+
     // Build sorted technique priorities for the LLM system prompt.
     let mut technique_priorities: Vec<(String, i32)> = config
         .strategy
@@ -681,6 +693,21 @@ async fn run_inner() -> Result<()> {
         tokio::spawn(
             async move { automation::state_refresh(refresh_disp, refresh_shutdown).await },
         );
+
+    // Pre-op clean slate: wipe cross-op attacker-side residue (hashcat potfile,
+    // ~/.nxc host/cred/share DBs + spider downloads, /tmp/ares-tickets ccaches)
+    // BEFORE any automation dispatches a tool, so this op cannot "cheat" off a
+    // prior op's crack/enumeration/ticket work. Complements the post-op target
+    // teardown (`ares ops teardown`). Opt out with ARES_KEEP_WORKSPACE=1.
+    {
+        let report = ares_tools::sanitize::sanitize_workspace();
+        info!(
+            potfile_reset = report.potfile_reset,
+            nxc_removed = report.nxc_paths_removed,
+            ccaches_removed = report.ccaches_removed,
+            "Pre-op attacker workspace sanitized"
+        );
+    }
 
     let auto_handles = spawn_automation_tasks(dispatcher.clone(), shutdown_rx.clone());
 
