@@ -598,7 +598,7 @@ pub async fn process_completed_task(
                     // sight; a generic auth-reject string must recur for the same
                     // principal before we believe blue disabled it, so one benign
                     // logon failure can't strike a still-valid credential from the
-                    // LLM's view. See FINDINGS.md Bug #3.
+                    // LLM's view.
                     let publish = if source
                         .contains(containment_recovery::KDC_CLIENT_REVOKED_MARKER)
                     {
