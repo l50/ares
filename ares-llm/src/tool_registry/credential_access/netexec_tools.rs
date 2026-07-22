@@ -327,7 +327,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "gmsa_dump_passwords".into(),
-            description: "Dump Group Managed Service Account (gMSA) passwords from Active Directory. Retrieves plaintext gMSA passwords via the msDS-ManagedPassword attribute if the authenticated user has read access.".into(),
+            description: "Dump Group Managed Service Account (gMSA) passwords from Active Directory. Retrieves plaintext gMSA passwords via the msDS-ManagedPassword attribute if the authenticated principal is in PrincipalsAllowedToRetrieveManagedPassword. That reader is often a machine account (HOST$) known only by NT hash — pass it via `hash` for -H auth.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -342,6 +342,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "password": {
                         "type": "string",
                         "description": "Password for authentication"
+                    },
+                    "hash": {
+                        "type": "string",
+                        "description": "NT hash (LM:NT or bare NT) for pass-the-hash auth; use for a machine-account reader (HOST$) with no password"
                     },
                     "domain": {
                         "type": "string",

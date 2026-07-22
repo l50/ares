@@ -80,6 +80,14 @@ static RE_MACHINE_ACCT_DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+// NTLM from a RID-less LSA `$MACHINE.ACC` row: `DOMAIN\HOST$:LM:NT:::`.
+// `RE_NTLM_DOMAIN`/`RE_NTLM_PLAIN` both require a numeric RID (`:\d+:`), so the
+// dumped host's own machine account — the key that unlocks gMSA reads / RBCD on
+// member servers — is otherwise never emitted by this fallback.
+static RE_NTLM_MACHINE_ACCT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([^\\:\s]+)\\([A-Za-z0-9_.-]+\$):([a-fA-F0-9]{32}):([a-fA-F0-9]{32}):::").unwrap()
+});
+
 pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -288,6 +296,41 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     is_trust_key: false,
                     trust_pair_label: None,
                 });
+            }
+            continue;
+        }
+
+        // NTLM machine account from a RID-less `$MACHINE.ACC` row
+        // (`DOMAIN\HOST$:LM:NT:::`). Attribute to the row's own prefix exactly
+        // as the domain-prefixed NTLM case does; it's the host's own account,
+        // never trust material.
+        if let Some(caps) = RE_NTLM_MACHINE_ACCT.captures(line) {
+            let domain = caps.get(1).unwrap().as_str();
+            let username = caps.get(2).unwrap().as_str();
+            let lm = caps.get(3).unwrap().as_str();
+            let nt = caps.get(4).unwrap().as_str();
+            if nt != "31d6cfe0d16ae931b73c59d7e0c089c0" {
+                let hash_value = format!("{lm}:{nt}");
+                let key = format!("ntlm:{}@{}", username.to_lowercase(), domain.to_lowercase());
+                if seen.insert(key) {
+                    hashes.push(Hash {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        username: username.to_string(),
+                        hash_value,
+                        hash_type: "ntlm".to_string(),
+                        domain: domain.to_string(),
+                        cracked_password: None,
+                        source: "output_extraction".to_string(),
+                        discovered_at: Some(chrono::Utc::now()),
+                        parent_id: None,
+                        attack_step: 0,
+                        aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                        is_previous: false,
+                        source_host: None,
+                        is_trust_key: false,
+                        trust_pair_label: None,
+                    });
+                }
             }
             continue;
         }
@@ -605,6 +648,25 @@ WDAGUtilityAccount:504:aad3b435b51404eeaad3b435b51404ee:1234567890abcdef12345678
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0].username, "jdoe");
         assert_eq!(hashes[0].domain, "CONTOSO");
+    }
+
+    #[test]
+    fn extract_hashes_ridless_machine_account() {
+        // RID-less LSA `$MACHINE.ACC` row: `DOMAIN\HOST$:LM:NT:::`. The domain
+        // and plain NTLM regexes both require a numeric RID, so this dedicated
+        // pass is what captures the dumped host's own machine account (the key
+        // that unlocks gMSA reads / RBCD on member servers).
+        let output =
+            "CONTOSO\\WEB01$:aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890:::";
+        let hashes = extract_hashes(output, "CONTOSO.LOCAL");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].username, "WEB01$");
+        assert_eq!(hashes[0].domain, "CONTOSO");
+        assert_eq!(
+            hashes[0].hash_value,
+            "aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890"
+        );
+        assert!(!hashes[0].is_trust_key);
     }
 
     #[test]

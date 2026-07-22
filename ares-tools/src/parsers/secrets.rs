@@ -41,6 +41,13 @@ enum DumpSection {
     Domain,
 }
 
+/// True for a 32-character all-hex string (an LM or NT hash). Used to tell a
+/// numeric RID apart from a hash when deciding whether a secretsdump row is the
+/// RID-less `$MACHINE.ACC` shape.
+fn is_hash32(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value>) {
     // Prefer target_domain (the domain being dumped) over domain (auth credential's domain)
     // to correctly attribute hashes when authenticating cross-domain.
@@ -110,6 +117,22 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
             if parts.len() >= 4 {
                 let raw_user = parts[0];
                 let rid = parts.get(1).copied().unwrap_or("");
+                // Standard NTDS/SAM rows are `user:RID:LM:NT:::` with a numeric
+                // RID. The LSA `$MACHINE.ACC` secret for the dumped host is
+                // RID-less — `DOMAIN\HOST$:LM:NT:::` — so LM/NT sit one field to
+                // the left and the old `parts[3]` NT slot is empty, silently
+                // dropping the host's own machine account (the key that unlocks
+                // gMSA reads / RBCD on member servers). Detect the RID-less shape
+                // (field 1 is a 32-hex hash, not a numeric RID) and read LM/NT
+                // from the shifted positions.
+                let rid_is_numeric = !rid.is_empty() && rid.bytes().all(|b| b.is_ascii_digit());
+                let ridless_machine_acct =
+                    !rid_is_numeric && is_hash32(parts[1]) && is_hash32(parts[2]);
+                let (lm_hash, nt_hash) = if ridless_machine_acct {
+                    (parts[1], parts[2])
+                } else {
+                    (parts[2], parts[3])
+                };
                 let (user_domain, username) = if section == DumpSection::LocalSam {
                     // In the local SAM section, any `\` prefix is the host's
                     // own computer name (or workgroup), never an AD realm.
@@ -137,10 +160,8 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                     (domain.to_string(), raw_user.to_string())
                 };
 
-                let nt_hash = parts[3];
                 if nt_hash.len() == 32 && nt_hash != "31d6cfe0d16ae931b73c59d7e0c089c0" {
                     // Skip empty/disabled hashes
-                    let lm_hash = parts[2];
                     let hash_value = format!("{}:{}", lm_hash, nt_hash);
 
                     // NTDS exposes rotated-out credentials as
@@ -157,8 +178,15 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                     // dumping machine's own computer-account. e.g. dumping
                     // contoso.local and seeing `FABRIKAM$` means FABRIKAM
                     // is on the other side of a trust we can forge across.
-                    let (is_trust_key, trust_pair_label) =
-                        classify_trust_key(&username_clean, &user_domain);
+                    // A RID-less `$MACHINE.ACC` row is always the dumped host's
+                    // OWN computer account (from LSA secrets), never a trust
+                    // partner — skip the label-mismatch heuristic that would
+                    // otherwise flag it as inter-realm forging material.
+                    let (is_trust_key, trust_pair_label) = if ridless_machine_acct {
+                        (false, None)
+                    } else {
+                        classify_trust_key(&username_clean, &user_domain)
+                    };
 
                     let mut entry = json!({
                         "username": username_clean,
@@ -626,6 +654,56 @@ svc_sql:1001:aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890::
         assert_eq!(hashes[1]["username"], "svc_sql");
         assert_eq!(hashes[1]["domain"], "");
         assert!(creds.is_empty());
+    }
+
+    #[test]
+    fn parse_secretsdump_ridless_machine_acct_captures_nt_hash() {
+        // The LSA `$MACHINE.ACC` secret for a dumped member server is RID-less
+        // — `DOMAIN\HOST$:LM:NT:::` — so the NT hash sits one field earlier than
+        // in NTDS/SAM rows. Before the fix `parts[3]` was empty and the row was
+        // silently dropped; the machine account (which unlocks gMSA reads / RBCD
+        // on member servers) must be captured, attributed to the dumped domain,
+        // and NOT flagged as inter-realm trust material — it's the host's own.
+        let output = "\
+[*] Dumping LSA Secrets
+[*] $MACHINE.ACC
+CONTOSO\\WEB01$:aes256-cts-hmac-sha1-96:1111111111111111111111111111111111111111111111111111111111111111
+CONTOSO\\WEB01$:aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890:::
+[*] Cleaning up...";
+        let params = json!({"target_domain": "contoso.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 1, "machine account row must be captured");
+        assert_eq!(hashes[0]["username"], "WEB01$");
+        assert_eq!(hashes[0]["domain"], "contoso.local");
+        assert_eq!(
+            hashes[0]["hash_value"],
+            "aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890"
+        );
+        // Own machine account — never trust-forge material.
+        assert!(hashes[0].get("is_trust_key").is_none());
+        // The preceding AES256 line still attaches.
+        assert_eq!(
+            hashes[0]["aes_key"],
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn parse_secretsdump_standard_rid_rows_unaffected_by_ridless_path() {
+        // Regression guard: numeric-RID rows must still read LM/NT from
+        // parts[2]/parts[3] exactly as before the RID-less machine-acct fix.
+        let output = "\
+[*] Dumping the NTDS
+[*] Reading and decrypting hashes from /tmp/ntds.dit
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890:::";
+        let params = json!({"target_domain": "contoso.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "Administrator");
+        assert_eq!(
+            hashes[0]["hash_value"],
+            "aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890"
+        );
     }
 
     #[test]

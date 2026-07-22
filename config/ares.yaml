@@ -14,17 +14,29 @@ operation:
   task_dispatch_delay: 1.0
   rate_limit_backoff: 15.0
   rate_limit_threshold: 2
-  # Completion mode (mutually exclusive — enable at most one):
+  # Completion mode — three supported stop conditions. The two flags are
+  # mutually exclusive (enable at most one); leaving both false selects the
+  # third (default) mode. See docs/red.md "Operation Completion" for details.
   #
-  # stop_on_domain_admin: true   — stop immediately on DA (any domain)
-  # stop_on_golden_ticket: true  — stop after golden ticket + all forests dominated
+  #   1. Stop on first DA        — stop_on_domain_admin: true
+  #      Ends the op the instant Domain Admin is achieved on ANY domain
+  #      (evaluate_completion in orchestrator/completion.rs, line ~265).
   #
-  # Default (both false): wait until ALL forest root DCs are secretsdumped.
-  # Child domain DA does NOT count — e.g. child.contoso.local krbtgt
-  # does not satisfy contoso.local; trust escalation must complete first.
-  # See docs/red.md "Operation Completion" for details.
-  # stop_on_domain_admin: true
-  stop_on_golden_ticket: true
+  #   2. Stop on first GT        — stop_on_golden_ticket: true
+  #      Ends the op the instant a golden ticket is forged on ANY domain
+  #      (completion.rs line ~268). NOTE: on a multi-domain / multi-forest
+  #      target the first ticket lands on the CHILD domain, so this stops at
+  #      1/N domains by design — pick it only when a single foothold ticket is
+  #      the goal, not full-forest compromise.
+  #
+  #   3. Stop when everything is compromised — both flags false (DEFAULT)
+  #      Runs until ALL forest root DCs are secretsdumped, then a grace period.
+  #      Child-domain DA does NOT count — e.g. child.contoso.local krbtgt does
+  #      not satisfy contoso.local; child→parent trust escalation and every
+  #      trusted forest must complete first. Use this for 3/3 dreadgoad ops.
+  #
+  stop_on_domain_admin: false
+  stop_on_golden_ticket: false
 
   # Strategy controls which attack techniques the operator prioritises.
   # Presets: "fast" (default), "comprehensive", "stealth"

@@ -1,6 +1,6 @@
 //! auto_crack_dispatch -- submit crack tasks for new hashes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,20 +23,21 @@ use super::crack_dedup_key;
 /// work and should never block roastable hashes from the single hashcat
 /// slot.
 fn crack_priority(hash_type: &str) -> u8 {
-    // Strip '-'/'_' before matching so the canonical stored spellings emitted by
-    // `dedup::normalize_hash_type` ("AS-REP", "TGS-REP") collapse onto the bare
-    // roast tokens. Without this, "AS-REP" lowercases to "as-rep" which never
-    // matched "asrep", so roastable tickets were misclassified as priority-1
-    // (NTLM-class), dropped from the roastable batch, and starved behind the
-    // secretsdump NTLM flood — a genuinely crackable AS-REP could sit forever.
-    // Mirrors `credential_resolver::is_authenticating_hash_type`.
+    // Strip '-'/'_' before matching so the hyphenated canonical spelling emitted
+    // by `dedup::normalize_hash_type` ("AS-REP") collapses onto the bare "asrep"
+    // token. Without this, "AS-REP" lowercases to "as-rep" which never matched
+    // "asrep", so AS-REP tickets were misclassified as priority-1 (NTLM-class),
+    // dropped from the roastable batch, and starved behind the secretsdump NTLM
+    // flood — a genuinely crackable AS-REP could sit forever. (Kerberoast is
+    // stored as "Kerberoast", which already matches after lowercasing.) Mirrors
+    // `credential_resolver::is_authenticating_hash_type`.
     let t: String = hash_type
         .to_ascii_lowercase()
         .chars()
         .filter(|c| *c != '-' && *c != '_')
         .collect();
     match t.as_str() {
-        "kerberoast" | "asrep" | "asreproast" | "krb5asrep" | "krb5tgs" | "tgsrep" | "tgs" => 0,
+        "kerberoast" | "asrep" | "asreproast" => 0,
         _ => 1,
     }
 }
@@ -72,6 +73,20 @@ fn is_uncrackable(hash: &ares_core::models::Hash) -> bool {
 fn is_krbtgt(username: &str) -> bool {
     let lower = username.trim().to_ascii_lowercase();
     lower == "krbtgt" || lower.starts_with("krbtgt_")
+}
+
+/// True for an NTLM hash whose domain we already fully own (it's in
+/// `dominated_domains` — we hold the domain's krbtgt). We already have the hash
+/// itself (PtH-usable), so cracking its plaintext buys no new access. Crucially,
+/// these secretsdump NTLM hashes flood the tiny (2-slot, ~8-min-per-run) crack
+/// queue and delay the AS-REP/kerberoast footholds that unlock the forests we do
+/// NOT own yet. Measured live: a foreign-forest AS-REP foothold sat ~38 min
+/// behind ~12 such already-owned NTLM jobs, then cracked in <1 min the moment it
+/// reached a slot. Roastables (priority 0) are never dropped here — only NTLM of
+/// an already-dominated domain. `dominated` is expected lowercased.
+fn is_owned_domain_ntlm(hash: &ares_core::models::Hash, dominated: &HashSet<String>) -> bool {
+    let domain = hash.domain.trim().to_lowercase();
+    crack_priority(&hash.hash_type) > 0 && !domain.is_empty() && dominated.contains(&domain)
 }
 
 /// Max times a single hash gets dispatched to hashcat before the dispatcher
@@ -216,6 +231,11 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
         let (attempts, total_hashes) = {
             let state = dispatcher.state.read().await;
             let total_hashes = state.hashes.len();
+            let dominated: HashSet<String> = state
+                .dominated_domains
+                .iter()
+                .map(|d| d.trim().to_lowercase())
+                .collect();
             for h in state.hashes.iter() {
                 if h.cracked_password.is_some() {
                     continue;
@@ -225,6 +245,14 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                     continue;
                 }
                 crackable_hashes += 1;
+                // Don't spend a scarce crack slot on NTLM of a domain we already
+                // fully own — it buys no new access and starves the AS-REP /
+                // kerberoast footholds for the forests we don't own yet.
+                if is_owned_domain_ntlm(h, &dominated) {
+                    dropped_reasons
+                        .push(format!("{}:{}:owned_domain_ntlm", h.username, h.hash_type));
+                    continue;
+                }
                 let dedup = crack_dedup_key(h);
                 if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
                     dropped_reasons.push(format!("{}:{}:dedup_processed", h.username, h.hash_type));
@@ -483,12 +511,12 @@ async fn record_crack_attempt(
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_same_mode_roastable, crack_priority, is_krbtgt, is_uncrackable, select_next_crack,
-        sort_crack_work, MAX_CRACK_ATTEMPTS, NTLM_TURN_AFTER_ROASTABLE_STREAK,
+        batch_same_mode_roastable, crack_priority, is_krbtgt, is_owned_domain_ntlm, is_uncrackable,
+        select_next_crack, sort_crack_work, MAX_CRACK_ATTEMPTS, NTLM_TURN_AFTER_ROASTABLE_STREAK,
     };
     use crate::orchestrator::state::{StateInner, DEDUP_CRACK_REQUESTS};
     use ares_core::models::Hash;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn mk(hash_type: &str) -> (String, Hash) {
         (
@@ -511,6 +539,48 @@ mod tests {
                 trust_pair_label: None,
             },
         )
+    }
+
+    fn dominated(domains: &[&str]) -> HashSet<String> {
+        domains.iter().map(|d| d.to_string()).collect()
+    }
+
+    #[test]
+    fn owned_domain_ntlm_is_skipped() {
+        // NTLM of a domain we already own → skip (no new access, and it starves
+        // the crack queue). Case-insensitive on the hash's domain.
+        let dom = dominated(&["contoso.local"]);
+        let mut h = mk_hash("alice", "ntlm", false);
+        h.domain = "contoso.local".into();
+        assert!(is_owned_domain_ntlm(&h, &dom));
+        h.domain = "CONTOSO.LOCAL".into();
+        assert!(is_owned_domain_ntlm(&h, &dom));
+    }
+
+    #[test]
+    fn unowned_or_empty_domain_ntlm_is_kept() {
+        let dom = dominated(&["contoso.local"]);
+        let mut h = mk_hash("bob", "ntlm", false);
+        // Un-owned forest: plaintext may unlock it — keep it crackable.
+        h.domain = "fabrikam.local".into();
+        assert!(!is_owned_domain_ntlm(&h, &dom));
+        // Empty domain: can't attribute to a dominated domain — keep.
+        h.domain = String::new();
+        assert!(!is_owned_domain_ntlm(&h, &dom));
+    }
+
+    #[test]
+    fn roastable_in_owned_domain_is_never_skipped() {
+        // Footholds (AS-REP / kerberoast, priority 0) are never dropped here —
+        // even in an already-dominated domain — since the whole point is to keep
+        // the queue clear FOR them.
+        let dom = dominated(&["contoso.local"]);
+        let mut a = mk_hash("svc_sql", "asrep", false);
+        a.domain = "contoso.local".into();
+        assert!(!is_owned_domain_ntlm(&a, &dom));
+        let mut k = mk_hash("svc_sql", "kerberoast", false);
+        k.domain = "contoso.local".into();
+        assert!(!is_owned_domain_ntlm(&k, &dom));
     }
 
     fn mk_hash(username: &str, hash_type: &str, is_trust_key: bool) -> Hash {
@@ -562,16 +632,15 @@ mod tests {
 
     #[test]
     fn crack_priority_normalizes_canonical_roast_spellings() {
-        // dedup::normalize_hash_type stores tickets as the hyphenated canonical
-        // forms ("AS-REP"/"TGS-REP"). crack_priority must rank those as
-        // top-priority roastables (0). Before the fix, plain lowercase
-        // "as-rep" missed the "asrep" arm and fell to priority 1, starving a
-        // crackable ticket behind the secretsdump NTLM flood.
+        // dedup::normalize_hash_type stores AS-REP tickets as the hyphenated
+        // canonical form "AS-REP" and kerberoast tickets as "Kerberoast" (never
+        // "TGS-REP"). crack_priority must rank both as top-priority roastables
+        // (0). Before the fix, plain lowercase "as-rep" missed the "asrep" arm
+        // and fell to priority 1, starving a crackable ticket behind the
+        // secretsdump NTLM flood.
         assert_eq!(crack_priority("AS-REP"), 0);
         assert_eq!(crack_priority("as-rep"), 0);
-        assert_eq!(crack_priority("TGS-REP"), 0);
-        assert_eq!(crack_priority("kerberoast"), 0);
-        assert_eq!(crack_priority("krb5asrep"), 0);
+        assert_eq!(crack_priority("Kerberoast"), 0);
         assert_eq!(crack_priority("NTLM"), 1);
         assert_eq!(crack_priority("ntlm"), 1);
     }

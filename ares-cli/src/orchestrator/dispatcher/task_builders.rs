@@ -326,18 +326,12 @@ impl Dispatcher {
             }
         }
 
-        // Mark nmap targets as scanned (optimistic, to prevent duplicate dispatches)
-        if is_nmap {
-            {
-                let mut state = self.state.write().await;
-                state.mark_processed(DEDUP_SCANNED_TARGETS, target_ip.to_string());
-            }
-            // Persist to Redis so it survives restarts
-            let _ = self
-                .state
-                .persist_dedup(&self.queue, DEDUP_SCANNED_TARGETS, target_ip)
-                .await;
-        }
+        // `scanned_targets` is marked when the scan task is actually dispatched
+        // (see `submit_to_llm`), not here at submit-request time. Marking before
+        // the throttle decision recorded a target as scanned even when the task
+        // was deferred and later evicted from the deferred queue unrun, which
+        // permanently suppressed the scan via Guard 2/Guard 3 above — leaving
+        // member-server hosts as bare IPs with no ports in loot.
 
         let mut payload = json!({
             "target_ip": target_ip,
