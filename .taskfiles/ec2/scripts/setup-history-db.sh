@@ -33,7 +33,9 @@ systemctl enable --now postgresql >/dev/null 2>&1 || true
 # would silently drop history persistence. Persistently enable the concrete
 # cluster unit (version-derived) so it survives reboots.
 PG_VER=$(pg_lsclusters -h 2>/dev/null | awk 'NR==1{print $1}')
-[ -n "$PG_VER" ] && systemctl enable --now "postgresql@${PG_VER}-main" >/dev/null 2>&1 || true
+if [ -n "$PG_VER" ]; then
+	systemctl enable --now "postgresql@${PG_VER}-main" >/dev/null 2>&1 || true
+fi
 
 # Role: LOGIN, no password (loopback trust below handles auth).
 sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 ||
