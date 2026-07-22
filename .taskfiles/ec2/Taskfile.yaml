@@ -973,6 +973,13 @@ tasks:
       POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
       MAX_WAIT: '{{.MAX_WAIT | default "7200"}}'
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+    preconditions:
+      # Without this, a missing ARES_CLI makes `ops status` fail silently
+      # (2>&1 || true swallows "No such file or directory") and the poll loop
+      # reports "no status yet" until MAX_WAIT — an op looks like it never
+      # started when it is actually running fine on the box.
+      - sh: 'test -x {{.ARES_CLI}}'
+        msg: "ARES_CLI ({{.ARES_CLI}}) not found/executable — build it first (cargo build --release -p ares-cli) or pass ARES_CLI=./target/debug/ares"
     cmds:
       - |
         if [ -z "{{.OPERATION_ID}}" ] && [ "{{.LATEST}}" != "true" ]; then

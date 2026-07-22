@@ -20,8 +20,31 @@ pub fn hint_for(tool: &str, args: &Value, output: &str) -> Option<Value> {
             }
             scrape_device_id(output).map(|id| json!({ "device_id": id }))
         }
+        "nopac" => {
+            // noPac mints a random machine account whose name is only in stdout;
+            // capture it so teardown can delete the orphaned computer.
+            scrape_created_computer(output).map(|name| json!({ "created_computer": name }))
+        }
         _ => None,
     }
+}
+
+/// Pull the machine-account name noPac created from lines like
+/// `[*] MachineAccount "WIN-3MG3G0LEUAD$" password = …` or
+/// `[*] Adding Computer Account "WIN-…$"`. Returns the sAMAccountName (`…$`).
+fn scrape_created_computer(output: &str) -> Option<String> {
+    for marker in ["MachineAccount \"", "Computer Account \""] {
+        if let Some(i) = output.find(marker) {
+            let rest = &output[i + marker.len()..];
+            if let Some(end) = rest.find('"') {
+                let name = rest[..end].trim();
+                if name.len() > 1 && name.ends_with('$') {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Pull the DeviceID GUID that pywhisker prints after adding a Key Credential
@@ -66,5 +89,26 @@ mod tests {
     #[test]
     fn no_hint_for_other_tools() {
         assert!(hint_for("rbcd_write", &json!({}), "DeviceID: x").is_none());
+    }
+
+    #[test]
+    fn captures_nopac_created_computer() {
+        let out = "[*] Selected Target dc01\n\
+                   [*] MachineAccount \"WIN-3MG3G0LEUAD$\" password = aB3xY...\n\
+                   [*] Successfully added";
+        let hint = hint_for("nopac", &json!({}), out).unwrap();
+        assert_eq!(hint["created_computer"], json!("WIN-3MG3G0LEUAD$"));
+    }
+
+    #[test]
+    fn captures_nopac_via_computer_account_marker() {
+        let out = "[*] Adding Computer Account \"WIN-ABCDEF12$\"\n[*] done";
+        let hint = hint_for("nopac", &json!({}), out).unwrap();
+        assert_eq!(hint["created_computer"], json!("WIN-ABCDEF12$"));
+    }
+
+    #[test]
+    fn no_nopac_hint_when_name_absent() {
+        assert!(hint_for("nopac", &json!({}), "[*] failed to add").is_none());
     }
 }

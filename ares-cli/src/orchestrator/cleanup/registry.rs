@@ -147,6 +147,42 @@ fn pywhisker_plan(record: &MutationRecord) -> UndoPlan {
     }
 }
 
+/// noPac creates a random `WIN-…$` machine account. It reverses cleanly only
+/// when that name was scraped into the journal hint; otherwise it is blocked as
+/// needs-capture. The inverse deletes the account via `add_computer -delete`
+/// using noPac's own creds (the creator can delete what it made).
+fn nopac_plan(record: &MutationRecord) -> UndoPlan {
+    let sam = record
+        .hint
+        .as_ref()
+        .and_then(|h| h.get("created_computer"))
+        .and_then(Value::as_str);
+    match sam {
+        Some(sam) => {
+            let a = &record.args;
+            let mut m = serde_json::Map::new();
+            for k in ["domain", "username", "dc_ip", "ticket_path", "hash"] {
+                if let Some(v) = a.get(k) {
+                    m.insert(k.to_string(), v.clone());
+                }
+            }
+            // impacket-addcomputer's -computer-name is the bare name (no `$`).
+            m.insert("computer_name".into(), json!(sam.trim_end_matches('$')));
+            m.insert("action".into(), json!("delete"));
+            UndoPlan {
+                class: Reversibility::Clean,
+                inverse: Some(("add_computer".into(), Value::Object(m))),
+                validate: Some(get_object_probe(a, sam, "sAMAccountName", sam)),
+                note: format!("delete the machine account noPac created ({sam})"),
+            }
+        }
+        None => UndoPlan::manual(
+            Reversibility::NeedsCapture,
+            "delete the machine account this created — needs the account name from tool output",
+        ),
+    }
+}
+
 /// Build the inverse plan for a journaled mutation.
 pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
     let a = &record.args;
@@ -245,7 +281,8 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             "restore the original userPrincipalName — needs a read-before-write capture",
         ),
         "certipy_ca" => certipy_ca_plan(a),
-        "nopac" | "krbrelayup" => UndoPlan::manual(
+        "nopac" => nopac_plan(record),
+        "krbrelayup" => UndoPlan::manual(
             Reversibility::NeedsCapture,
             "delete the machine account this created — needs the account name from tool output",
         ),
@@ -264,12 +301,13 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
 }
 
 /// Build `mssql_command` args that disable xp_cmdshell, reusing the forward
-/// call's auth/target keys and dropping any enable-specific keys.
+/// call's auth/target/impersonate keys. NOTE: `mssql_command`'s SQL argument is
+/// `command`, not `query` — passing `query` fails with "missing required
+/// argument: command" (caught in a live teardown run).
 fn xp_cmdshell_disable_args(forward: &Value) -> Value {
     let mut m = forward.as_object().cloned().unwrap_or_default();
-    m.remove("query");
     m.insert(
-        "query".into(),
+        "command".into(),
         json!(
             "EXEC sp_configure 'show advanced options',1; RECONFIGURE; \
                EXEC sp_configure 'xp_cmdshell',0; RECONFIGURE;"
@@ -337,8 +375,45 @@ mod tests {
         assert_eq!(p.class, Reversibility::Clean);
         let (tool, args) = p.inverse.unwrap();
         assert_eq!(tool, "mssql_command");
-        assert!(args["query"].as_str().unwrap().contains("'xp_cmdshell',0"));
+        // mssql_command's SQL arg is `command`, not `query` (the live-run bug).
+        assert!(
+            args.get("query").is_none(),
+            "must not use the wrong `query` key"
+        );
+        assert!(args["command"]
+            .as_str()
+            .unwrap()
+            .contains("'xp_cmdshell',0"));
         assert_eq!(args["username"], json!("sa"));
+    }
+
+    #[test]
+    fn nopac_is_needs_capture_without_hint() {
+        let p = undo_plan(&rec("nopac", json!({ "domain": "contoso.local" })));
+        assert_eq!(p.class, Reversibility::NeedsCapture);
+        assert!(p.inverse.is_none());
+    }
+
+    #[test]
+    fn nopac_is_clean_with_captured_computer_name() {
+        let mut r = rec(
+            "nopac",
+            json!({ "domain": "contoso.local", "username": "alice", "dc_ip": "192.168.58.240" }),
+        );
+        r.hint = Some(json!({ "created_computer": "WIN-ABC123$" }));
+        let p = undo_plan(&r);
+        assert_eq!(p.class, Reversibility::Clean);
+        let (tool, args) = p.inverse.unwrap();
+        assert_eq!(tool, "add_computer");
+        assert_eq!(args["action"], json!("delete"));
+        // computer_name is the bare name (no trailing `$`).
+        assert_eq!(args["computer_name"], json!("WIN-ABC123"));
+        assert_eq!(args["username"], json!("alice"));
+        // validation probe reads back the sAMAccountName (with `$`).
+        assert_eq!(
+            p.validate.unwrap().expect_absent.as_deref(),
+            Some("WIN-ABC123$")
+        );
     }
 
     #[test]
