@@ -10,8 +10,9 @@
 //! Sanitized (at op start, before any tool runs — so wiping ccaches is safe):
 //! - **hashcat potfile** — cracked plaintexts would seed the next op's
 //!   known-password wordlist for free.
-//! - **netexec `~/.nxc`** — its SQLite host/cred/share DBs and `spider_plus`
-//!   file downloads persist every prior op's enumeration and loot.
+//! - **netexec `~/.nxc`** — its SQLite host/cred/share DBs, `spider_plus` file
+//!   downloads, and captured artifacts (`screenshots`, `obfuscated_scripts`,
+//!   `tmp`) persist every prior op's enumeration and loot (`nxc.conf` is kept).
 //! - **Kerberos ccaches** in `/tmp/ares-tickets` — a still-valid TGT would let
 //!   a later op skip re-authentication / re-compromise.
 //!
@@ -87,7 +88,8 @@ fn nxc_home() -> Option<PathBuf> {
 }
 
 /// Remove netexec's cross-op state — workspace SQLite DBs, top-level proto DBs,
-/// and `spider_plus` file downloads — while preserving `nxc.conf`.
+/// `spider_plus` file downloads, and captured artifacts (RDP screenshots,
+/// obfuscated payload scripts, scratch tmp) — while preserving `nxc.conf`.
 fn reset_nxc_workspace(nxc: Option<&Path>) -> usize {
     let Some(nxc) = nxc else {
         return 0;
@@ -96,7 +98,10 @@ fn reset_nxc_workspace(nxc: Option<&Path>) -> usize {
         return 0;
     }
     let mut removed = 0;
-    removed += remove_path(&nxc.join("workspaces"));
+    // Cross-op state/artifact dirs (the dir and nxc.conf are preserved).
+    for sub in ["workspaces", "screenshots", "obfuscated_scripts", "tmp"] {
+        removed += remove_path(&nxc.join(sub));
+    }
     removed += remove_path(&nxc.join("modules").join("nxc_spider_plus"));
     // Older nxc layout stores proto DBs at the top level (smb.db, ldap.db, …).
     if let Ok(entries) = std::fs::read_dir(nxc) {
@@ -209,13 +214,22 @@ mod tests {
             "loot",
         )
         .unwrap();
+        // Captured-artifact dirs the sanitizer must also wipe.
+        for sub in ["screenshots", "obfuscated_scripts", "tmp"] {
+            fs::create_dir_all(nxc.join(sub)).unwrap();
+            fs::write(nxc.join(sub).join("artifact"), "x").unwrap();
+        }
 
         let removed = reset_nxc_workspace(Some(&nxc));
-        assert_eq!(removed, 3, "workspaces + spider_plus + smb.db");
+        // workspaces + spider_plus + smb.db + screenshots + obfuscated_scripts + tmp
+        assert_eq!(removed, 6);
         assert!(nxc.join("nxc.conf").exists(), "config must be preserved");
         assert!(!nxc.join("smb.db").exists());
         assert!(!nxc.join("workspaces").exists());
         assert!(!nxc.join("modules/nxc_spider_plus").exists());
+        assert!(!nxc.join("screenshots").exists());
+        assert!(!nxc.join("obfuscated_scripts").exists());
+        assert!(!nxc.join("tmp").exists());
         fs::remove_dir_all(&nxc).ok();
     }
 
