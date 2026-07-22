@@ -1314,6 +1314,13 @@ tasks:
         export OTEL_RESOURCE_ATTRIBUTES='deployment.environment=staging,attack.team=red'
         export ARES_OPERATION_ID='${PAYLOAD}'
         mkdir -p {{.ARES_LOG_DIR}}
+        # Fresh-op guarantee: wipe cross-op attacker residue (hashcat potfile,
+        # ~/.nxc DBs/spider/artifacts, /tmp/ares-tickets ccaches) BEFORE the
+        # orchestrator and its tools run, so no op can cheat off a prior op.
+        # Explicit + visible here (belt-and-suspenders alongside the in-binary
+        # pre-op hook). Honors ARES_KEEP_WORKSPACE=1 for dev loops.
+        echo '[launch] pre-op workspace sanitize:'
+        /usr/local/bin/ares ops sanitize || echo '[launch] WARNING: ops sanitize failed'
         nohup /usr/local/bin/ares orchestrator >{{.ARES_LOG_DIR}}/orchestrator.log 2>&1 &
         sleep 2
         if pgrep -f 'ares orchestrator' >/dev/null; then
