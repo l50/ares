@@ -11,6 +11,7 @@ use tracing::{debug, field::Empty, info, info_span, warn, Instrument};
 use crate::orchestrator::deferred::DeferredTask;
 use crate::orchestrator::llm_runner::LlmTaskRunner;
 use crate::orchestrator::routing::ActiveTask;
+use crate::orchestrator::state::DEDUP_SCANNED_TARGETS;
 use crate::orchestrator::task_queue::TaskResult;
 use crate::orchestrator::throttling::ThrottleDecision;
 
@@ -320,6 +321,27 @@ impl Dispatcher {
 
         self.throttler.record_dispatch().await;
 
+        // Record the target as scanned only now that the scan task is actually
+        // being dispatched (past the throttle and per-credential gates). Marking
+        // at submit-request time recorded targets as scanned even when the task
+        // was deferred and later evicted from the deferred queue unrun, which
+        // permanently suppressed the scan via `request_recon`'s scan guards — the
+        // host then never got a service scan (bare IP / no ports in loot).
+        // Idempotent; the deferred queue's signature dedup bounds duplicate
+        // dispatches while a scan is pending.
+        if task_type == "recon" {
+            if let Some(ip) = scan_target_from_payload(&payload) {
+                {
+                    let mut state = self.state.write().await;
+                    state.mark_processed(DEDUP_SCANNED_TARGETS, ip.clone());
+                }
+                let _ = self
+                    .state
+                    .persist_dedup(&self.queue, DEDUP_SCANNED_TARGETS, &ip)
+                    .await;
+            }
+        }
+
         // Set initial task status with full metadata
         let _ = self
             .queue
@@ -614,6 +636,28 @@ impl Dispatcher {
 /// the original payload.
 ///
 /// Used by `submit_to_llm` when persisting the `TaskInfo` to Redis.
+/// If `payload` is a recon task that performs a network scan (`network_scan`
+/// or `nmap_scan` technique) against a concrete `target_ip`, return that IP.
+///
+/// Callers use this to record `scanned_targets` at actual-dispatch time rather
+/// than at submit-request time. A scan the throttler defers and the deferred
+/// queue later evicts unrun never reaches dispatch, so it no longer leaves a
+/// false "scanned" mark that permanently suppresses the scan.
+fn scan_target_from_payload(payload: &Value) -> Option<String> {
+    let ip = payload.get("target_ip").and_then(Value::as_str)?;
+    if ip.is_empty() {
+        return None;
+    }
+    let runs_scan = payload
+        .get("techniques")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|t| t == "network_scan" || t == "nmap_scan");
+    runs_scan.then(|| ip.to_string())
+}
+
 pub(crate) fn task_params_from_payload(
     payload: &Value,
     cred_key: Option<&str>,
@@ -809,6 +853,40 @@ pub(crate) fn assist_pattern_key(task_type: &str, payload: &serde_json::Value) -
 mod assist_key_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scan_target_matches_network_scan_technique() {
+        let p = json!({"target_ip": "192.168.58.10", "techniques": ["network_scan", "smb_signing_check"]});
+        assert_eq!(
+            scan_target_from_payload(&p).as_deref(),
+            Some("192.168.58.10")
+        );
+    }
+
+    #[test]
+    fn scan_target_matches_nmap_scan_alias() {
+        let p = json!({"target_ip": "192.168.58.11", "techniques": ["nmap_scan"]});
+        assert_eq!(
+            scan_target_from_payload(&p).as_deref(),
+            Some("192.168.58.11")
+        );
+    }
+
+    #[test]
+    fn scan_target_none_without_scan_technique() {
+        // Share/user enumeration carries no scan technique — dispatching it must
+        // not mark the target scanned (that would suppress the real port scan).
+        let p = json!({"target_ip": "192.168.58.10", "techniques": ["enumerate_shares"]});
+        assert!(scan_target_from_payload(&p).is_none());
+    }
+
+    #[test]
+    fn scan_target_none_without_target_ip() {
+        let p = json!({"techniques": ["network_scan"]});
+        assert!(scan_target_from_payload(&p).is_none());
+        let p = json!({"target_ip": "", "techniques": ["network_scan"]});
+        assert!(scan_target_from_payload(&p).is_none());
+    }
 
     #[test]
     fn pattern_key_includes_target_user_domain() {

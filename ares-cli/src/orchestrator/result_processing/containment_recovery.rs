@@ -116,8 +116,7 @@ const NETWORK_UNREACHABLE_MARKERS: &[&str] = &[
 /// here: it means the KDC couldn't find the *queried* principal (a missing SPN
 /// or a non-existent user), which is a routine side-effect of kerberoast/AS-REP
 /// SPN enumeration — not evidence the acting account was disabled. Treating it
-/// as a revocation string revoked the op's own principal on benign recon. See
-/// FINDINGS.md Bug #3.
+/// as a revocation string revoked the op's own principal on benign recon.
 const CREDENTIAL_REJECT_MARKERS: &[&str] = &[
     "STATUS_LOGON_FAILURE",
     "INVALID_CREDENTIALS",

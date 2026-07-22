@@ -254,7 +254,7 @@ fn candidate_pivot_logins(state: &StateInner, domain: &str) -> Vec<(String, Stri
     // dispatches with no `-hashes` and no password, and impacket falls back to
     // an interactive getpass() that consumes the piped SQL query as the
     // "password". Queuing those accounts spends the whole MAX_PIVOT_ATTEMPTS
-    // budget on guaranteed getpass failures. See FINDINGS.md Bug #2.
+    // budget on guaranteed getpass failures.
     let hashes = state
         .hashes
         .iter()

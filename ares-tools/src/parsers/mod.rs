@@ -268,8 +268,9 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 discoveries["vulnerabilities"] = Value::Array(vec![vuln]);
             }
         }
-        "certipy_esc1_full_chain" | "certipy_auth" => {
-            // Both emit "Got hash for 'user@realm': <lm>:<nt>" on success.
+        "certipy_esc1_full_chain" | "certipy_esc13_full_chain" | "certipy_auth" => {
+            // All emit "Got hash for 'user@realm': <lm>:<nt>" (certipy auth) and/or
+            // the secretsdump `krbtgt:...:::` DCSync line on success.
             set_if_nonempty(
                 &mut discoveries,
                 "hashes",

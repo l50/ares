@@ -2235,18 +2235,6 @@ async fn dispatch_post_ticket_acl_enumeration(
     }
 }
 
-/// Enumerate ADCS templates and CAs in the target forest with the forged
-/// inter-realm ticket.
-///
-/// The foreign CA rejects NTLM RPC (`ept_s_not_registered` /
-/// `rpc_s_access_denied`) across a SID-filtered trust, so the LLM's ADCS recon
-/// stalls there. certipy authenticates its LDAP + CA RPC over `-k -no-pass`
-/// (KRB5CCNAME) once the credential resolver injects `ticket_path` for the
-/// target realm — the certipy subset of Bug B, gated by
-/// `is_cross_forest_certipy_tool` and keyed off the `domain` argument set here.
-/// Running `certipy find` directly surfaces ESC1/2/3/4/9/13/15 templates into
-/// state so the ADCS automations (which now issue `certipy req` with the same
-/// ccache) have targets without waiting for another recon round.
 /// True when `cred` can enumerate `target_domain`'s CA as a *native* principal:
 /// a same-domain, non-machine account with a recovered password. A native
 /// enrollee is a member of the target's Domain Users, so certipy flags
@@ -2262,53 +2250,30 @@ fn is_native_adcs_enum_candidate(
         && !cred.username.trim_end().ends_with('$')
 }
 
-async fn dispatch_post_ticket_adcs_enumeration(
+/// Outcome of one post-ticket `certipy find` dispatch.
+enum AdcsEnumOutcome {
+    /// certipy find completed and surfaced this many vulnerabilities.
+    Found(usize),
+    /// The tool errored or the dispatch itself failed — nothing was enumerated.
+    Failed,
+}
+
+/// Dispatch a single post-ticket `certipy find` against `target_domain`'s CA as
+/// `principal`, log the result, and report whether it surfaced vulnerabilities.
+/// `native` only labels the log line (true = same-domain enrollee, false = the
+/// forged cross-forest Administrator).
+async fn run_post_ticket_adcs_enum(
     dispatcher: &Dispatcher,
     source_domain: &str,
     target_domain: &str,
-) {
-    let (target_dc_ip, native_user) = {
-        let s = dispatcher.state.read().await;
-        let Some(dc_ip) = s.resolve_dc_ip(target_domain) else {
-            warn!(
-                source_domain,
-                target_domain, "post-ticket ADCS enum skipped: no DC IP for target domain"
-            );
-            return;
-        };
-        // Prefer a native credential for the target domain over the forged
-        // cross-forest Administrator. Only a member of the target's Domain Users
-        // enrolls in — and so gets certipy to flag as vulnerable — the
-        // enrollee-supplies-subject templates (ESC1). The cross-forest
-        // Administrator is not in that group, so enumerating as it leaves ESC1
-        // undiscovered and the ADCS takeover path dark.
-        let native_user = s
-            .credentials
-            .iter()
-            .find(|c| {
-                is_native_adcs_enum_candidate(c, target_domain)
-                    && !s.is_delegation_account(&c.username)
-                    && !s.is_principal_quarantined(&c.username, &c.domain)
-            })
-            .map(|c| c.username.clone());
-        (dc_ip, native_user)
-    };
-
-    // With a native user the credential_resolver injects that account's
-    // password/hash and — because a same-domain credential now exists — skips
-    // the cross-forest ccache (see `resolve_cross_forest_ticket`), so certipy
-    // binds as the native enrollee. Otherwise fall back to the forged
-    // Administrator: `domain` = target forest so the resolver looks up the
-    // forged ccache under that realm (see `is_cross_forest_certipy_tool`); no
-    // password/hash is supplied so certipy_find soft-skips rather than
-    // attempting a doomed cross-forest NTLM bind.
-    let enum_user = native_user
-        .clone()
-        .unwrap_or_else(|| "Administrator".to_string());
+    target_dc_ip: &str,
+    principal: &str,
+    native: bool,
+) -> AdcsEnumOutcome {
     let tool_args = json!({
         "domain": target_domain,
         "dc_ip": target_dc_ip,
-        "username": enum_user,
+        "username": principal,
     });
     let call = ToolCall {
         id: format!("post_ticket_adcs_{}", uuid::Uuid::new_v4().simple()),
@@ -2324,8 +2289,8 @@ async fn dispatch_post_ticket_adcs_enumeration(
         task_id = %task_id,
         source_domain,
         target_domain,
-        principal = native_user.as_deref().unwrap_or("Administrator"),
-        native = native_user.is_some(),
+        principal,
+        native,
         "Post-ticket ADCS enumeration dispatched"
     );
 
@@ -2341,9 +2306,10 @@ async fn dispatch_post_ticket_adcs_enumeration(
                     err = %err,
                     source_domain,
                     target_domain,
+                    principal,
                     "Post-ticket ADCS enumeration returned tool error"
                 );
-                return;
+                return AdcsEnumOutcome::Failed;
             }
             let vuln_count = exec
                 .discoveries
@@ -2354,15 +2320,103 @@ async fn dispatch_post_ticket_adcs_enumeration(
                 .unwrap_or(0);
             info!(
                 source_domain,
-                target_domain, vuln_count, "Post-ticket ADCS enumeration completed"
+                target_domain, principal, vuln_count, "Post-ticket ADCS enumeration completed"
             );
+            AdcsEnumOutcome::Found(vuln_count)
         }
-        Err(e) => warn!(
-            err = %e,
+        Err(e) => {
+            warn!(
+                err = %e,
+                source_domain,
+                target_domain,
+                principal,
+                "Post-ticket ADCS enumeration dispatch failed"
+            );
+            AdcsEnumOutcome::Failed
+        }
+    }
+}
+
+/// Enumerate ADCS templates and CAs in the target forest with the forged
+/// inter-realm ticket.
+///
+/// The foreign CA rejects NTLM RPC (`ept_s_not_registered` /
+/// `rpc_s_access_denied`) across a SID-filtered trust, so the LLM's ADCS recon
+/// stalls there. certipy authenticates its LDAP + CA RPC over `-k -no-pass`
+/// (KRB5CCNAME) once the credential resolver injects `ticket_path` for the
+/// target realm — the certipy subset of Bug B, gated by
+/// `is_cross_forest_certipy_tool` and keyed off the `domain` argument set here.
+/// Running `certipy find` directly surfaces ESC1/2/3/4/9/13/15 templates into
+/// state so the ADCS automations (which now issue `certipy req` with the same
+/// ccache) have targets without waiting for another recon round.
+///
+/// Principal selection: prefer a native target-domain enrollee (see
+/// `is_native_adcs_enum_candidate`) because only a Domain Users member gets
+/// certipy to flag the enrollee-supplies-subject (ESC1) templates as
+/// vulnerable-for-us. Fall back to the forged cross-forest Administrator when no
+/// native credential exists *or* when the native bind surfaced nothing — a
+/// recovered password can be stale/rotated, and a failed native bind must not
+/// leave the CA un-enumerated. The Administrator ccache path is what the
+/// pre-native code always used; it soft-skips when no forged ccache exists
+/// rather than attempting a doomed cross-forest NTLM bind.
+async fn dispatch_post_ticket_adcs_enumeration(
+    dispatcher: &Dispatcher,
+    source_domain: &str,
+    target_domain: &str,
+) {
+    let (target_dc_ip, native_user) = {
+        let s = dispatcher.state.read().await;
+        let Some(dc_ip) = s.resolve_dc_ip(target_domain) else {
+            warn!(
+                source_domain,
+                target_domain, "post-ticket ADCS enum skipped: no DC IP for target domain"
+            );
+            return;
+        };
+        let native_user = s
+            .credentials
+            .iter()
+            .find(|c| {
+                is_native_adcs_enum_candidate(c, target_domain)
+                    && !s.is_delegation_account(&c.username)
+                    && !s.is_principal_quarantined(&c.username, &c.domain)
+            })
+            .map(|c| c.username.clone());
+        (dc_ip, native_user)
+    };
+
+    // Try the native enrollee first: only it surfaces the ESC1 templates a
+    // cross-forest Administrator can't. Then fall back to Administrator unless
+    // that native run already found vulnerabilities — so a stale/rotated native
+    // password can never leave the CA un-enumerated versus the old
+    // always-Administrator behaviour.
+    let native_found_vulns = if let Some(user) = &native_user {
+        matches!(
+            run_post_ticket_adcs_enum(
+                dispatcher,
+                source_domain,
+                target_domain,
+                &target_dc_ip,
+                user,
+                true,
+            )
+            .await,
+            AdcsEnumOutcome::Found(n) if n > 0
+        )
+    } else {
+        false
+    };
+
+    if !native_found_vulns {
+        run_post_ticket_adcs_enum(
+            dispatcher,
             source_domain,
             target_domain,
-            "Post-ticket ADCS enumeration dispatch failed"
-        ),
+            &target_dc_ip,
+            "Administrator",
+            false,
+        )
+        .await;
     }
 }
 
