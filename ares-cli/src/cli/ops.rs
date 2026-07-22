@@ -277,6 +277,26 @@ pub(crate) enum OpsCommands {
         latest: bool,
     },
 
+    /// Reverse the persistent target mutations an operation made (using its
+    /// mutation journal). Distinct from `cleanup` (Redis-key GC).
+    Teardown {
+        /// Operation ID (omit to use the latest operation)
+        operation_id: Option<String>,
+        /// Use the latest operation
+        #[arg(long)]
+        latest: bool,
+        /// Print the revert plan without touching any target
+        #[arg(long)]
+        dry_run: bool,
+        /// Only revert mutations from this tool (e.g. `rbcd_write`)
+        #[arg(long)]
+        only: Option<String>,
+    },
+
+    /// Wipe cross-op attacker-side residue (potfile, ~/.nxc, ccaches) so the
+    /// next op starts fresh. Same pass the orchestrator runs at op start.
+    Sanitize {},
+
     /// Delete an operation and all its associated data
     Delete {
         /// Operation ID

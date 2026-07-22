@@ -14,11 +14,13 @@ mod replay;
 pub(crate) mod report;
 pub(crate) mod resolve;
 mod runtime;
+mod sanitize;
 mod sessions;
 mod status;
 mod stop;
 pub(crate) mod submit;
 mod tasks;
+mod teardown;
 
 use anyhow::Result;
 
@@ -108,6 +110,13 @@ pub(crate) async fn run_ops(cmd: OpsCommands, redis_url: Option<String>) -> Resu
             operation_id,
             latest,
         } => stop::ops_stop(redis_url, operation_id, latest).await,
+        OpsCommands::Teardown {
+            operation_id,
+            latest,
+            dry_run,
+            only,
+        } => teardown::ops_teardown(redis_url, operation_id, latest, dry_run, only).await,
+        OpsCommands::Sanitize {} => sanitize::ops_sanitize().await,
         OpsCommands::Delete {
             operation_id,
             force,

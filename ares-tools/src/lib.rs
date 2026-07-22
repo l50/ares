@@ -21,6 +21,7 @@ pub mod lateral;
 pub mod parsers;
 pub mod privesc;
 pub mod recon;
+pub mod sanitize;
 pub mod scope;
 
 use anyhow::Result;
@@ -203,6 +204,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
 
         // ── ACL Exploitation ────────────────────────────────────────
         "bloodyad_add_group_member" => acl::bloodyad_add_group_member(arguments).await,
+        "bloodyad_get_object" => acl::bloodyad_get_object(arguments).await,
         "bloodyad_set_password" => acl::bloodyad_set_password(arguments).await,
         "bloodyad_add_genericall" => acl::bloodyad_add_genericall(arguments).await,
         "bloodyad_set_object_attr" => acl::bloodyad_set_object_attr(arguments).await,

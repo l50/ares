@@ -123,26 +123,31 @@ pub async fn generate_golden_ticket(args: &Value) -> Result<ToolOutput> {
 
 /// Add a computer account to the domain using impacket-addcomputer.
 ///
-/// Required args: `domain`, `username`, `password`, `computer_name`,
-///                `computer_password`, `dc_ip`
+/// Required args: `domain`, `username`, `password`, `computer_name`, `dc_ip`
+/// (`computer_password` required only for the default add action).
+/// Optional args: `action` (`add` [default] | `delete`). `delete` removes the
+///                named computer — used by operation teardown to drop a machine
+///                account this op created.
 pub async fn add_computer(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
     let password = required_str(args, "password")?;
     let computer_name = required_str(args, "computer_name")?;
-    let computer_password = required_str(args, "computer_password")?;
     let dc_ip = required_str(args, "dc_ip")?;
+    let action = optional_str(args, "action").unwrap_or("add");
 
     let target = format!("{domain}/{username}:{password}");
 
-    CommandBuilder::new("impacket-addcomputer")
+    let mut cmd = CommandBuilder::new("impacket-addcomputer")
         .arg(target)
         .flag("-computer-name", computer_name)
-        .flag("-computer-pass", computer_password)
-        .flag("-dc-ip", dc_ip)
-        .timeout_secs(120)
-        .execute()
-        .await
+        .flag("-dc-ip", dc_ip);
+    if matches!(action, "delete" | "del" | "remove") {
+        cmd = cmd.arg("-delete");
+    } else {
+        cmd = cmd.flag("-computer-pass", required_str(args, "computer_password")?);
+    }
+    cmd.timeout_secs(120).execute().await
 }
 
 /// Add or remove an SPN on a target account using bloodyAD.

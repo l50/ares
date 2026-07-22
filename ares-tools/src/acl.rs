@@ -80,9 +80,11 @@ pub fn build_bloodyad_add_group_member(args: &Value) -> Result<CommandBuilder> {
     let dc_ip = required_str(args, "dc_ip")?;
     let group = required_str(args, "group")?;
     let target_user = required_str(args, "target_user")?;
+    // `action` (default "add") lets teardown pass "remove" to reverse the write.
+    let action = optional_str(args, "action").unwrap_or("add");
 
     Ok(bloodyad_base(args, domain, dc_ip)?
-        .arg("add")
+        .arg(action)
         .arg("groupMember")
         .arg(group)
         .arg(target_user)
@@ -137,9 +139,11 @@ pub fn build_bloodyad_add_genericall(args: &Value) -> Result<CommandBuilder> {
     let dc_ip = required_str(args, "dc_ip")?;
     let target_dn = required_str(args, "target_dn")?;
     let principal = required_str(args, "principal")?;
+    // `action` (default "add") lets teardown pass "remove" to reverse the grant.
+    let action = optional_str(args, "action").unwrap_or("add");
 
     Ok(bloodyad_base(args, domain, dc_ip)?
-        .arg("add")
+        .arg(action)
         .arg("genericAll")
         .arg(target_dn)
         .arg(principal)
@@ -173,6 +177,28 @@ pub async fn adminsd_holder_add_ace(args: &Value) -> Result<ToolOutput> {
         .timeout_secs(120)
         .execute()
         .await
+}
+
+/// Read LDAP attributes of an object via `bloodyAD get object` — used by
+/// operation teardown to validate that a mutation was reversed.
+///
+/// Required args: `domain`, `dc_ip`, `target`
+/// Optional args: `attr` (single attribute to read; omit for all)
+/// Auth: same as the other bloodyAD tools (username+password, ticket, or hash
+///       via [`bloodyad_base`]).
+pub async fn bloodyad_get_object(args: &Value) -> Result<ToolOutput> {
+    let domain = required_str(args, "domain")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let target = required_str(args, "target")?;
+
+    let mut cmd = bloodyad_base(args, domain, dc_ip)?
+        .arg("get")
+        .arg("object")
+        .arg(target);
+    if let Some(attr) = optional_str(args, "attr").filter(|s| !s.is_empty()) {
+        cmd = cmd.arg("--attr").arg(attr);
+    }
+    cmd.timeout_secs(60).execute().await
 }
 
 /// Read a gMSA account's managed password via `bloodyAD get object`.
@@ -233,6 +259,12 @@ pub fn build_pywhisker(args: &Value) -> Result<CommandBuilder> {
         .flag("--target", target_sam)
         .flag("--action", action)
         .flag("--dc-ip", dc_ip);
+
+    // Removing a Key Credential requires the DeviceID minted by the add;
+    // teardown supplies it from the captured `device_id` hint.
+    if let Some(device_id) = optional_str(args, "device_id").filter(|s| !s.is_empty()) {
+        cmd = cmd.flag("--device-id", device_id);
+    }
 
     if let Some(tpath) = ticket_path {
         // Kerberos: pywhisker uses standard impacket-style `-k` + KRB5CCNAME.
