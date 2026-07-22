@@ -63,7 +63,7 @@ jobs:
       has_gpu_dependent_templates: ${{ steps.discover.outputs.has_gpu_dependent_templates }}
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup XDG directories
         run: |
@@ -454,7 +454,7 @@ jobs:
       max-parallel: 20
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ github.token }}
 
@@ -742,7 +742,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup XDG directories
         run: |
@@ -945,7 +945,7 @@ jobs:
       max-parallel: 20
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ github.token }}
 
@@ -1237,7 +1237,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup XDG directories
         run: |
@@ -1435,7 +1435,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ github.token }}
 
@@ -1661,7 +1661,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup XDG directories
         run: |
@@ -1801,7 +1801,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ github.token }}
 
@@ -2028,7 +2028,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup XDG directories
         run: |
