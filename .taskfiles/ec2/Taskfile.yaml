@@ -509,11 +509,29 @@ tasks:
 
         echo -e "{{.SUCCESS}} EC2 setup complete"
 
+  history-db:
+    desc: "Provision the box-local ares-history Postgres on EC2 (idempotent; usage: task ec2:history-db [EC2_NAME=kali-ares])"
+    silent: true
+    cmds:
+      - |
+        {{.AWS_PROFILE_EXPORT}}
+        export AWS_REGION="{{.AWS_REGION}}"
+        . .taskfiles/ec2/scripts/run-ssm.sh
+
+        INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}") || exit 1
+
+        echo -e "{{.INFO}} Provisioning ares-history Postgres on $INSTANCE_ID..."
+
+        PAYLOAD=$(cat .taskfiles/ec2/scripts/setup-history-db.sh)
+        run_ssm_cmd "$INSTANCE_ID" "$PAYLOAD" 600 || exit 1
+
+        echo -e "{{.SUCCESS}} ares-history DB ready (postgresql://ares_admin@127.0.0.1:5432/ares_history)"
+
   # ============================================================================
   # Process Management
   # ============================================================================
   start:
-    desc: "Start Redis + NATS on EC2 (infra only; orchestrator launched per-op via red:ec2:multi)"
+    desc: "Start Redis + NATS + history Postgres on EC2 (infra only; orchestrator launched per-op via red:ec2:multi)"
     silent: true
     cmds:
       - |
@@ -526,7 +544,11 @@ tasks:
         echo -e "{{.INFO}} Starting infra services on $INSTANCE_ID..."
 
         START_CMD="systemctl start redis-server 2>/dev/null || systemctl start redis; sleep 1; redis-cli ping; "
-        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'"
+        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'; "
+        # ares-history Postgres — best-effort start (only present once
+        # `task ec2:history-db` has provisioned it); the launcher probes 5432 and
+        # no-ops persistence if it is absent, so a missing DB never blocks an op.
+        START_CMD+="systemctl start postgresql 2>/dev/null; pg_isready -h 127.0.0.1 -q && echo 'PG OK' || echo 'PG NOT RUNNING (run: task ec2:history-db)'"
 
         run_ssm_cmd "$INSTANCE_ID" "$START_CMD" 30 || exit 1
         echo -e "{{.SUCCESS}} Infra services started"
@@ -1029,10 +1051,12 @@ tasks:
       SECRETS_ID: '{{.SECRETS_ID | default "ares/api-keys"}}'
       # Postgres history DB (ares-history). The orchestrator's projector + op
       # finalizer persist every run here so red ops are comparable across runs.
-      # Password comes from Secrets Manager (never committed); host/user/db are
-      # stable lab defaults. Set RDS_SECRET_ID="" to disable SQL persistence, or
-      # pass ARES_DATABASE_URL=... to override the constructed URL entirely.
-      ARES_DATABASE_URL: '{{.ARES_DATABASE_URL | default ""}}'
+      # Default is a box-local loopback Postgres co-located with the orchestrator
+      # (provision once with `task ec2:history-db`) — no cross-region networking,
+      # no secret. Pass ARES_DATABASE_URL=... to point at a remote DB instead;
+      # if you do, the box→DB reachability probe below derives host:port from it.
+      # The RDS_* vars below only take effect when ARES_DATABASE_URL is empty.
+      ARES_DATABASE_URL: '{{.ARES_DATABASE_URL | default "postgresql://ares_admin@127.0.0.1:5432/ares_history"}}'
       RDS_SECRET_ID: '{{.RDS_SECRET_ID | default "ares/rds/master"}}'
       RDS_ENDPOINT: '{{.RDS_ENDPOINT | default "ares-history.cr8uqakiuqnq.us-west-1.rds.amazonaws.com"}}'
       RDS_USER: '{{.RDS_USER | default "ares_admin"}}'
@@ -1180,6 +1204,13 @@ tasks:
             echo -e "{{.WARN}} could not read {{.RDS_SECRET_ID}} — SQL history persistence disabled for this op" >&2
           fi
         fi
+        # Derive host:port from the DB URL for the box-side reachability probe
+        # below. Works for both the box-local 127.0.0.1 default and any remote
+        # endpoint. The `.*@` strip is greedy so a password containing '@' or
+        # '/' can't fool the host parse.
+        DB_HP=$(printf %s "$ARES_DATABASE_URL_VAL" | sed -E 's#^[a-z]+://##; s#.*@##; s#[/?].*$##')
+        DB_PROBE_HOST=${DB_HP%%:*}
+        case "$DB_HP" in *:*) DB_PROBE_PORT=${DB_HP##*:} ;; *) DB_PROBE_PORT=5432 ;; esac
 
         # Parse host:port from URLs for box-side reachability probes. The
         # observability endpoints in Secrets Manager may live in a VPC the box
@@ -1240,11 +1271,13 @@ tasks:
         # Env var name per ares-llm/src/agent_loop/config.rs.
         ENV_FILE_CMD="$ENV_FILE_CMD; printf 'ARES_SESSION_LOG_DIR=%q\n' '/var/log/ares/session' >> \$ENV_TMP"
         ENV_FILE_CMD="$ENV_FILE_CMD; mkdir -p /var/log/ares/session && chmod 0755 /var/log/ares/session"
-        # ares-history Postgres — gated on box→RDS reachability (5432) so an
-        # unreachable DB never wedges orchestrator startup; the projector +
-        # finalizer both no-op cleanly when ARES_DATABASE_URL is absent.
+        # ares-history Postgres — gated on box→DB reachability (probe host:port
+        # parsed from the URL) so an unreachable DB never wedges orchestrator
+        # startup; the projector + finalizer both no-op cleanly when
+        # ARES_DATABASE_URL is absent. For the box-local default this probes
+        # 127.0.0.1:5432 (the loopback Postgres from `task ec2:history-db`).
         if [ -n "$ARES_DATABASE_URL_VAL" ]; then
-          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/{{.RDS_ENDPOINT}}/5432' 2>/dev/null; then printf 'ARES_DATABASE_URL=%q\n' '${ARES_DATABASE_URL_VAL}' >> \$ENV_TMP; else echo 'SKIP: ARES_DATABASE_URL {{.RDS_ENDPOINT}}:5432 unreachable from box' >&2; fi"
+          ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${DB_PROBE_HOST}/${DB_PROBE_PORT}' 2>/dev/null; then printf 'ARES_DATABASE_URL=%q\n' '${ARES_DATABASE_URL_VAL}' >> \$ENV_TMP; else echo 'SKIP: ARES_DATABASE_URL ${DB_PROBE_HOST}:${DB_PROBE_PORT} unreachable from box' >&2; fi"
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 \$ENV_TMP; mv \$ENV_TMP /etc/ares/env; echo Wrote /etc/ares/env"
 
