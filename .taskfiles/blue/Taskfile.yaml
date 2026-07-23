@@ -243,19 +243,24 @@ tasks:
         fi
 
   reports:consolidate:
-    desc: "Generate a consolidated report from Redis state (usage: task blue:reports:consolidate [OPERATION_ID=op-xxx] [LATEST=true])"
+    desc: "Generate a consolidated report from Redis state (usage: task blue:reports:consolidate [OPERATION_ID=op-xxx] [LATEST=true] [REGENERATE=true])"
     silent: true
     vars:
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
       LATEST: '{{.LATEST | default ""}}'
       OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+      REGENERATE: '{{.REGENERATE | default "false"}}'
     preconditions:
       - sh: test -n "{{.OPERATION_ID}}" || test "{{.LATEST}}" = "true"
         msg: "Either OPERATION_ID or LATEST=true is required"
     cmds:
-      - cmd: mkdir -p "{{.OUTPUT_DIR}}"
-        silent: true
       - |
+        set -euo pipefail
+        mkdir -p "{{.OUTPUT_DIR}}/blue"
+
+        # Blue state lives in the orchestrator's Redis on the remote backend
+        # (EC2 or K8s), never on localhost — so both the generate and the
+        # fetch-back must go over the transport, same as multi:list/status/etc.
         LATEST_FLAG=""
         if [ "{{.LATEST}}" = "true" ]; then
           LATEST_FLAG="--latest"
@@ -264,7 +269,40 @@ tasks:
         if [ -n "{{.OPERATION_ID}}" ]; then
           OP_ID_ARG="--operation-id {{.OPERATION_ID}}"
         fi
-        {{.ARES_CLI}} blue report $OP_ID_ARG $LATEST_FLAG --output-dir "{{.OUTPUT_DIR}}"
+        REGEN_ARG=""
+        if [ "{{.REGENERATE}}" = "true" ]; then
+          REGEN_ARG="--regenerate"
+        fi
+        REMOTE_DIR="/tmp/ares-blue-reports"
+
+        # Generate on the remote backend; it prints "... saved to <path>".
+        GEN_OUT=$({{.ARES_CLI}} {{.TRANSPORT_ARGS}} blue report $OP_ID_ARG $LATEST_FLAG $REGEN_ARG --output-dir "$REMOTE_DIR")
+        printf '%s\n' "$GEN_OUT"
+        REMOTE_PATH=$(printf '%s\n' "$GEN_OUT" | sed -n 's/.* saved to //p' | tail -1)
+        if [ -z "$REMOTE_PATH" ]; then
+          echo "ERROR: could not determine remote report path from generator output" >&2
+          exit 1
+        fi
+        LOCAL_PATH="{{.OUTPUT_DIR}}/blue/$(basename "$REMOTE_PATH")"
+
+        # Pull the generated markdown back to the local machine.
+        if [ "{{.BLUE_TRANSPORT}}" = "ec2" ]; then
+          . .taskfiles/ec2/scripts/run-ssm.sh
+          export AWS_REGION="{{.EC2_REGION | default "us-west-1"}}"
+          export AWS_PROFILE="{{.EC2_PROFILE | default "lab"}}"
+          INSTANCE_ID=$(resolve_instance_id "{{.EC2_NAME}}")
+          run_ssm_cmd "$INSTANCE_ID" "cat $REMOTE_PATH" 60 > "$LOCAL_PATH"
+        else
+          kubectl exec -n {{.K8S_NAMESPACE}} deploy/ares-blue-orchestrator -- cat "$REMOTE_PATH" > "$LOCAL_PATH"
+        fi
+
+        if [ -s "$LOCAL_PATH" ]; then
+          echo "Report saved to: $LOCAL_PATH"
+        else
+          echo "ERROR: fetched report is empty ($LOCAL_PATH)" >&2
+          rm -f "$LOCAL_PATH"
+          exit 1
+        fi
 
   reports:clean:
     desc: Remove all blue team reports
