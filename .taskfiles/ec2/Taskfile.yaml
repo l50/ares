@@ -73,7 +73,13 @@ vars:
   BUILD_TOOL: '{{.BUILD_TOOL | default (env "BUILD_TOOL") | default "remote"}}'
   # Build profile: release (optimized) or dev-deploy (fast compile, less optimized)
   BUILD_PROFILE: '{{.BUILD_PROFILE | default "dev-deploy"}}'
-  REMOTE_BUILD_DIR: '/tmp/ares-build'
+  # Disk-backed, NOT /tmp: on kali-ares /tmp is a 7.7G tmpfs that
+  # systemd-tmpfiles-clean sweeps daily (age 10d). Aged cargo build-script
+  # outputs (e.g. rustversion's OUT_DIR/version.expr) got reaped while their
+  # fingerprints survived, so `include!(OUT_DIR/version.expr)` failed with
+  # ENOENT on the next incremental build. /var/tmp is on / (53G free, tmpfiles
+  # age 30d) and also fits a full clean target/ that overflows the tmpfs.
+  REMOTE_BUILD_DIR: '/var/tmp/ares-build'
   # Loki deployment label for blue team queries
   EC2_DEPLOYMENT: '{{.EC2_DEPLOYMENT | default "alpha-operator-range"}}'
 
