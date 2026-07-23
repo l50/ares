@@ -227,6 +227,19 @@ impl Dispatcher {
         payload: serde_json::Value,
         priority: i32,
     ) -> Result<SubmissionOutcome> {
+        // Once the completion monitor has decided the op is done, drop every new
+        // red task. This is the single choke point for automation dispatch,
+        // direct exploit dispatch, and the deferred-queue drain, so freezing it
+        // halts all red LLM token burn during the post-completion blue-drain
+        // wait. Blue runs on its own runner and is unaffected.
+        if self.is_red_draining() {
+            debug!(
+                task_type,
+                target_role, "Red draining — dropping task (op completion decided)"
+            );
+            return Ok(SubmissionOutcome::Dropped);
+        }
+
         let role = ares_llm::tool_registry::AgentRole::parse(target_role)
             .or_else(|| crate::orchestrator::llm_runner::role_for_task_type(task_type));
 

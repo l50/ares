@@ -8,6 +8,7 @@ mod submission;
 pub(crate) mod task_builders;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
@@ -130,6 +131,12 @@ pub struct Dispatcher {
     /// fallback for the rare race the mutex didn't prevent (a still-
     /// running ntlmrelayx from a prior dispatch).
     pub relay_slot: Arc<Mutex<()>>,
+    /// Set once the completion monitor decides the op is done (all forests
+    /// dominated / max runtime). While true, `do_submit_outcome` drops every
+    /// new red task so the swarm stops burning tokens on the exploit/ACL
+    /// backlog during the post-completion blue-drain wait. Blue investigations
+    /// run on their own runner and are unaffected.
+    pub red_draining: Arc<AtomicBool>,
 }
 
 impl Dispatcher {
@@ -168,7 +175,20 @@ impl Dispatcher {
             // Allow up to 3 concurrent tasks per credential
             credential_inflight: CredentialInflight::new(3),
             relay_slot: Arc::new(Mutex::new(())),
+            red_draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Freeze new red-task dispatch. Called by the completion monitor the
+    /// instant the op is deemed complete so the swarm stops burning tokens
+    /// while blue investigations drain. Idempotent.
+    pub fn mark_red_draining(&self) {
+        self.red_draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether red dispatch has been frozen by [`mark_red_draining`].
+    pub fn is_red_draining(&self) -> bool {
+        self.red_draining.load(Ordering::SeqCst)
     }
 }
 

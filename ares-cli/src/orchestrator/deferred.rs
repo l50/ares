@@ -520,6 +520,71 @@ async fn scan_keys_async(conn: &mut redis::aio::ConnectionManager, pattern: &str
 ///
 /// Uses `Dispatcher::do_submit()` to route tasks directly to the LLM agent
 /// loop (not Redis task queues, which have no consumer in this process).
+/// Return the human-readable reason a deferred task should be dropped from
+/// the queue because a blue-team containment observation has invalidated
+/// its preconditions, or `None` when the task remains viable.
+///
+/// Kept intentionally narrow: mirrors the checks in the exploitation
+/// pre-dispatch filter (`orchestrator/exploitation.rs`) but limited to the
+/// fields commonly present in deferred payloads — target IP, credential
+/// tuple, and (for Kerberos-typed tasks) the target realm. Certificate
+/// serial is not usually present at defer-time and is handled downstream
+/// in exploitation.
+async fn task_dropped_by_containment(
+    task: &DeferredTask,
+    state: &crate::orchestrator::state::SharedState,
+) -> Option<String> {
+    let state = state.read().await;
+
+    // Host isolated → drop any task pointing at that IP.
+    let target_ip = task
+        .payload
+        .get("target_ip")
+        .or_else(|| task.payload.get("dc_ip"))
+        .or_else(|| task.payload.get("target"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !target_ip.is_empty() && state.is_host_isolated(target_ip) {
+        return Some(format!("host isolated ({target_ip})"));
+    }
+
+    // Credential revoked → drop any task bound to that principal.
+    if let Some(cred) = task.payload.get("credential") {
+        let user = cred.get("username").and_then(|v| v.as_str()).unwrap_or("");
+        let domain = cred.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+        if !user.is_empty() && !domain.is_empty() && state.is_credential_revoked(user, domain) {
+            return Some(format!("credential revoked ({user}@{domain})"));
+        }
+    }
+
+    // krbtgt rotated → drop Kerberos-shaped tasks in that realm. Task-type
+    // strings vary (`authentication`, `kerberos`, `lateral`) so gate on a
+    // technique keyword or explicit realm field rather than a hardcoded
+    // task_type list.
+    let realm = task
+        .payload
+        .get("domain")
+        .or_else(|| task.payload.get("realm"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let technique = task
+        .payload
+        .get("technique")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let kerberos_shaped = matches!(
+        task.task_type.as_str(),
+        "authentication" | "kerberos" | "kerberoast" | "asrep_roast"
+    ) || technique.to_lowercase().contains("kerberos")
+        || technique.to_lowercase().contains("kerberoast")
+        || technique.to_lowercase().contains("golden");
+    if !realm.is_empty() && kerberos_shaped && state.is_krbtgt_rotated(realm) {
+        return Some(format!("krbtgt rotated ({realm})"));
+    }
+
+    None
+}
+
 pub fn spawn_deferred_processor(
     deferred: Arc<DeferredQueue>,
     dispatcher: Arc<Dispatcher>,
@@ -556,6 +621,24 @@ pub fn spawn_deferred_processor(
                 }) else {
                     break; // queue empty
                 };
+
+                // Drop deferred tasks whose target/credential blue has
+                // observably contained. Mirrors the pre-dispatch filter in
+                // `exploitation.rs`: without this, tasks deferred before
+                // blue took action get re-dispatched anyway, chew a
+                // credential-inflight slot, and surface as noisy
+                // STATUS_LOGON_FAILURE / STATUS_HOST_UNREACHABLE tool
+                // errors — exactly the visual mess the containment loop is
+                // supposed to prevent for the demo.
+                if let Some(reason) = task_dropped_by_containment(&task, &dispatcher.state).await {
+                    info!(
+                        task_type = %task.task_type,
+                        target_role = %task.target_role,
+                        reason = %reason,
+                        "Dropping deferred task — invalidated by blue containment"
+                    );
+                    continue;
+                }
 
                 // Re-check throttle before submitting
                 let decision = throttler
@@ -630,6 +713,7 @@ pub fn spawn_deferred_processor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::SharedState;
 
     fn make_task(priority: i32, enqueue_time: f64) -> DeferredTask {
         DeferredTask {
@@ -640,6 +724,121 @@ mod tests {
             payload: serde_json::json!({}),
             source_agent: "orchestrator".into(),
         }
+    }
+
+    fn task_with_payload(task_type: &str, payload: serde_json::Value) -> DeferredTask {
+        DeferredTask {
+            priority: 5,
+            enqueue_time: 1000.0,
+            task_type: task_type.into(),
+            target_role: "recon".into(),
+            payload,
+            source_agent: "orchestrator".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drops_task_when_target_host_isolated() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_host_isolated(
+                "192.168.58.20",
+                "web01.contoso.local",
+                "blue_simulated:inv-1",
+            )
+            .await;
+        let task = task_with_payload(
+            "credential_access",
+            serde_json::json!({ "target_ip": "192.168.58.20" }),
+        );
+        let reason = task_dropped_by_containment(&task, &state).await;
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("host isolated"));
+    }
+
+    #[tokio::test]
+    async fn keeps_task_when_host_not_isolated() {
+        let state = SharedState::new("op-x".into());
+        let task = task_with_payload(
+            "credential_access",
+            serde_json::json!({ "target_ip": "192.168.58.20" }),
+        );
+        assert!(task_dropped_by_containment(&task, &state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn drops_task_when_credential_revoked() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_credential_revoked("svc_mssql", "contoso.local", "blue_simulated:inv-1")
+            .await;
+        let task = task_with_payload(
+            "lateral",
+            serde_json::json!({
+                "target_ip": "192.168.58.21",
+                "credential": { "username": "svc_mssql", "domain": "contoso.local" },
+            }),
+        );
+        let reason = task_dropped_by_containment(&task, &state).await;
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("credential revoked"));
+    }
+
+    #[tokio::test]
+    async fn drops_kerberos_task_when_krbtgt_rotated() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_krbtgt_rotated("contoso.local", "blue_simulated:inv-1")
+            .await;
+        let task = task_with_payload(
+            "kerberos",
+            serde_json::json!({
+                "target_ip": "192.168.58.240",
+                "domain": "contoso.local",
+            }),
+        );
+        let reason = task_dropped_by_containment(&task, &state).await;
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("krbtgt rotated"));
+    }
+
+    #[tokio::test]
+    async fn keeps_non_kerberos_task_when_only_krbtgt_rotated() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_krbtgt_rotated("contoso.local", "blue_simulated:inv-1")
+            .await;
+        // Plain SMB recon in the same realm should still be dispatched —
+        // krbtgt rotation only kills Kerberos-shaped attacks.
+        let task = task_with_payload(
+            "recon",
+            serde_json::json!({
+                "target_ip": "192.168.58.240",
+                "domain": "contoso.local",
+                "technique": "smb_enumeration",
+            }),
+        );
+        assert!(task_dropped_by_containment(&task, &state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn drops_kerberoast_technique_when_krbtgt_rotated() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_krbtgt_rotated("contoso.local", "blue_simulated:inv-1")
+            .await;
+        // task_type is `credential_access` but technique gives it away.
+        let task = task_with_payload(
+            "credential_access",
+            serde_json::json!({
+                "dc_ip": "192.168.58.240",
+                "domain": "contoso.local",
+                "technique": "Kerberoasting",
+            }),
+        );
+        let reason = task_dropped_by_containment(&task, &state).await;
+        assert!(reason.is_some(), "expected kerberoast to be dropped");
+        assert!(reason.unwrap().contains("krbtgt rotated"));
     }
 
     #[test]

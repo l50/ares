@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{info, warn};
 
+use ares_core::op_state_log::OpStateRecorder;
 use ares_llm::agent_loop::CallbackResult;
 use ares_llm::tool_registry::blue::{self, BlueAgentRole};
 use ares_llm::{
@@ -20,6 +21,7 @@ use ares_llm::{
     ToolCall, ToolDispatcher,
 };
 
+use super::simulated_response::{self, emit_simulated_response_span};
 use super::sub_agent::{BlueToolDispatcher, SubAgentCallbackHandler};
 
 /// All tool names this handler recognizes as callbacks.
@@ -56,9 +58,24 @@ pub struct BlueCallbackHandler {
     alert: serde_json::Value,
     redis_url: String,
     deployment: Option<String>,
+    /// Operation ID pulled from the alert labels (or empty when the alert
+    /// carries no operation context). Included on every simulated-response
+    /// span so the `attack-demo-live` dashboard's per-operation filter matches.
+    operation_id: String,
+    /// Recorder for op-state events. When active, `confirm_escalation` with a
+    /// containment action publishes a matching containment event so the
+    /// red-side projector observes it and the exploitation queue drops
+    /// entries whose preconditions are now invalid. Defaults to
+    /// [`OpStateRecorder::disabled`] when the caller does not opt in.
+    op_state_recorder: OpStateRecorder,
 }
 
 impl BlueCallbackHandler {
+    /// Convenience constructor with no op-state recorder — simulated
+    /// containment actions still emit a tracing span but no red-side
+    /// observation is published. Kept for tests and any future call site
+    /// that doesn't have a NATS broker to hand.
+    #[allow(dead_code)]
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         dispatcher: Arc<dyn ToolDispatcher>,
@@ -66,6 +83,32 @@ impl BlueCallbackHandler {
         investigation_id: String,
         alert: serde_json::Value,
         redis_url: String,
+    ) -> Self {
+        Self::with_recorder(
+            provider,
+            dispatcher,
+            model,
+            investigation_id,
+            alert,
+            redis_url,
+            OpStateRecorder::disabled(),
+        )
+    }
+
+    /// Same as [`Self::new`] but wires an op-state recorder so that simulated
+    /// containment actions confirmed through `confirm_escalation` are
+    /// published as red-side observations. Callers that already own a
+    /// NATS-backed recorder (production) or a capturing one (tests) should
+    /// use this constructor; the recorder-less `new` still works and simply
+    /// omits the red-side observation half of the demo path.
+    pub fn with_recorder(
+        provider: Arc<dyn LlmProvider>,
+        dispatcher: Arc<dyn ToolDispatcher>,
+        model: String,
+        investigation_id: String,
+        alert: serde_json::Value,
+        redis_url: String,
+        op_state_recorder: OpStateRecorder,
     ) -> Self {
         // Extract deployment from alert labels or fall back to env var
         let deployment = alert
@@ -75,6 +118,16 @@ impl BlueCallbackHandler {
             .map(String::from)
             .or_else(|| std::env::var("ARES_DEPLOYMENT").ok());
 
+        // Correlate blue lifecycle spans with the red operation so the demo
+        // dashboard's per-op filter picks them up. Empty string when the
+        // alert carries no operation context (unit tests, ad-hoc alerts).
+        let operation_id = alert
+            .get("labels")
+            .and_then(|l| l.get("operation_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         Self {
             provider,
             dispatcher,
@@ -83,6 +136,8 @@ impl BlueCallbackHandler {
             alert,
             redis_url,
             deployment,
+            operation_id,
+            op_state_recorder,
         }
     }
 
@@ -299,6 +354,16 @@ impl BlueCallbackHandler {
         let reason = call.arguments["reason"].as_str().unwrap_or("unknown");
         let severity = call.arguments["severity"].as_str().unwrap_or("high");
 
+        // Emit a simulated-response span for the escalation decision itself
+        // so the demo dashboard shows the moment blue kicked off triage.
+        let _ = emit_simulated_response_span(
+            simulated_response::ACTION_ESCALATE_TO_HUMAN,
+            severity,
+            &self.investigation_id,
+            &self.operation_id,
+            reason,
+        );
+
         info!(
             investigation_id = %self.investigation_id,
             severity = severity,
@@ -345,6 +410,69 @@ impl BlueCallbackHandler {
                 "Escalation triage result:\n{result}"
             )))
         }
+    }
+
+    /// Handle `confirm_escalation`. Always emits a simulated-response span
+    /// so the demo dashboard's `Simulated Response Actions` panel picks up
+    /// the decision; when a containment action is named and the recorder is
+    /// active, also publishes the matching op-state event so the red
+    /// projector observes it and the queue-filter drops invalidated
+    /// entries. Result value is identical to the pre-existing static path so
+    /// upstream state machines are unaffected.
+    async fn handle_confirm_escalation(&self, call: &ToolCall) -> Result<CallbackResult> {
+        let action_type = call.arguments["containment_action"]
+            .as_str()
+            .unwrap_or(simulated_response::ACTION_ESCALATE_TO_HUMAN);
+        let target = call.arguments["target"].as_str().unwrap_or("");
+        let reasoning = call.arguments["reasoning"].as_str().unwrap_or("");
+
+        let _ = emit_simulated_response_span(
+            action_type,
+            target,
+            &self.investigation_id,
+            &self.operation_id,
+            reasoning,
+        );
+
+        if let Some(payload) =
+            simulated_response::payload_for_containment(action_type, target, &self.investigation_id)
+        {
+            let op_id = if self.operation_id.is_empty() {
+                &self.investigation_id
+            } else {
+                &self.operation_id
+            };
+            simulated_response::publish_containment(&self.op_state_recorder, op_id, payload).await;
+        }
+
+        // Preserve the lifecycle-callback contract from the static path.
+        let action_result = call.arguments["action"].as_str().unwrap_or(action_type);
+        Ok(CallbackResult::TaskComplete {
+            task_id: "escalation_triage".into(),
+            result: format!("Escalation confirmed: {action_result}"),
+        })
+    }
+
+    /// Handle `downgrade_escalation`. Emits a simulated-response span so the
+    /// dashboard shows blue explicitly ruling out containment (false
+    /// positives are still a datapoint in the demo scoreboard). No
+    /// containment publish — a downgrade never invalidates red's queue.
+    async fn handle_downgrade_escalation(&self, call: &ToolCall) -> Result<CallbackResult> {
+        let reason = call.arguments["reason"]
+            .as_str()
+            .or_else(|| call.arguments["reasoning"].as_str())
+            .unwrap_or("");
+        let _ = emit_simulated_response_span(
+            simulated_response::ACTION_DOWNGRADE_ESCALATION,
+            "",
+            &self.investigation_id,
+            &self.operation_id,
+            reason,
+        );
+        Ok(CallbackResult::TaskComplete {
+            task_id: "escalation_triage".into(),
+            result: format!("Escalation downgraded: {reason}"),
+        })
     }
 
     /// Handle query tools that read investigation state from Redis.
@@ -446,6 +574,10 @@ impl BlueCallbackHandler {
                 })
             }
             // escalate_investigation is handled async in dispatch_escalation_triage
+            // confirm_escalation and downgrade_escalation are also handled
+            // async now — see `handle_confirm_escalation` /
+            // `handle_downgrade_escalation` for span emission + optional
+            // simulated-containment publish.
             "confirm_escalation" => {
                 let action = call.arguments["action"].as_str().unwrap_or("escalate");
                 Some(CallbackResult::TaskComplete {
@@ -495,12 +627,17 @@ impl CallbackHandler for BlueCallbackHandler {
             // Escalation — launches escalation triage sub-agent
             "escalate_investigation" => Some(self.dispatch_escalation_triage(call).await),
 
+            // Confirm/downgrade need &self so they can emit spans and
+            // (optionally) publish simulated-containment op-state events.
+            "confirm_escalation" => Some(self.handle_confirm_escalation(call).await),
+            "downgrade_escalation" => Some(self.handle_downgrade_escalation(call).await),
+
             // Query tools
             "get_investigation_status" | "get_task_result" | "wait_for_all_tasks" => {
                 Some(self.handle_query_tool(call).await)
             }
 
-            // Lifecycle callbacks
+            // Lifecycle callbacks (triage_complete, hunt_complete, etc.)
             _ => Self::handle_lifecycle_callback(call).map(Ok),
         }
     }
@@ -543,6 +680,8 @@ mod tests {
             alert: json!({}),
             redis_url: "redis://localhost".into(),
             deployment: None,
+            operation_id: String::new(),
+            op_state_recorder: OpStateRecorder::disabled(),
         };
 
         assert!(handler.is_callback("dispatch_triage"));
@@ -617,6 +756,130 @@ mod tests {
             arguments: json!({}),
         };
         assert!(BlueCallbackHandler::handle_lifecycle_callback(&call).is_none());
+    }
+
+    fn test_handler_with_recorder(recorder: OpStateRecorder) -> BlueCallbackHandler {
+        BlueCallbackHandler::with_recorder(
+            Arc::new(MockProvider),
+            Arc::new(MockDispatcher),
+            "test".into(),
+            "inv-42".into(),
+            json!({ "labels": { "operation_id": "op-42" } }),
+            "redis://localhost".into(),
+            recorder,
+        )
+    }
+
+    #[tokio::test]
+    async fn confirm_escalation_publishes_containment_when_action_named() {
+        let recorder = OpStateRecorder::capturing();
+        let handler = test_handler_with_recorder(recorder.clone());
+        let call = ToolCall {
+            id: "c-confirm".into(),
+            name: "confirm_escalation".into(),
+            arguments: json!({
+                "reasoning": "Confirmed kerberoast, revoking service account",
+                "severity": "high",
+                "confidence": 0.9,
+                "containment_action": "disable_ad_account",
+                "target": "svc_mssql@contoso.local",
+            }),
+        };
+        let outcome = handler.handle_confirm_escalation(&call).await.unwrap();
+        assert!(matches!(outcome, CallbackResult::TaskComplete { .. }));
+        let events = recorder.captured().await;
+        assert_eq!(events.len(), 1, "expected one containment event published");
+        assert!(matches!(
+            events[0].payload,
+            ares_core::models::OpStateEventPayload::CredentialRevoked { .. }
+        ));
+        assert_eq!(events[0].op_id, "op-42");
+    }
+
+    #[tokio::test]
+    async fn confirm_escalation_without_action_only_emits_span() {
+        let recorder = OpStateRecorder::capturing();
+        let handler = test_handler_with_recorder(recorder.clone());
+        let call = ToolCall {
+            id: "c-confirm-noop".into(),
+            name: "confirm_escalation".into(),
+            arguments: json!({
+                "reasoning": "Real intrusion, humans should decide the response",
+                "severity": "critical",
+                "confidence": 0.95,
+                "containment_action": "escalate_to_human",
+            }),
+        };
+        let outcome = handler.handle_confirm_escalation(&call).await.unwrap();
+        assert!(matches!(outcome, CallbackResult::TaskComplete { .. }));
+        // escalate_to_human is not a containment action, so no state event.
+        assert!(recorder.captured().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_escalation_target_only_publishes_when_present() {
+        let recorder = OpStateRecorder::capturing();
+        let handler = test_handler_with_recorder(recorder.clone());
+        let call = ToolCall {
+            id: "c-confirm-notarget".into(),
+            name: "confirm_escalation".into(),
+            arguments: json!({
+                "reasoning": "Would isolate but target unknown",
+                "severity": "high",
+                "confidence": 0.7,
+                "containment_action": "isolate_host_firewall",
+                // no `target` — payload_for_containment must decline
+            }),
+        };
+        let _ = handler.handle_confirm_escalation(&call).await.unwrap();
+        assert!(
+            recorder.captured().await.is_empty(),
+            "no target should mean no containment publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn downgrade_escalation_never_publishes_containment() {
+        let recorder = OpStateRecorder::capturing();
+        let handler = test_handler_with_recorder(recorder.clone());
+        let call = ToolCall {
+            id: "c-down".into(),
+            name: "downgrade_escalation".into(),
+            arguments: json!({
+                "reasoning": "Turned out to be a scheduled scan",
+                "is_false_positive": true,
+                "confidence": 0.95,
+            }),
+        };
+        let outcome = handler.handle_downgrade_escalation(&call).await.unwrap();
+        assert!(matches!(outcome, CallbackResult::TaskComplete { .. }));
+        assert!(recorder.captured().await.is_empty());
+    }
+
+    #[test]
+    fn extract_operation_id_from_alert_labels() {
+        let handler = BlueCallbackHandler::new(
+            Arc::new(MockProvider),
+            Arc::new(MockDispatcher),
+            "test".into(),
+            "inv-x".into(),
+            json!({ "labels": { "operation_id": "op-hero-01" } }),
+            "redis://localhost".into(),
+        );
+        assert_eq!(handler.operation_id, "op-hero-01");
+    }
+
+    #[test]
+    fn extract_operation_id_defaults_empty() {
+        let handler = BlueCallbackHandler::new(
+            Arc::new(MockProvider),
+            Arc::new(MockDispatcher),
+            "test".into(),
+            "inv-x".into(),
+            json!({ "labels": { "deployment": "prod" } }),
+            "redis://localhost".into(),
+        );
+        assert!(handler.operation_id.is_empty());
     }
 
     // Minimal mock types for tests

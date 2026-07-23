@@ -13,6 +13,7 @@ mod callbacks;
 pub mod chaining;
 mod investigation;
 mod runner;
+mod simulated_response;
 mod sub_agent;
 
 pub use auto_submit::spawn_blue_auto_submit;
