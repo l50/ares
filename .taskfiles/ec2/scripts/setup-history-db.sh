@@ -20,8 +20,12 @@ DB_NAME=ares_history
 DB_USER=ares_admin
 export DEBIAN_FRONTEND=noninteractive
 
-if ! command -v psql >/dev/null 2>&1; then
-	echo "[*] Installing postgresql (waiting up to 300s for apt lock)..."
+# Guard on the server, not psql: kali-ares ships postgresql-client (pulled in by
+# other tooling) without the server, so `command -v psql` is true even when no
+# cluster exists. pg_lsclusters (from postgresql-common) is the exact command
+# this script relies on next, so its absence is the right install trigger.
+if ! command -v pg_lsclusters >/dev/null 2>&1; then
+	echo "[*] Installing postgresql server (waiting up to 300s for apt lock)..."
 	apt-get -o DPkg::Lock::Timeout=300 update -qq
 	apt-get -o DPkg::Lock::Timeout=300 install -y -qq postgresql
 fi
