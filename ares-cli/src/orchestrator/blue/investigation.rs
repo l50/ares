@@ -80,6 +80,12 @@ impl Investigation {
 ///
 /// The orchestrator agent coordinates triage, threat hunting, and lateral
 /// analysis by calling `dispatch_task` and processing results.
+///
+/// `op_state_recorder` is used by the callback handler to publish
+/// simulated-containment events (from `confirm_escalation`) into the
+/// red-side op-state log. Pass [`OpStateRecorder::disabled`] to skip the
+/// red-side observation half — the blue tracing spans still fire for the
+/// demo dashboard either way.
 pub async fn run_investigation(
     investigation: &Investigation,
     provider: Arc<dyn LlmProvider>,
@@ -87,6 +93,7 @@ pub async fn run_investigation(
     _task_queue: &mut BlueTaskQueue,
     redis_url: &str,
     conn: &mut redis::aio::ConnectionManager,
+    op_state_recorder: ares_core::op_state_log::OpStateRecorder,
 ) -> Result<InvestigationOutcome> {
     info!(
         investigation_id = %investigation.investigation_id,
@@ -185,14 +192,35 @@ pub async fn run_investigation(
         ..AgentLoopConfig::default()
     };
 
-    // Wire blue callback handler for dispatch + query + lifecycle tools
-    let callback_handler = Arc::new(BlueCallbackHandler::new(
+    // Wire blue callback handler for dispatch + query + lifecycle tools.
+    //
+    // Splice `operation_id` into `alert.labels.operation_id` so the callback
+    // handler can tag simulated-response spans with `attack_operation_id`
+    // (the demo dashboard filters by it). The Investigation carries the id
+    // out-of-band; without this splice, blue-side spans would only be
+    // filterable by investigation_id and disappear from per-op dashboards.
+    let mut alert_for_callbacks = investigation.alert.clone();
+    if let Some(op_id) = investigation.operation_id.as_deref() {
+        let labels = alert_for_callbacks.as_object_mut().and_then(|m| {
+            m.entry("labels")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        });
+        if let Some(labels) = labels {
+            labels
+                .entry("operation_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(op_id.to_string()));
+        }
+    }
+
+    let callback_handler = Arc::new(BlueCallbackHandler::with_recorder(
         Arc::clone(&provider),
         Arc::clone(&dispatcher),
         investigation.model.clone(),
         investigation.investigation_id.clone(),
-        investigation.alert.clone(),
+        alert_for_callbacks,
         redis_url.to_string(),
+        op_state_recorder,
     ));
 
     // Run the orchestrator agent loop

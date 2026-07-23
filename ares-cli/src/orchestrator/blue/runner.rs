@@ -11,6 +11,8 @@ use redis::AsyncCommands;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+use ares_core::nats::NatsBroker;
+use ares_core::op_state_log::OpStateRecorder;
 use ares_core::state::blue_task_queue::BlueTaskQueue;
 use ares_llm::{LlmProvider, ToolDispatcher};
 
@@ -177,6 +179,38 @@ impl BlueOrchestrator {
             .await
             .context("Failed to connect blue task queue (Redis + NATS)")?;
 
+        // Blue is DETECT-ONLY by default: it investigates and identifies red's
+        // activity but publishes no containment, so red runs its full attack
+        // while blue tracks it. Opt in to the red-facing containment loop
+        // (`confirm_escalation` with a containment action → ARES_OPSTATE event →
+        // red-side projector drops invalidated tasks) with
+        // ARES_BLUE_SIMULATED_CONTAINMENT=1. When off, a disabled recorder makes
+        // `publish_containment` a no-op; blue's investigation/detection output is
+        // unaffected either way.
+        let containment_enabled =
+            std::env::var("ARES_BLUE_SIMULATED_CONTAINMENT").as_deref() == Ok("1");
+        let op_state_recorder = if !containment_enabled {
+            info!(
+                "Blue orchestrator: detect-only (simulated containment OFF); set \
+                 ARES_BLUE_SIMULATED_CONTAINMENT=1 to feed containment observations to red"
+            );
+            OpStateRecorder::disabled()
+        } else {
+            match NatsBroker::connect(&self.nats_url).await {
+                Ok(broker) => {
+                    info!("Blue orchestrator: simulated containment ON — op-state recorder wired to NATS");
+                    OpStateRecorder::nats(Arc::new(broker))
+                }
+                Err(e) => {
+                    warn!(
+                        err = %e,
+                        "Blue orchestrator: could not connect NATS broker for op-state recorder — simulated-containment publish disabled"
+                    );
+                    OpStateRecorder::disabled()
+                }
+            }
+        };
+
         let mut retry_delay = Duration::from_secs(1);
         let max_retry_delay = Duration::from_secs(30);
         let mut last_stale_check = std::time::Instant::now();
@@ -273,6 +307,7 @@ impl BlueOrchestrator {
                             &mut task_queue,
                             &self.redis_url,
                             &mut conn,
+                            op_state_recorder.clone(),
                         ),
                     )
                     .await

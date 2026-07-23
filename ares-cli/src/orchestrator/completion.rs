@@ -63,23 +63,28 @@ pub fn compute_undominated_forests(
         return Vec::new();
     }
 
-    // Only count a domain as covering a forest root when that domain IS the
-    // forest root.  Dominating a child domain (e.g. contoso.local)
-    // does NOT mean the forest root (contoso.local) is compromised — its
-    // DC has a separate krbtgt.  The child-to-parent escalation (ExtraSid /
-    // trust key) must still happen before we declare the forest dominated.
-    let dominated_roots: HashSet<String> = dominated_domains
-        .iter()
-        .filter(|d| {
-            let root = forest_root_of(d);
-            root == d.to_lowercase()
-        })
-        .map(|d| forest_root_of(d))
-        .collect();
+    let dominated_roots = dominated_forest_roots(dominated_domains);
 
     required_forests
         .difference(&dominated_roots)
         .cloned()
+        .collect()
+}
+
+/// The set of forest root domains that are fully dominated.
+///
+/// Only count a domain as covering a forest root when that domain IS the
+/// forest root. Dominating a child domain (e.g. `child.contoso.local`) does
+/// NOT mean the forest root (`contoso.local`) is compromised — its DC has a
+/// separate krbtgt. The child-to-parent escalation (ExtraSid / trust key) must
+/// still happen before we declare the forest dominated. Shared by
+/// [`compute_undominated_forests`] and [`has_pending_cross_forest_escalation`]
+/// so the two completion guards can't drift.
+fn dominated_forest_roots(dominated_domains: &HashSet<String>) -> HashSet<String> {
+    dominated_domains
+        .iter()
+        .filter(|d| forest_root_of(d) == d.to_lowercase())
+        .map(|d| forest_root_of(d))
         .collect()
 }
 
@@ -107,12 +112,37 @@ pub async fn undominated_forests(state: &SharedState) -> Vec<String> {
 fn has_pending_cross_forest_escalation(
     discovered: &std::collections::HashMap<String, ares_core::models::VulnerabilityInfo>,
     exploited: &HashSet<String>,
+    dominated_domains: &HashSet<String>,
 ) -> bool {
+    let dominated_roots = dominated_forest_roots(dominated_domains);
     discovered.values().any(|v| {
         v.vuln_type == "forest_trust_escalation"
             && !exploited.contains(&v.vuln_id)
             && !is_trust_escalation_written_off(v)
+            && !escalation_target_forest_dominated(v, &dominated_roots)
     })
+}
+
+/// True when a `forest_trust_escalation` vuln targets a forest whose root is
+/// already dominated. Such an escalation is satisfied-by-domination: the op
+/// reached that forest's krbtgt by another path (native ADCS ESC13, a direct
+/// DCSync) so the trust forge is moot and must not pin the op open. Without
+/// this, a discovered-but-never-exploited trust forge — the SID-filtered
+/// dead-ends that are never `written_off` — keeps `is_multi_forest_op_complete`
+/// false and runs a fully-owned op out to the hard max-runtime cap.
+///
+/// A missing or blank `target_domain` is treated as NOT dominated so the vuln
+/// stays pending — the conservative default.
+fn escalation_target_forest_dominated(
+    vuln: &ares_core::models::VulnerabilityInfo,
+    dominated_roots: &HashSet<String>,
+) -> bool {
+    vuln.details
+        .get("target_domain")
+        .and_then(serde_json::Value::as_str)
+        .filter(|d| !d.is_empty())
+        .map(|d| dominated_roots.contains(&forest_root_of(d)))
+        .unwrap_or(false)
 }
 
 /// A cross-forest escalation is "written off" only once the fallback automation
@@ -139,11 +169,15 @@ fn is_trust_escalation_written_off(vuln: &ares_core::models::VulnerabilityInfo) 
 /// with the parent forest still unowned and its escalation un-fired. Gating
 /// completion on the vuln directly closes it: the op runs on (bounded by
 /// max_runtime) until the escalation is exploited or explicitly written off.
+///
+/// An escalation whose target forest is already dominated does not count — see
+/// [`escalation_target_forest_dominated`].
 async fn is_multi_forest_op_complete(state: &SharedState) -> bool {
     let inner = state.read().await;
     !has_pending_cross_forest_escalation(
         &inner.discovered_vulnerabilities,
         &inner.exploited_vulnerabilities,
+        &inner.dominated_domains,
     )
 }
 
@@ -394,6 +428,16 @@ pub async fn wait_for_completion(
                 has_golden_ticket = has_gt,
                 "Completion condition met"
             );
+
+            // Freeze red dispatch immediately. Everything past this point is
+            // teardown — the blue-drain wait and the red-task drain below. Without
+            // this, the automation loops and deferred queue keep spawning new
+            // exploit/recon agent loops (burning tokens on the un-exploitable
+            // ACL/ADCS backlog) for the entire blue-drain window, which can run
+            // up to 45 minutes. Blue investigations run on their own runner and
+            // are unaffected.
+            dispatcher.mark_red_draining();
+            info!("Red dispatch frozen — draining in-flight tasks; blue investigations continue");
 
             if let Err(e) = mark_red_completion_for_loot(dispatcher, reason, blue_enabled).await {
                 warn!(err = %e, "Failed to persist red completion metadata");
@@ -801,9 +845,14 @@ mod tests {
 
     fn make_forest_escalation_vuln(
         vuln_id: &str,
+        target_domain: &str,
         written_off: bool,
     ) -> ares_core::models::VulnerabilityInfo {
         let mut details = std::collections::HashMap::new();
+        details.insert(
+            "target_domain".to_string(),
+            serde_json::json!(target_domain),
+        );
         if written_off {
             details.insert("written_off".to_string(), serde_json::json!(true));
         }
@@ -821,22 +870,34 @@ mod tests {
 
     #[test]
     fn pending_escalation_blocks_completion() {
-        // A discovered, unexploited forest_trust_escalation keeps the op alive.
+        // A discovered, unexploited forest_trust_escalation into an un-owned
+        // forest keeps the op alive.
         let mut discovered = std::collections::HashMap::new();
-        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", false));
+        discovered.insert(
+            "v1".to_string(),
+            make_forest_escalation_vuln("v1", "fabrikam.local", false),
+        );
         let exploited = HashSet::new();
-        assert!(has_pending_cross_forest_escalation(&discovered, &exploited));
+        assert!(has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited,
+            &HashSet::new()
+        ));
     }
 
     #[test]
     fn exploited_escalation_allows_completion() {
         let mut discovered = std::collections::HashMap::new();
-        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", false));
+        discovered.insert(
+            "v1".to_string(),
+            make_forest_escalation_vuln("v1", "fabrikam.local", false),
+        );
         let mut exploited = HashSet::new();
         exploited.insert("v1".to_string());
         assert!(!has_pending_cross_forest_escalation(
             &discovered,
-            &exploited
+            &exploited,
+            &HashSet::new()
         ));
     }
 
@@ -844,11 +905,15 @@ mod tests {
     fn written_off_escalation_allows_completion() {
         // The escape valve: a flagged-dead trust must not pin the op open.
         let mut discovered = std::collections::HashMap::new();
-        discovered.insert("v1".to_string(), make_forest_escalation_vuln("v1", true));
+        discovered.insert(
+            "v1".to_string(),
+            make_forest_escalation_vuln("v1", "fabrikam.local", true),
+        );
         let exploited = HashSet::new();
         assert!(!has_pending_cross_forest_escalation(
             &discovered,
-            &exploited
+            &exploited,
+            &HashSet::new()
         ));
     }
 
@@ -857,13 +922,87 @@ mod tests {
         // Only forest_trust_escalation gates multi-forest completion; a stray
         // unexploited esc1 (single-forest) must not block the op forever.
         let mut discovered = std::collections::HashMap::new();
-        let mut esc1 = make_forest_escalation_vuln("v1", false);
+        let mut esc1 = make_forest_escalation_vuln("v1", "fabrikam.local", false);
         esc1.vuln_type = "esc1".to_string();
         discovered.insert("v1".to_string(), esc1);
         let exploited = HashSet::new();
         assert!(!has_pending_cross_forest_escalation(
             &discovered,
-            &exploited
+            &exploited,
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn escalation_into_dominated_forest_allows_completion() {
+        // Regression: both forests were owned via direct paths (native ADCS /
+        // DCSync), leaving an un-exploited, never-written-off trust forge in
+        // state. Its target forest is already dominated, so it must NOT pin the
+        // op open to the hard max-runtime cap.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert(
+            "v1".to_string(),
+            make_forest_escalation_vuln("v1", "fabrikam.local", false),
+        );
+        let exploited = HashSet::new();
+        let dominated: HashSet<String> = ["fabrikam.local".to_string()].into_iter().collect();
+        assert!(!has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited,
+            &dominated
+        ));
+    }
+
+    #[test]
+    fn escalation_into_undominated_forest_still_blocks() {
+        // A different forest being owned must not satisfy an escalation whose
+        // own target forest is still un-owned.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert(
+            "v1".to_string(),
+            make_forest_escalation_vuln("v1", "fabrikam.local", false),
+        );
+        let exploited = HashSet::new();
+        let dominated: HashSet<String> = ["contoso.local".to_string()].into_iter().collect();
+        assert!(has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited,
+            &dominated
+        ));
+    }
+
+    #[test]
+    fn escalation_target_dominated_via_child_only_still_blocks() {
+        // Dominating a child domain does not own the forest root, so a trust
+        // forge into that root stays pending.
+        let mut discovered = std::collections::HashMap::new();
+        discovered.insert(
+            "v1".to_string(),
+            make_forest_escalation_vuln("v1", "contoso.local", false),
+        );
+        let exploited = HashSet::new();
+        let dominated: HashSet<String> = ["child.contoso.local".to_string()].into_iter().collect();
+        assert!(has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited,
+            &dominated
+        ));
+    }
+
+    #[test]
+    fn escalation_missing_target_domain_stays_pending() {
+        // Conservative default: a vuln with no target_domain can't be proven
+        // moot, so it keeps blocking.
+        let mut discovered = std::collections::HashMap::new();
+        let mut v = make_forest_escalation_vuln("v1", "fabrikam.local", false);
+        v.details.remove("target_domain");
+        discovered.insert("v1".to_string(), v);
+        let exploited = HashSet::new();
+        let dominated: HashSet<String> = ["fabrikam.local".to_string()].into_iter().collect();
+        assert!(has_pending_cross_forest_escalation(
+            &discovered,
+            &exploited,
+            &dominated
         ));
     }
 
