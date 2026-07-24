@@ -143,6 +143,20 @@ pub async fn run_investigation(
         .await
         .ok();
 
+    // Deterministic baseline detection sweep. Run the full detection catalog in
+    // code and record every hit BEFORE the LLM loop, so catalog coverage never
+    // depends on the hunter surviving its token/context budget (it routinely
+    // truncated after 1-2 techniques). The summary is folded into the task
+    // prompt so the LLM starts from the recorded baseline and spends its budget
+    // on depth — chaining, IOCs, timeline, verdict — not on rediscovering
+    // detections. Toggle with ARES_BLUE_DETERMINISTIC_SWEEP=0. See `sweep`.
+    let sweep_summary = if super::sweep::sweep_enabled() {
+        let outcome = super::sweep::run_detection_sweep(&investigation.investigation_id).await;
+        outcome.ran().then(|| outcome.prompt_summary())
+    } else {
+        None
+    };
+
     // Build the orchestrator system prompt
     let role = BlueAgentRole::Orchestrator;
     let tools = ares_llm::tool_registry::blue::blue_tools_for_role(role);
@@ -168,12 +182,19 @@ pub async fn run_investigation(
     .context("Failed to build blue orchestrator system prompt")?;
 
     // Build the task prompt with alert context using the initial alert prompt template
-    let task_prompt = ares_llm::prompt::blue::build_initial_alert_prompt(
+    let mut task_prompt = ares_llm::prompt::blue::build_initial_alert_prompt(
         &investigation.investigation_id,
         &investigation.alert,
         investigation.operation_id.as_deref(),
     )
     .context("Failed to build initial alert prompt")?;
+
+    // Seed the orchestrator with the baseline sweep results so it builds on the
+    // already-recorded coverage instead of re-running detection templates.
+    if let Some(summary) = &sweep_summary {
+        task_prompt.push_str("\n\n");
+        task_prompt.push_str(summary);
+    }
 
     let config = AgentLoopConfig {
         model: investigation.model.clone(),

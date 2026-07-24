@@ -228,10 +228,16 @@ impl RedBlueCorrelator {
     }
 
     /// Load and parse a blue team investigation report.
+    ///
+    /// One investigation can record several techniques, so this returns one
+    /// [`BlueTeamDetection`] per distinct technique — a single first-match
+    /// collapse would let a 6-technique report correlate against only one red
+    /// activity. A report with no technique still yields a single detection so
+    /// it counts toward volume and false-positive metrics.
     pub fn load_investigation_report(
         &self,
         report_path: &Path,
-    ) -> anyhow::Result<Option<BlueTeamDetection>> {
+    ) -> anyhow::Result<Vec<BlueTeamDetection>> {
         let content = std::fs::read_to_string(report_path)?;
 
         // Skip DatasourceNoData reports
@@ -240,7 +246,7 @@ impl RedBlueCorrelator {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.contains("DatasourceNoData"))
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let inv_id_re = Regex::new(r"\*\*Investigation ID:\*\*\s*`?(\S+?)`?(?:\n|$)")?;
@@ -280,11 +286,23 @@ impl RedBlueCorrelator {
                 .unwrap_or_else(Utc::now)
         };
 
+        // Collect every distinct technique the investigation recorded. Scope the
+        // scan to the blue-authored body — everything before the appendix — because
+        // the appendix embeds red's ground-truth `techniques_used` list from the
+        // alert payload; scanning the whole file would falsely credit blue with the
+        // entire attack.
         let technique_re = Regex::new(r"(T\d{4}(?:\.\d{3})?)")?;
-        let technique_id = technique_re
-            .captures(&content)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
+        let body = content
+            .split("## Appendix")
+            .next()
+            .unwrap_or(content.as_str());
+        let mut techniques: Vec<String> = Vec::new();
+        for cap in technique_re.captures_iter(body) {
+            let technique = cap[1].to_string();
+            if !techniques.contains(&technique) {
+                techniques.push(technique);
+            }
+        }
 
         let status_re = Regex::new(r"\|\s*Status\s*\|\s*(\w+)")?;
         let status = status_re
@@ -313,10 +331,10 @@ impl RedBlueCorrelator {
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
 
-        Ok(Some(BlueTeamDetection {
+        let base = BlueTeamDetection {
             timestamp,
             alert_name,
-            technique_id,
+            technique_id: None,
             severity,
             target_ip,
             target_host: None,
@@ -325,7 +343,19 @@ impl RedBlueCorrelator {
             evidence_count,
             highest_pyramid_level,
             metadata: HashMap::new(),
-        }))
+        };
+
+        if techniques.is_empty() {
+            return Ok(vec![base]);
+        }
+
+        Ok(techniques
+            .into_iter()
+            .map(|technique| BlueTeamDetection {
+                technique_id: Some(technique),
+                ..base.clone()
+            })
+            .collect())
     }
 
     /// Load all reports from the reports directory (recursively).
@@ -366,8 +396,7 @@ impl RedBlueCorrelator {
                 }
             } else if is_blue {
                 match self.load_investigation_report(&path) {
-                    Ok(Some(detection)) => blue_team_detections.push(detection),
-                    Ok(None) => {}
+                    Ok(detections) => blue_team_detections.extend(detections),
                     Err(e) => {
                         warn!(path = %path.display(), error = %e, "Failed to parse investigation report")
                     }
@@ -494,13 +523,20 @@ impl RedBlueCorrelator {
             })
             .collect();
 
-        // Identify false positives
+        // Identify false positives. A detection is only a false positive if red
+        // never performed a matching technique — not merely because the greedy 1:1
+        // matcher assigned some other detection to that red activity. This keeps a
+        // report that records both a parent technique and its sub-technique (e.g.
+        // T1021 and T1021.002) from spuriously flagging one as a false positive.
         let false_positives: Vec<BlueTeamDetection> = blue_detections
             .iter()
             .filter(|d| {
                 !matched_blue_keys.contains(&d.key())
                     && d.timestamp >= time_window_start
                     && d.timestamp <= time_window_end
+                    && !red_activities.iter().any(|a| {
+                        Self::techniques_match(a.technique_id.as_deref(), d.technique_id.as_deref())
+                    })
             })
             .cloned()
             .collect();

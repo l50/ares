@@ -125,13 +125,25 @@ paths blue has historically missed:
 | Kerberoasting (T1558.003) | `detect_kerberoasting` |
 | DCSync (T1003.006) | `detect_dcsync`, `detect_dcsync_replication` |
 | Golden Ticket (T1558.001) | `detect_golden_ticket` |
+| Valid-account reuse (T1078.002) | `detect_valid_account_reuse` |
+| S4U / constrained delegation (T1550.003) | `detect_s4u_delegation` |
 
 **If DCSync or Kerberoasting is confirmed, ALSO run the ADCS templates** — cert theft
 (ESC1 → Administrator cert → DCSync) is a common upstream path in the same window.
-Example crown-jewel sweep:
+
+**`detect_s4u_delegation` and `detect_valid_account_reuse` are NOT optional.** Whenever
+there is ANY Kerberos (4769/4768), DA, or credential-theft activity — which is nearly
+always — you MUST run both in your FIRST sweep, before the token budget runs low.
+Constrained-delegation / RBCD abuse (T1550.003) and explicit-credential reuse
+(T1078.002) are high-value privesc/lateral steps that blue keeps missing precisely
+because they get deprioritized behind DCSync/Golden and never get queried. Run them
+FIRST, not last.
+
+Example crown-jewel sweep — run this batch up front:
 
 ```
 run_parallel_detections(query_names=[
+  "detect_s4u_delegation", "detect_valid_account_reuse",
   "detect_esc1_attack", "detect_adcs_exploitation",
   "detect_cross_realm_tgs", "detect_child_krbtgt_forge",
   "detect_sid_history_extrasid", "detect_asrep_roasting"
@@ -189,13 +201,37 @@ Use these exact LogQL queries for ad-hoc pivots. They are optimized for the Loki
 - Check if the requesting IP is a known Domain Controller — if not, it's suspicious
 - Also search for `ticketer` or `mimikatz` in process/command-line logs (event 4688)
 
-### Constrained Delegation / S4U (T1558.003) — Event 4769
+### Constrained Delegation / S4U (T1550.003) — Event 4769
 ```
 {% if deployment %}{job="windows-security", deployment="{{ deployment }}"} |= "4769" |= "TransmittedServices"{% else %}{job="windows-security"} |= "4769" |= "TransmittedServices"{% endif %}
 ```
-- `TransmittedServices` field populated = S4U2Proxy (constrained delegation) in use
-- Check if the delegating account is expected to use delegation
-- Cross-reference with the SPN being accessed
+- `TransmittedServices` field populated = S4U2Proxy (constrained delegation / RBCD) in use
+
+**S4U Attribution Decision Tree (MANDATORY):**
+1. If any 4769 has a **non-empty** `TransmittedServices` value → **CONFIRMED S4U delegation abuse**
+   - The account requested a service ticket *on behalf of* another user = constrained-delegation / RBCD abuse
+   - **Record as T1550.003, pyramid level 6 (TTP), severity HIGH** — do NOT stop at a narrative note like "potential forged ticket chain"
+2. Cross-reference the SPN being accessed and the impersonated user to extend the timeline
+3. `TransmittedServices: -` (empty/dash) = ordinary ticket request, NOT S4U — do not record
+
+**A populated `TransmittedServices` MUST be recorded as T1550.003. Describing it is not detecting it.**
+
+### Valid Account Reuse (T1078.002) — Event 4648
+
+Prefer the template: `run_detection_query(query_name="detect_valid_account_reuse")`. Raw LogQL fallback (explicit-credential logon):
+```
+{% if deployment %}{job="windows-security", deployment="{{ deployment }}"} |= "4648"{% else %}{job="windows-security"} |= "4648"{% endif %}
+```
+- Event 4648 = "a logon was attempted using explicit credentials" (runas /netonly, alternate creds, tooling that supplies creds directly) = the on-wire shape of stolen-credential reuse
+
+**Valid-Account Attribution Decision Tree (MANDATORY):**
+1. If a 4648 names a **user** account (no `$` suffix) as the target/subject → **CONFIRMED valid-account reuse**
+   - Explicit credentials for a domain user — especially from an unusual source host — = reused/harvested creds
+   - **Record as T1078.002, pyramid level 6 (TTP), severity HIGH** — do NOT settle for prose like "harvested credentials"
+2. If the target account ends in `$` (machine account) → routine computer/service auth, do NOT record
+3. Cross-reference the source IP against known-good admin hosts to extend the timeline
+
+**A 4648 that names a user account MUST be recorded as T1078.002. Observing it is not detecting it.**
 
 ### AS-REP Roasting (T1558.004) — Event 4768
 
@@ -242,6 +278,7 @@ This runs all 5 detection queries in one tool call (~30s total) instead of 5 seq
 
 ## Evidence Recording
 - Record ALL indicators of compromise as evidence
+- **A detection query that returns matching events MUST be recorded as its MITRE technique.** A narrative description ("potential forged ticket chain", "harvested credentials", "suspicious delegation") does NOT count as a detection. If the query fired on real events, tag the technique — otherwise the hunt gets no credit for what it actually found.
 - Build timeline events with cross-references to evidence IDs
 - Map every observation to MITRE ATT&CK techniques where possible
 - Note detection gaps (what you expected to find but didn't)

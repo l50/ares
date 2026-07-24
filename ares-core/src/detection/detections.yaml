@@ -437,14 +437,20 @@ templates:
     red_team_tool: get_st
     auto_pivot: true
     event_ids: ["4769"]
-    # Match TransmittedServices field (populated during S4U2Proxy) targeting
-    # sensitive SPNs. Matches TransmittedServices patterns from Grafana alert rules.
+    # A 4769 with a POPULATED TransmittedServices field IS S4U2Proxy (constrained
+    # delegation / RBCD in use) — that single stage is the detection. Do NOT add a
+    # service-class stage (cifs/|ldap/|host/|http/|mssql/|krbtgt): in the real 4769
+    # log shape `ServiceName` is the target account SAM name (e.g. DC01$), not
+    # a class/host SPN, so that filter matched ~1% of true S4U events (measured live:
+    # 163 populated-TransmittedServices events → 2) and blackholed the whole rule.
     filter_stages:
       - ['TransmittedServices']
-      - ['cifs/', 'ldap/', 'host/', 'http/', 'mssql/', 'krbtgt']
+    # Drop 4769 events where TransmittedServices is empty (not actually S4U).
+    # Do NOT exclude machine-account targets: S4U2Proxy / RBCD abuse legitimately
+    # requests a host's SPN (e.g. cifs/WEB01$), so a `TargetUserName…$` exclude
+    # drops exactly the true positives this rule exists to catch.
     exclude_patterns:
       - 'TransmittedServices\s*:\s*-\s*$'
-      - 'TargetUserName.{0,30}\$'
 
   detect_lsa_secrets_access:
     description: "LSA Secrets Extraction Detection"
@@ -504,6 +510,28 @@ templates:
       - 'crackmapexec'
       - 'netexec'
 
+  detect_valid_account_reuse:
+    description: "Valid Account Reuse Detection (explicit / alternate credentials)"
+    mitre_id: "T1078.002"
+    tactic: defense_evasion
+    severity: high
+    red_team_tool: domain_admin_checker
+    event_ids: ["4648"]
+    # Event 4648 = "a logon was attempted using explicit credentials" (runas
+    # /netonly, alternate creds, tooling that supplies creds directly). That is
+    # the on-wire shape of stolen-credential reuse, distinct from an interactive
+    # logon. TargetServerName/TargetInfo are 4648-specific EventData fields, so
+    # they reliably narrow to genuine 4648 records regardless of message rendering.
+    patterns:
+      - 'TargetServerName'
+      - 'TargetInfo'
+      - 'explicit.credential'
+      - 'runas'
+    # Exclude machine-account targets (ending $) — routine computer/service auth,
+    # not valid-account reuse. Mirrors the DCSync exclude's Loki-escaped form.
+    exclude_patterns:
+      - "TargetUserName'.u003e[A-Z0-9_-]+[$]"
+
   detect_lateral_movement:
     description: "Lateral Movement Detection (PSExec/WMI/WinRM)"
     mitre_id: "T1021"
@@ -543,9 +571,16 @@ templates:
     tactic: privilege_escalation
     severity: high
     red_team_tool: "certipy_*"
+    # Stage 2 adds the dangerous-EKU OIDs from Grafana adcs-alerts so ESC2/ESC3
+    # enrollments are caught even without ESC keyword / SAN strings:
+    #   2.5.29.37.0            = Any Purpose EKU (ESC2)
+    #   1.3.6.1.4.1.311.20.2.1 = Certificate Request Agent (ESC3)
+    #   1.3.6.1.4.1.311.76.6.1 = SubCA
     filter_stages:
       - ['4886', '4887', '4876', 'certipy', 'certificate.*request']
-      - ['esc[0-9]', 'enrollee.*supplies.*subject', 'altname', 'upn']
+      - ['esc[0-9]', 'enrollee.*supplies.*subject', 'altname', 'upn',
+         '2\.5\.29\.37\.0', '1\.3\.6\.1\.4\.1\.311\.20\.2\.1',
+         '1\.3\.6\.1\.4\.1\.311\.76\.6\.1', 'certificate.request.agent', 'any.?purpose']
 
   detect_delegation_abuse:
     description: "Kerberos Delegation Abuse Detection (RBCD)"
@@ -576,15 +611,23 @@ templates:
   # ─── Persistence (TA0003) ──────────────────────────────────────────────────
 
   detect_golden_ticket:
-    description: "Golden Ticket Detection"
+    description: "Golden Ticket Detection (RC4 service ticket for DC SPNs)"
     mitre_id: "T1558.001"
     tactic: persistence
     severity: critical
     red_team_tool: generate_golden_ticket
-    event_ids: ["4768", "4769"]
+    event_ids: ["4769"]
+    # Golden Tickets are forged offline — no 4768 (TGT request) is emitted, so the
+    # old tool-string patterns ('golden ticket', 'ticketer') never appear in
+    # Windows Security logs and never fired. USING the ticket, however, still emits
+    # a 4769 service-ticket request. In an AES-enforced domain an RC4 (0x17) TGS for
+    # a Domain Controller service (cifs//ldap//host//krbtgt) is a strong Golden /
+    # encryption-downgrade signal. Ported from Grafana `ad_golden_ticket_detection`.
+    # The stronger absence variant (4769 to a DC SPN with NO preceding 4768) needs
+    # cross-event correlation this single-line engine can't express — Grafana-only.
     filter_stages:
-      - ['golden.*ticket', 'krbtgt', 'ticketer', 'krbcred']
-      - ['forged', '4769', 'kerberos.*ticket', 'enterprise.*admin']
+      - ['0x17', 'rc4']
+      - ['cifs/', 'ldap/', 'host/', 'krbtgt']
 
   # ─── Execution (TA0002) ────────────────────────────────────────────────────
 
