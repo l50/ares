@@ -32,10 +32,12 @@ fn event_filter_empty() {
 }
 
 #[test]
-fn pattern_filter_uses_contains_for_few_literals() {
-    // 2 simple literals: chain |= filters (faster than regex)
+fn pattern_filter_ors_multiple_literals() {
+    // 2+ literals in one stage are OR alternatives → regex alternation, NOT
+    // chained |= (which ANDs them: a line would have to contain BOTH, so the
+    // stage matches nothing).
     let filter = build_pattern_filter(&["nmap", "masscan"]);
-    assert_eq!(filter, r#" |= "nmap" |= "masscan""#);
+    assert_eq!(filter, r#" |~ "(?i)(nmap|masscan)""#);
 }
 
 #[test]
@@ -224,6 +226,42 @@ fn s4u_template_has_exclude_patterns() {
     assert!(
         tmpl.logql.contains("TransmittedServices"),
         "S4U template should filter on TransmittedServices field"
+    );
+}
+
+#[test]
+fn multi_literal_stages_or_not_and() {
+    // Regression: OR alternatives within one stage must compile to a single
+    // `(?i)(a|b)` regex, never a chain of `|=` (which ANDs them so the stage
+    // matches lines containing every term at once — i.e. nothing). This
+    // previously blackholed golden-ticket (0x17 vs rc4), RBCD delegation
+    // (attribute casings), and remote-registry (service state) detections.
+    let golden = build_detection_template("detect_golden_ticket", None)
+        .unwrap()
+        .logql;
+    assert!(
+        golden.contains("(?i)(0x17|rc4)"),
+        "golden ticket must OR its RC4 encodings, got: {golden}"
+    );
+    assert!(
+        !golden.contains(r#"|= "0x17""#),
+        "golden ticket must not chain |= for OR alternatives, got: {golden}"
+    );
+
+    let rbcd = build_detection_template("detect_delegation_abuse", None)
+        .unwrap()
+        .logql;
+    assert!(
+        rbcd.contains("(?i)(") && rbcd.contains("|rbcd)"),
+        "RBCD attribute casings must OR into one regex, got: {rbcd}"
+    );
+
+    let regsvc = build_detection_template("detect_remote_registry_start", None)
+        .unwrap()
+        .logql;
+    assert!(
+        regsvc.contains("(?i)(running|started|start)"),
+        "remote-registry service states must OR, got: {regsvc}"
     );
 }
 
