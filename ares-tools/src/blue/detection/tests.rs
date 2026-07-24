@@ -234,26 +234,18 @@ fn multi_literal_stages_or_not_and() {
     // Regression: OR alternatives within one stage must compile to a single
     // `(?i)(a|b)` regex, never a chain of `|=` (which ANDs them so the stage
     // matches lines containing every term at once — i.e. nothing). This
-    // previously blackholed golden-ticket (0x17 vs rc4), RBCD delegation
-    // (attribute casings), and remote-registry (service state) detections.
-    let golden = build_detection_template("detect_golden_ticket", None)
-        .unwrap()
-        .logql;
-    assert!(
-        golden.contains("(?i)(0x17|rc4)"),
-        "golden ticket must OR its RC4 encodings, got: {golden}"
-    );
-    assert!(
-        !golden.contains(r#"|= "0x17""#),
-        "golden ticket must not chain |= for OR alternatives, got: {golden}"
-    );
-
+    // previously blackholed RBCD delegation (attribute casings) and
+    // remote-registry (service state) detections.
     let rbcd = build_detection_template("detect_delegation_abuse", None)
         .unwrap()
         .logql;
     assert!(
         rbcd.contains("(?i)(") && rbcd.contains("|rbcd)"),
         "RBCD attribute casings must OR into one regex, got: {rbcd}"
+    );
+    assert!(
+        !rbcd.contains(r#"|= "rbcd""#),
+        "RBCD must not chain |= for OR alternatives, got: {rbcd}"
     );
 
     let regsvc = build_detection_template("detect_remote_registry_start", None)
@@ -262,6 +254,25 @@ fn multi_literal_stages_or_not_and() {
     assert!(
         regsvc.contains("(?i)(running|started|start)"),
         "remote-registry service states must OR, got: {regsvc}"
+    );
+}
+
+#[test]
+fn golden_ticket_keys_on_ticket_encryption_type() {
+    // Golden-ticket stage 1 must match the ACTUAL TicketEncryptionType field, not a
+    // bare '0x17'/'rc4'. Live Loki showed bare 'rc4' hits ~90% of 4769 (RC4 in the
+    // capability-enumeration fields) and bare '0x17' hits AES tickets via
+    // SessionKeyEncryptionType — both flood golden with false positives.
+    let golden = build_detection_template("detect_golden_ticket", None)
+        .unwrap()
+        .logql;
+    assert!(
+        golden.contains("TicketEncryptionType"),
+        "golden must key on the TicketEncryptionType field, got: {golden}"
+    );
+    assert!(
+        !golden.contains(r#""(?i)(0x17|rc4)""#),
+        "golden must not match bare 0x17/rc4 (capability-field false positives), got: {golden}"
     );
 }
 

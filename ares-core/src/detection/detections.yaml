@@ -620,13 +620,27 @@ templates:
     # Golden Tickets are forged offline — no 4768 (TGT request) is emitted, so the
     # old tool-string patterns ('golden ticket', 'ticketer') never appear in
     # Windows Security logs and never fired. USING the ticket, however, still emits
-    # a 4769 service-ticket request. In an AES-enforced domain an RC4 (0x17) TGS for
-    # a Domain Controller service (cifs//ldap//host//krbtgt) is a strong Golden /
-    # encryption-downgrade signal. Ported from Grafana `ad_golden_ticket_detection`.
-    # The stronger absence variant (4769 to a DC SPN with NO preceding 4768) needs
-    # cross-event correlation this single-line engine can't express — Grafana-only.
+    # a 4769 service-ticket request. An RC4 (0x17) service ticket in an AES domain is
+    # the encryption-downgrade signal. Ported from Grafana `ad_golden_ticket_detection`.
+    #
+    # Stage 1 keys on the ACTUAL ticket encryption type, not a bare '0x17'/'rc4'.
+    # Verified live vs Loki: bare 'rc4' matches ~90% of all 4769 (RC4 sits in the
+    # capability-enumeration fields ServiceSupportedEncryptionTypes /
+    # ClientAdvertizedEncryptionTypes on nearly every event), and bare '0x17' still
+    # matches AES tickets because SessionKeyEncryptionType is 0x17 almost always. Only
+    # the TicketEncryptionType field distinguishes a real RC4 ticket. The '..' matches
+    # the JSON-escaped `'>` between the field name and value (Loki stores XML > as
+    # > — same escaping trick as the DCSync exclude).
+    #
+    # Stage 2 (DC service class) currently zeroes recall: in the real 4769 log shape
+    # ServiceName is a SAM name (e.g. SQL01$, svc_sql), never a cifs//ldap//host/ SPN,
+    # so this stage blackholes every real RC4 ticket — the same failure that killed the
+    # S4U rule. Kept because dropping it makes this fire on ALL RC4 downgrades, which is
+    # kerberoasting (T1558.003), not uniquely golden — a single-line 4769 rule genuinely
+    # can't separate the two. True golden detection (4769 to a DC SPN with NO preceding
+    # 4768) needs cross-event correlation only the Grafana rule expresses.
     filter_stages:
-      - ['0x17', 'rc4']
+      - ['TicketEncryptionType..u003e0x17']
       - ['cifs/', 'ldap/', 'host/', 'krbtgt']
 
   # ─── Execution (TA0002) ────────────────────────────────────────────────────
