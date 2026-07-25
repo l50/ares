@@ -277,6 +277,50 @@ fn golden_ticket_keys_on_ticket_encryption_type() {
 }
 
 #[test]
+fn kerberoasting_keys_on_ticket_encryption_type() {
+    // Same failure as golden, on the rule that actually fires. The old patterns
+    // let `encryption.*type` span the field NAME (ServiceSupportedEncryptionTypes)
+    // into a capability value, so `.*rc4` matched almost everything: live Loki over
+    // 24h gave 690/870 4769 events matched where only 28 were real RC4 tickets.
+    let roast = build_detection_template("detect_kerberoasting", None)
+        .unwrap()
+        .logql;
+    assert!(
+        roast.contains("TicketEncryptionType"),
+        "kerberoast must key on the TicketEncryptionType field, got: {roast}"
+    );
+    assert!(
+        !roast.contains("encryption.*type"),
+        "kerberoast must not use a name-spanning encryption.*type pattern, got: {roast}"
+    );
+    // ServiceName is a SAM account name, never an SPN — this stage matched 0 live.
+    assert!(
+        !roast.contains("servicename"),
+        "kerberoast must not filter on SPN-shaped ServiceName (matches nothing), got: {roast}"
+    );
+}
+
+#[test]
+fn asrep_roasting_keys_on_preauthtype_zero() {
+    // Third instance of the same span bug. `preauthtype.*0` reaches any later zero
+    // on the line, so PreAuthType 2/15/16/17 all matched; live Loki over 24h gave
+    // 411/590 4768 events where only 12 were real no-pre-auth TGTs.
+    let asrep = build_detection_template("detect_asrep_roasting", None)
+        .unwrap()
+        .logql;
+    assert!(
+        asrep.contains("PreAuthType..u003e0.u003c"),
+        "asrep must match PreAuthType=0 with the closing tag anchored, got: {asrep}"
+    );
+    for bad in ["preauthtype.*0", "encryption.*type", "ticket.*options"] {
+        assert!(
+            !asrep.contains(bad),
+            "asrep must not use over-broad pattern {bad}, got: {asrep}"
+        );
+    }
+}
+
+#[test]
 fn dcsync_template_excludes_machine_accounts() {
     let tmpl = build_detection_template("detect_dcsync", None).unwrap();
     assert!(
