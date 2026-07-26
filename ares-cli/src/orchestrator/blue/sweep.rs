@@ -636,6 +636,7 @@ pub(crate) async fn run_detection_sweep(investigation_id: &str) -> SweepOutcome 
         no_match = no_match.len(),
         not_run = not_run.len(),
         timed_out,
+        golden_ticket = %golden_ticket_log_value(&golden_ticket),
         "Baseline detection sweep complete"
     );
 
@@ -646,6 +647,31 @@ pub(crate) async fn run_detection_sweep(investigation_id: &str) -> SweepOutcome 
         not_run,
         timed_out,
         golden_ticket,
+    }
+}
+
+/// Render the correlation's verdict for the sweep's completion log.
+///
+/// Every outcome has to be distinguishable from the log alone. Previously only
+/// a hit was logged (via `warn!`), which made "ran, found nothing" and "never
+/// produced an answer" look identical — silence. That is the one ambiguity this
+/// rule cannot afford, since a clean verdict is treated downstream as
+/// authoritative that no forged TGT was used.
+fn golden_ticket_log_value(outcome: &Option<GoldenTicketOutcome>) -> String {
+    match outcome {
+        None => "disabled".to_string(),
+        Some(GoldenTicketOutcome::Inconclusive(reason)) => format!("no_verdict ({reason})"),
+        Some(GoldenTicketOutcome::Correlated(c)) if c.orphans.is_empty() => {
+            format!(
+                "clean ({} candidates vs {} baseline)",
+                c.candidates, c.baseline
+            )
+        }
+        Some(GoldenTicketOutcome::Correlated(c)) => format!(
+            "{} orphan(s) of {} candidates",
+            c.orphans.len(),
+            c.candidates
+        ),
     }
 }
 
@@ -1343,6 +1369,50 @@ mod tests {
         // The cap is stated, not applied silently.
         assert!(s.contains("5 more"), "{s}");
         assert!(!s.contains("svc_24"), "listing must stop at the cap: {s}");
+    }
+
+    #[test]
+    fn every_correlation_outcome_is_distinguishable_in_the_log() {
+        // "ran and found nothing" must never look like "never produced an
+        // answer". A clean verdict is treated as authoritative downstream, so
+        // the log has to say which one actually happened.
+        assert_eq!(golden_ticket_log_value(&None), "disabled");
+
+        let clean = golden_ticket_log_value(&Some(GoldenTicketOutcome::Correlated(
+            GoldenTicketCorrelation {
+                candidates: 4,
+                baseline: 19,
+                orphans: vec![],
+            },
+        )));
+        assert!(clean.starts_with("clean"), "{clean}");
+        assert!(clean.contains('4') && clean.contains("19"), "{clean}");
+
+        let hit = golden_ticket_log_value(&Some(GoldenTicketOutcome::Correlated(
+            GoldenTicketCorrelation {
+                candidates: 5,
+                baseline: 19,
+                orphans: vec![OrphanAccount {
+                    account: "admin@contoso".into(),
+                    service_ticket_count: 3,
+                }],
+            },
+        )));
+        assert!(hit.contains("1 orphan"), "{hit}");
+
+        let broken = golden_ticket_log_value(&Some(GoldenTicketOutcome::Inconclusive(
+            "baseline query failed".into(),
+        )));
+        assert!(broken.starts_with("no_verdict"), "{broken}");
+        assert!(broken.contains("baseline query failed"), "{broken}");
+
+        // All four must be mutually distinct.
+        let all = [clean, hit, broken, "disabled".to_string()];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "log values must be distinguishable");
+            }
+        }
     }
 
     #[test]
