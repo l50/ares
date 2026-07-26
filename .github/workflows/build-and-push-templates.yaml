@@ -16,9 +16,6 @@ on:
       - 'ares-tools/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-  # ansible/requirements.yml tracks l50.arsenal, cowdogmoo.workstation and
-  # l50.bulwark at unpinned `main`, so upstream drift can break these builds
-  # with no commit here to trigger them. Rebuild weekly to surface that.
   schedule:
     - cron: '0 9 * * 1'
   workflow_dispatch:
@@ -2234,8 +2231,6 @@ jobs:
             echo "All image builds and manifest merges completed successfully"
           fi
 
-  # A red main went unnoticed for three weeks because a failed run is silent
-  # unless someone opens the Actions tab. File (or bump) an issue instead.
   report-failure:
     name: Report Build Failure
     runs-on: ubuntu-24.04

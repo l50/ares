@@ -56,9 +56,6 @@ jobs:
           # Extract unique template names from changed paths
           CHANGED_TEMPLATES=$(echo "$CHANGED_FILES" | grep -oP 'warpgate-templates/templates/\K[^/]+' | sort -u)
 
-          # Ansible provisioning lives outside warpgate-templates/, so a template
-          # diff alone misses playbook, role, and collection-requirement breakage.
-          # Map changed ansible paths back to the templates that consume them.
           CHANGED_ANSIBLE=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- ansible/)
 
           if [ -n "$CHANGED_ANSIBLE" ]; then
@@ -66,9 +63,6 @@ jobs:
             echo "Changed ansible files:"
             echo "$CHANGED_ANSIBLE"
 
-            # A change confined to playbooks/ares/<name>.yml only affects the templates
-            # running that playbook. Anything else (roles, requirements.yml, ansible.cfg)
-            # is shared and can affect every ansible-provisioned template.
             SHARED_ANSIBLE_CHANGE=false
             if echo "$CHANGED_ANSIBLE" | grep -qvE '^ansible/playbooks/ares/[^/]+\.yml$'; then
               SHARED_ANSIBLE_CHANGE=true
@@ -413,10 +407,6 @@ jobs:
 
           echo "Building ${{ matrix.name }} for amd64..."
 
-          # No --push: warpgate loads the built image straight into the local
-          # Docker daemon as <registry>/<name>:<tag>, which is all the artifact
-          # step below needs. Pushing would require packages: write and would
-          # fail outright on fork PRs, whose tokens are always read-only.
           warpgate build warpgate.yaml \
             --arch amd64 \
             --registry ghcr.io/${{ matrix.namespace }} \
@@ -429,9 +419,6 @@ jobs:
 
       - name: Free up disk space after build
         run: |
-          # Reclaim the BuildKit cache (the bulk of the usage) to make room for
-          # docker save. Deliberately NOT `docker system prune -af`: the image we
-          # just built is only in the local daemon now, and -a would delete it.
           docker buildx prune -af || true
           docker system prune -f || true
           df -h /
