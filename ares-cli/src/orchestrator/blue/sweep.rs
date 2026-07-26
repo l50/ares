@@ -650,6 +650,59 @@ pub(crate) async fn run_detection_sweep(investigation_id: &str) -> SweepOutcome 
     }
 }
 
+/// Re-run the golden-ticket correlation as the investigation closes.
+///
+/// The baseline sweep runs BEFORE the LLM loop, so its window closes the moment
+/// the investigation opens — typically minutes before the attack it is
+/// investigating has finished. Domain compromise is the LAST phase of an
+/// intrusion, so the forged-TGT usage this rule exists to catch routinely lands
+/// after the sweep has already answered "clean".
+///
+/// That is not hypothetical. On op-20260726-003632 the sweep queried at
+/// 00:38:47 and returned clean; the orphaned principal's service-ticket request
+/// was logged at 00:39:14 — 27 seconds later. Red went on to obtain golden
+/// tickets in all three domains and blue never looked again, so a correct rule
+/// with a correct verdict still produced a missed detection.
+///
+/// Re-running only this correlation is cheap (two aggregation queries) and is
+/// the only way T1558.001 can be found at all, since no template can express
+/// an absent partner event. Records are deduped by the underlying tools, so an
+/// overlap with the opening sweep is harmless.
+pub(crate) async fn recheck_golden_tickets(investigation_id: &str) -> Option<GoldenTicketOutcome> {
+    if !sweep_enabled() || !golden_ticket_enabled() {
+        return None;
+    }
+
+    let outcome =
+        match run_golden_ticket_correlation(SWEEP_HOURS_BACK, golden_baseline_hours()).await {
+            Ok(c) => GoldenTicketOutcome::Correlated(c),
+            Err(reason) => GoldenTicketOutcome::Inconclusive(reason),
+        };
+
+    info!(
+        investigation_id,
+        golden_ticket = %golden_ticket_log_value(&Some(outcome.clone())),
+        "Golden ticket correlation re-checked at investigation close"
+    );
+
+    if let GoldenTicketOutcome::Correlated(c) = &outcome {
+        if let Some(f) = c.as_fired() {
+            warn!(
+                investigation_id,
+                orphan_accounts = c.orphans.len(),
+                candidates = c.candidates,
+                baseline = c.baseline,
+                "Golden ticket correlation found forged-TGT usage on the closing re-check \
+                 (the opening sweep ran before this activity was logged)"
+            );
+            record_fired(investigation_id, &f).await;
+            record_orphan_accounts(investigation_id, &c.orphans).await;
+        }
+    }
+
+    Some(outcome)
+}
+
 /// Render the correlation's verdict for the sweep's completion log.
 ///
 /// Every outcome has to be distinguishable from the log alone. Previously only
@@ -1369,6 +1422,20 @@ mod tests {
         // The cap is stated, not applied silently.
         assert!(s.contains("5 more"), "{s}");
         assert!(!s.contains("svc_24"), "listing must stop at the cap: {s}");
+    }
+
+    #[tokio::test]
+    async fn recheck_is_disabled_by_the_same_toggles_as_the_sweep() {
+        // The close-of-investigation re-check must respect both switches, or
+        // disabling the sweep would still fire two Loki queries per
+        // investigation.
+        std::env::set_var("ARES_BLUE_DETERMINISTIC_SWEEP", "0");
+        assert!(recheck_golden_tickets("inv-test").await.is_none());
+        std::env::remove_var("ARES_BLUE_DETERMINISTIC_SWEEP");
+
+        std::env::set_var("ARES_BLUE_GOLDEN_TICKET_CORRELATION", "0");
+        assert!(recheck_golden_tickets("inv-test").await.is_none());
+        std::env::remove_var("ARES_BLUE_GOLDEN_TICKET_CORRELATION");
     }
 
     #[test]
