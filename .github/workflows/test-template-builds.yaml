@@ -17,7 +17,9 @@ on:
 
 permissions:
   contents: read
-  packages: read
+  # The test build pushes a throwaway test-<run_id> tag to ghcr, then pulls it
+  # back to hand to dependent templates as an artifact — so it needs write.
+  packages: write
 
 concurrency:
   cancel-in-progress: true
