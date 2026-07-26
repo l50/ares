@@ -101,8 +101,8 @@ const DOMAIN_REGEXP: &str = r#"TargetDomainName'\\u003e(?P<ares_domain>[^\\]*)"#
 /// this 8h baseline left none.
 const DEFAULT_GOLDEN_BASELINE_HOURS: i64 = 8;
 
-/// Cap on accounts named in evidence and in the prompt. The count reported is
-/// always the true one; only the enumeration is bounded.
+/// Cap on principals enumerated in the timeline and the prompt. The count
+/// reported is always the true one; only the enumeration is bounded.
 const MAX_REPORTED_ORPHANS: usize = 20;
 
 /// An account that requested service tickets without ever requesting a TGT.
@@ -429,8 +429,17 @@ impl SweepOutcome {
             }
             GoldenTicketOutcome::Correlated(c) if c.orphans.is_empty() => {
                 s.push_str(&format!(
-                    "clean. All {} account(s) seen requesting service tickets also requested a TGT \
-                     (baseline: {} account(s)). No forged-TGT usage.\n\n",
+                    "CLEAN — all {} account(s) that requested a service ticket also requested a \
+                     TGT (baseline: {} account(s)). There was no forged-TGT usage.\n\
+                     This correlation is the authoritative answer for \
+                     {GOLDEN_TICKET_MITRE_ID}; it is the only signal that can distinguish a forged \
+                     TGT from ordinary Kerberos traffic. Do NOT record \
+                     {GOLDEN_TICKET_MITRE_ID} on top of it. In particular, none of these are \
+                     golden-ticket indicators — each matches ordinary traffic: a 4769 whose \
+                     ServiceName is krbtgt (that is a TGT renewal), a TicketOptions value like \
+                     0x40810010 (that is the ordinary value), a request from a non-DC IP (every \
+                     workstation does that), or an RC4 session key (present on nearly every \
+                     event). An RC4 *ticket* is Kerberoasting (T1558.003), not golden.\n\n",
                     c.candidates, c.baseline
                 ));
             }
@@ -1266,7 +1275,7 @@ mod tests {
             ..Default::default()
         };
         let s = clean.golden_ticket_summary();
-        assert!(s.contains("clean"), "{s}");
+        assert!(s.contains("CLEAN"), "{s}");
         assert!(!s.contains("NO VERDICT"), "{s}");
 
         let broken = SweepOutcome {
@@ -1277,7 +1286,39 @@ mod tests {
         // A failed correlation must never read as an all-clear.
         assert!(s.contains("NO VERDICT"), "{s}");
         assert!(s.contains("unchecked"), "{s}");
-        assert!(!s.contains("clean"), "{s}");
+        assert!(!s.contains("CLEAN"), "{s}");
+    }
+
+    #[test]
+    fn clean_verdict_forbids_retagging_from_field_heuristics() {
+        // A live investigation tagged T1558.001 off `ServiceName=krbtgt`,
+        // `TicketOptions=0x40810010` and an RC4 session key from a non-DC IP —
+        // every one of which matches ordinary Kerberos traffic. The clean
+        // verdict has to say so, or the LLM re-derives the same false positive
+        // on top of a correlation that already answered the question.
+        let clean = SweepOutcome {
+            golden_ticket: Some(GoldenTicketOutcome::Correlated(GoldenTicketCorrelation {
+                candidates: 4,
+                baseline: 19,
+                orphans: vec![],
+            })),
+            ..Default::default()
+        };
+        let s = clean.golden_ticket_summary();
+        assert!(
+            s.contains("authoritative"),
+            "clean verdict must claim authority over {GOLDEN_TICKET_MITRE_ID}: {s}"
+        );
+        assert!(
+            s.contains("Do NOT record"),
+            "clean verdict must forbid re-tagging: {s}"
+        );
+        for non_signal in ["krbtgt", "0x40810010", "non-DC IP", "RC4 session key"] {
+            assert!(
+                s.contains(non_signal),
+                "clean verdict must name the non-signal '{non_signal}': {s}"
+            );
+        }
     }
 
     #[test]
