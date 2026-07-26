@@ -17,9 +17,7 @@ on:
 
 permissions:
   contents: read
-  # The test build pushes a throwaway test-<run_id> tag to ghcr, then pulls it
-  # back to hand to dependent templates as an artifact — so it needs write.
-  packages: write
+  packages: read
 
 concurrency:
   cancel-in-progress: true
@@ -415,13 +413,14 @@ jobs:
 
           echo "Building ${{ matrix.name }} for amd64..."
 
-          # Build and push to registry with test tag
-          # We push to make the image available, then pull locally for artifact creation
+          # No --push: warpgate loads the built image straight into the local
+          # Docker daemon as <registry>/<name>:<tag>, which is all the artifact
+          # step below needs. Pushing would require packages: write and would
+          # fail outright on fork PRs, whose tokens are always read-only.
           warpgate build warpgate.yaml \
             --arch amd64 \
             --registry ghcr.io/${{ matrix.namespace }} \
             --tag test-${{ github.run_id }} \
-            --push \
             --verbose
 
           echo "Build successful for ${{ matrix.name }}"
@@ -430,16 +429,12 @@ jobs:
 
       - name: Free up disk space after build
         run: |
-          # Remove buildx cache and unused images to make room for docker save
+          # Reclaim the BuildKit cache (the bulk of the usage) to make room for
+          # docker save. Deliberately NOT `docker system prune -af`: the image we
+          # just built is only in the local daemon now, and -a would delete it.
           docker buildx prune -af || true
-          docker system prune -af || true
+          docker system prune -f || true
           df -h /
-
-      - name: Pull image for local use
-        run: |
-          IMAGE_NAME="ghcr.io/${{ matrix.namespace }}/${{ matrix.name }}:test-${{ github.run_id }}"
-          echo "Pulling $IMAGE_NAME..."
-          docker pull "$IMAGE_NAME"
 
       - name: Save image for dependent templates
         run: |
