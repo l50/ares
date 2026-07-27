@@ -85,6 +85,15 @@ pub async fn run_detection_query_events(
     )
     .await?;
 
+    if !entries.is_empty() {
+        let joined = entries
+            .iter()
+            .map(|e| e.line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        super::super::evidence_validator::store_query_result(&joined);
+    }
+
     let mut hosts: Vec<String> = entries
         .iter()
         .filter_map(|e| {
