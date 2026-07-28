@@ -97,6 +97,19 @@ fn astr<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Canonicalize a SID argument for substring matching against rendered output.
+///
+/// bloodyAD renders a security descriptor as SDDL, where each ACE ends in the
+/// literal `S-1-5-21-…` account SID (there is no well-known-SID abbreviation
+/// table — only `WELLKNOWN_GUID`), so a raw SID needle does match. What does
+/// not match is a SID the agent decorated: live journals contain the same
+/// principal passed both as `…-1163` and `…-1163$`. A trailing `$` can never
+/// appear in the SDDL, so the needle is absent on the first read and the probe
+/// reports the revert verified without having checked anything.
+fn normalize_sid(sid: &str) -> String {
+    sid.trim().trim_end_matches('$').to_ascii_uppercase()
+}
+
 /// Build a `bloodyad_get_object` read-back probe that reuses the forward call's
 /// connection/auth keys. `expect_absent` is the needle that must be GONE from
 /// the read output once the mutation is reversed.
@@ -206,10 +219,23 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             inverse: Some(("rbcd_write".into(), with_override(a, "action", "remove"))),
             validate: astr(a, "target_computer").zip(astr(a, "attacker_sid")).map(
                 |(target, sid)| {
-                    get_object_probe(a, target, "msDS-AllowedToActOnBehalfOfOtherIdentity", sid)
+                    get_object_probe(
+                        a,
+                        target,
+                        "msDS-AllowedToActOnBehalfOfOtherIdentity",
+                        &normalize_sid(sid),
+                    )
                 },
             ),
-            note: "remove the RBCD delegation entry (msDS-AllowedToActOnBehalfOfOtherIdentity)".into(),
+            note: "remove the RBCD delegation entry (msDS-AllowedToActOnBehalfOfOtherIdentity). \
+                   rbcd.py write and remove are both read-modify-write scoped to the exact SID \
+                   (wiping the attribute is `-action flush`, which is never dispatched), so \
+                   unrelated ACEs survive the revert. Clean rests on one further premise: the \
+                   documented chain is add_computer -> rbcd_write, so attacker_sid is a machine \
+                   account this operation just created and no pre-existing ACE can reference it. \
+                   A write naming an already-delegated SID no-ops while still being journalled, \
+                   and the inverse would then strip an ACE we did not create"
+                .into(),
         },
         // NOT auto-reverted: same DACL read-modify-write hazard as
         // `bloodyad_add_genericall` — `dacledit.py -action write` does not fail
@@ -510,6 +536,36 @@ mod tests {
         assert_eq!(probe.tool, "bloodyad_get_object");
         assert_eq!(probe.args["target"], json!("dc01$"));
         assert_eq!(probe.expect_absent.as_deref(), Some("S-1-5-21-1-2-3-1105"));
+    }
+
+    /// Live journals carry the same principal as both `…-1105` and `…-1105$`.
+    /// The `$` form can never appear in bloodyAD's SDDL rendering, so an
+    /// un-normalized needle is absent on the first read and the probe reports
+    /// a revert verified without having checked anything.
+    #[test]
+    fn rbcd_probe_needle_is_normalized_so_it_can_actually_match() {
+        let p = undo_plan(&rec(
+            "rbcd_write",
+            json!({ "target_computer": "dc01$", "attacker_sid": "s-1-5-21-1-2-3-1105$ ",
+                    "domain": "contoso.local", "dc_ip": "192.168.58.240", "username": "alice" }),
+        ));
+        let probe = p
+            .validate
+            .expect("rbcd revert should have a read-back probe");
+        assert_eq!(
+            probe.expect_absent.as_deref(),
+            Some("S-1-5-21-1-2-3-1105"),
+            "a decorated SID must be canonicalized or the probe silently always passes"
+        );
+    }
+
+    #[test]
+    fn normalize_sid_strips_decoration_without_mangling_a_clean_sid() {
+        assert_eq!(normalize_sid("S-1-5-21-1-2-3-1105"), "S-1-5-21-1-2-3-1105");
+        assert_eq!(
+            normalize_sid(" s-1-5-21-1-2-3-1105$"),
+            "S-1-5-21-1-2-3-1105"
+        );
     }
 
     #[test]
