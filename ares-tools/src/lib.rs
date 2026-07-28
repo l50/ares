@@ -18,6 +18,7 @@ pub mod executor;
 pub use executor::{spawn_error_kind, SpawnErrorKind};
 pub mod filter;
 pub mod lateral;
+pub mod mutation;
 pub mod parsers;
 pub mod privesc;
 pub mod recon;
@@ -77,6 +78,7 @@ impl ToolOutput {
 pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> {
     credentials::validate_arguments(tool_name, arguments)?;
     scope::validate_in_scope(tool_name, arguments)?;
+    mutation::validate_mutation_allowed(tool_name)?;
 
     // Cap concurrent spider_plus dispatches process-wide to prevent the
     // netexec fork-storm OOM observed on EC2.
