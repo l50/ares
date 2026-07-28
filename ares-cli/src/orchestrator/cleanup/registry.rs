@@ -6,9 +6,12 @@
 //! Inverse construction is deliberately uniform: for action-parameterized tools
 //! (pywhisker, dacl_edit, addspn, and the ones given an `action` branch) the
 //! reverse is the *same* forward arguments with the `action` key overridden, so
-//! all targeting/auth keys carry over untouched. Tools that reverse via a
-//! different command (xp_cmdshell → mssql_command) build fresh args from the
-//! forward call's auth/target keys.
+//! all targeting/auth keys carry over untouched.
+//!
+//! A mutation only earns [`Reversibility::Clean`] when the journalled call
+//! proves the prior state. An idempotent "make it so" call does not: it records
+//! that we asked, not that the setting was off beforehand, so reverting it can
+//! erase configuration the range shipped with rather than our own change.
 
 use serde_json::{json, Value};
 
@@ -242,12 +245,19 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             validate: None,
             note: "remove the added SPN".into(),
         },
-        "mssql_enable_xp_cmdshell" => UndoPlan {
-            class: Reversibility::Clean,
-            inverse: Some(("mssql_command".into(), xp_cmdshell_disable_args(a))),
-            validate: Some(xp_cmdshell_probe(a)),
-            note: "disable xp_cmdshell (sp_configure 'xp_cmdshell',0)".into(),
-        },
+        // NOT auto-reverted: `sp_configure 'xp_cmdshell',1` is idempotent, so a
+        // journalled call proves only that we asked — not that it was off
+        // beforehand. GOAD provisions the setting ON as the MSSQL vulnerability
+        // (`ansible/roles/mssql/tasks/config.yml`), so disabling it deletes a
+        // lab-provisioned weakness instead of reverting our own change. That is
+        // exactly the "revert drifts the range" failure this module exists to
+        // avoid, and it happened live before this was reclassified.
+        "mssql_enable_xp_cmdshell" => UndoPlan::manual(
+            Reversibility::NeedsCapture,
+            "xp_cmdshell may already have been enabled before the operation (GOAD ships it on); \
+             disabling it unconditionally removes a provisioned vulnerability — needs a \
+             read-before-write capture of sys.configurations.value_in_use",
+        ),
 
         // ── HARD: reversible core but leaves residue needing a scrub ──
         // No clean tool inverse: the deployed bloodyAD exposes no `aclEntry`
@@ -298,45 +308,6 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             "no known inverse for this tool",
         ),
     }
-}
-
-/// Build `mssql_command` args that disable xp_cmdshell, reusing the forward
-/// call's auth/target/impersonate keys. NOTE: `mssql_command`'s SQL argument is
-/// `command`, not `query` — passing `query` fails with "missing required
-/// argument: command" (caught in a live teardown run).
-/// Read-back probe proving `xp_cmdshell` is actually off.
-///
-/// `sys.configurations.value_in_use` is the authoritative post-`RECONFIGURE`
-/// state, so this confirms the setting rather than trusting the disable
-/// command's own exit status. The value is tagged (`XPSTATE=`) because the
-/// probe matches on a needle in raw tool output: a bare `1` or `0` would
-/// collide with row counts, timestamps, and the server banner.
-fn xp_cmdshell_probe(forward: &Value) -> ValidateProbe {
-    let mut m = forward.as_object().cloned().unwrap_or_default();
-    m.insert(
-        "command".into(),
-        json!(
-            "SELECT 'XPSTATE=' + CAST(value_in_use AS VARCHAR(2)) \
-               FROM sys.configurations WHERE name = 'xp_cmdshell';"
-        ),
-    );
-    ValidateProbe {
-        tool: "mssql_command".into(),
-        args: Value::Object(m),
-        expect_absent: Some("XPSTATE=1".into()),
-    }
-}
-
-fn xp_cmdshell_disable_args(forward: &Value) -> Value {
-    let mut m = forward.as_object().cloned().unwrap_or_default();
-    m.insert(
-        "command".into(),
-        json!(
-            "EXEC sp_configure 'show advanced options',1; RECONFIGURE; \
-               EXEC sp_configure 'xp_cmdshell',0; RECONFIGURE;"
-        ),
-    );
-    Value::Object(m)
 }
 
 /// `certipy_ca` covers several sub-actions; only `add-officer` has a clean
@@ -390,46 +361,22 @@ mod tests {
     }
 
     #[test]
-    fn xp_cmdshell_reverses_via_mssql_command_disable() {
+    fn xp_cmdshell_is_never_auto_disabled() {
+        // GOAD ships xp_cmdshell enabled as the MSSQL vulnerability, and
+        // `sp_configure ...,1` is idempotent — so a journalled enable does not
+        // prove it was off beforehand. Auto-disabling deleted a provisioned
+        // weakness from a live range; it must stay blocked until a
+        // read-before-write capture exists.
         let p = undo_plan(&rec(
             "mssql_enable_xp_cmdshell",
             json!({ "target": "192.168.58.30", "username": "sa" }),
         ));
-        assert_eq!(p.class, Reversibility::Clean);
-        let (tool, args) = p.inverse.unwrap();
-        assert_eq!(tool, "mssql_command");
-        // mssql_command's SQL arg is `command`, not `query` (the live-run bug).
+        assert_eq!(p.class, Reversibility::NeedsCapture);
         assert!(
-            args.get("query").is_none(),
-            "must not use the wrong `query` key"
+            p.inverse.is_none(),
+            "must not dispatch a disable without knowing the prior state"
         );
-        assert!(args["command"]
-            .as_str()
-            .unwrap()
-            .contains("'xp_cmdshell',0"));
-        assert_eq!(args["username"], json!("sa"));
-    }
-
-    #[test]
-    fn xp_cmdshell_revert_is_probed_not_assumed() {
-        // Without a probe the engine reports "reverted (no read-back probe)"
-        // and the operator has to confirm by hand against sys.configurations.
-        let p = undo_plan(&rec(
-            "mssql_enable_xp_cmdshell",
-            json!({ "target": "192.168.58.30", "username": "sa" }),
-        ));
-        let probe = p.validate.expect("disable must be independently verified");
-        assert_eq!(probe.tool, "mssql_command");
-        assert_eq!(probe.expect_absent.as_deref(), Some("XPSTATE=1"));
-
-        let sql = probe.args["command"].as_str().unwrap();
-        assert!(sql.contains("sys.configurations"), "got: {sql}");
-        assert!(sql.contains("xp_cmdshell"), "got: {sql}");
-        assert!(
-            sql.contains("value_in_use"),
-            "value_in_use is the post-RECONFIGURE truth, got: {sql}"
-        );
-        assert_eq!(probe.args["target"], json!("192.168.58.30"));
+        assert!(p.validate.is_none());
     }
 
     #[test]
