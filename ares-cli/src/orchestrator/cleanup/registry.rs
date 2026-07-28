@@ -211,12 +211,16 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             ),
             note: "remove the RBCD delegation entry (msDS-AllowedToActOnBehalfOfOtherIdentity)".into(),
         },
-        "dacl_edit" => UndoPlan {
-            class: Reversibility::Clean,
-            inverse: Some(("dacl_edit".into(), with_override(a, "action", "remove"))),
-            validate: None,
-            note: "remove the added ACE".into(),
-        },
+        // NOT auto-reverted: same DACL read-modify-write hazard as
+        // `bloodyad_add_genericall` — `dacledit.py -action write` does not fail
+        // on an ACE that already exists, and `-action remove` deletes every ACE
+        // matching principal+rights, ours and the range's alike.
+        "dacl_edit" => UndoPlan::manual(
+            Reversibility::NeedsCapture,
+            "remove the added ACE — `dacledit -action write` no-ops when the ACE already exists, \
+             so the matching remove can strip a pre-existing (lab-provisioned) ACE; needs a \
+             read-before-write capture of the target DACL",
+        ),
         "bloodyad_add_group_member" => UndoPlan {
             class: Reversibility::Clean,
             inverse: Some((
@@ -230,15 +234,19 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             }),
             note: "remove the added group member".into(),
         },
-        "bloodyad_add_genericall" => UndoPlan {
-            class: Reversibility::Clean,
-            inverse: Some((
-                "bloodyad_add_genericall".into(),
-                with_override(a, "action", "remove"),
-            )),
-            validate: None,
-            note: "remove the GenericAll ACE".into(),
-        },
+        // NOT auto-reverted: bloodyAD's `add genericAll` is a read-modify-write
+        // of the whole DACL (getSD → addRight → write back), so it succeeds
+        // silently when the trustee already holds rights. The inverse strips
+        // every ACE matching that trustee, and GOAD provisions the very edges
+        // this tool is pointed at (GenericAll lord.varys→Domain Admins,
+        // KingsGuard→stannis.baratheon, …). Reverting an add that was a no-op
+        // therefore deletes a provisioned attack path.
+        "bloodyad_add_genericall" => UndoPlan::manual(
+            Reversibility::NeedsCapture,
+            "remove the GenericAll ACE — the add is a DACL read-modify-write that no-ops when \
+             the right already exists, so an unconditional remove can strip a pre-existing \
+             (lab-provisioned) ACE; needs a read-before-write capture of the target DACL",
+        ),
         "addspn" => UndoPlan {
             class: Reversibility::Clean,
             inverse: Some(("addspn".into(), with_override(a, "action", "remove"))),
@@ -320,15 +328,16 @@ fn certipy_ca_plan(a: &Value) -> UndoPlan {
         .or_else(|| a.get("ca_action").and_then(Value::as_str))
         .unwrap_or("");
     if action.contains("add-officer") || a.get("add_officer").is_some() {
-        UndoPlan {
-            class: Reversibility::Clean,
-            inverse: Some((
-                "certipy_ca".into(),
-                with_override(a, "action", "remove-officer"),
-            )),
-            validate: None,
-            note: "remove the CA officer we added".into(),
-        }
+        // NOT auto-reverted: GOAD provisions `adcs_esc7`, which *is* officer /
+        // ManageCA rights on the CA. Adding an officer that already holds the
+        // role does not fail, so `remove-officer` can revoke a right the range
+        // shipped with rather than the one we added.
+        UndoPlan::manual(
+            Reversibility::NeedsCapture,
+            "remove the CA officer — adding an existing officer does not fail, and the range \
+             provisions ESC7 officer rights, so an unconditional remove can revoke a \
+             lab-provisioned role; needs a read-before-write capture of the CA's officer list",
+        )
     } else {
         UndoPlan::manual(
             Reversibility::Unsupported,
@@ -358,6 +367,51 @@ mod tests {
         assert_eq!(args["action"], json!("remove"));
         // targeting keys carried over
         assert_eq!(args["delegate_to"], json!("dc01$"));
+    }
+
+    /// An unconditional "remove" inverse is only safe when the forward "add"
+    /// would have FAILED had the state already existed. Where the add silently
+    /// no-ops, the revert cannot tell our change from the range's own
+    /// configuration and strips a provisioned attack path.
+    #[test]
+    fn dacl_and_officer_grants_are_not_auto_reverted() {
+        for (tool, args) in [
+            (
+                "bloodyad_add_genericall",
+                json!({ "target_dn": "CN=Domain Admins,DC=contoso,DC=local", "principal": "alice" }),
+            ),
+            (
+                "dacl_edit",
+                json!({ "target_dn": "CN=bob,DC=contoso,DC=local", "principal": "alice", "rights": "FullControl" }),
+            ),
+            (
+                "certipy_ca",
+                json!({ "action": "add-officer", "ca": "contoso-CA" }),
+            ),
+        ] {
+            let p = undo_plan(&rec(tool, args));
+            assert_eq!(
+                p.class,
+                Reversibility::NeedsCapture,
+                "{tool} must not auto-revert without knowing the prior state"
+            );
+            assert!(p.inverse.is_none(), "{tool} must dispatch no inverse");
+        }
+    }
+
+    /// The counter-case: LDAP `Change.ADD` on an existing group member returns
+    /// `attributeOrValueExists`, so the tool errors and the mutation is never
+    /// journalled. A journalled add therefore proves we created the membership.
+    #[test]
+    fn group_member_add_stays_cleanly_reversible() {
+        let p = undo_plan(&rec(
+            "bloodyad_add_group_member",
+            json!({ "group": "Domain Admins", "target_user": "alice" }),
+        ));
+        assert_eq!(p.class, Reversibility::Clean);
+        let (tool, args) = p.inverse.expect("membership we added must be removed");
+        assert_eq!(tool, "bloodyad_add_group_member");
+        assert_eq!(args["action"], json!("remove"));
     }
 
     #[test]
@@ -428,13 +482,13 @@ mod tests {
     }
 
     #[test]
-    fn certipy_ca_add_officer_reverses_to_remove_officer() {
+    fn certipy_ca_non_officer_actions_stay_unsupported() {
         let p = undo_plan(&rec(
             "certipy_ca",
-            json!({ "action": "add-officer", "ca": "contoso-CA" }),
+            json!({ "action": "backup", "ca": "contoso-CA" }),
         ));
-        assert_eq!(p.class, Reversibility::Clean);
-        assert_eq!(p.inverse.unwrap().1["action"], json!("remove-officer"));
+        assert_eq!(p.class, Reversibility::Unsupported);
+        assert!(p.inverse.is_none());
     }
 
     #[test]
