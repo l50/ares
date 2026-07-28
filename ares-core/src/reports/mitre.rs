@@ -28,16 +28,24 @@ fn lookup(technique_id: &str) -> Option<&'static TechniqueEntry> {
 }
 
 /// Get a display string for a MITRE technique ID (e.g. "T1003.006 (DCSync)").
+///
+/// Uses the same parent fallback as [`get_technique_tactic`], so an unlisted
+/// sub-technique renders under its parent's name rather than as a bare ID.
 pub fn get_technique_display(technique_id: &str) -> String {
-    match MITRE_TECHNIQUES.get(technique_id) {
+    match lookup(technique_id) {
         Some(e) => format!("{technique_id} ({})", e.name),
         None => technique_id.to_string(),
     }
 }
 
 /// Get the human-readable name for a MITRE technique ID, if known.
+///
+/// Falls back to the parent technique's name for an unlisted sub-technique.
+/// Resolving the tactic but not the name left report rows half-populated — a
+/// known tactic beside a bare `T1558.999` — which is the gap [`lookup`] exists
+/// to close.
 pub fn get_technique_name(technique_id: &str) -> Option<&'static str> {
-    MITRE_TECHNIQUES.get(technique_id).map(|e| e.name.as_str())
+    lookup(technique_id).map(|e| e.name.as_str())
 }
 
 /// Get the ATT&CK tactic a technique is attributed to.
@@ -89,6 +97,27 @@ mod tests {
     fn unlisted_sub_technique_inherits_its_parent_tactic() {
         assert!(!MITRE_TECHNIQUES.contains_key("T1558.999"));
         assert_eq!(get_technique_tactic("T1558.999"), "Credential Access");
+    }
+
+    #[test]
+    fn unlisted_sub_technique_inherits_its_parent_name() {
+        // The tactic fallback alone left report rows half-populated: a
+        // resolved tactic beside a bare `T1558.999` where a name belongs.
+        assert!(!MITRE_TECHNIQUES.contains_key("T1558.999"));
+        assert_eq!(
+            get_technique_name("T1558.999"),
+            get_technique_name("T1558"),
+            "an unlisted sub-technique must resolve to its parent's name"
+        );
+        assert!(get_technique_display("T1558.999").starts_with("T1558.999 ("));
+    }
+
+    #[test]
+    fn wholly_unknown_technique_has_no_name_and_renders_bare() {
+        assert_eq!(get_technique_name("T9999"), None);
+        assert_eq!(get_technique_display("T9999"), "T9999");
+        // A parent that is itself uncatalogued must not invent a name.
+        assert_eq!(get_technique_name("T9999.001"), None);
     }
 
     #[test]
