@@ -245,7 +245,7 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
         "mssql_enable_xp_cmdshell" => UndoPlan {
             class: Reversibility::Clean,
             inverse: Some(("mssql_command".into(), xp_cmdshell_disable_args(a))),
-            validate: None,
+            validate: Some(xp_cmdshell_probe(a)),
             note: "disable xp_cmdshell (sp_configure 'xp_cmdshell',0)".into(),
         },
 
@@ -304,6 +304,29 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
 /// call's auth/target/impersonate keys. NOTE: `mssql_command`'s SQL argument is
 /// `command`, not `query` — passing `query` fails with "missing required
 /// argument: command" (caught in a live teardown run).
+/// Read-back probe proving `xp_cmdshell` is actually off.
+///
+/// `sys.configurations.value_in_use` is the authoritative post-`RECONFIGURE`
+/// state, so this confirms the setting rather than trusting the disable
+/// command's own exit status. The value is tagged (`XPSTATE=`) because the
+/// probe matches on a needle in raw tool output: a bare `1` or `0` would
+/// collide with row counts, timestamps, and the server banner.
+fn xp_cmdshell_probe(forward: &Value) -> ValidateProbe {
+    let mut m = forward.as_object().cloned().unwrap_or_default();
+    m.insert(
+        "command".into(),
+        json!(
+            "SELECT 'XPSTATE=' + CAST(value_in_use AS VARCHAR(2)) \
+               FROM sys.configurations WHERE name = 'xp_cmdshell';"
+        ),
+    );
+    ValidateProbe {
+        tool: "mssql_command".into(),
+        args: Value::Object(m),
+        expect_absent: Some("XPSTATE=1".into()),
+    }
+}
+
 fn xp_cmdshell_disable_args(forward: &Value) -> Value {
     let mut m = forward.as_object().cloned().unwrap_or_default();
     m.insert(
@@ -385,6 +408,28 @@ mod tests {
             .unwrap()
             .contains("'xp_cmdshell',0"));
         assert_eq!(args["username"], json!("sa"));
+    }
+
+    #[test]
+    fn xp_cmdshell_revert_is_probed_not_assumed() {
+        // Without a probe the engine reports "reverted (no read-back probe)"
+        // and the operator has to confirm by hand against sys.configurations.
+        let p = undo_plan(&rec(
+            "mssql_enable_xp_cmdshell",
+            json!({ "target": "192.168.58.30", "username": "sa" }),
+        ));
+        let probe = p.validate.expect("disable must be independently verified");
+        assert_eq!(probe.tool, "mssql_command");
+        assert_eq!(probe.expect_absent.as_deref(), Some("XPSTATE=1"));
+
+        let sql = probe.args["command"].as_str().unwrap();
+        assert!(sql.contains("sys.configurations"), "got: {sql}");
+        assert!(sql.contains("xp_cmdshell"), "got: {sql}");
+        assert!(
+            sql.contains("value_in_use"),
+            "value_in_use is the post-RECONFIGURE truth, got: {sql}"
+        );
+        assert_eq!(probe.args["target"], json!("192.168.58.30"));
     }
 
     #[test]
