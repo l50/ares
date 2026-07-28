@@ -366,4 +366,27 @@ mod tests {
             "expected tool name in error message, got: {msg}"
         );
     }
+
+    /// The gate has to hold at [`dispatch`], not just in the classifier: every
+    /// automation path and every direct LLM tool call funnels through here, and
+    /// a classifier nothing consults is the bug this was written to prevent.
+    #[tokio::test]
+    async fn dispatch_refuses_irreversible_tool_without_opt_in() {
+        let args = serde_json::json!({
+            "domain": "contoso.local",
+            "dc_ip": "192.168.58.10",
+            "username": "alice",
+            "password": "P@ssw0rd!",
+            "target_user": "bob",
+            "new_password": "NewP@ss123!"
+        });
+        let msg = match dispatch("bloodyad_set_password", &args).await {
+            Ok(_) => panic!("dispatch must refuse an irreversible tool without opt-in"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("irreversibly") && msg.contains(mutation::ALLOW_IRREVERSIBLE_ENV),
+            "expected the irreversible-mutation refusal, got: {msg}"
+        );
+    }
 }
