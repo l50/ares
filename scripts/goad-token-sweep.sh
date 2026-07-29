@@ -30,8 +30,10 @@ banned="${names}|${leaks}|${placeholders}|${ips}|${passwords}"
 
 # Paths that may legitimately carry real lab tokens: CLI wrappers that drive the
 # range, the lab spec itself, operator-facing config comments, local agent
-# tooling, the gitignored demo viewer, and scratch space.
-exempt='(^|/)(\.git|target|node_modules|\.claude|\.gemini|\.taskfiles|demo|safe)/|(^|/)Taskfile\.yaml$|(^|/)CLAUDE\.md$|(^|/)docs/goad-checklist\.md$|(^|/)docs/plan-.*\.md$|(^|/)config/ares\.yaml$|(^|/)scripts/goad-token-sweep\.sh$|(^|/)FINDINGS(-.*)?\.md$'
+# tooling, the gitignored demo viewer, and scratch space. docs/DEMO-PLAN.md is
+# exempt for the same reason as the other planning docs: it narrates real ops,
+# and its own text requires the GOAD names verbatim for the recording.
+exempt='(^|/)(\.git|target|node_modules|\.claude|\.gemini|\.taskfiles|demo|safe)/|(^|/)Taskfile\.yaml$|(^|/)CLAUDE\.md$|(^|/)docs/goad-checklist\.md$|(^|/)docs/(plan-.*|DEMO-PLAN)\.md$|(^|/)config/ares\.yaml$|(^|/)scripts/goad-token-sweep\.sh$|(^|/)FINDINGS(-.*)?\.md$'
 
 extensions='\.(rs|tera|py|md|ya?ml|toml|json|sh)$'
 
