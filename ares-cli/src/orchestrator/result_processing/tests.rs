@@ -1332,18 +1332,14 @@ fn is_acl_mutation_vuln_rejects_non_acl_primitives() {
     assert!(!is_acl_mutation_vuln("adcs_esc1_192.168.58.50"));
     assert!(!is_acl_mutation_vuln("rbcd_dc01_target"));
     assert!(!is_acl_mutation_vuln("dc_secretsdump_192.168.58.240"));
-    assert!(!is_acl_mutation_vuln(
-        "golden_ticket_north.sevenkingdoms.local"
-    ));
+    assert!(!is_acl_mutation_vuln("golden_ticket_child.contoso.local"));
     assert!(!is_acl_mutation_vuln(""));
 }
 
 #[test]
 fn is_ticket_grant_vuln_recognizes_golden_ticket_prefix() {
     use super::is_ticket_grant_vuln;
-    assert!(is_ticket_grant_vuln(
-        "golden_ticket_north.sevenkingdoms.local"
-    ));
+    assert!(is_ticket_grant_vuln("golden_ticket_child.contoso.local"));
     assert!(is_ticket_grant_vuln("golden_ticket_contoso.local"));
     assert!(is_ticket_grant_vuln("GOLDEN_TICKET_CONTOSO.LOCAL"));
 }
