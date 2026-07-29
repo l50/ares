@@ -1484,6 +1484,76 @@ fn acl_shadow_cred_success_now_clears_the_whole_exploit_gate() {
 }
 
 #[test]
+fn error_indicates_assistance_matches_submission_format() {
+    use super::error_indicates_assistance;
+    assert!(error_indicates_assistance(Some(
+        "Assistance needed: Shadow credentials PFX generated (context: ...)"
+    )));
+    assert!(error_indicates_assistance(Some(
+        "assistance needed: lower case variant"
+    )));
+    assert!(!error_indicates_assistance(Some("rpc_s_access_denied")));
+    assert!(!error_indicates_assistance(Some("Agent hit max steps")));
+    assert!(!error_indicates_assistance(Some("")));
+    assert!(!error_indicates_assistance(None));
+}
+
+#[test]
+fn assisted_acl_write_with_evidence_scores_as_success() {
+    use super::{
+        error_indicates_assistance, is_acl_mutation_vuln, result_has_acl_mutation_evidence,
+        result_text_indicates_failure,
+    };
+    let vuln_id = "acl_genericall_alice_krbtgt";
+    let err = "Assistance needed: Shadow credentials PFX generated for krbtgt (context: need PKINIT to convert)";
+    let result = Some(json!({
+        "vuln_id": vuln_id,
+        "summary": "Wrote msDS-KeyCredentialLink and exported the PFX; need help converting it.",
+        "tool_outputs": [
+            {"name": "pywhisker",
+             "output": "[+] Updated the msDS-KeyCredentialLink attribute of the target object\n\
+                        [+] Saved PFX (#PKCS12) certificate & key at path: /tmp/krbtgt.pfx"}
+        ]
+    }));
+
+    let has_acl_evidence =
+        is_acl_mutation_vuln(vuln_id) && result_has_acl_mutation_evidence(&result);
+    let assisted_with_evidence = error_indicates_assistance(Some(err))
+        && !result_text_indicates_failure(&result)
+        && has_acl_evidence;
+
+    assert!(
+        assisted_with_evidence,
+        "a request_assistance whose primitive landed must still score as exploited"
+    );
+}
+
+#[test]
+fn assisted_acl_write_without_evidence_stays_failed() {
+    use super::{
+        error_indicates_assistance, is_acl_mutation_vuln, result_has_acl_mutation_evidence,
+    };
+    let vuln_id = "acl_genericall_alice_krbtgt";
+    let err =
+        "Assistance needed: pywhisker shadow credentials failed: invalidCredentials (context: ...)";
+    let result = Some(json!({
+        "vuln_id": vuln_id,
+        "tool_outputs": [
+            {"name": "pywhisker",
+             "output": "[-] pywhisker error: invalidCredentials binding to LDAP"}
+        ]
+    }));
+
+    let has_acl_evidence =
+        is_acl_mutation_vuln(vuln_id) && result_has_acl_mutation_evidence(&result);
+    assert!(error_indicates_assistance(Some(err)));
+    assert!(
+        !has_acl_evidence,
+        "an assistance request with no confirmed write must NOT be credited"
+    );
+}
+
+#[test]
 fn acl_evidence_empty_payload() {
     use super::result_has_acl_mutation_evidence;
     assert!(!result_has_acl_mutation_evidence(&None));

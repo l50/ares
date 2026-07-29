@@ -330,12 +330,19 @@ pub async fn process_completed_task(
                 && (result_has_parser_evidence(&result.result)
                     || has_ticket_evidence
                     || has_acl_evidence);
+            let assisted_with_evidence = !result.success
+                && error_indicates_assistance(result.error.as_deref())
+                && !result_text_indicates_failure(&result.result)
+                && (result_has_parser_evidence(&result.result)
+                    || has_ticket_evidence
+                    || has_acl_evidence);
             let actually_succeeded = (result.success
                 && !result_text_indicates_failure(&result.result)
                 && (result_has_parser_evidence(&result.result)
                     || has_ticket_evidence
                     || has_acl_evidence))
-                || stalled_with_evidence;
+                || stalled_with_evidence
+                || assisted_with_evidence;
 
             if actually_succeeded {
                 info!(vuln_id = %vuln_id, task_id = %task_id, "Marking vulnerability as exploited");
@@ -1323,6 +1330,15 @@ fn error_indicates_stall(err: Option<&str>) -> bool {
         || lower.contains("max steps")
         || lower.contains("agent hit max tokens")
         || lower.contains("budget exceeded")
+}
+
+fn error_indicates_assistance(err: Option<&str>) -> bool {
+    let Some(e) = err else {
+        return false;
+    };
+    e.trim_start()
+        .to_lowercase()
+        .starts_with("assistance needed:")
 }
 
 fn result_has_parser_evidence(result: &Option<Value>) -> bool {
