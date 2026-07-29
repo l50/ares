@@ -287,7 +287,7 @@ pub async fn process_completed_task(
     }
 
     // Handle exploit task outcomes — create timeline events for both success and failure
-    if completed.task_id.starts_with("exploit_") {
+    if is_exploit_scoped_task_id(&completed.task_id) {
         if let Some(vuln_id) = result
             .result
             .as_ref()
@@ -1147,10 +1147,18 @@ fn is_ticket_grant_vuln(vuln_id: &str) -> bool {
         || v.starts_with("unconstrained_delegation_")
         || v.starts_with("rbcd_")
         || v.starts_with("s4u_")
+        || v.starts_with("golden_ticket_")
 }
 
 fn is_acl_mutation_vuln(vuln_id: &str) -> bool {
-    vuln_id.to_lowercase().starts_with("acl_")
+    let v = vuln_id.to_lowercase();
+    v.starts_with("acl_") || v.starts_with("gpo_")
+}
+
+fn is_exploit_scoped_task_id(task_id: &str) -> bool {
+    task_id.starts_with("exploit_")
+        || task_id.starts_with("lateral_")
+        || task_id.starts_with("privesc_")
 }
 
 /// True when `vuln_type` (as recorded in `task.params.vuln_type`) belongs

@@ -1310,12 +1310,60 @@ fn is_acl_mutation_vuln_recognizes_acl_prefixes() {
 }
 
 #[test]
+fn is_acl_mutation_vuln_recognizes_gpo_prefixes() {
+    use super::is_acl_mutation_vuln;
+    assert!(is_acl_mutation_vuln(
+        "gpo_genericall_alice_default_domain_policy"
+    ));
+    assert!(is_acl_mutation_vuln(
+        "gpo_writeproperty_alice_default_domain_policy"
+    ));
+    assert!(is_acl_mutation_vuln(
+        "GPO_WRITEDACL_ALICE_DEFAULT_DOMAIN_CONTROLLERS_POLICY"
+    ));
+    assert!(is_acl_mutation_vuln(
+        "gpo_writeowner_alice_default_domain_policy"
+    ));
+}
+
+#[test]
 fn is_acl_mutation_vuln_rejects_non_acl_primitives() {
     use super::is_acl_mutation_vuln;
     assert!(!is_acl_mutation_vuln("adcs_esc1_192.168.58.50"));
     assert!(!is_acl_mutation_vuln("rbcd_dc01_target"));
     assert!(!is_acl_mutation_vuln("dc_secretsdump_192.168.58.240"));
+    assert!(!is_acl_mutation_vuln(
+        "golden_ticket_north.sevenkingdoms.local"
+    ));
     assert!(!is_acl_mutation_vuln(""));
+}
+
+#[test]
+fn is_ticket_grant_vuln_recognizes_golden_ticket_prefix() {
+    use super::is_ticket_grant_vuln;
+    assert!(is_ticket_grant_vuln(
+        "golden_ticket_north.sevenkingdoms.local"
+    ));
+    assert!(is_ticket_grant_vuln("golden_ticket_contoso.local"));
+    assert!(is_ticket_grant_vuln("GOLDEN_TICKET_CONTOSO.LOCAL"));
+}
+
+#[test]
+fn is_exploit_scoped_task_id_recognizes_all_exploit_families() {
+    use super::is_exploit_scoped_task_id;
+    assert!(is_exploit_scoped_task_id("exploit_abcdef123456"));
+    assert!(is_exploit_scoped_task_id("lateral_abcdef123456"));
+    assert!(is_exploit_scoped_task_id("privesc_abcdef123456"));
+}
+
+#[test]
+fn is_exploit_scoped_task_id_rejects_unrelated_task_types() {
+    use super::is_exploit_scoped_task_id;
+    assert!(!is_exploit_scoped_task_id("recon_abcdef123456"));
+    assert!(!is_exploit_scoped_task_id("credential_access_abcdef123456"));
+    assert!(!is_exploit_scoped_task_id("coercion_abcdef123456"));
+    assert!(!is_exploit_scoped_task_id("acl_chain_step_abcdef123456"));
+    assert!(!is_exploit_scoped_task_id(""));
 }
 
 #[test]
