@@ -1432,6 +1432,37 @@ fn acl_evidence_rejects_insufficient_access_rights() {
 }
 
 #[test]
+fn acl_evidence_detects_bloodyad_attribute_update() {
+    use super::result_has_acl_mutation_evidence;
+    let payload = json!({
+        "tool_outputs": [{"output": "[+] servicePrincipalName of ws01 has been updated"}]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(payload)));
+}
+
+#[test]
+fn acl_evidence_rejects_unrelated_tool_lines_matching_generic_markers() {
+    use super::result_has_acl_mutation_evidence;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "[*] 42 hashes added to /tmp/loot/ntlm.txt"}
+        ]
+    });
+    assert!(!result_has_acl_mutation_evidence(&Some(payload)));
+}
+
+#[test]
+fn acl_evidence_rejects_unrelated_attribute_update_line() {
+    use super::result_has_acl_mutation_evidence;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "[*] Certificate template cache has been updated"}
+        ]
+    });
+    assert!(!result_has_acl_mutation_evidence(&Some(payload)));
+}
+
+#[test]
 fn acl_evidence_rejects_llm_prose_without_tool_marker() {
     use super::result_has_acl_mutation_evidence;
     let payload = json!({

@@ -1279,12 +1279,30 @@ const ACL_MUTATION_MARKERS: &[&str] = &[
     "password changed successfully",
     "is now able to dcsync",
     "can now impersonate users on",
-    "added to ",
-    "has been updated",
     "successfully added msds-keycredentiallink",
     "updated the msds-keycredentiallink",
     "saved pfx",
 ];
+
+const ACL_WRITABLE_ATTRIBUTES: &[&str] = &[
+    "msds-keycredentiallink",
+    "msds-allowedtoactonbehalfofotheridentity",
+    "serviceprincipalname",
+    "useraccountcontrol",
+    "unicodepwd",
+];
+
+fn line_shows_group_add(lower: &str) -> bool {
+    let Some((_, rest)) = lower.split_once("added to ") else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && !rest.contains('/')
+}
+
+fn line_shows_attribute_update(lower: &str) -> bool {
+    lower.contains("has been updated") && ACL_WRITABLE_ATTRIBUTES.iter().any(|a| lower.contains(a))
+}
 
 fn result_has_acl_mutation_evidence(result: &Option<Value>) -> bool {
     let Some(payload) = result.as_ref() else {
@@ -1296,7 +1314,10 @@ fn result_has_acl_mutation_evidence(result: &Option<Value>) -> bool {
             if !lower.starts_with("[+]") && !lower.starts_with("[*]") {
                 continue;
             }
-            if ACL_MUTATION_MARKERS.iter().any(|m| lower.contains(m)) {
+            if ACL_MUTATION_MARKERS.iter().any(|m| lower.contains(m))
+                || line_shows_group_add(&lower)
+                || line_shows_attribute_update(&lower)
+            {
                 return true;
             }
         }
