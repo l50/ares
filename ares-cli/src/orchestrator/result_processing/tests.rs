@@ -1301,6 +1301,148 @@ fn ccache_evidence_empty_payload() {
 }
 
 #[test]
+fn is_acl_mutation_vuln_recognizes_acl_prefixes() {
+    use super::is_acl_mutation_vuln;
+    assert!(is_acl_mutation_vuln("acl_writeproperty_alice_bob"));
+    assert!(is_acl_mutation_vuln("acl_genericall_alice_krbtgt"));
+    assert!(is_acl_mutation_vuln("ACL_ALLEXTENDEDRIGHTS_ALICE_ADMIN"));
+    assert!(is_acl_mutation_vuln("acl_genericwrite_alice_dc01"));
+}
+
+#[test]
+fn is_acl_mutation_vuln_rejects_non_acl_primitives() {
+    use super::is_acl_mutation_vuln;
+    assert!(!is_acl_mutation_vuln("adcs_esc1_192.168.58.50"));
+    assert!(!is_acl_mutation_vuln("rbcd_dc01_target"));
+    assert!(!is_acl_mutation_vuln("dc_secretsdump_192.168.58.240"));
+    assert!(!is_acl_mutation_vuln(""));
+}
+
+#[test]
+fn acl_evidence_detects_pywhisker_keycredlink_write() {
+    use super::result_has_acl_mutation_evidence;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "[+] KeyCredential generated with DeviceID: 4b1c9f2a-1234-4a2b-9c3d-abcdef012345\n\
+                        [+] Updated the msDS-KeyCredentialLink attribute of the target object\n\
+                        [+] Saved PFX (#PKCS12) certificate & key at path: /tmp/ws01.pfx"}
+        ]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(payload)));
+}
+
+#[test]
+fn acl_evidence_matches_pywhisker_success_line_alone() {
+    use super::result_has_acl_mutation_evidence;
+    for line in [
+        "[+] Updated the msDS-KeyCredentialLink attribute of the target object",
+        "[+] Saved PFX (#PKCS12) certificate & key at path: /tmp/ws01.pfx",
+    ] {
+        let payload = json!({ "tool_outputs": [{"output": line}] });
+        assert!(
+            result_has_acl_mutation_evidence(&Some(payload)),
+            "marker set must cover pywhisker's own success line: {line}"
+        );
+    }
+}
+
+#[test]
+fn acl_evidence_detects_bloodyad_grant_and_group_add() {
+    use super::result_has_acl_mutation_evidence;
+    let genericall = json!({
+        "tool_outputs": [{"output": "[+] alice has now GenericAll on dc01"}]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(genericall)));
+
+    let group = json!({
+        "tool_outputs": [{"output": "[+] alice added to Domain Admins"}]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(group)));
+}
+
+#[test]
+fn acl_evidence_detects_dacledit_and_password_reset() {
+    use super::result_has_acl_mutation_evidence;
+    let dacl = json!({
+        "tool_outputs": [
+            {"output": "[*] DACL backed up to dacledit-20260728.bak\n[*] DACL modified successfully!"}
+        ]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(dacl)));
+
+    let reset = json!({
+        "tool_outputs": [{"output": "[+] Password changed successfully!"}]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(reset)));
+}
+
+#[test]
+fn acl_evidence_rejects_insufficient_access_rights() {
+    use super::result_has_acl_mutation_evidence;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "[-] pywhisker error: INSUFF_ACCESS_RIGHTS when writing msDS-KeyCredentialLink for target WS01$"}
+        ]
+    });
+    assert!(!result_has_acl_mutation_evidence(&Some(payload)));
+}
+
+#[test]
+fn acl_evidence_rejects_llm_prose_without_tool_marker() {
+    use super::result_has_acl_mutation_evidence;
+    let payload = json!({
+        "tool_outputs": [
+            {"output": "I would have added to the group once the DACL modified successfully, but auth failed."}
+        ]
+    });
+    assert!(!result_has_acl_mutation_evidence(&Some(payload)));
+}
+
+#[test]
+fn acl_shadow_cred_success_now_clears_the_whole_exploit_gate() {
+    use super::{
+        is_acl_mutation_vuln, result_has_acl_mutation_evidence, result_has_parser_evidence,
+        result_text_indicates_failure,
+    };
+    let vuln_id = "acl_genericall_alice_krbtgt";
+    let payload = json!({
+        "vuln_id": vuln_id,
+        "summary": "Added shadow credentials to krbtgt and exported the PFX.",
+        "tool_outputs": [
+            {"name": "pywhisker",
+             "output": "[+] KeyCredential generated with DeviceID: 4b1c9f2a-1234-4a2b-9c3d-abcdef012345\n\
+                        [+] Updated the msDS-KeyCredentialLink attribute of the target object\n\
+                        [+] Saved PFX (#PKCS12) certificate & key at path: /tmp/krbtgt.pfx"}
+        ]
+    });
+    let result = Some(payload);
+
+    assert!(
+        !result_has_parser_evidence(&result),
+        "ACL tools still emit no discoveries — the carve-out is what must carry this"
+    );
+
+    let task_reported_success = true;
+    let has_acl_evidence =
+        is_acl_mutation_vuln(vuln_id) && result_has_acl_mutation_evidence(&result);
+    let actually_succeeded = task_reported_success
+        && !result_text_indicates_failure(&result)
+        && (result_has_parser_evidence(&result) || has_acl_evidence);
+
+    assert!(
+        actually_succeeded,
+        "a confirmed msDS-KeyCredentialLink write must score as an exploit success"
+    );
+}
+
+#[test]
+fn acl_evidence_empty_payload() {
+    use super::result_has_acl_mutation_evidence;
+    assert!(!result_has_acl_mutation_evidence(&None));
+    assert!(!result_has_acl_mutation_evidence(&Some(json!({}))));
+}
+
+#[test]
 fn is_gmsa_principal_matches_trailing_dollar_with_gmsa_name() {
     use super::is_gmsa_principal;
     assert!(is_gmsa_principal("gmsaDragon$"));

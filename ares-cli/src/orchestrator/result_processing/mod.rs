@@ -311,6 +311,8 @@ pub async fn process_completed_task(
             // primitive on getST exit-0.
             let has_ticket_evidence =
                 is_ticket_grant_vuln(&vuln_id) && result_has_ccache_evidence(&result.result);
+            let has_acl_evidence =
+                is_acl_mutation_vuln(&vuln_id) && result_has_acl_mutation_evidence(&result.result);
             // Stall-tolerance: when the LLM ends its turn without calling
             // task_complete (LoopEndReason::MaxSteps or budget exhaustion),
             // submission.rs stamps `success=false` with an error string
@@ -325,10 +327,14 @@ pub async fn process_completed_task(
             let stalled_with_evidence = !result.success
                 && error_indicates_stall(result.error.as_deref())
                 && !result_text_indicates_failure(&result.result)
-                && (result_has_parser_evidence(&result.result) || has_ticket_evidence);
+                && (result_has_parser_evidence(&result.result)
+                    || has_ticket_evidence
+                    || has_acl_evidence);
             let actually_succeeded = (result.success
                 && !result_text_indicates_failure(&result.result)
-                && (result_has_parser_evidence(&result.result) || has_ticket_evidence))
+                && (result_has_parser_evidence(&result.result)
+                    || has_ticket_evidence
+                    || has_acl_evidence))
                 || stalled_with_evidence;
 
             if actually_succeeded {
@@ -1143,6 +1149,10 @@ fn is_ticket_grant_vuln(vuln_id: &str) -> bool {
         || v.starts_with("s4u_")
 }
 
+fn is_acl_mutation_vuln(vuln_id: &str) -> bool {
+    vuln_id.to_lowercase().starts_with("acl_")
+}
+
 /// True when `vuln_type` (as recorded in `task.params.vuln_type`) belongs
 /// to a shadow-credentials dispatch — the shape of the vuln types kept in
 /// sync with `automation::shadow_credentials::is_shadow_cred_candidate`.
@@ -1251,6 +1261,38 @@ fn result_has_ccache_evidence(result: &Option<Value>) -> bool {
         let lower = text.to_lowercase();
         if lower.contains("saving ticket in") && lower.contains(".ccache") {
             return true;
+        }
+    }
+    false
+}
+
+const ACL_MUTATION_MARKERS: &[&str] = &[
+    "dacl modified successfully",
+    "has now genericall on",
+    "has now genericall over",
+    "password changed successfully",
+    "is now able to dcsync",
+    "can now impersonate users on",
+    "added to ",
+    "has been updated",
+    "successfully added msds-keycredentiallink",
+    "updated the msds-keycredentiallink",
+    "saved pfx",
+];
+
+fn result_has_acl_mutation_evidence(result: &Option<Value>) -> bool {
+    let Some(payload) = result.as_ref() else {
+        return false;
+    };
+    for text in collect_result_text_parts(payload) {
+        for line in text.lines() {
+            let lower = line.trim().to_lowercase();
+            if !lower.starts_with("[+]") && !lower.starts_with("[*]") {
+                continue;
+            }
+            if ACL_MUTATION_MARKERS.iter().any(|m| lower.contains(m)) {
+                return true;
+            }
         }
     }
     false
