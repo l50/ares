@@ -2,7 +2,9 @@ use super::admin_checks::{
     extract_ip_from_line, has_golden_ticket_indicator, parse_pwned_line, resolve_da_path,
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
-use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
+use super::timeline::{
+    admin_upgrade_description, credential_techniques, hash_techniques, is_critical_hash,
+};
 use super::{
     extract_asrep_roastable_users, result_has_credential_evidence, result_has_parser_evidence,
 };
@@ -3221,4 +3223,28 @@ fn asrep_finding_multiple_findings_all_recovered() {
     assert_eq!(users[0].domain, "contoso.local");
     assert_eq!(users[1].username, "bob");
     assert_eq!(users[1].domain, "fabrikam.local");
+}
+
+// ── Admin-upgrade host scope ────────────────────────────────────────────────
+
+#[test]
+fn admin_upgrade_description_names_the_host_the_grant_was_proven_on() {
+    let d = admin_upgrade_description("alice", "contoso.local", Some("192.168.58.20"));
+    assert_eq!(
+        d,
+        "Admin access confirmed: contoso.local\\alice on 192.168.58.20 (Pwn3d!)"
+    );
+    assert!(
+        d.starts_with("Admin access confirmed: "),
+        "the corpus reproduction greps key off this prefix: {d}"
+    );
+}
+
+#[test]
+fn admin_upgrade_description_falls_back_when_the_host_is_unknown() {
+    // `extract_ip_from_line` returns None on a Pwn3d! line with no IP; the
+    // event must still fire rather than losing the grant entirely.
+    let d = admin_upgrade_description("alice", "contoso.local", None);
+    assert_eq!(d, "Admin access confirmed: contoso.local\\alice (Pwn3d!)");
+    assert!(d.starts_with("Admin access confirmed: "), "{d}");
 }
