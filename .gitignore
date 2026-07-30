@@ -57,6 +57,7 @@ benchmarks/replay-stack/data/
 TODO
 .tool-versions
 *.parquet
+GAPS.md
 
 # Captured op snapshots (Loki/traces/state) — runtime observability
 # artifacts, not code. Contain live loot tokens.
