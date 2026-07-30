@@ -2,7 +2,9 @@ use super::admin_checks::{
     extract_ip_from_line, has_golden_ticket_indicator, parse_pwned_line, resolve_da_path,
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
-use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
+use super::timeline::{
+    admin_upgrade_description, credential_techniques, hash_techniques, is_critical_hash,
+};
 use super::{
     extract_asrep_roastable_users, result_has_credential_evidence, result_has_parser_evidence,
 };
@@ -1512,6 +1514,62 @@ fn acl_evidence_credits_generic_markers_from_the_acl_tool_itself() {
         assert!(
             result_has_acl_mutation_evidence(&Some(payload)),
             "{tool} must still credit its own success line"
+        );
+    }
+}
+
+#[test]
+fn acl_evidence_credits_llm_driven_gpo_abuse() {
+    use super::result_has_acl_mutation_evidence;
+    let pygpoabuse = json!({
+        "tool_outputs": [{
+            "name": "pygpoabuse_immediate_task",
+            "output": "[+] Version updated\n[+] ScheduledTask AresProbe created!"
+        }]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(pygpoabuse)));
+
+    let sharpgpoabuse = json!({
+        "tool_outputs": [{
+            "name": "sharpgpoabuse",
+            "output": "[+] versionNumber attribute changed successfully\n[+] Done!"
+        }]
+    });
+    assert!(result_has_acl_mutation_evidence(&Some(sharpgpoabuse)));
+}
+
+#[test]
+fn acl_evidence_ignores_gpo_markers_from_unrelated_tools() {
+    use super::result_has_acl_mutation_evidence;
+    for output in [
+        "[+] ScheduledTask enumeration complete",
+        "[*] Done!",
+        "[+] Version updated",
+    ] {
+        let payload = json!({
+            "tool_outputs": [{"name": "enumerate_users", "output": output}]
+        });
+        assert!(
+            !result_has_acl_mutation_evidence(&Some(payload)),
+            "an unrelated tool must not credit a GPO write: {output}"
+        );
+    }
+}
+
+#[test]
+fn acl_evidence_ignores_gpo_failure_output() {
+    use super::result_has_acl_mutation_evidence;
+    for output in [
+        "[-] Unable to write to the GPO: insufficient access rights",
+        "[!] Failed to open connection: KDC_ERR_PREAUTH_FAILED",
+        "[+] GUID of the GPO is {31B2F340-016D-11D2-945F-00C04FB984F9}",
+    ] {
+        let payload = json!({
+            "tool_outputs": [{"name": "pygpoabuse_immediate_task", "output": output}]
+        });
+        assert!(
+            !result_has_acl_mutation_evidence(&Some(payload)),
+            "a GPO run without a write marker must not be credited: {output}"
         );
     }
 }
@@ -3296,4 +3354,28 @@ fn every_hash_credit_step_lives_in_the_shared_helper() {
             "{step} vanished from the credit path entirely — hash credit is now incomplete"
         );
     }
+}
+
+// ── Admin-upgrade host scope ────────────────────────────────────────────────
+
+#[test]
+fn admin_upgrade_description_names_the_host_the_grant_was_proven_on() {
+    let d = admin_upgrade_description("alice", "contoso.local", Some("192.168.58.20"));
+    assert_eq!(
+        d,
+        "Admin access confirmed: contoso.local\\alice on 192.168.58.20 (Pwn3d!)"
+    );
+    assert!(
+        d.starts_with("Admin access confirmed: "),
+        "the corpus reproduction greps key off this prefix: {d}"
+    );
+}
+
+#[test]
+fn admin_upgrade_description_falls_back_when_the_host_is_unknown() {
+    // `extract_ip_from_line` returns None on a Pwn3d! line with no IP; the
+    // event must still fire rather than losing the grant entirely.
+    let d = admin_upgrade_description("alice", "contoso.local", None);
+    assert_eq!(d, "Admin access confirmed: contoso.local\\alice (Pwn3d!)");
+    assert!(d.starts_with("Admin access confirmed: "), "{d}");
 }
