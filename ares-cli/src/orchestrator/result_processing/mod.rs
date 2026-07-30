@@ -1078,24 +1078,34 @@ fn gmsa_exploit_token(username: &str) -> String {
     format!("gmsa_{}", username.trim_end_matches('$').to_lowercase())
 }
 
-/// gMSA managed-password recovery side-effect: when secretsdump returns a
-/// Group Managed Service Account hash (account ends with `$` and name
-/// contains "gmsa"), credit the gMSA primitive even though we never went
-/// through `auto_gmsa_extraction`. Without this, gMSA hashes captured
-/// incidentally via DCSync never emit a `gmsa_*` token to the exploited
-/// set and the scoreboard understates progress.
+/// True when `source` names a tool that actually reads a gMSA managed
+/// password (`gmsa_dump_passwords`, `gmsa_read_password_bloodyad`) rather
+/// than a tool that merely returns the account's NTLM hash as a byproduct.
+fn is_gmsa_read_source(source: &str) -> bool {
+    source.to_lowercase().contains("gmsa")
+}
+
+/// gMSA managed-password recovery side-effect: credit the gMSA primitive
+/// when a managed-password read actually produced the material.
 ///
-/// No-op for non-gMSA usernames. Errors from `mark_exploited` are logged
-/// but not propagated — credit emission is best-effort and shouldn't
-/// fail the surrounding hash-publish flow.
+/// Requires BOTH a gMSA-looking principal AND a producing tool that reads
+/// managed passwords. A DCSync of the domain returns every gMSA account's
+/// NTLM hash as ordinary NTDS loot; crediting that as a gMSA read marks the
+/// primitive exploited on operations that never attempted it, which is the
+/// same precondition-as-outcome error `seimpersonate` was corrected for.
+///
+/// No-op otherwise. Errors from `mark_exploited` are logged but not
+/// propagated — credit emission is best-effort and shouldn't fail the
+/// surrounding hash-publish flow.
 async fn emit_gmsa_exploit_token_if_gmsa<C>(
     state: &SharedState,
     queue: &TaskQueueCore<C>,
     username: &str,
+    source: &str,
 ) where
     C: ConnectionLike + Clone + Send + Sync + 'static,
 {
-    if !is_gmsa_principal(username) {
+    if !is_gmsa_principal(username) || !is_gmsa_read_source(source) {
         return;
     }
     let vuln_id = gmsa_exploit_token(username);
@@ -1109,7 +1119,7 @@ async fn emit_gmsa_exploit_token_if_gmsa<C>(
         info!(
             vuln_id = %vuln_id,
             account = %username,
-            "gMSA hash captured via secretsdump — emitted exploit token"
+            "gMSA managed password read — emitted exploit token"
         );
     }
 }
@@ -1595,6 +1605,56 @@ fn roast_exploit_token(hash_value: &str, username: &str, domain: &str) -> Option
     }
 }
 
+/// Everything a newly-published hash earns: its timeline event, the gMSA
+/// exploit token when the read was genuine, and AS-REP / Kerberoast primitive
+/// credit.
+///
+/// Call this from **every** path that gets `Ok(true)` out of `publish_hash`.
+/// There are two — the parser path and the realtime discovery channel — and
+/// they drifted for the entire life of the corpus: the realtime channel did
+/// only part of this work, which is why `T1558.004` appears zero times in 92
+/// operations despite 145 AS-REP captures, and why roast primitive credit was
+/// missing on the channel roast hashes actually arrive over. Keeping the three
+/// steps in one function is what stops that recurring.
+///
+/// Credit is deliberately emitted at *capture* time, not crack time: a crack
+/// can fail on wordlist coverage or an AES etype, but the capture already
+/// proves the primitive.
+pub(crate) async fn credit_published_hash(
+    dispatcher: &Arc<Dispatcher>,
+    username: &str,
+    domain: &str,
+    hash_type: &str,
+    hash_value: &str,
+    source: &str,
+) {
+    create_hash_timeline_event(dispatcher, username, domain, hash_type, hash_value, source).await;
+
+    emit_gmsa_exploit_token_if_gmsa(&dispatcher.state, &dispatcher.queue, username, source).await;
+
+    let Some(token) = roast_exploit_token(hash_value, username, domain) else {
+        return;
+    };
+    if let Err(e) = dispatcher
+        .state
+        .mark_exploited(&dispatcher.queue, &token)
+        .await
+    {
+        warn!(
+            err = %e,
+            vuln_id = %token,
+            "Failed to mark roast hash as exploited"
+        );
+    } else {
+        info!(
+            vuln_id = %token,
+            account = %username,
+            domain = %domain,
+            "Kerberos roast hash captured — emitted exploit token"
+        );
+    }
+}
+
 /// True when `s` is a dotted-quad IPv4 literal (four all-digit segments).
 /// Used to reject a finding `target` that names the DC IP rather than the
 /// affected account.
@@ -1758,6 +1818,7 @@ pub(crate) fn extract_asrep_roastable_users(payload: &Value, default_domain: &st
                         .to_string(),
                 is_admin: false,
                 source: "asrep_roastable_finding".to_string(),
+                member_of: Vec::new(),
             });
         }
     }
@@ -2310,7 +2371,7 @@ pub(crate) async fn extract_discoveries(
         match dispatcher.state.publish_hash(&dispatcher.queue, hash).await {
             Ok(true) => {
                 debug!("Published new hash from result");
-                create_hash_timeline_event(
+                credit_published_hash(
                     dispatcher,
                     &username,
                     &domain,
@@ -2319,38 +2380,6 @@ pub(crate) async fn extract_discoveries(
                     &source,
                 )
                 .await;
-
-                emit_gmsa_exploit_token_if_gmsa(&dispatcher.state, &dispatcher.queue, &username)
-                    .await;
-
-                // AS-REP / Kerberoast primitive credit on hash capture.
-                // dreadgoad's scoreboard otherwise infers `asrep_roast` /
-                // `kerberoast` from the cracked-credential hint, which only
-                // fires AFTER the hash crack succeeds. The crack may fail
-                // (insufficient wordlist coverage, AES instead of RC4) yet
-                // the capture itself already proves the primitive. Emit the
-                // token at capture time so credit is independent of crack
-                // outcome.
-                if let Some(token) = roast_exploit_token(&hash_value, &username, &domain) {
-                    if let Err(e) = dispatcher
-                        .state
-                        .mark_exploited(&dispatcher.queue, &token)
-                        .await
-                    {
-                        warn!(
-                            err = %e,
-                            vuln_id = %token,
-                            "Failed to mark roast hash as exploited"
-                        );
-                    } else {
-                        info!(
-                            vuln_id = %token,
-                            account = %username,
-                            domain = %domain,
-                            "Kerberos roast hash captured — emitted exploit token"
-                        );
-                    }
-                }
             }
             Ok(false) => {}
             Err(e) => warn!(err = %e, "Failed to publish hash"),

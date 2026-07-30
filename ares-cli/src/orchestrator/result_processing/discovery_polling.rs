@@ -33,7 +33,7 @@ pub async fn discovery_poller(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
     }
 }
 
-async fn poll_discoveries(dispatcher: &Dispatcher) -> Result<()> {
+async fn poll_discoveries(dispatcher: &Arc<Dispatcher>) -> Result<()> {
     let key = dispatcher.state.discovery_key().await;
     let mut conn = dispatcher.queue.connection();
     let discoveries: Vec<String> = conn.lrange(&key, 0, -1).await.unwrap_or_default();
@@ -128,7 +128,25 @@ async fn poll_discoveries(dispatcher: &Dispatcher) -> Result<()> {
                         hash.attack_step = step;
                         drop(state);
                     }
-                    let _ = dispatcher.state.publish_hash(&dispatcher.queue, hash).await;
+                    let username = hash.username.clone();
+                    let domain = hash.domain.clone();
+                    let hash_type = hash.hash_type.clone();
+                    let hash_value = hash.hash_value.clone();
+                    let source = hash.source.clone();
+                    if matches!(
+                        dispatcher.state.publish_hash(&dispatcher.queue, hash).await,
+                        Ok(true)
+                    ) {
+                        super::credit_published_hash(
+                            dispatcher,
+                            &username,
+                            &domain,
+                            &hash_type,
+                            &hash_value,
+                            &source,
+                        )
+                        .await;
+                    }
                 }
             }
             "vulnerability" | "delegation" => {

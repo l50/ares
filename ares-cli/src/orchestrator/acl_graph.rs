@@ -114,6 +114,42 @@ fn detail_str(vuln: &ares_core::models::VulnerabilityInfo, keys: &[&str]) -> Str
 }
 
 /// Lift the ACL-typed vulnerabilities in `state` into graph edges.
+/// Members of `group_name` derived from enumerated `memberOf`, lowercased.
+///
+/// The BloodHound collector parser is the only other producer of
+/// `source_members`, and BloodHound almost never runs — so without this an ACE
+/// granted to a group named a principal nothing could authenticate as, and the
+/// edge was undispatchable by both ACL drivers.
+///
+/// Matches the `memberOf` value either whole or on its leading `CN=` RDN, since
+/// LDAP returns full distinguished names while ACL edges carry bare names.
+fn members_from_ldap(state: &StateInner, group_name: &str) -> Vec<String> {
+    let wanted = group_name.trim().to_lowercase();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    let mut members: Vec<String> = state
+        .users
+        .iter()
+        .filter(|u| {
+            u.member_of.iter().any(|g| {
+                let g = g.trim().to_lowercase();
+                g == wanted
+                    || g.split(',')
+                        .next()
+                        .and_then(|rdn| rdn.strip_prefix("cn="))
+                        .is_some_and(|cn| cn == wanted)
+            })
+        })
+        .map(|u| u.username.to_lowercase())
+        .collect();
+
+    members.sort();
+    members.dedup();
+    members
+}
+
 pub(crate) fn build_edges(state: &StateInner) -> Vec<AclEdge> {
     let mut edges: Vec<AclEdge> = state
         .discovered_vulnerabilities
@@ -128,7 +164,7 @@ pub(crate) fn build_edges(state: &StateInner) -> Vec<AclEdge> {
             }
             let domain = detail_str(v, &["domain", "source_domain"]);
             let source_domain = detail_str(v, &["source_domain", "domain"]);
-            let source_members = v
+            let source_members: Vec<String> = v
                 .details
                 .get("source_members")
                 .and_then(|m| m.as_array())
@@ -139,6 +175,11 @@ pub(crate) fn build_edges(state: &StateInner) -> Vec<AclEdge> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let source_members = if source_members.is_empty() {
+                members_from_ldap(state, &source)
+            } else {
+                source_members
+            };
             Some(AclEdge {
                 vuln_id: v.vuln_id.clone(),
                 right: v.vuln_type.to_lowercase(),
@@ -270,6 +311,44 @@ fn owned_principals(state: &StateInner) -> HashSet<String> {
     passwords.chain(hashes).chain(tickets).collect()
 }
 
+/// True for Kerberos roast material (TGS-REP / AS-REP), by hash value or type.
+///
+/// Deliberately disjoint from [`is_usable_hash`]: roast tickets are not an
+/// authenticating hash type, so the worker cannot inject them, and a principal
+/// known only by one is not "owned".
+fn is_roastable_hash(hash: &ares_core::models::Hash) -> bool {
+    let value = hash.hash_value.to_lowercase();
+    if value.contains("$krb5tgs$") || value.contains("$krb5asrep$") {
+        return true;
+    }
+    matches!(
+        hash.hash_type.to_lowercase().as_str(),
+        "kerberoast" | "krb5tgs" | "tgs-rep" | "tgs" | "asrep" | "as-rep" | "krb5asrep"
+    )
+}
+
+/// Principals holding uncracked roast material — one hashcat run from a
+/// plaintext, lowercased.
+///
+/// These seed chain construction but never satisfy a dispatch. Seeding here is
+/// what lets a chain exist *before* the DCSync that is otherwise the only source
+/// of its root principal: empirically every ACL success in the corpus landed
+/// after Domain Admin, because a chain rooted at a principal recoverable only
+/// from NTDS cannot be built until NTDS has already been dumped.
+///
+/// Safe because `collect_acl_chain_work` resolves each step's principal and
+/// abandons the chain when no usable material exists yet, so a chain rooted here
+/// simply waits for the crack instead of dispatching a doomed step.
+pub(crate) fn crackable_principals(state: &StateInner) -> HashSet<String> {
+    state
+        .hashes
+        .iter()
+        .filter(|h| is_roastable_hash(h))
+        .filter(|h| h.cracked_password.is_none())
+        .map(|h| h.username.to_lowercase())
+        .collect()
+}
+
 fn chain_id(steps: &[Value]) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -393,8 +472,10 @@ pub(crate) fn analyze(state: &StateInner) -> AclAnalysis {
     }
 
     let owned = owned_principals(state);
-    let mut privileged: Vec<(usize, String, Value)> = Vec::new();
-    let mut unprivileged: Vec<(String, Value)> = Vec::new();
+    let crackable = crackable_principals(state);
+    let seeds: HashSet<String> = owned.union(&crackable).cloned().collect();
+    let mut privileged: Vec<(usize, usize, String, Value)> = Vec::new();
+    let mut unprivileged: Vec<(usize, String, Value)> = Vec::new();
     let mut seen_chains: HashSet<String> = HashSet::new();
 
     let mut by_principal: HashMap<String, Vec<&AclEdge>> = HashMap::new();
@@ -404,7 +485,7 @@ pub(crate) fn analyze(state: &StateInner) -> AclAnalysis {
         }
     }
 
-    let mut starts: Vec<&String> = owned.iter().collect();
+    let mut starts: Vec<&String> = seeds.iter().collect();
     starts.sort();
 
     for start in starts {
@@ -413,12 +494,15 @@ pub(crate) fn analyze(state: &StateInner) -> AclAnalysis {
             if !seen_chains.insert(id.clone()) {
                 continue;
             }
+            let root_owned = owned.contains(start);
             privileged.push((
+                usize::from(!root_owned),
                 hops,
                 id.clone(),
                 json!({
                     "chain_id": id,
                     "reaches_privileged": true,
+                    "root_owned": root_owned,
                     "hops": hops,
                     "terminal": terminal,
                     "steps": steps,
@@ -433,7 +517,7 @@ pub(crate) fn analyze(state: &StateInner) -> AclAnalysis {
         }
         let Some(principal) = edge_principals(edge)
             .into_iter()
-            .find(|p| owned.contains(p))
+            .find(|p| seeds.contains(p))
         else {
             continue;
         };
@@ -444,11 +528,14 @@ pub(crate) fn analyze(state: &StateInner) -> AclAnalysis {
         if !seen_chains.insert(id.clone()) {
             continue;
         }
+        let root_owned = owned.contains(&principal);
         unprivileged.push((
+            usize::from(!root_owned),
             id.clone(),
             json!({
                 "chain_id": id,
                 "reaches_privileged": false,
+                "root_owned": root_owned,
                 "hops": 1,
                 "terminal": Value::Null,
                 "steps": steps,
@@ -456,13 +543,17 @@ pub(crate) fn analyze(state: &StateInner) -> AclAnalysis {
         ));
     }
 
-    privileged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    unprivileged.sort_by(|a, b| a.0.cmp(&b.0));
+    privileged.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    unprivileged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     let chains: Vec<Value> = privileged
         .into_iter()
-        .map(|(_, _, v)| v)
-        .chain(unprivileged.into_iter().map(|(_, v)| v))
+        .map(|(_, _, _, v)| v)
+        .chain(unprivileged.into_iter().map(|(_, _, v)| v))
         .take(MAX_CHAINS)
         .collect();
 
@@ -565,12 +656,202 @@ mod tests {
         s
     }
 
+    fn user_in(username: &str, groups: &[&str]) -> ares_core::models::User {
+        ares_core::models::User {
+            username: username.into(),
+            domain: "contoso.local".into(),
+            description: String::new(),
+            is_admin: false,
+            source: "ldap_enumeration".into(),
+            member_of: groups.iter().map(|g| (*g).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn ldap_membership_makes_a_group_sourced_edge_dispatchable() {
+        let mut s = state_with(
+            vec![edge_vuln_typed(
+                "acl_addmember_smallcouncil_dragonstone",
+                "addmember",
+                "Small Council",
+                "DragonStone",
+                "Group",
+                &[],
+            )],
+            vec![cred("alice", "contoso.local", false)],
+        );
+        s.users.push(user_in("alice", &["Small Council"]));
+
+        let edges = build_edges(&s);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source_members, vec!["alice".to_string()]);
+        assert!(edge_principals(&edges[0]).contains(&"alice".to_string()));
+
+        let a = analyze(&s);
+        assert_eq!(a.chains.len(), 1, "group-sourced edge must yield a chain");
+    }
+
+    #[test]
+    fn membership_matches_a_distinguished_name() {
+        let mut s = state_with(
+            vec![edge_vuln_typed(
+                "acl_addmember_smallcouncil_dragonstone",
+                "addmember",
+                "Small Council",
+                "DragonStone",
+                "Group",
+                &[],
+            )],
+            vec![],
+        );
+        s.users.push(user_in(
+            "bob",
+            &["CN=Small Council,OU=Groups,DC=contoso,DC=local"],
+        ));
+
+        assert_eq!(build_edges(&s)[0].source_members, vec!["bob".to_string()]);
+    }
+
+    #[test]
+    fn bloodhound_supplied_members_are_not_overwritten() {
+        let s = state_with(
+            vec![edge_vuln_typed(
+                "acl_addmember_smallcouncil_dragonstone",
+                "addmember",
+                "Small Council",
+                "DragonStone",
+                "Group",
+                &["carol"],
+            )],
+            vec![],
+        );
+
+        assert_eq!(build_edges(&s)[0].source_members, vec!["carol".to_string()]);
+    }
+
+    #[test]
+    fn non_members_do_not_leak_into_an_edge() {
+        let mut s = state_with(
+            vec![edge_vuln_typed(
+                "acl_addmember_smallcouncil_dragonstone",
+                "addmember",
+                "Small Council",
+                "DragonStone",
+                "Group",
+                &[],
+            )],
+            vec![],
+        );
+        s.users.push(user_in("dave", &["Domain Users"]));
+
+        assert!(build_edges(&s)[0].source_members.is_empty());
+    }
+
     #[test]
     fn empty_state_produces_no_chains() {
         let s = StateInner::new("op".into());
         let a = analyze(&s);
         assert!(a.chains.is_empty());
         assert!(a.hops_to_terminal.is_empty());
+    }
+
+    fn roast_hash(username: &str, ticket: &str) -> ares_core::models::Hash {
+        let mut h = hash_for(username, "contoso.local", "kerberoast");
+        h.hash_value = ticket.into();
+        h
+    }
+
+    #[test]
+    fn roastable_hash_is_not_owned_but_is_crackable() {
+        let mut s = state_with(vec![], vec![]);
+        s.hashes
+            .push(roast_hash("bob", "$krb5tgs$23$*bob$CONTOSO.LOCAL*"));
+
+        assert!(!owned_principals(&s).contains("bob"));
+        assert!(crackable_principals(&s).contains("bob"));
+    }
+
+    #[test]
+    fn asrep_and_type_keyed_roast_material_both_count() {
+        let mut s = state_with(vec![], vec![]);
+        s.hashes
+            .push(roast_hash("bob", "$krb5asrep$23$bob@CONTOSO.LOCAL"));
+        let mut typed = hash_for("carol", "contoso.local", "asrep");
+        typed.hash_value = "opaque".into();
+        s.hashes.push(typed);
+
+        let crackable = crackable_principals(&s);
+        assert!(crackable.contains("bob"));
+        assert!(crackable.contains("carol"));
+    }
+
+    #[test]
+    fn already_cracked_roast_material_is_not_a_speculative_seed() {
+        let mut s = state_with(vec![], vec![]);
+        let mut h = roast_hash("bob", "$krb5tgs$23$*bob$CONTOSO.LOCAL*");
+        h.cracked_password = Some("P@ssw0rd!".into());
+        s.hashes.push(h);
+
+        assert!(!crackable_principals(&s).contains("bob"));
+    }
+
+    #[test]
+    fn chain_is_built_from_an_uncracked_roast_principal() {
+        let mut s = state_with(
+            vec![edge_vuln_typed(
+                "acl_genericall_bob_da",
+                "genericall",
+                "bob",
+                "Domain Admins",
+                "Group",
+                &[],
+            )],
+            vec![],
+        );
+        s.hashes
+            .push(roast_hash("bob", "$krb5tgs$23$*bob$CONTOSO.LOCAL*"));
+
+        let a = analyze(&s);
+
+        assert_eq!(a.chains.len(), 1, "chain should exist before the crack");
+        assert_eq!(a.chains[0]["reaches_privileged"], true);
+        assert_eq!(a.chains[0]["root_owned"], false);
+    }
+
+    #[test]
+    fn owned_rooted_chains_outrank_speculative_ones() {
+        let mut s = state_with(
+            vec![
+                edge_vuln_typed(
+                    "acl_genericall_bob_da",
+                    "genericall",
+                    "bob",
+                    "Domain Admins",
+                    "Group",
+                    &[],
+                ),
+                edge_vuln_typed(
+                    "acl_genericall_alice_ea",
+                    "genericall",
+                    "alice",
+                    "Enterprise Admins",
+                    "Group",
+                    &[],
+                ),
+            ],
+            vec![cred("alice", "contoso.local", false)],
+        );
+        s.hashes
+            .push(roast_hash("bob", "$krb5tgs$23$*bob$CONTOSO.LOCAL*"));
+
+        let a = analyze(&s);
+
+        assert_eq!(a.chains.len(), 2);
+        assert_eq!(
+            a.chains[0]["root_owned"], true,
+            "an actionable chain must not be displaced by a speculative one"
+        );
+        assert_eq!(a.chains[1]["root_owned"], false);
     }
 
     #[test]
@@ -660,7 +941,8 @@ mod tests {
         s.hashes.push(hash_for("alice", "contoso.local", "AS-REP"));
         let a = analyze(&s);
         assert_eq!(a.rank_of("acl_genericall_alice_da"), 1);
-        assert!(a.chains.is_empty());
+        assert!(!owned_principals(&s).contains("alice"));
+        assert!(a.chains.iter().all(|c| c["root_owned"] == false));
     }
 
     #[test]

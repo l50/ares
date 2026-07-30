@@ -1710,12 +1710,31 @@ mod emit_gmsa_exploit_token {
     }
 
     #[tokio::test]
-    async fn marks_exploited_for_gmsa_principal() {
+    async fn marks_exploited_for_gmsa_principal_read_by_a_gmsa_tool() {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
-        emit_gmsa_exploit_token_if_gmsa(&state, &q, "gmsaDragon$").await;
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "gmsaDragon$", "gmsa_dump_passwords").await;
         let s = state.read().await;
         assert!(s.exploited_vulnerabilities.contains("gmsa_gmsadragon"));
+    }
+
+    #[tokio::test]
+    async fn marks_exploited_for_bloodyad_managed_password_read() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "gmsaDragon$", "gmsa_read_password_bloodyad")
+            .await;
+        let s = state.read().await;
+        assert!(s.exploited_vulnerabilities.contains("gmsa_gmsadragon"));
+    }
+
+    #[tokio::test]
+    async fn no_op_for_gmsa_hash_arriving_from_dcsync() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "gmsaDragon$", "secretsdump").await;
+        let s = state.read().await;
+        assert!(s.exploited_vulnerabilities.is_empty());
     }
 
     #[tokio::test]
@@ -1723,7 +1742,7 @@ mod emit_gmsa_exploit_token {
         // DC01$ ends with `$` but is not a gMSA — no token should be emitted.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
-        emit_gmsa_exploit_token_if_gmsa(&state, &q, "DC01$").await;
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "DC01$", "gmsa_dump_passwords").await;
         let s = state.read().await;
         assert!(s.exploited_vulnerabilities.is_empty());
     }
@@ -1732,7 +1751,7 @@ mod emit_gmsa_exploit_token {
     async fn no_op_for_regular_user() {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
-        emit_gmsa_exploit_token_if_gmsa(&state, &q, "alice").await;
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "alice", "gmsa_dump_passwords").await;
         let s = state.read().await;
         assert!(s.exploited_vulnerabilities.is_empty());
     }
@@ -1741,7 +1760,7 @@ mod emit_gmsa_exploit_token {
     async fn token_normalized_lowercase_for_mixed_case_input() {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
-        emit_gmsa_exploit_token_if_gmsa(&state, &q, "GMSA_WEB$").await;
+        emit_gmsa_exploit_token_if_gmsa(&state, &q, "GMSA_WEB$", "gmsa_dump_passwords").await;
         let s = state.read().await;
         assert!(s.exploited_vulnerabilities.contains("gmsa_gmsa_web"));
     }
@@ -2429,6 +2448,7 @@ mod reconcile_extracted_credential_domain {
             description: String::new(),
             is_admin: false,
             source: "kerberos_enum".to_string(),
+            member_of: Vec::new(),
         }
     }
 
@@ -2505,6 +2525,7 @@ mod reconcile_low_trust_credential_domain {
             description: String::new(),
             is_admin: false,
             source: "kerberos_enum".to_string(),
+            member_of: Vec::new(),
         }
     }
 
@@ -3202,4 +3223,66 @@ fn asrep_finding_multiple_findings_all_recovered() {
     assert_eq!(users[0].domain, "contoso.local");
     assert_eq!(users[1].username, "bob");
     assert_eq!(users[1].domain, "fabrikam.local");
+}
+
+// ── Hash-credit convergence ─────────────────────────────────────────────────
+//
+// Two paths publish hashes — the parser path in `mod.rs` and the realtime
+// discovery channel in `discovery_polling.rs` — and for the whole life of the
+// corpus they did different amounts of work on success. The realtime channel
+// emitted no timeline event (so `T1558.004` appears zero times in 92 ops
+// despite 145 AS-REP captures), and after that was fixed it still emitted no
+// roast or gMSA exploit token. `credit_published_hash` is the single place all
+// three steps live; these tests fail if a path starts doing its own thing
+// again. Read as source-level parity guards, not behaviour tests — the
+// behaviour needs a live `Dispatcher`, which this module cannot build.
+
+/// Source of the realtime discovery channel, read at compile time.
+const DISCOVERY_POLLING_SRC: &str = include_str!("discovery_polling.rs");
+
+/// Source of the parser path.
+const RESULT_PROCESSING_SRC: &str = include_str!("mod.rs");
+
+#[test]
+fn realtime_hash_publish_routes_through_the_shared_credit_helper() {
+    assert!(
+        DISCOVERY_POLLING_SRC.contains("credit_published_hash("),
+        "the realtime channel stopped routing hash credit through the shared helper"
+    );
+}
+
+#[test]
+fn realtime_hash_publish_does_not_hand_roll_part_of_the_credit() {
+    for partial in [
+        "create_hash_timeline_event(",
+        "emit_gmsa_exploit_token_if_gmsa(",
+        "roast_exploit_token(",
+    ] {
+        assert!(
+            !DISCOVERY_POLLING_SRC.contains(partial),
+            "the realtime channel calls {partial} directly — that is the drift \
+             that lost AS-REP attribution and roast credit; call \
+             credit_published_hash instead"
+        );
+    }
+}
+
+#[test]
+fn every_hash_credit_step_lives_in_the_shared_helper() {
+    assert!(
+        RESULT_PROCESSING_SRC.contains("pub(crate) async fn credit_published_hash("),
+        "credit_published_hash moved or was renamed"
+    );
+
+    for step in [
+        "create_hash_timeline_event(",
+        "emit_gmsa_exploit_token_if_gmsa(",
+        "roast_exploit_token(",
+    ] {
+        let calls = RESULT_PROCESSING_SRC.matches(step).count();
+        assert!(
+            calls > 0,
+            "{step} vanished from the credit path entirely — hash credit is now incomplete"
+        );
+    }
 }
