@@ -1175,8 +1175,8 @@ async fn record_state(context: &str, tool: &str, args: &serde_json::Value) {
 /// would be silently rejected, and satisfying the check by injecting a
 /// synthetic query result would hollow out a safeguard that exists to stop
 /// fabricated IOCs. The technique-level record in [`record_fired`] already
-/// carries the rule's MITRE ID (its value is the ID, which auto-grounds); this
-/// adds the names an analyst needs to pivot on.
+/// carries the rule's MITRE ID (grounded there by the fired detection itself);
+/// this adds the names an analyst needs to pivot on.
 ///
 /// The enumeration is capped, and the cap is logged rather than applied
 /// silently — a truncated list that looks complete would understate the blast
@@ -1235,9 +1235,15 @@ async fn record_orphan_accounts(
 /// Record a fired detection as blue-team state: a MITRE technique (for coverage
 /// scoring + the report technique table), a TTP-level evidence item (for
 /// evidence count, pyramid, precision, and evidence-based chaining), and a
-/// timeline event (for the narrative + timeline scoring). The evidence value is
-/// the MITRE ID, which auto-validates the grounding check.
+/// timeline event (for the narrative + timeline scoring).
+///
+/// The evidence value is the MITRE ID, which grounds only once registered. This
+/// function is the single funnel for every sweep-confirmed detection — catalog
+/// templates and the Rust-side ticket correlations alike — so it registers here
+/// rather than relying on the catalog runner, which the correlation rules never
+/// go through.
 async fn record_fired(investigation_id: &str, f: &FiredDetection) {
+    ares_tools::blue::evidence_validator::register_grounded_technique(&f.mitre_id);
     let confidence = confidence_for_severity(&f.severity);
     let observed_at = f
         .first_event_at
