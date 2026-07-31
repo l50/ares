@@ -28,6 +28,7 @@ pub(crate) mod exploitation;
 mod llm_runner;
 mod monitoring;
 pub(crate) mod output_extraction;
+pub(crate) mod proposals;
 pub(crate) mod recovery;
 mod result_processing;
 mod results;
@@ -504,6 +505,10 @@ async fn run_inner() -> Result<()> {
         llm_runner::RoleProvider,
     > = std::collections::HashMap::new();
     let role_yaml_names: &[(ares_llm::tool_registry::AgentRole, &str)] = &[
+        (
+            ares_llm::tool_registry::AgentRole::Orchestrator,
+            "orchestrator",
+        ),
         (ares_llm::tool_registry::AgentRole::Recon, "recon"),
         (
             ares_llm::tool_registry::AgentRole::CredentialAccess,
@@ -702,6 +707,19 @@ async fn run_inner() -> Result<()> {
         config.clone(),
         shutdown_rx.clone(),
     );
+
+    let proposal_sweeper_handle = if proposals::mediation_enabled() {
+        info!(
+            window_secs = dispatcher.proposals.window().as_secs(),
+            "Orchestrator mediation ENABLED — automation dispatch routes through the orchestrator"
+        );
+        Some(proposals::spawn_proposal_sweeper(
+            dispatcher.clone(),
+            shutdown_rx.clone(),
+        ))
+    } else {
+        None
+    };
 
     let cost_handle = spawn_cost_summary(queue.clone(), config.clone(), shutdown_rx.clone());
 
@@ -1058,6 +1076,9 @@ async fn run_inner() -> Result<()> {
                 completion_handle,
             );
             for h in auto_handles {
+                let _ = h.await;
+            }
+            if let Some(h) = proposal_sweeper_handle {
                 let _ = h.await;
             }
             if let Some((h, auto)) = blue_handle {

@@ -1586,7 +1586,10 @@ pub(crate) fn reconcile_extracted_credential_domain(
     let user_lc = username.to_lowercase();
     let mut domains: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for u in users {
-        if u.username.to_lowercase() == user_lc && !u.domain.is_empty() {
+        if u.username.to_lowercase() == user_lc
+            && !u.domain.is_empty()
+            && !user_source_is_model_authored(&u.source)
+        {
             domains.insert(u.domain.to_lowercase());
         }
     }
@@ -1598,6 +1601,10 @@ pub(crate) fn reconcile_extracted_credential_domain(
         return None;
     }
     Some(only)
+}
+
+pub(crate) fn user_source_is_model_authored(source: &str) -> bool {
+    matches!(source, "asrep_roastable_finding")
 }
 
 fn is_low_trust_realm_inferred_credential_source(source: &str) -> bool {
