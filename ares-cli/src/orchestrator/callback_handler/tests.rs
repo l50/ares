@@ -65,7 +65,10 @@ async fn unknown_tool_returns_none() {
         name: "nmap_scan".into(),
         arguments: json!({}),
     };
-    assert!(handler.handle_callback(&call).await.is_none());
+    assert!(handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -90,7 +93,11 @@ async fn operation_summary() {
         name: "get_operation_summary".into(),
         arguments: json!({}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -123,7 +130,11 @@ async fn all_credentials_pagination() {
         name: "list_credentials".into(),
         arguments: json!({"limit": 3, "offset": 2}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -182,7 +193,11 @@ async fn full_summary_with_populated_state() {
         name: "get_operation_summary".into(),
         arguments: json!({}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             let p: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -205,7 +220,11 @@ async fn record_credential_disabled() {
         name: "record_credential".into(),
         arguments: json!({"username": "admin", "password": "pass", "domain": "contoso.local"}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             assert!(msg.contains("disabled"));
@@ -223,7 +242,11 @@ async fn record_timeline_event_disabled() {
         name: "record_timeline_event".into(),
         arguments: json!({"event": "some event"}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             assert!(msg.contains("disabled"));
@@ -245,7 +268,10 @@ async fn report_cracked_credential_falls_through_to_builtin_handler() {
             "password": "secret123",
         }),
     };
-    assert!(handler.handle_callback(&call).await.is_none());
+    assert!(handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -264,7 +290,11 @@ async fn list_credentials_delegates_to_get_all() {
         name: "list_credentials".into(),
         arguments: json!({}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -296,7 +326,11 @@ async fn all_credentials_zero_offset_default_limit() {
         name: "list_credentials".into(),
         arguments: json!({}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -317,7 +351,11 @@ async fn operation_summary_empty_state() {
         name: "get_operation_summary".into(),
         arguments: json!({}),
     };
-    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
     match result {
         CallbackResult::Continue(msg) => {
             let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -332,9 +370,8 @@ async fn operation_summary_empty_state() {
 }
 
 #[tokio::test]
-async fn orchestrator_tools_are_trapped_but_never_executed() {
-    let handler = make_handler();
-    let retired = [
+async fn orchestrator_tools_never_reach_a_worker_queue() {
+    for tool in [
         "dispatch_recon",
         "dispatch_credential_access",
         "dispatch_lateral_movement",
@@ -345,26 +382,29 @@ async fn orchestrator_tools_are_trapped_but_never_executed() {
         "get_credential_summary",
         "get_hash_summary",
         "get_all_hashes",
-        "get_hash_value",
         "get_pending_tasks",
         "get_agent_status",
-    ];
-
-    for tool in &retired {
+    ] {
         assert!(
             ares_llm::tool_registry::is_callback_tool(tool),
-            "{tool} must stay trapped in-process so it is never sent to a worker"
-        );
-        let call = ToolCall {
-            id: format!("retired-{tool}"),
-            name: tool.to_string(),
-            arguments: json!({"username": "alice", "domain": "contoso.local", "target_ip": "192.168.58.10"}),
-        };
-        assert!(
-            handler.handle_callback(&call).await.is_none(),
-            "{tool} must not be routed to a live handler"
+            "{tool} must route in-process so it is never sent to a worker"
         );
     }
+}
+
+#[tokio::test]
+async fn get_hash_value_stays_retired() {
+    let handler = make_handler();
+    assert!(ares_llm::tool_registry::is_callback_tool("get_hash_value"));
+    let call = ToolCall {
+        id: "retired-get_hash_value".into(),
+        name: "get_hash_value".into(),
+        arguments: json!({"username": "alice", "domain": "contoso.local"}),
+    };
+    assert!(handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -377,8 +417,108 @@ async fn universal_reporting_tools_still_route() {
             arguments: json!({}),
         };
         assert!(
-            handler.handle_callback(&call).await.is_some(),
+            handler
+                .handle_callback(&call, "orchestrator")
+                .await
+                .is_some(),
             "{tool} is offered to every role and must still be handled"
         );
+    }
+}
+
+#[tokio::test]
+async fn worker_role_cannot_dispatch_work() {
+    let handler = make_handler();
+    for tool in [
+        "dispatch_recon",
+        "dispatch_credential_access",
+        "dispatch_lateral_movement",
+        "dispatch_privesc_exploit",
+        "dispatch_coercion",
+        "dispatch_crack",
+    ] {
+        let call = ToolCall {
+            id: "w-1".into(),
+            name: tool.into(),
+            arguments: json!({"target_ip": "192.168.58.10", "domain": "contoso.local"}),
+        };
+        let result = handler
+            .handle_callback(&call, "recon")
+            .await
+            .unwrap_or_else(|| panic!("{tool} must be intercepted, not passed through"))
+            .unwrap();
+        match result {
+            CallbackResult::Continue(msg) => {
+                assert!(
+                    msg.contains("not the orchestrator"),
+                    "{tool} must be refused for a worker, got: {msg}"
+                );
+            }
+            other => panic!("{tool} must return Continue, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_role_cannot_end_the_operation() {
+    let handler = make_handler();
+    let call = ToolCall {
+        id: "w-2".into(),
+        name: "complete_operation".into(),
+        arguments: json!({"summary": "all done"}),
+    };
+    let result = handler
+        .handle_callback(&call, "privesc")
+        .await
+        .unwrap()
+        .unwrap();
+    match result {
+        CallbackResult::Continue(msg) => assert!(msg.contains("not the orchestrator")),
+        other => panic!("Expected Continue, got {other:?}"),
+    }
+    assert!(
+        !handler.state.read().await.completed,
+        "a worker must not be able to set the completion flag"
+    );
+}
+
+#[tokio::test]
+async fn orchestrator_completing_sets_the_state_flag() {
+    let handler = make_handler();
+    assert!(!handler.state.read().await.completed);
+
+    let call = ToolCall {
+        id: "o-1".into(),
+        name: "complete_operation".into(),
+        arguments: json!({"summary": "krbtgt extracted in every forest"}),
+    };
+    let result = handler
+        .handle_callback(&call, "orchestrator")
+        .await
+        .unwrap()
+        .unwrap();
+    match result {
+        CallbackResult::Continue(msg) => assert!(msg.contains("marked complete")),
+        other => panic!("Expected Continue, got {other:?}"),
+    }
+    assert!(handler.state.read().await.completed);
+}
+
+#[tokio::test]
+async fn worker_role_may_still_query_state() {
+    let handler = make_handler();
+    let call = ToolCall {
+        id: "w-3".into(),
+        name: "get_operation_summary".into(),
+        arguments: json!({}),
+    };
+    let result = handler
+        .handle_callback(&call, "lateral")
+        .await
+        .unwrap()
+        .unwrap();
+    match result {
+        CallbackResult::Continue(msg) => assert!(msg.contains("operation_id")),
+        other => panic!("Expected Continue, got {other:?}"),
     }
 }

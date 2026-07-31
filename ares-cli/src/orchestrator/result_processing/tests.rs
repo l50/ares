@@ -2650,6 +2650,49 @@ mod reconcile_extracted_credential_domain {
         }
     }
 
+    fn user_from(username: &str, domain: &str, source: &str) -> User {
+        User {
+            source: source.to_string(),
+            ..user(username, domain)
+        }
+    }
+
+    #[test]
+    fn a_model_authored_user_cannot_rewrite_a_parser_credential_realm() {
+        let users = vec![user_from(
+            "alice",
+            "fabrikam.local",
+            "asrep_roastable_finding",
+        )];
+        assert_eq!(
+            reconcile_extracted_credential_domain(&users, "alice", "contoso.local"),
+            None,
+            "report_finding is a model assertion and must not repoint a parsed credential"
+        );
+    }
+
+    #[test]
+    fn a_parser_derived_user_still_corrects_the_realm() {
+        let users = vec![user_from("alice", "child.contoso.local", "ldap_extraction")];
+        assert_eq!(
+            reconcile_extracted_credential_domain(&users, "alice", "contoso.local"),
+            Some("child.contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn a_model_authored_user_does_not_mask_a_parser_derived_one() {
+        let users = vec![
+            user_from("alice", "fabrikam.local", "asrep_roastable_finding"),
+            user_from("alice", "child.contoso.local", "ldap_extraction"),
+        ];
+        assert_eq!(
+            reconcile_extracted_credential_domain(&users, "alice", "contoso.local"),
+            Some("child.contoso.local".to_string()),
+            "the model-authored row must be ignored, not treated as an ambiguity"
+        );
+    }
+
     #[test]
     fn corrects_when_username_unique_in_other_domain() {
         let users = vec![user("alice", "child.contoso.local")];
