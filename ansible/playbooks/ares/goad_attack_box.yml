@@ -99,12 +99,13 @@
     privesc_tools_install_nopac: true
     privesc_tools_install_printnightmare: true
 
-    # Provisioned attacker-side with no ares dispatch path today — GAPS.md §5.8
-    # is the pending work to wire them up (transfer to target, execute under an
-    # unprivileged foothold, journal for cleanup on op wrap). Kept staged so
-    # that work does not also need a second AMI rebake. If you land a code
-    # path for any of these, promote it to the group above and mark it closed
-    # in §5.8 so the grouping stays honest.
+    # Provisioned attacker-side with no ares dispatch path today. Wiring them
+    # up requires an unprivileged on-target execution primitive (webshell,
+    # linked-server xp_cmdshell as service account, or non-admin WinRM/RDP), a
+    # remote file-transfer primitive, and a cleanup arm that removes the
+    # dropped PE on op wrap. Kept staged so that work does not also need a
+    # second AMI rebake. If you land a code path for any of these, promote it
+    # to the group above so the grouping stays honest.
     privesc_tools_install_printspoofer: true
     privesc_tools_install_godpotato: true
     privesc_tools_install_sweetpotato: true
