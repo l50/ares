@@ -83,6 +83,62 @@ impl UndoPlan {
     }
 }
 
+/// Revert a password reset by writing the victim's original NT hash back.
+///
+/// `Clean` only when the write-ahead capture recorded a `prior_nt_hash`. The
+/// plaintext is unrecoverable either way — `unicodePwd` destroyed it — but the
+/// hash is the account's actual credential material, so restoring it returns
+/// the account to a state indistinguishable from before the reset.
+///
+/// Without a captured hash there is nothing to put back, and the honest plan
+/// names the account and the value it now holds so an operator can re-provision
+/// it. That is strictly better than the previous note, which described a
+/// baseline-reset mechanism that has never existed.
+fn password_reset_plan(record: &MutationRecord) -> UndoPlan {
+    let a = &record.args;
+    let target = astr(a, "target_user").unwrap_or("<unknown>");
+    let prior = record
+        .hint
+        .as_ref()
+        .and_then(|h| h.get("prior_nt_hash"))
+        .and_then(Value::as_str);
+
+    match prior {
+        Some(nt) => {
+            let mut inverse = serde_json::Map::new();
+            for key in ["domain", "dc_ip", "target_user"] {
+                if let Some(v) = a.get(key) {
+                    inverse.insert(key.to_string(), v.clone());
+                }
+            }
+            inverse.insert("nt_hash".to_string(), Value::String(nt.to_string()));
+            UndoPlan {
+                class: Reversibility::Clean,
+                inverse: Some(("restore_password_hash".into(), Value::Object(inverse))),
+                validate: None,
+                note: format!(
+                    "restore {target}'s original NT hash over SAMR — the plaintext is gone, \
+                     but the credential material is what the account is actually keyed on"
+                ),
+            }
+        }
+        None => UndoPlan::manual(
+            Reversibility::Impossible,
+            match astr(a, "new_password") {
+                Some(pw) => format!(
+                    "no NT hash for {target} was captured before the reset, so nothing can be \
+                     put back. The account now has the password '{pw}' — re-provision it from \
+                     the range definition."
+                ),
+                None => format!(
+                    "no NT hash for {target} was captured before the reset, and the journal did \
+                     not record the value it was set to. This account needs an out-of-band reset."
+                ),
+            },
+        ),
+    }
+}
+
 /// Clone forward args and override a single key (typically `action`).
 fn with_override(args: &Value, key: &str, val: &str) -> Value {
     let mut m = args.as_object().cloned().unwrap_or_default();
@@ -364,11 +420,7 @@ pub fn undo_plan(record: &MutationRecord) -> UndoPlan {
             "delete the machine account this created — needs the account name from tool output",
         ),
 
-        // ── IMPOSSIBLE ───────────────────────────────────────────────
-        "bloodyad_set_password" => UndoPlan::manual(
-            Reversibility::Impossible,
-            "original plaintext is unknowable — optional lab-reset to a baseline password",
-        ),
+        "bloodyad_set_password" => password_reset_plan(record),
 
         _ => UndoPlan::manual(
             Reversibility::Unsupported,
@@ -653,6 +705,50 @@ mod tests {
         let p = undo_plan(&rec("bloodyad_set_password", json!({ "target": "alice" })));
         assert_eq!(p.class, Reversibility::Impossible);
         assert!(p.inverse.is_none());
+    }
+
+    #[test]
+    fn password_reset_with_captured_hash_restores_it() {
+        let mut r = rec(
+            "bloodyad_set_password",
+            json!({
+                "domain": "contoso.local",
+                "dc_ip": "192.168.58.10",
+                "target_user": "alice",
+                "new_password": "P@ssw0rd!"
+            }),
+        );
+        r.hint = Some(json!({ "prior_nt_hash": "31d6cfe0d16ae931b73c59d7e0c089c0" }));
+
+        let p = undo_plan(&r);
+        assert_eq!(
+            p.class,
+            Reversibility::Clean,
+            "a captured NT hash is exactly what makes this revertable"
+        );
+        let (tool, args) = p.inverse.expect("captured hash must yield an inverse");
+        assert_eq!(tool, "restore_password_hash");
+        assert_eq!(args["nt_hash"], "31d6cfe0d16ae931b73c59d7e0c089c0");
+        assert_eq!(args["target_user"], "alice");
+        assert_eq!(args["dc_ip"], "192.168.58.10");
+        assert!(
+            args.get("new_password").is_none(),
+            "the value we overwrote with must not ride along into the restore"
+        );
+    }
+
+    #[test]
+    fn unrestorable_password_reset_names_the_account_and_its_new_value() {
+        let p = undo_plan(&rec(
+            "bloodyad_set_password",
+            json!({ "target_user": "alice", "new_password": "P@ssw0rd!" }),
+        ));
+        assert_eq!(p.class, Reversibility::Impossible);
+        assert!(
+            p.note.contains("alice") && p.note.contains("P@ssw0rd!"),
+            "an unrevertable reset must tell the operator which account broke and what it now holds, got: {}",
+            p.note
+        );
     }
 
     #[test]

@@ -39,6 +39,32 @@ impl JournalingToolDispatcher {
     }
 }
 
+impl JournalingToolDispatcher {
+    /// Read the state a mutation is about to overwrite, before it runs.
+    ///
+    /// Best-effort in the same sense as [`journal::append`]: a Redis failure
+    /// here must never fail the tool call it is observing, so it degrades to
+    /// `None` and the revert falls back to being reported rather than
+    /// performed.
+    async fn prior_state(&self, tool: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
+        if tool != "bloodyad_set_password" {
+            return None;
+        }
+        let reader = ares_core::state::RedisStateReader::new(self.operation_id.clone());
+        let mut conn = self.conn.clone();
+        let hashes = reader.get_hashes(&mut conn).await.ok()?;
+        let hint = super::capture::prior_state_hint(tool, args, &hashes);
+        if hint.is_none() {
+            warn!(
+                tool = %tool,
+                target = args.get("target_user").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                "password reset has no prior NT hash in state — this mutation will not be revertable by teardown"
+            );
+        }
+        hint
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolDispatcher for JournalingToolDispatcher {
     async fn dispatch_tool(
@@ -51,7 +77,8 @@ impl ToolDispatcher for JournalingToolDispatcher {
         // post-hoc journal loses every mutation the process does not outlive,
         // and the worker-path timeout below is guaranteed to lose one.
         let intent = if journal::is_mutating(&call.name) {
-            let record = MutationRecord::intent(role, task_id, &call.name, &call.arguments);
+            let mut record = MutationRecord::intent(role, task_id, &call.name, &call.arguments);
+            record.hint = self.prior_state(&call.name, &call.arguments).await;
             journal::append(&self.conn, &self.operation_id, &record).await;
             Some(record)
         } else {

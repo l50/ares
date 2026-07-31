@@ -73,6 +73,62 @@ pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
     build_bloodyad_set_password(args)?.execute().await
 }
 
+/// Restore a principal's password to a known NT hash via SAMR.
+///
+/// Teardown-only, and the reason `bloodyad_set_password` can be reverted at
+/// all. `bloodyAD set password` writes `unicodePwd`, which the protocol
+/// requires to be a plaintext — so it can never put back a value it did not
+/// invent. `changepasswd -newhashes :<nt> -reset` writes the hash directly
+/// over SAMR, which restores the original account state byte for byte without
+/// anyone ever knowing the plaintext.
+///
+/// Required args: `domain`, `dc_ip`, `target_user`, `nt_hash`
+/// Auth: `username` + `password`/`hash` for a principal that can reset
+/// `target_user` — resolved fresh by teardown, never read from the journal.
+pub async fn restore_password_hash(args: &Value) -> Result<ToolOutput> {
+    build_restore_password_hash(args)?.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_restore_password_hash(args: &Value) -> Result<CommandBuilder> {
+    let domain = required_str(args, "domain")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let target_user = required_str(args, "target_user")?;
+    let nt_hash = required_str(args, "nt_hash")?;
+
+    let nt = nt_hash.rsplit(':').next().unwrap_or(nt_hash).trim();
+    if nt.len() != 32 || !nt.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "refusing to restore '{target_user}': expected a 32-hex-character NT hash, got {} \
+             characters. Writing a malformed hash would leave the account unusable with no \
+             record of the correct value.",
+            nt.len()
+        );
+    }
+
+    let auth_user = required_str(args, "username")?;
+    let mut cmd = CommandBuilder::new("impacket-changepasswd")
+        .arg(format!("{domain}/{target_user}@{dc_ip}"))
+        .flag("-newhashes", format!(":{nt}"))
+        .arg("-reset")
+        .flag("-altuser", auth_user);
+
+    if let Some(pass) = optional_str(args, "password") {
+        cmd = cmd.flag("-altpass", pass);
+    } else if let Some(hash) =
+        optional_str(args, "hash").or_else(|| optional_str(args, "nt_hash_auth"))
+    {
+        cmd = cmd.flag("-hashes", credentials::hash_args(hash)[1].clone());
+    } else {
+        anyhow::bail!(
+            "refusing to restore '{target_user}': no password or hash supplied for the \
+             authenticating principal '{auth_user}'."
+        );
+    }
+
+    Ok(cmd.timeout_secs(120))
+}
+
 /// Principals whose password must never be overwritten by an automated reset.
 ///
 /// Hijacking one of these does not advance an operation — we already model
@@ -755,6 +811,64 @@ mod tests {
             "target_user": target_user,
             "new_password": "NewP@ss123!"
         })
+    }
+
+    fn restore_args(nt: &str) -> serde_json::Value {
+        json!({
+            "domain": "contoso.local",
+            "dc_ip": "192.168.58.10",
+            "target_user": "alice",
+            "nt_hash": nt,
+            "username": "admin",
+            "password": "P@ssw0rd!"
+        })
+    }
+
+    #[test]
+    fn restore_password_hash_writes_the_hash_over_samr() {
+        let cmd = build_restore_password_hash(&restore_args("31d6cfe0d16ae931b73c59d7e0c089c0"))
+            .expect("well-formed restore must build");
+        let argv = cmd.args_for_test();
+        assert_eq!(
+            flag_value(argv, "-newhashes"),
+            Some(":31d6cfe0d16ae931b73c59d7e0c089c0"),
+            "the NT hash must be written as the new value, which is what bloodyAD cannot do"
+        );
+        assert!(argv.iter().any(|a| a == "-reset"));
+        assert_eq!(flag_value(argv, "-altuser"), Some("admin"));
+        assert_eq!(flag_value(argv, "-altpass"), Some("P@ssw0rd!"));
+        assert!(argv
+            .iter()
+            .any(|a| a == "contoso.local/alice@192.168.58.10"));
+    }
+
+    #[test]
+    fn restore_password_hash_accepts_an_lm_colon_nt_pair() {
+        let cmd = build_restore_password_hash(&restore_args(
+            "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+        ))
+        .expect("LM:NT is the shape secretsdump emits");
+        assert_eq!(
+            flag_value(cmd.args_for_test(), "-newhashes"),
+            Some(":31d6cfe0d16ae931b73c59d7e0c089c0")
+        );
+    }
+
+    #[test]
+    fn restore_password_hash_refuses_a_malformed_hash() {
+        for bad in ["", "notahash", "31d6cfe0", "$krb5tgs$23$*alice*$abcd"] {
+            assert!(
+                build_restore_password_hash(&restore_args(bad)).is_err(),
+                "writing {bad:?} back would leave the account unusable with no record of the right value"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_password_hash_refuses_without_auth_material() {
+        let mut args = restore_args("31d6cfe0d16ae931b73c59d7e0c089c0");
+        args.as_object_mut().unwrap().remove("password");
+        assert!(build_restore_password_hash(&args).is_err());
     }
 
     #[test]
