@@ -163,6 +163,41 @@ fn credential_for_hash(hash: &ares_core::models::Hash) -> ares_core::models::Cre
     }
 }
 
+/// Build the dispatch payload for one resolved chain step.
+///
+/// `source_user` is the principal the worker will authenticate as, not the
+/// trustee the ACE names: the task template renders it as "we authenticate as
+/// this", and a group-sourced edge whose trustee reached that line had the
+/// agent trying to log in as a group. The trustee is preserved as `via_group`
+/// so the record of *why* this principal was chosen survives.
+fn step_payload(
+    vuln_id: &str,
+    step: &serde_json::Value,
+    cred: &ares_core::models::Credential,
+) -> serde_json::Value {
+    let trustee = extract_source_user(step);
+    let via_group = (!cred.username.eq_ignore_ascii_case(trustee)).then(|| trustee.to_string());
+
+    let mut payload = json!({
+        "technique": "acl_chain_step",
+        "vuln_id": vuln_id,
+        "acl_type": step.get("acl_type").and_then(|v| v.as_str()).unwrap_or(""),
+        "source_user": cred.username,
+        "target_user": step.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+        "target_ip": step.get("target_ip").and_then(|v| v.as_str()).unwrap_or(""),
+        "step": step,
+        "credential": {
+            "username": cred.username,
+            "password": cred.password,
+            "domain": cred.domain,
+        },
+    });
+    if let Some(group) = via_group {
+        payload["via_group"] = json!(group);
+    }
+    payload
+}
+
 /// One ACL chain step ready to dispatch.
 pub(crate) struct AclStepWork {
     pub dedup_key: String,
@@ -405,20 +440,7 @@ pub async fn auto_acl_chain_follow(
             credential: cred,
         } in work
         {
-            let payload = json!({
-                "technique": "acl_chain_step",
-                "vuln_id": vuln_id,
-                "acl_type": step.get("acl_type").and_then(|v| v.as_str()).unwrap_or(""),
-                "source_user": extract_source_user(&step),
-                "target_user": step.get("target").and_then(|v| v.as_str()).unwrap_or(""),
-                "target_ip": step.get("target_ip").and_then(|v| v.as_str()).unwrap_or(""),
-                "step": step,
-                "credential": {
-                    "username": cred.username,
-                    "password": cred.password,
-                    "domain": cred.domain,
-                },
-            });
+            let payload = step_payload(&vuln_id, &step, &cred);
 
             let priority = dispatcher.effective_priority("acl_abuse");
             // Mark dedup on Submitted OR Deferred — Deferred means the task is
@@ -869,6 +891,33 @@ mod tests {
         assert!(collect_acl_chain_work_census(&state, &mut no_member).is_empty());
         assert_eq!(no_member.group_no_owned_member, 1);
         assert_eq!(no_member.group_unmapped, 0);
+    }
+
+    #[test]
+    fn payload_authenticates_as_the_member_not_the_group() {
+        let step = group_sourced_chain()["steps"][0].clone();
+        let payload = step_payload(
+            "acl_genericwrite_certpublishers_web01",
+            &step,
+            &cred("alice", "P@ssw0rd!", "contoso.local"),
+        );
+
+        assert_eq!(payload["source_user"], "alice");
+        assert_eq!(payload["via_group"], "Cert Publishers");
+        assert_eq!(payload["step"]["source"], "Cert Publishers");
+    }
+
+    #[test]
+    fn payload_omits_via_group_for_a_directly_sourced_step() {
+        let step = two_step_chain()["steps"][0].clone();
+        let payload = step_payload(
+            "acl_genericall_alice_bob",
+            &step,
+            &cred("alice", "P@ssw0rd!", "contoso.local"),
+        );
+
+        assert_eq!(payload["source_user"], "alice");
+        assert!(payload.get("via_group").is_none());
     }
 
     #[test]
