@@ -22,7 +22,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use ares_core::blue_invalidation::ContainmentKind;
+use ares_core::blue_invalidation::{ContainmentAttribution, ContainmentKind};
 
 use crate::orchestrator::config::OrchestratorConfig;
 use crate::orchestrator::dispatcher::Dispatcher;
@@ -574,6 +574,7 @@ impl DeferredQueue {
         task_type: &str,
         target_role: &str,
         kind: ContainmentKind,
+        attribution: ContainmentAttribution,
     ) {
         let mut conn = self.queue_conn();
         if let Err(e) = ares_core::blue_invalidation::record_blue_invalidated_task(
@@ -582,6 +583,7 @@ impl DeferredQueue {
             task_type,
             target_role,
             kind,
+            attribution,
         )
         .await
         {
@@ -638,10 +640,12 @@ async fn scan_keys_async(conn: &mut redis::aio::ConnectionManager, pattern: &str
 }
 
 /// A deferred task's cause of death: the closed-set kind that the per-op
-/// counter aggregates, plus the human-readable detail that names the revoked
-/// principal, isolated host or rotated realm for the log line.
+/// counter aggregates, how far that cause may be attributed, plus the
+/// human-readable detail that names the revoked principal, isolated host or
+/// rotated realm for the log line.
 struct ContainmentDrop {
     kind: ContainmentKind,
+    attribution: ContainmentAttribution,
     detail: String,
 }
 
@@ -660,6 +664,7 @@ async fn task_dropped_by_containment(
     state: &crate::orchestrator::state::SharedState,
 ) -> Option<ContainmentDrop> {
     let state = state.read().await;
+    let attribution = state.containment_attribution();
 
     // Host isolated → drop any task pointing at that IP.
     let target_ip = task
@@ -670,9 +675,11 @@ async fn task_dropped_by_containment(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if !target_ip.is_empty() && state.is_host_isolated(target_ip) {
+        let kind = ContainmentKind::HostIsolated;
         return Some(ContainmentDrop {
-            kind: ContainmentKind::HostIsolated,
-            detail: format!("host isolated ({target_ip})"),
+            kind,
+            attribution,
+            detail: format!("{} ({target_ip})", kind.detail_label(attribution)),
         });
     }
 
@@ -681,9 +688,11 @@ async fn task_dropped_by_containment(
         let user = cred.get("username").and_then(|v| v.as_str()).unwrap_or("");
         let domain = cred.get("domain").and_then(|v| v.as_str()).unwrap_or("");
         if !user.is_empty() && !domain.is_empty() && state.is_credential_revoked(user, domain) {
+            let kind = ContainmentKind::CredentialRevoked;
             return Some(ContainmentDrop {
-                kind: ContainmentKind::CredentialRevoked,
-                detail: format!("credential revoked ({user}@{domain})"),
+                kind,
+                attribution,
+                detail: format!("{} ({user}@{domain})", kind.detail_label(attribution)),
             });
         }
     }
@@ -710,9 +719,11 @@ async fn task_dropped_by_containment(
         || technique.to_lowercase().contains("kerberoast")
         || technique.to_lowercase().contains("golden");
     if !realm.is_empty() && kerberos_shaped && state.is_krbtgt_rotated(realm) {
+        let kind = ContainmentKind::KrbtgtRotated;
         return Some(ContainmentDrop {
-            kind: ContainmentKind::KrbtgtRotated,
-            detail: format!("krbtgt rotated ({realm})"),
+            kind,
+            attribution,
+            detail: format!("{} ({realm})", kind.detail_label(attribution)),
         });
     }
 
@@ -770,18 +781,31 @@ pub fn spawn_deferred_processor(
                 // errors — exactly the visual mess the containment loop is
                 // supposed to prevent for the demo.
                 if let Some(drop) = task_dropped_by_containment(&task, &dispatcher.state).await {
-                    info!(
-                        task_type = %task.task_type,
-                        target_role = %task.target_role,
-                        reason = %drop.detail,
-                        "Dropping deferred task — invalidated by blue containment"
-                    );
+                    match drop.attribution {
+                        ContainmentAttribution::BlueActive => info!(
+                            task_type = %task.task_type,
+                            target_role = %task.target_role,
+                            reason = %drop.detail,
+                            "Dropping deferred task — invalidated by blue containment"
+                        ),
+                        ContainmentAttribution::RedInferred => info!(
+                            task_type = %task.task_type,
+                            target_role = %task.target_role,
+                            reason = %drop.detail,
+                            "Dropping deferred task — invalidated by inferred credential/host failure (blue not running, NOT containment)"
+                        ),
+                    }
                     // Signature is left in the SET by pop_best (POP_HOLD_SCRIPT
                     // doesn't SREM it), so it now serves as the tombstone that
                     // blocks producers from re-emitting equivalent work. No
                     // explicit tombstone_signature call is needed.
                     deferred
-                        .record_blue_invalidation(&task.task_type, &task.target_role, drop.kind)
+                        .record_blue_invalidation(
+                            &task.task_type,
+                            &task.target_role,
+                            drop.kind,
+                            drop.attribution,
+                        )
                         .await;
                     continue;
                 }
@@ -893,6 +917,7 @@ mod tests {
     #[tokio::test]
     async fn drops_task_when_target_host_isolated() {
         let state = SharedState::new("op-x".into());
+        state.set_blue_enabled(true).await;
         state
             .publish_host_isolated(
                 "192.168.58.20",
@@ -908,6 +933,7 @@ mod tests {
             .await
             .expect("isolated host should drop the task");
         assert_eq!(drop.kind, ContainmentKind::HostIsolated);
+        assert_eq!(drop.attribution, ContainmentAttribution::BlueActive);
         assert!(drop.detail.contains("host isolated"));
     }
 
@@ -924,6 +950,7 @@ mod tests {
     #[tokio::test]
     async fn drops_task_when_credential_revoked() {
         let state = SharedState::new("op-x".into());
+        state.set_blue_enabled(true).await;
         state
             .publish_credential_revoked("svc_mssql", "contoso.local", "blue_simulated:inv-1")
             .await;
@@ -938,12 +965,65 @@ mod tests {
             .await
             .expect("revoked credential should drop the task");
         assert_eq!(drop.kind, ContainmentKind::CredentialRevoked);
+        assert_eq!(drop.attribution, ContainmentAttribution::BlueActive);
         assert!(drop.detail.contains("credential revoked"));
+    }
+
+    #[tokio::test]
+    async fn credential_drop_with_blue_off_is_not_attributed_to_blue() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_credential_revoked("svc_mssql", "contoso.local", "STATUS_LOGON_FAILURE")
+            .await;
+        let task = task_with_payload(
+            "lateral",
+            serde_json::json!({
+                "target_ip": "192.168.58.21",
+                "credential": { "username": "svc_mssql", "domain": "contoso.local" },
+            }),
+        );
+        let drop = task_dropped_by_containment(&task, &state)
+            .await
+            .expect("a rejected credential still invalidates the task");
+        assert_eq!(drop.kind, ContainmentKind::CredentialRevoked);
+        assert_eq!(drop.attribution, ContainmentAttribution::RedInferred);
+        assert!(
+            !drop.detail.contains("revoked"),
+            "blue-off detail still claims revocation: {}",
+            drop.detail
+        );
+        assert!(
+            drop.detail.contains("credential rejected"),
+            "{}",
+            drop.detail
+        );
+        assert_eq!(
+            drop.kind.reason_field(drop.attribution),
+            "credential_rejected_inferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_drop_with_blue_off_is_not_attributed_to_blue() {
+        let state = SharedState::new("op-x".into());
+        state
+            .publish_host_isolated("192.168.58.20", "web01.contoso.local", "STATUS_IO_TIMEOUT")
+            .await;
+        let task = task_with_payload(
+            "credential_access",
+            serde_json::json!({ "target_ip": "192.168.58.20" }),
+        );
+        let drop = task_dropped_by_containment(&task, &state)
+            .await
+            .expect("an unreachable host still invalidates the task");
+        assert_eq!(drop.attribution, ContainmentAttribution::RedInferred);
+        assert!(drop.detail.contains("host unreachable"), "{}", drop.detail);
     }
 
     #[tokio::test]
     async fn drops_kerberos_task_when_krbtgt_rotated() {
         let state = SharedState::new("op-x".into());
+        state.set_blue_enabled(true).await;
         state
             .publish_krbtgt_rotated("contoso.local", "blue_simulated:inv-1")
             .await;
@@ -958,6 +1038,7 @@ mod tests {
             .await
             .expect("rotated krbtgt should drop the kerberos task");
         assert_eq!(drop.kind, ContainmentKind::KrbtgtRotated);
+        assert_eq!(drop.attribution, ContainmentAttribution::BlueActive);
         assert!(drop.detail.contains("krbtgt rotated"));
     }
 
@@ -983,6 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn drops_kerberoast_technique_when_krbtgt_rotated() {
         let state = SharedState::new("op-x".into());
+        state.set_blue_enabled(true).await;
         state
             .publish_krbtgt_rotated("contoso.local", "blue_simulated:inv-1")
             .await;
@@ -999,6 +1081,7 @@ mod tests {
             .await
             .expect("expected kerberoast to be dropped");
         assert_eq!(drop.kind, ContainmentKind::KrbtgtRotated);
+        assert_eq!(drop.attribution, ContainmentAttribution::BlueActive);
         assert!(drop.detail.contains("krbtgt rotated"));
     }
 

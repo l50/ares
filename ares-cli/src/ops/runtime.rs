@@ -43,10 +43,25 @@ fn format_blue_invalidated(
     }
 
     let plural = if counts.total == 1 { "" } else { "s" };
-    let mut lines = vec![format!(
-        "Warning: {} deferred task{plural} deleted by blue containment before dispatch (red verification may be voided)",
-        counts.total
-    )];
+    let blue = counts.blue_active_total();
+    let inferred = counts.red_inferred_total();
+    let headline = if inferred > 0 && blue > 0 {
+        format!(
+            "Warning: {} deferred task{plural} deleted before dispatch — {blue} with blue active, {inferred} inferred from red's own tool failures with blue off (red verification may be voided)",
+            counts.total
+        )
+    } else if inferred > 0 {
+        format!(
+            "Warning: {} deferred task{plural} deleted before dispatch by inferred credential/host failure — blue was not running, so this is red's own auth noise and NOT blue containment (red verification may be voided)",
+            counts.total
+        )
+    } else {
+        format!(
+            "Warning: {} deferred task{plural} deleted by blue containment before dispatch (red verification may be voided)",
+            counts.total
+        )
+    };
+    let mut lines = vec![headline];
 
     let roles = counts.roles_by_count();
     let task_types = counts.task_types_by_count();
@@ -314,7 +329,24 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
             by_reason: Default::default(),
+            by_attribution: Default::default(),
         }
+    }
+
+    fn with_attribution(
+        mut c: ares_core::blue_invalidation::BlueInvalidatedTasks,
+        blue_active: u64,
+        red_inferred: u64,
+    ) -> ares_core::blue_invalidation::BlueInvalidatedTasks {
+        if blue_active > 0 {
+            c.by_attribution
+                .insert("blue_active".to_string(), blue_active);
+        }
+        if red_inferred > 0 {
+            c.by_attribution
+                .insert("red_inferred".to_string(), red_inferred);
+        }
+        c
     }
 
     #[test]
@@ -366,6 +398,62 @@ mod tests {
             "  by reason: credential_revoked 59, host_isolated 16"
         );
         assert_eq!(lines[2], "  by role: recon 40, lateral 35");
+    }
+
+    #[test]
+    fn blue_off_drops_are_never_reported_as_blue_containment() {
+        let mut c = with_attribution(counts(11, &[("recon", 11)], &[]), 0, 11);
+        c.by_reason = [("credential_rejected_inferred".to_string(), 11_u64)]
+            .into_iter()
+            .collect();
+
+        let lines = format_blue_invalidated(&c);
+
+        assert!(
+            !lines[0].contains("by blue containment"),
+            "headline still blames blue: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("blue was not running"),
+            "got {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("11 deferred tasks deleted"));
+        assert_eq!(lines[1], "  by reason: credential_rejected_inferred 11");
+    }
+
+    #[test]
+    fn mixed_attribution_headline_splits_the_two_causes() {
+        let c = with_attribution(counts(9, &[("recon", 9)], &[]), 4, 5);
+        let lines = format_blue_invalidated(&c);
+        assert!(lines[0].contains("4 with blue active"), "got {}", lines[0]);
+        assert!(
+            lines[0].contains("5 inferred from red's own tool failures"),
+            "got {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn blue_active_only_keeps_the_containment_headline() {
+        let c = with_attribution(counts(6, &[("lateral", 6)], &[]), 6, 0);
+        let lines = format_blue_invalidated(&c);
+        assert!(
+            lines[0].contains("6 deferred tasks deleted by blue containment"),
+            "got {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn pre_attribution_operations_render_the_legacy_headline() {
+        let lines = format_blue_invalidated(&counts(238, &[("recon", 238)], &[]));
+        assert!(
+            lines[0].contains("238 deferred tasks deleted by blue containment"),
+            "got {}",
+            lines[0]
+        );
     }
 
     #[test]

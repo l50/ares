@@ -257,7 +257,16 @@ pub struct StateInner {
     /// target, which is the one thing that can make the retry succeed.
     pub forge_wedged: HashMap<String, crate::orchestrator::automation::trust::WedgedForge>,
 
-    /// Blue-side containment observations — a credential we hold started
+    /// Whether a blue team is running alongside red in this operation,
+    /// resolved once at orchestrator startup from `ARES_BLUE_ENABLED`.
+    ///
+    /// The containment classifier reads red's own tool output and never sees
+    /// blue, so this flag is the only fact separating "blue may have contained
+    /// us" from "our credential simply failed". Defaults to `false` so any
+    /// state built outside the orchestrator attributes nothing to blue.
+    pub blue_enabled: bool,
+
+    /// Containment observations — a credential we hold started
     /// consistently returning `STATUS_LOGON_FAILURE` or LDAP
     /// `INVALID_CREDENTIALS`. Keyed by `user@domain` (lowercase). Read by
     /// the exploitation queue to drop attempts that depend on the principal
@@ -365,6 +374,7 @@ impl StateInner {
             completed: false,
             all_forests_dominated_at: None,
             coercion_phase_state: HashMap::new(),
+            blue_enabled: false,
             revoked_principals: HashMap::new(),
             isolated_hosts: HashMap::new(),
             krbtgt_rotated_at: HashMap::new(),
@@ -379,19 +389,25 @@ impl StateInner {
         }
     }
 
-    /// Whether blue has revoked a credential for the given principal.
+    /// How far a containment observation in this operation may be attributed.
+    pub fn containment_attribution(&self) -> ares_core::blue_invalidation::ContainmentAttribution {
+        ares_core::blue_invalidation::ContainmentAttribution::from_blue_enabled(self.blue_enabled)
+    }
+
+    /// Whether a credential for the given principal has been observed revoked.
     /// Comparison is case-insensitive on both fields.
     pub fn is_credential_revoked(&self, username: &str, domain: &str) -> bool {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
         self.revoked_principals.contains_key(&key)
     }
 
-    /// Whether blue has firewalled off the given IP.
+    /// Whether the given IP has been observed cut off.
     pub fn is_host_isolated(&self, ip: &str) -> bool {
         self.isolated_hosts.contains_key(ip)
     }
 
-    /// Whether blue has rotated krbtgt in the given realm (case-insensitive).
+    /// Whether krbtgt has been observed rotated in the given realm
+    /// (case-insensitive).
     pub fn is_krbtgt_rotated(&self, domain: &str) -> bool {
         self.krbtgt_rotated_at.contains_key(&domain.to_lowercase())
     }
