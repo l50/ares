@@ -35,11 +35,29 @@ fn breakdown_line(label: &str, rows: &[(&str, u64)]) -> Option<String> {
     Some(line)
 }
 
+fn format_retained(counts: &ares_core::blue_invalidation::BlueInvalidatedTasks) -> Vec<String> {
+    if counts.retained_total == 0 {
+        return Vec::new();
+    }
+    let plural = if counts.retained_total == 1 { "" } else { "s" };
+    let mut lines = vec![format!(
+        "Note: {} deferred task{plural} kept despite an inferred credential rejection — credential hidden from the LLM, queued work left intact (no KDC_ERR_CLIENT_REVOKED, blue not running)",
+        counts.retained_total
+    )];
+    if let Some(line) = breakdown_line("role", &counts.retained_roles_by_count()) {
+        lines.push(line);
+    }
+    lines
+}
+
 fn format_blue_invalidated(
     counts: &ares_core::blue_invalidation::BlueInvalidatedTasks,
 ) -> Vec<String> {
     if counts.is_empty() {
         return Vec::new();
+    }
+    if counts.total == 0 {
+        return format_retained(counts);
     }
 
     let plural = if counts.total == 1 { "" } else { "s" };
@@ -76,6 +94,7 @@ fn format_blue_invalidated(
             lines.push(line);
         }
     }
+    lines.extend(format_retained(counts));
 
     lines
 }
@@ -330,6 +349,8 @@ mod tests {
                 .collect(),
             by_reason: Default::default(),
             by_attribution: Default::default(),
+            retained_total: 0,
+            retained_by_role: Default::default(),
         }
     }
 
@@ -453,6 +474,45 @@ mod tests {
             lines[0].contains("238 deferred tasks deleted by blue containment"),
             "got {}",
             lines[0]
+        );
+    }
+
+    #[test]
+    fn retained_tasks_are_reported_when_nothing_was_dropped() {
+        let mut c = counts(0, &[], &[]);
+        c.retained_total = 40;
+        c.retained_by_role = [("recon".to_string(), 40_u64)].into_iter().collect();
+
+        let lines = format_blue_invalidated(&c);
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("40 deferred tasks kept despite an inferred credential rejection"),
+            "got {}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("blue containment"), "got {}", lines[0]);
+        assert_eq!(lines[1], "  by role: recon 40");
+    }
+
+    #[test]
+    fn retained_tasks_are_appended_to_a_drop_report() {
+        let mut c = with_attribution(counts(2, &[("lateral", 2)], &[]), 0, 2);
+        c.retained_total = 40;
+        c.retained_by_role = [("recon".to_string(), 40_u64)].into_iter().collect();
+
+        let lines = format_blue_invalidated(&c);
+
+        assert!(
+            lines[0].contains("2 deferred tasks deleted"),
+            "got {}",
+            lines[0]
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l
+                    .contains("40 deferred tasks kept despite an inferred credential rejection"))
         );
     }
 

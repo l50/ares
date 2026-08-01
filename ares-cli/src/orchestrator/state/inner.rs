@@ -276,6 +276,17 @@ pub struct StateInner {
     /// the remainder of the op unless an operator rolls it back.
     pub revoked_principals: HashMap<String, DateTime<Utc>>,
 
+    /// Subset of [`Self::revoked_principals`] whose revocation the KDC itself
+    /// declared, via `KDC_ERR_CLIENT_REVOKED`. Keyed the same way.
+    ///
+    /// Everything else in `revoked_principals` got there because a generic
+    /// auth-reject string recurred — a stale hash, a lockout, an expired
+    /// ticket or a wrong password guess all produce exactly that. Membership
+    /// here is what separates "the KDC says this account is disabled" from
+    /// "this credential was refused twice", and it decides whether a
+    /// revocation may delete queued work or only hide the credential.
+    pub kdc_declared_revocations: HashSet<String>,
+
     /// Hosts blue firewalled off. Keyed by IP string. Populated when SMB,
     /// WinRM and LDAP to a previously-reachable host all start returning
     /// network-unreachable inside a short window. Consumers skip vulns
@@ -376,6 +387,7 @@ impl StateInner {
             coercion_phase_state: HashMap::new(),
             blue_enabled: false,
             revoked_principals: HashMap::new(),
+            kdc_declared_revocations: HashSet::new(),
             isolated_hosts: HashMap::new(),
             krbtgt_rotated_at: HashMap::new(),
             revoked_certificates: HashMap::new(),
@@ -399,6 +411,26 @@ impl StateInner {
     pub fn is_credential_revoked(&self, username: &str, domain: &str) -> bool {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
         self.revoked_principals.contains_key(&key)
+    }
+
+    /// Whether the KDC itself declared this principal revoked, rather than the
+    /// revocation being inferred from repeated generic auth rejects.
+    pub fn is_kdc_declared_revocation(&self, username: &str, domain: &str) -> bool {
+        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+        self.kdc_declared_revocations.contains(&key)
+    }
+
+    /// Whether a revocation on this principal is strong enough to delete
+    /// queued work that depends on it, as opposed to only hiding the
+    /// credential from the LLM.
+    ///
+    /// A KDC-declared revocation always is. An inferred one only counts while
+    /// blue is running: with blue off, two `STATUS_LOGON_FAILURE`s against one
+    /// principal are ordinary auth noise, and deleting every queued task bound
+    /// to that principal destroys red's own work on a guess.
+    pub fn credential_revocation_deletes_queued_work(&self, username: &str, domain: &str) -> bool {
+        self.is_credential_revoked(username, domain)
+            && (self.blue_enabled || self.is_kdc_declared_revocation(username, domain))
     }
 
     /// Whether the given IP has been observed cut off.

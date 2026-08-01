@@ -39,9 +39,15 @@ impl SharedState {
         source: &str,
     ) -> bool {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+        let kdc_declared = source.contains(
+            crate::orchestrator::result_processing::containment_recovery::KDC_CLIENT_REVOKED_MARKER,
+        );
         let (added, attribution) = {
             let mut state = self.inner.write().await;
             let attribution = state.containment_attribution();
+            if kdc_declared {
+                state.kdc_declared_revocations.insert(key.clone());
+            }
             (
                 state.revoked_principals.insert(key, Utc::now()).is_none(),
                 attribution,

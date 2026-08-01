@@ -19,6 +19,8 @@
 //! | `type:{task_type}` | Tasks dropped, per task type |
 //! | `reason:{kind}` | Tasks dropped, per containment kind |
 //! | `attribution:{attribution}` | Tasks dropped, split by who the drop can honestly be blamed on |
+//! | `retained_total` | Tasks *kept* despite a containment observation too weak to delete them |
+//! | `retained_role:{target_role}` | Retained tasks, per agent role |
 //!
 //! Role, task-type and reason names are bounded, operator-authored identifiers,
 //! so they are stored verbatim rather than encoded. The revoked principal
@@ -48,6 +50,10 @@ const TYPE_PREFIX: &str = "type";
 const REASON_PREFIX: &str = "reason";
 /// HASH field prefix for per-attribution counters.
 const ATTRIBUTION_PREFIX: &str = "attribution";
+/// HASH field holding the operation-wide retained total.
+const FIELD_RETAINED_TOTAL: &str = "retained_total";
+/// HASH field prefix for per-role retained counters.
+const RETAINED_ROLE_PREFIX: &str = "retained_role";
 
 /// Who a dropped task can honestly be blamed on.
 ///
@@ -164,6 +170,11 @@ pub struct BlueInvalidatedTasks {
     /// attribution existed, which callers must render as the legacy case
     /// rather than as "nothing attributed".
     pub by_attribution: BTreeMap<String, u64>,
+    /// Tasks kept in the queue despite a containment observation whose
+    /// evidence was too weak to justify deleting them.
+    pub retained_total: u64,
+    /// Retained tasks per agent role.
+    pub retained_by_role: BTreeMap<String, u64>,
 }
 
 impl BlueInvalidatedTasks {
@@ -174,6 +185,8 @@ impl BlueInvalidatedTasks {
             && self.by_task_type.is_empty()
             && self.by_reason.is_empty()
             && self.by_attribution.is_empty()
+            && self.retained_total == 0
+            && self.retained_by_role.is_empty()
     }
 
     /// Drops recorded while blue was running for the operation.
@@ -205,6 +218,11 @@ impl BlueInvalidatedTasks {
     /// Containment kinds ordered by dropped-task count, highest first.
     pub fn reasons_by_count(&self) -> Vec<(&str, u64)> {
         rank_by_count(&self.by_reason)
+    }
+
+    /// Roles ordered by retained-task count, highest first.
+    pub fn retained_roles_by_count(&self) -> Vec<(&str, u64)> {
+        rank_by_count(&self.retained_by_role)
     }
 }
 
@@ -263,6 +281,36 @@ pub async fn record_blue_invalidated_task(
     Ok(())
 }
 
+/// Record one deferred task that a containment observation did *not* delete.
+///
+/// The counterpart to [`record_blue_invalidated_task`]: an inferred credential
+/// rejection with blue off hides the credential from the LLM but leaves queued
+/// work alone, and that decision has to stay visible. Without this an operator
+/// who fixes the false attribution just sees the drop count fall to zero and
+/// concludes the signal was thrown away.
+pub async fn record_retained_task(
+    conn: &mut impl AsyncCommands,
+    operation_id: &str,
+    target_role: &str,
+) -> Result<(), redis::RedisError> {
+    let key = blue_invalidated_key(operation_id);
+
+    let mut pipe = redis::pipe();
+    pipe.cmd("HINCRBY")
+        .arg(&key)
+        .arg(FIELD_RETAINED_TOTAL)
+        .arg(1);
+    if !target_role.is_empty() {
+        pipe.cmd("HINCRBY")
+            .arg(&key)
+            .arg(format!("{RETAINED_ROLE_PREFIX}:{target_role}"))
+            .arg(1);
+    }
+
+    pipe.query_async::<()>(conn).await?;
+    Ok(())
+}
+
 /// Read the blue-invalidation counters for an operation.
 ///
 /// Returns an all-zero record when the key is absent, so a caller can render
@@ -281,6 +329,10 @@ pub async fn get_blue_invalidated_tasks(
         };
         if field == FIELD_TOTAL {
             counts.total = count;
+        } else if field == FIELD_RETAINED_TOTAL {
+            counts.retained_total = count;
+        } else if let Some(role) = field.strip_prefix(&format!("{RETAINED_ROLE_PREFIX}:")) {
+            counts.retained_by_role.insert(role.to_string(), count);
         } else if let Some(role) = field.strip_prefix(&format!("{ROLE_PREFIX}:")) {
             counts.by_role.insert(role.to_string(), count);
         } else if let Some(task_type) = field.strip_prefix(&format!("{TYPE_PREFIX}:")) {
@@ -391,6 +443,52 @@ mod tests {
         assert_eq!(counts.by_reason.get("credential_revoked"), None);
         assert_eq!(counts.red_inferred_total(), 1);
         assert_eq!(counts.blue_active_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_tasks_are_counted_separately_from_drops() {
+        let mut conn = MockRedisConnection::new();
+        record_blue_invalidated_task(
+            &mut conn,
+            "op-test-001",
+            "lateral",
+            "lateral",
+            ContainmentKind::CredentialRevoked,
+            ContainmentAttribution::RedInferred,
+        )
+        .await
+        .expect("record should succeed");
+        for _ in 0..40 {
+            record_retained_task(&mut conn, "op-test-001", "recon")
+                .await
+                .expect("record should succeed");
+        }
+
+        let counts = get_blue_invalidated_tasks(&mut conn, "op-test-001")
+            .await
+            .expect("read should succeed");
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.retained_total, 40);
+        assert_eq!(counts.retained_by_role.get("recon"), Some(&40));
+        assert_eq!(counts.by_role.get("recon"), None);
+        assert_eq!(counts.retained_roles_by_count(), vec![("recon", 40)]);
+    }
+
+    #[tokio::test]
+    async fn retention_alone_is_not_an_empty_record() {
+        let mut conn = MockRedisConnection::new();
+        record_retained_task(&mut conn, "op-test-001", "recon")
+            .await
+            .expect("record should succeed");
+
+        let counts = get_blue_invalidated_tasks(&mut conn, "op-test-001")
+            .await
+            .expect("read should succeed");
+
+        assert!(!counts.is_empty());
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.retained_total, 1);
     }
 
     #[tokio::test]
@@ -540,6 +638,8 @@ mod tests {
             by_task_type: BTreeMap::new(),
             by_reason: BTreeMap::new(),
             by_attribution: BTreeMap::new(),
+            retained_total: 0,
+            retained_by_role: BTreeMap::new(),
         };
 
         assert_eq!(
@@ -559,6 +659,8 @@ mod tests {
             ]),
             by_reason: BTreeMap::new(),
             by_attribution: BTreeMap::new(),
+            retained_total: 0,
+            retained_by_role: BTreeMap::new(),
         };
 
         assert_eq!(
@@ -578,6 +680,8 @@ mod tests {
                 ("credential_revoked".to_string(), 59),
             ]),
             by_attribution: BTreeMap::new(),
+            retained_total: 0,
+            retained_by_role: BTreeMap::new(),
         };
 
         assert_eq!(
