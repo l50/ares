@@ -71,7 +71,10 @@ includes:
       ARES_CONFIG: '{{.ARES_CONFIG}}'
       OTEL_TRACES_ENDPOINT: '{{.OTEL_TRACES_ENDPOINT}}'
       ALLOY_LOKI_ENDPOINT: '{{.ALLOY_LOKI_ENDPOINT}}'
+      GRAFANA_URL: '{{.GRAFANA_URL}}'
       LOKI_URL: '{{.LOKI_URL}}'
+      EC2_GRAFANA_URL: '{{.EC2_GRAFANA_URL}}'
+      EC2_LOKI_URL: '{{.EC2_LOKI_URL}}'
   k8s:
     taskfile: .taskfiles/k8s/Taskfile.yaml
     optional: true

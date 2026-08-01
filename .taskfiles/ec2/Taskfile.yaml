@@ -1257,7 +1257,13 @@ tasks:
         # tools then fall through to their built-in defaults instead of wedging
         # on a black-holed URL.
         _url_host() { printf %s "$1" | awk -F/ '{print $3}' | cut -d: -f1; }
-        _url_port() { case "$1" in http://*) echo 80 ;; https://*|*) echo 443 ;; esac; }
+        _url_port() {
+          _authority=$(printf %s "$1" | awk -F/ '{print $3}')
+          case "$_authority" in
+            *:*) printf %s "${_authority##*:}" ;;
+            *) case "$1" in http://*) echo 80 ;; *) echo 443 ;; esac ;;
+          esac
+        }
         GRAFANA_HOST=$(_url_host "$GRAFANA_URL_VAL"); GRAFANA_PORT=$(_url_port "$GRAFANA_URL_VAL")
         LOKI_HOST=$(_url_host "$LOKI_URL_VAL");       LOKI_PORT=$(_url_port "$LOKI_URL_VAL")
         OTEL_TRACES_ENDPOINT="{{.OTEL_TRACES_ENDPOINT}}"
@@ -1321,6 +1327,7 @@ tasks:
           ENV_FILE_CMD="$ENV_FILE_CMD; if timeout 3 bash -c '>/dev/tcp/${DB_PROBE_HOST}/${DB_PROBE_PORT}' 2>/dev/null; then printf 'ARES_DATABASE_URL=%q\n' '${ARES_DATABASE_URL_VAL}' >> \$ENV_TMP; else echo 'SKIP: ARES_DATABASE_URL ${DB_PROBE_HOST}:${DB_PROBE_PORT} unreachable from box' >&2; fi"
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 \$ENV_TMP; mv \$ENV_TMP /etc/ares/env; echo Wrote /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; if ! grep -q '^LOKI_URL=' /etc/ares/env; then echo 'WARNING: no reachable LOKI_URL was injected but blue starts enabled — every detection query will fail and the sweep reports its whole catalog UNCHECKED, which is not the same as clean' >&2; fi"
 
         LAUNCH_SCRIPT="#!/bin/bash
         set -e
