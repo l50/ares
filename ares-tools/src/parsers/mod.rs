@@ -27,8 +27,8 @@ pub use bloodhound::{
 pub use certipy::{parse_certipy_esc1_chain, parse_certipy_find, ESC_TYPES};
 pub use cracker::parse_cracker_output;
 pub use credential_tools::{
-    parse_adidnsdump, parse_laps, parse_ldap_descriptions, parse_lsassy, parse_netexec_auth,
-    parse_ntds_dit, parse_spray_success,
+    parse_adidnsdump, parse_gmsa, parse_laps, parse_ldap_descriptions, parse_lsassy,
+    parse_netexec_auth, parse_ntds_dit, parse_spray_success,
 };
 pub use delegation::{
     extract_delegation_account, parse_add_computer, parse_delegation, parse_silver_ticket,
@@ -665,8 +665,18 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                     .or_else(|| params.get("target_dc").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 let user = relayed_user.unwrap_or("");
+                let relayed_over_rpc = params
+                    .get("relay_target_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("rpc://"));
+                let (esc_type, esc_display) = if relayed_over_rpc {
+                    ("esc11", "ESC11")
+                } else {
+                    ("esc8", "ESC8")
+                };
                 let mut details = serde_json::Map::new();
                 details.insert("pfx_path".into(), json!(pfx));
+                details.insert("esc_type".into(), json!(esc_type));
                 if !target_domain.is_empty() {
                     details.insert("domain".into(), json!(target_domain));
                 }
@@ -681,7 +691,7 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 details.insert(
                     "description".into(),
                     json!(format!(
-                        "ESC8 relay captured certificate for {user} in {target_domain}"
+                        "{esc_display} relay captured certificate for {user} in {target_domain}"
                     )),
                 );
                 let user_safe = user.replace(['$', '.'], "_");
@@ -885,6 +895,13 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
         }
         "laps_dump" => {
             set_if_nonempty(&mut discoveries, "credentials", parse_laps(output, params));
+        }
+        "gmsa_dump_passwords" | "gmsa_read_password_bloodyad" => {
+            set_if_nonempty(
+                &mut discoveries,
+                "hashes",
+                parse_gmsa(output, params, tool_name),
+            );
         }
         "netexec_auth_check" => {
             set_if_nonempty(
@@ -1625,6 +1642,64 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
         let disc = parse_tool_output("relay_and_coerce", output, &params);
         let vulns = disc["vulnerabilities"].as_array().unwrap();
         assert_eq!(vulns[0]["target"], "192.168.58.20");
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_rpc_target_reports_esc11() {
+        let output = "PFX_FILE=/tmp/ares_relay_11/dc01$.pfx\nRELAYED_USER=dc01$\n";
+        let params = json!({
+            "ca_host": "192.168.58.10",
+            "coerce_target": "192.168.58.20",
+            "coerce_domain": "contoso.local",
+            "relay_target_url": "rpc://192.168.58.10",
+        });
+        let disc = parse_tool_output("relay_and_coerce", output, &params);
+        let vulns = disc["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns[0]["details"]["esc_type"], "esc11");
+        assert_eq!(
+            vulns[0]["details"]["description"],
+            "ESC11 relay captured certificate for dc01$ in contoso.local"
+        );
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_default_target_reports_esc8() {
+        let output = "PFX_FILE=/tmp/ares_relay_12/dc01$.pfx\nRELAYED_USER=dc01$\n";
+        let params = json!({
+            "ca_host": "192.168.58.10",
+            "coerce_target": "192.168.58.20",
+            "coerce_domain": "contoso.local",
+        });
+        let disc = parse_tool_output("relay_and_coerce", output, &params);
+        let vulns = disc["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns[0]["details"]["esc_type"], "esc8");
+        assert_eq!(
+            vulns[0]["details"]["description"],
+            "ESC8 relay captured certificate for dc01$ in contoso.local"
+        );
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_http_and_empty_target_report_esc8() {
+        let output = "PFX_FILE=/tmp/ares_relay_13/dc01$.pfx\nRELAYED_USER=dc01$\n";
+        for url in [
+            "http://192.168.58.10/certsrv/certfnsh.asp",
+            "https://192.168.58.10/certsrv/certfnsh.asp",
+            "",
+        ] {
+            let params = json!({
+                "ca_host": "192.168.58.10",
+                "coerce_target": "192.168.58.20",
+                "coerce_domain": "contoso.local",
+                "relay_target_url": url,
+            });
+            let disc = parse_tool_output("relay_and_coerce", output, &params);
+            let vulns = disc["vulnerabilities"].as_array().unwrap();
+            assert_eq!(
+                vulns[0]["details"]["esc_type"], "esc8",
+                "relay_target_url `{url}` is not the ESC11 RPC path"
+            );
+        }
     }
 
     #[test]
@@ -2598,6 +2673,44 @@ LDAP  192.168.58.10  389  DC01  Computer:SRV01                    Password:LapsP
     fn parse_tool_output_laps_dump_empty_output() {
         let disc = parse_tool_output("laps_dump", "", &json!({"domain": "contoso.local"}));
         assert!(disc.get("credentials").is_none());
+    }
+
+    #[test]
+    fn parse_tool_output_gmsa_dump_passwords_reaches_the_parser() {
+        let output = "\
+LDAP  192.168.58.10  389  DC01  [*] Getting GMSA Passwords
+GMSA  192.168.58.10  389  DC01  Account: svc_gmsa$   NTLM: aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890";
+        let disc = parse_tool_output(
+            "gmsa_dump_passwords",
+            output,
+            &json!({"domain": "contoso.local"}),
+        );
+        let hashes = disc["hashes"].as_array().expect("hashes");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "svc_gmsa$");
+        assert_eq!(hashes[0]["source"], "gmsa_dump_passwords");
+    }
+
+    #[test]
+    fn parse_tool_output_gmsa_read_password_bloodyad_reaches_the_parser() {
+        let output = "msDS-ManagedPassword.NTLM: aad3b435b51404eeaad3b435b51404ee:abcdef1234567890abcdef1234567890";
+        let disc = parse_tool_output(
+            "gmsa_read_password_bloodyad",
+            output,
+            &json!({"domain": "contoso.local", "gmsa_account": "svc_gmsa$"}),
+        );
+        let hashes = disc["hashes"].as_array().expect("hashes");
+        assert_eq!(hashes[0]["source"], "gmsa_read_password_bloodyad");
+    }
+
+    #[test]
+    fn parse_tool_output_gmsa_empty_output() {
+        let disc = parse_tool_output(
+            "gmsa_dump_passwords",
+            "",
+            &json!({"domain": "contoso.local"}),
+        );
+        assert!(disc.get("hashes").is_none());
     }
 
     #[test]
