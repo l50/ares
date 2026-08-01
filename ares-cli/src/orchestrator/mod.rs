@@ -184,6 +184,12 @@ async fn run_inner() -> Result<()> {
 
     let mut shared_state = SharedState::new(config.operation_id.clone());
 
+    #[cfg(feature = "blue")]
+    let blue_enabled = std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1");
+    #[cfg(not(feature = "blue"))]
+    let blue_enabled = false;
+    shared_state.set_blue_enabled(blue_enabled).await;
+
     if let Some(cfg) = ares_config.as_deref() {
         shared_state
             .set_acl_publish_cap(cfg.operation.acl_publish_cap)
@@ -533,8 +539,20 @@ async fn run_inner() -> Result<()> {
                     .as_ref()
                     .and_then(|c| c.agents.get(*yaml_key))
                     .map(|a| a.max_steps),
+            )
+            .with_config_max_tokens(
+                ares_config
+                    .as_ref()
+                    .and_then(|c| c.agents.get(*yaml_key))
+                    .and_then(|a| a.max_tokens),
             );
-        info!(role = %yaml_key, model = %spec, max_steps = cfg.max_steps, "Per-role model");
+        info!(
+            role = %yaml_key,
+            model = %spec,
+            max_steps = cfg.max_steps,
+            max_tokens = cfg.max_tokens,
+            "Per-role model"
+        );
         providers.insert(
             *role,
             llm_runner::RoleProvider {
@@ -793,11 +811,6 @@ async fn run_inner() -> Result<()> {
     // blue would spawn from mod.rs but the completion loop's own read of
     // ARES_BLUE_ENABLED would come back empty, so it never waited for
     // investigations to drain and blue got shot dead mid-lateral-analyst.
-    #[cfg(feature = "blue")]
-    let blue_enabled = std::env::var("ARES_BLUE_ENABLED").as_deref() == Ok("1");
-    #[cfg(not(feature = "blue"))]
-    let blue_enabled = false;
-
     #[cfg(feature = "blue")]
     let blue_handle = if blue_enabled {
         // Create a separate LLM provider for the blue team

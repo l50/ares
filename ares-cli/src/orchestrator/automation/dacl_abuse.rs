@@ -26,6 +26,89 @@ pub(crate) fn is_destructive_acl_type(vuln_type: &str) -> bool {
     t.contains("forcechangepassword") || t.contains("genericall")
 }
 
+/// True when the ACL edge's target is a Group Policy Object.
+///
+/// `ldap_acl_enumeration` prefixes the vuln type (`gpo_writeowner`); the
+/// BloodHound path keeps the bare right and marks the object class in
+/// `target_type`. Either is authoritative.
+pub(crate) fn is_gpo_acl_target(vuln_type: &str, target_type: &str) -> bool {
+    vuln_type.to_lowercase().starts_with("gpo_") || target_type.eq_ignore_ascii_case("gpo")
+}
+
+fn brace_wrapped_guid(raw: &str) -> Option<String> {
+    let inner = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut groups = inner.split('-');
+    for len in [8usize, 4, 4, 4, 12] {
+        let group = groups.next()?;
+        if group.len() != len || !group.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    if groups.next().is_some() {
+        return None;
+    }
+    Some(format!("{{{inner}}}"))
+}
+
+fn domain_base_dn(domain: &str) -> String {
+    domain
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| format!("DC={part}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Build the distinguished name of a Group Policy container.
+///
+/// Every GPO lives at `CN={GUID},CN=Policies,CN=System,<domain base DN>`; the
+/// GUID alone resolves to nothing, and `dacledit.py` / `owneredit.py` bind by
+/// DN.
+pub(crate) fn gpo_container_dn(gpo_id: &str, domain: &str) -> Option<String> {
+    let guid = brace_wrapped_guid(gpo_id)?;
+    let base = domain_base_dn(domain);
+    if base.is_empty() {
+        return None;
+    }
+    Some(format!("CN={guid},CN=Policies,CN=System,{base}"))
+}
+
+/// Resolve the distinguished name the impacket ACL tools have to be given for
+/// this edge's target.
+///
+/// Prefers the DN the discovery parser captured verbatim. Falls back, for GPO
+/// targets only, to reconstructing it from the container GUID — vulnerabilities
+/// replayed out of Redis from before the parsers emitted `target_dn` carry
+/// `gpo_id` but no DN, and their `target` is the bare GUID, which resolves to
+/// nothing.
+pub(crate) fn resolve_acl_target_dn(
+    details: &std::collections::HashMap<String, serde_json::Value>,
+    vuln_type: &str,
+    target_type: &str,
+    target_name: &str,
+    domain: &str,
+) -> String {
+    let detail_str = |key: &str| {
+        details
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+
+    if let Some(dn) = detail_str("target_dn").filter(|s| s.contains('=')) {
+        return dn.to_string();
+    }
+    if !is_gpo_acl_target(vuln_type, target_type) {
+        return String::new();
+    }
+    let gpo_id = detail_str("gpo_id")
+        .or_else(|| detail_str("gpo_guid"))
+        .unwrap_or(target_name);
+    let dn_domain = detail_str("domain").unwrap_or(domain);
+    gpo_container_dn(gpo_id, dn_domain).unwrap_or_default()
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct DaclTickCensus {
     pub technique_gated: bool,
@@ -36,9 +119,14 @@ pub(crate) struct DaclTickCensus {
     pub ghost_target: usize,
     pub no_source_principal: usize,
     pub unresolvable_principal: usize,
+    pub privileged_group_no_member: usize,
+    pub group_no_owned_member: usize,
+    pub group_unmapped: usize,
+    pub non_principal_source: usize,
     pub domain_dominated: usize,
     pub capture_in_flight: usize,
     pub target_material_held: usize,
+    pub no_target_dn: usize,
     pub over_tick_cap: usize,
     pub eligible: usize,
 }
@@ -48,6 +136,28 @@ impl DaclTickCensus {
         Self {
             technique_gated: true,
             ..Self::default()
+        }
+    }
+
+    /// Book an unresolved edge source against the reason it failed.
+    ///
+    /// One `unresolvable_principal` count cannot be acted on: a group ares
+    /// never enumerated, a privileged group it owns no member of, and an ACE
+    /// trustee that is not a principal at all want three different responses,
+    /// and the first census to report this loss put 197 of 200 edges in the
+    /// single bucket.
+    pub(crate) fn record_unresolved(&mut self, reason: acl_graph::UnresolvedSource, source: &str) {
+        match reason {
+            acl_graph::UnresolvedSource::GroupNoOwnedMember => self.group_no_owned_member += 1,
+            acl_graph::UnresolvedSource::GroupUnmapped => self.group_unmapped += 1,
+            acl_graph::UnresolvedSource::NonPrincipal => self.non_principal_source += 1,
+            acl_graph::UnresolvedSource::NoMaterial => {
+                if names_well_known_privileged_group(source) {
+                    self.privileged_group_no_member += 1;
+                } else {
+                    self.unresolvable_principal += 1;
+                }
+            }
         }
     }
 
@@ -61,9 +171,14 @@ impl DaclTickCensus {
             ghost_target = self.ghost_target,
             no_source_principal = self.no_source_principal,
             unresolvable_principal = self.unresolvable_principal,
+            privileged_group_no_member = self.privileged_group_no_member,
+            group_no_owned_member = self.group_no_owned_member,
+            group_unmapped = self.group_unmapped,
+            non_principal_source = self.non_principal_source,
             domain_dominated = self.domain_dominated,
             capture_in_flight = self.capture_in_flight,
             target_material_held = self.target_material_held,
+            no_target_dn = self.no_target_dn,
             over_tick_cap = self.over_tick_cap,
             eligible = self.eligible,
             "DACL abuse tick census"
@@ -183,6 +298,15 @@ pub(crate) fn build_dacl_payload(item: &DaclWork) -> serde_json::Value {
         "target_ip": item.dc_ip,
         "domain": item.domain,
     });
+    if !item.target_dn.is_empty() {
+        payload["target_dn"] = json!(item.target_dn);
+    }
+    if !item.target_type.is_empty() {
+        payload["target_type"] = json!(item.target_type);
+    }
+    if let Some(ref group) = item.via_group {
+        payload["via_group"] = json!(group);
+    }
     if let Some(ref cred) = item.credential {
         payload["username"] = json!(cred.username);
         payload["password"] = json!(cred.password);
@@ -307,6 +431,25 @@ pub(crate) fn collect_dacl_work_census(
             None
         };
 
+        let (cred, hash) = if cred.is_none() && hash.is_none() {
+            match acl_graph::resolve_group_source(state, source_user, source_domain) {
+                Ok(acl_graph::SourceMaterial::Credential(c)) => (Some(c), None),
+                Ok(acl_graph::SourceMaterial::Hash(h)) => (None, Some(h)),
+                Err(reason) => {
+                    census.record_unresolved(reason, source_user);
+                    debug!(
+                        vuln_id = %vuln.vuln_id,
+                        source = %source_user,
+                        reason = ?reason,
+                        "DACL abuse skipped: no owned principal for the edge source"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            (cred, hash)
+        };
+
         let Some((auth_username, auth_domain)) = cred
             .as_ref()
             .map(|c| (c.username.clone(), c.domain.clone()))
@@ -369,18 +512,47 @@ pub(crate) fn collect_dacl_work_census(
         // SAM account name as `source_user` — not the SID. Tool schemas
         // require a username for credential injection by `(user, domain)`,
         // and the LLM otherwise echoes the SID as the auth principal.
-        let dispatched_source_user = if source_user.starts_with("S-1-5-21-") {
+        let resolved_from_trustee = !auth_username.eq_ignore_ascii_case(source_user);
+        let dispatched_source_user = if resolved_from_trustee {
             auth_username
         } else {
             source_user.to_string()
         };
+
+        let target_type = vuln
+            .details
+            .get("target_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let target_dn = resolve_acl_target_dn(
+            &vuln.details,
+            &vtype,
+            &target_type,
+            &target_user,
+            &auth_domain,
+        );
+
+        if target_dn.is_empty() && is_gpo_acl_target(&vtype, &target_type) {
+            census.no_target_dn += 1;
+            debug!(
+                vuln_id = %vuln.vuln_id,
+                target = %target_user,
+                "GPO ACL edge skipped: no distinguished name — the container GUID alone \
+                 resolves to nothing and every impacket ACL tool binds by DN"
+            );
+            continue;
+        }
 
         items.push(DaclWork {
             dedup_key,
             vuln_id: vuln.vuln_id.clone(),
             vuln_type: vtype,
             source_user: dispatched_source_user,
+            via_group: resolved_from_trustee.then(|| source_user.to_string()),
             target_user,
+            target_type,
+            target_dn,
             domain: auth_domain,
             dc_ip,
             credential: cred,
@@ -406,7 +578,11 @@ pub(crate) struct DaclWork {
     pub vuln_id: String,
     pub vuln_type: String,
     pub source_user: String,
+    /// The ACE trustee, when `source_user` is a member ares resolved it to.
+    pub via_group: Option<String>,
     pub target_user: String,
+    pub target_type: String,
+    pub target_dn: String,
     pub domain: String,
     pub dc_ip: String,
     pub credential: Option<ares_core::models::Credential>,
@@ -417,6 +593,22 @@ pub(crate) struct DaclWork {
 /// ACL source may be resolved through. Resolving such a source to a credential
 /// is only correct when that credential belongs to *a* member of the group —
 /// the RID names which group membership has to be established against.
+/// True when `source` is a domain SID whose RID names one of those groups.
+///
+/// Separates "we own no member of Enterprise Admins" from "we hold no material
+/// for this principal" in the tick census — the first is a forest-root
+/// membership problem, the second is a looting one.
+fn names_well_known_privileged_group(source: &str) -> bool {
+    if !source.starts_with("S-1-5-21-") {
+        return false;
+    }
+    source
+        .rsplit_once('-')
+        .and_then(|(_, rid)| rid.parse::<u32>().ok())
+        .and_then(well_known_privileged_group)
+        .is_some()
+}
+
 fn well_known_privileged_group(rid: u32) -> Option<&'static str> {
     match rid {
         512 => Some("Domain Admins"),
@@ -1045,6 +1237,185 @@ mod tests {
         assert_eq!(census.domain_dominated, 0);
     }
 
+    fn ldap_user(username: &str, domain: &str, groups: &[&str]) -> ares_core::models::User {
+        ares_core::models::User {
+            username: username.into(),
+            domain: domain.into(),
+            description: String::new(),
+            is_admin: false,
+            source: "ldap_enumeration".into(),
+            member_of: groups.iter().map(|g| (*g).to_string()).collect(),
+        }
+    }
+
+    async fn group_sourced_state(source: &str) -> SharedState {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            let details = acl_details(source, "web01", "contoso.local");
+            let vuln = make_vuln("vuln-gw-group-001", "GenericWrite", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+        shared
+    }
+
+    #[tokio::test]
+    async fn group_sourced_edge_dispatches_as_an_owned_member() {
+        let shared = group_sourced_state("Cert Publishers").await;
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("alice", "contoso.local"));
+            state
+                .users
+                .push(ldap_user("alice", "contoso.local", &["Cert Publishers"]));
+        }
+
+        let state = shared.read().await;
+        let mut census = DaclTickCensus::default();
+        let work = collect_dacl_work_census(&state, &mut census);
+
+        assert_eq!(work.len(), 1, "a group trustee is no longer discarded");
+        assert_eq!(work[0].source_user, "alice");
+        assert_eq!(work[0].via_group.as_deref(), Some("Cert Publishers"));
+        assert_eq!(census.group_no_owned_member, 0);
+        assert_eq!(census.unresolvable_principal, 0);
+
+        let payload = build_dacl_payload(&work[0]);
+        assert_eq!(payload["source_user"], "alice");
+        assert_eq!(payload["via_group"], "Cert Publishers");
+    }
+
+    #[tokio::test]
+    async fn group_sourced_edge_is_refused_when_no_member_is_owned() {
+        let shared = group_sourced_state("Cert Publishers").await;
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("carol", "contoso.local"));
+            state
+                .users
+                .push(ldap_user("alice", "contoso.local", &["Cert Publishers"]));
+            state
+                .users
+                .push(ldap_user("carol", "contoso.local", &["Domain Users"]));
+        }
+
+        let state = shared.read().await;
+        let mut census = DaclTickCensus::default();
+        let work = collect_dacl_work_census(&state, &mut census);
+
+        assert!(
+            work.is_empty(),
+            "a non-member must not be handed the group's right"
+        );
+        assert_eq!(census.group_no_owned_member, 1);
+        assert_eq!(census.unresolvable_principal, 0);
+        assert_eq!(census.group_unmapped, 0);
+    }
+
+    #[tokio::test]
+    async fn census_separates_an_unmapped_group_from_an_unowned_one() {
+        let shared = group_sourced_state("Terminal Server License Servers").await;
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("carol", "contoso.local"));
+            state
+                .users
+                .push(ldap_user("carol", "contoso.local", &["Domain Users"]));
+        }
+
+        let state = shared.read().await;
+        let mut census = DaclTickCensus::default();
+        assert!(collect_dacl_work_census(&state, &mut census).is_empty());
+        assert_eq!(census.group_unmapped, 1);
+        assert_eq!(census.group_no_owned_member, 0);
+        assert_eq!(census.unresolvable_principal, 0);
+    }
+
+    #[tokio::test]
+    async fn census_separates_a_privileged_rid_with_no_owned_member() {
+        let shared = group_sourced_state(&format!("{CONTOSO_SID}-519")).await;
+        {
+            let mut state = shared.write().await;
+            state
+                .domain_sids
+                .insert("contoso.local".into(), CONTOSO_SID.into());
+            state
+                .credentials
+                .push(make_credential("carol", "contoso.local"));
+            state
+                .users
+                .push(ldap_user("carol", "contoso.local", &["Domain Users"]));
+        }
+
+        let state = shared.read().await;
+        let mut census = DaclTickCensus::default();
+        assert!(collect_dacl_work_census(&state, &mut census).is_empty());
+        assert_eq!(census.privileged_group_no_member, 1);
+        assert_eq!(census.unresolvable_principal, 0);
+        assert_eq!(census.group_unmapped, 0);
+    }
+
+    #[tokio::test]
+    async fn census_counts_a_non_principal_trustee() {
+        let shared = group_sourced_state("S-1-3-0").await;
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("carol", "contoso.local"));
+        }
+
+        let state = shared.read().await;
+        let mut census = DaclTickCensus::default();
+        assert!(collect_dacl_work_census(&state, &mut census).is_empty());
+        assert_eq!(census.non_principal_source, 1);
+        assert_eq!(census.unresolvable_principal, 0);
+    }
+
+    #[tokio::test]
+    async fn group_sourced_edge_dispatches_a_hash_only_member() {
+        let shared = group_sourced_state("Cert Publishers").await;
+        {
+            let mut state = shared.write().await;
+            state
+                .users
+                .push(ldap_user("bob", "contoso.local", &["Cert Publishers"]));
+            state.hashes.push(ares_core::models::Hash {
+                id: "h-bob".into(),
+                username: "bob".into(),
+                hash_value: "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
+                    .into(),
+                hash_type: "ntlm".into(),
+                domain: "contoso.local".into(),
+                cracked_password: None,
+                source: "secretsdump".into(),
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+                aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: false,
+                trust_pair_label: None,
+            });
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].source_user, "bob");
+        assert!(work[0].credential.is_none());
+        assert!(work[0].hash.is_some());
+    }
+
     #[tokio::test]
     async fn census_counts_an_eligible_edge() {
         let shared = SharedState::new("test".into());
@@ -1433,6 +1804,209 @@ mod tests {
         let work = collect_dacl_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].source_user, "admin");
+    }
+
+    const GPO_GUID: &str = "{34034095-875D-4230-9232-2611A167C9E1}";
+    const GPO_DN: &str =
+        "CN={34034095-875D-4230-9232-2611A167C9E1},CN=Policies,CN=System,DC=contoso,DC=local";
+
+    fn gpo_details(source: &str, domain: &str) -> HashMap<String, serde_json::Value> {
+        let mut m = acl_details(source, GPO_GUID, domain);
+        m.insert("domain".to_string(), serde_json::json!(domain));
+        m.insert("target_type".to_string(), serde_json::json!("GPO"));
+        m.insert("gpo_id".to_string(), serde_json::json!(GPO_GUID));
+        m
+    }
+
+    #[test]
+    fn gpo_container_dn_builds_the_policies_container_path() {
+        assert_eq!(
+            gpo_container_dn(GPO_GUID, "contoso.local").as_deref(),
+            Some(GPO_DN)
+        );
+    }
+
+    #[test]
+    fn gpo_container_dn_accepts_an_unbraced_guid_and_a_child_domain() {
+        assert_eq!(
+            gpo_container_dn(
+                "34034095-875D-4230-9232-2611A167C9E1",
+                "child.contoso.local"
+            )
+            .as_deref(),
+            Some(
+                "CN={34034095-875D-4230-9232-2611A167C9E1},CN=Policies,CN=System,\
+                 DC=child,DC=contoso,DC=local"
+            )
+        );
+    }
+
+    #[test]
+    fn gpo_container_dn_refuses_to_fabricate_a_dn_from_a_non_guid() {
+        assert_eq!(
+            gpo_container_dn("Default Domain Policy", "contoso.local"),
+            None
+        );
+        assert_eq!(gpo_container_dn("{not-a-guid}", "contoso.local"), None);
+        assert_eq!(gpo_container_dn(GPO_GUID, ""), None);
+    }
+
+    #[test]
+    fn gpo_dn_builds_a_dn_bound_command_for_both_impacket_tools() {
+        let dn = gpo_container_dn(GPO_GUID, "contoso.local").expect("GPO DN must build");
+
+        let owner = ares_tools::acl::build_owner_edit(&serde_json::json!({
+            "domain": "contoso.local",
+            "username": "alice",
+            "password": "P@ssw0rd!", // pragma: allowlist secret
+            "dc_ip": "192.168.58.10",
+            "target": dn,
+            "new_owner": "alice",
+        }))
+        .expect("owner_edit must accept a GPO DN through its `target` argument");
+        let owner_argv = owner.args_for_test();
+        assert!(
+            owner_argv.iter().any(|a| a == "-target-dn"),
+            "a DN handed to owner_edit must reach owneredit.py's -target-dn flag, \
+             not -target: {owner_argv:?}"
+        );
+        assert!(owner_argv.iter().any(|a| a == &dn));
+        assert!(
+            !owner_argv.iter().any(|a| a == GPO_GUID),
+            "the bare container GUID resolves to nothing: {owner_argv:?}"
+        );
+
+        let dacl = ares_tools::acl::build_dacl_edit(&serde_json::json!({
+            "domain": "contoso.local",
+            "username": "alice",
+            "password": "P@ssw0rd!", // pragma: allowlist secret
+            "dc_ip": "192.168.58.10",
+            "target_dn": dn,
+            "principal": "alice",
+            "rights": "GenericAll",
+        }))
+        .expect("dacl_edit must accept a GPO DN");
+        let dacl_argv = dacl.args_for_test();
+        assert!(dacl_argv.iter().any(|a| a == "-target-dn"));
+        assert!(dacl_argv.iter().any(|a| a == &dn));
+    }
+
+    #[test]
+    fn resolve_acl_target_dn_prefers_the_dn_the_parser_captured() {
+        let mut details = gpo_details("alice", "contoso.local");
+        details.insert("target_dn".to_string(), serde_json::json!(GPO_DN));
+        assert_eq!(
+            resolve_acl_target_dn(&details, "gpo_writeowner", "GPO", GPO_GUID, "contoso.local"),
+            GPO_DN
+        );
+    }
+
+    #[test]
+    fn resolve_acl_target_dn_reconstructs_a_gpo_dn_when_the_parser_dropped_it() {
+        let details = gpo_details("alice", "contoso.local");
+        assert_eq!(
+            resolve_acl_target_dn(&details, "gpo_writeowner", "GPO", GPO_GUID, "contoso.local"),
+            GPO_DN,
+            "vulns replayed from Redis predate the parser emitting target_dn"
+        );
+    }
+
+    #[test]
+    fn resolve_acl_target_dn_leaves_sam_bearing_targets_alone() {
+        let details = acl_details("alice", "victim", "contoso.local");
+        assert_eq!(
+            resolve_acl_target_dn(&details, "writeowner", "User", "victim", "contoso.local"),
+            "",
+            "a user/group/computer target still resolves by sAMAccountName"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_gpo_edge_dispatches_a_dn_not_the_container_guid() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("alice", "contoso.local"));
+            state
+                .domain_controllers
+                .insert("contoso.local".to_string(), "192.168.58.10".to_string());
+            let vuln = make_vuln(
+                "gpo_writeowner_alice__34034095_875d_4230_9232_2611a167c9e1_",
+                "gpo_writeowner",
+                gpo_details("alice", "contoso.local"),
+            );
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1, "GPO ACL edges are still dispatchable");
+        assert_eq!(work[0].target_dn, GPO_DN);
+        assert_eq!(work[0].target_type, "GPO");
+
+        let payload = build_dacl_payload(&work[0]);
+        assert_eq!(payload["target_dn"], GPO_DN);
+        assert_eq!(payload["target_type"], "GPO");
+        assert_eq!(
+            payload["target_user"], GPO_GUID,
+            "the GUID stays available for pygpoabuse; the DN is what the ACL tools bind on"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_gpo_edge_without_a_resolvable_dn_is_not_dispatched() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("alice", "contoso.local"));
+            let mut details = acl_details("alice", "Workstation Lockdown", "contoso.local");
+            details.insert("domain".to_string(), serde_json::json!("contoso.local"));
+            details.insert("target_type".to_string(), serde_json::json!("GPO"));
+            let vuln = make_vuln("gpo_writedacl_alice_x", "gpo_writedacl", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let mut census = DaclTickCensus::default();
+        let work = collect_dacl_work_census(&state, &mut census);
+        assert!(
+            work.is_empty(),
+            "dispatching a GPO edge with no DN burns an LLM turn on a guaranteed failure"
+        );
+        assert_eq!(census.no_target_dn, 1);
+    }
+
+    #[tokio::test]
+    async fn collect_non_gpo_edge_carries_the_parser_dn_when_present() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("alice", "contoso.local"));
+            let mut details = acl_details("alice", "victim", "contoso.local");
+            details.insert(
+                "target_dn".to_string(),
+                serde_json::json!("CN=victim,CN=Users,DC=contoso,DC=local"),
+            );
+            let vuln = make_vuln("acl_writedacl_alice_victim", "writedacl", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_dn, "CN=victim,CN=Users,DC=contoso,DC=local");
     }
 
     #[tokio::test]
@@ -1877,7 +2451,10 @@ mod tests {
             vuln_id: "v1".into(),
             vuln_type: "genericall".into(),
             source_user: "alice".into(),
+            via_group: None,
             target_user: "victim".into(),
+            target_type: String::new(),
+            target_dn: String::new(),
             domain: "contoso.local".into(),
             dc_ip: "192.168.58.10".into(),
             credential: Some(make_cred("alice", "P@ssw0rd!", "contoso.local")),
