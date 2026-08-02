@@ -155,12 +155,22 @@ const CALLBACK_NAMES_WITH_SECRETS: &[&str] = &[
     "get_hash_value",
 ];
 
+pub const KERBEROS_ONLY_TOOLS: &[&str] = &[
+    "secretsdump_kerberos",
+    "psexec_kerberos",
+    "wmiexec_kerberos",
+    "smbexec_kerberos",
+];
+
 /// Per-tool exposed-key exemptions. For tools where a "secret-shaped" argument
 /// is actually input *data* (e.g. `password_spray.password` is the candidate
 /// password to spray, not a credential to look up), the named keys remain in
 /// the LLM-visible schema. The credential resolver will not inject anything
 /// for these keys because the calls have no `(username, domain)` principal.
 fn exposed_secret_keys(tool_name: &str) -> &'static [&'static str] {
+    if KERBEROS_ONLY_TOOLS.contains(&tool_name) {
+        return &["ticket_path"];
+    }
     match tool_name {
         "password_spray" => &["password"],
         _ => &[],
@@ -300,7 +310,11 @@ pub fn tools_for_role(role: AgentRole) -> Vec<ToolDefinition> {
         }
         AgentRole::CredentialAccess => credential_access::tool_definitions(),
         AgentRole::Cracker => cracker::tool_definitions(),
-        AgentRole::Acl => acl::tool_definitions(),
+        AgentRole::Acl => {
+            let mut t = acl::tool_definitions();
+            t.push(privesc::adcs::certipy_shadow_definition());
+            t
+        }
         AgentRole::Privesc => {
             let mut t = privesc::tool_definitions();
             // MSSQL tools are implemented in the lateral module but privesc
@@ -736,6 +750,83 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(required, vec!["username", "domain", "spn"]);
+    }
+
+    #[test]
+    fn kerberos_only_tools_advertise_the_ccache_slot_in_every_role() {
+        for role in [AgentRole::Privesc, AgentRole::Lateral] {
+            for tool in tools_for_role(role)
+                .into_iter()
+                .filter(|t| KERBEROS_ONLY_TOOLS.contains(&t.name.as_str()))
+            {
+                let props = tool.input_schema["properties"]
+                    .as_object()
+                    .expect("properties");
+                assert!(
+                    props.contains_key("ticket_path"),
+                    "{} has no auth mode other than a Kerberos ccache, so stripping ticket_path \
+                     leaves the LLM unable to spend a ticket it just obtained: {:?}",
+                    tool.name,
+                    props.keys().collect::<Vec<_>>()
+                );
+                for secret in ["password", "hash", "nt_hash", "aes_key"] {
+                    assert!(
+                        !props.contains_key(secret),
+                        "{} must still hide {secret}",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_path_stays_stripped_from_tools_with_another_auth_mode() {
+        for role in [AgentRole::Acl, AgentRole::Privesc, AgentRole::Lateral] {
+            for tool in tools_for_role(role) {
+                if KERBEROS_ONLY_TOOLS.contains(&tool.name.as_str()) {
+                    continue;
+                }
+                let Some(props) = tool.input_schema["properties"].as_object() else {
+                    continue;
+                };
+                assert!(
+                    !props.contains_key("ticket_path"),
+                    "{} takes a password or hash too — the resolver owns its ticket_path",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acl_has_shadow_credential_tools() {
+        let tools = tools_for_role(AgentRole::Acl);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"dacl_edit"));
+        assert!(names.contains(&"owner_edit"));
+        assert!(names.contains(&"pywhisker"));
+        assert!(names.contains(&"certipy_auth"));
+        assert!(
+            names.contains(&"certipy_shadow"),
+            "the acl role is the only role that discovers GenericWrite/GenericAll edges and \
+             auto_shadow_credentials routes those dispatches to the acl worker, so without \
+             certipy_shadow the shadow-credential spine has no one-step primitive: {names:?}"
+        );
+    }
+
+    #[test]
+    fn acl_certipy_shadow_matches_the_privesc_definition() {
+        let acl_tool = tools_for_role(AgentRole::Acl)
+            .into_iter()
+            .find(|t| t.name == "certipy_shadow")
+            .expect("acl registry must advertise certipy_shadow");
+        let privesc_tool = tools_for_role(AgentRole::Privesc)
+            .into_iter()
+            .find(|t| t.name == "certipy_shadow")
+            .expect("privesc registry must advertise certipy_shadow");
+        assert_eq!(acl_tool.description, privesc_tool.description);
+        assert_eq!(acl_tool.input_schema, privesc_tool.input_schema);
     }
 
     #[test]
