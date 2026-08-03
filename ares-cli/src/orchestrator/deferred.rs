@@ -662,11 +662,11 @@ async fn scan_keys_async(conn: &mut redis::aio::ConnectionManager, pattern: &str
 /// evidence is strong enough to delete the task, plus the human-readable
 /// detail that names the revoked principal, isolated host or rotated realm
 /// for the log line.
-struct ContainmentDrop {
-    kind: ContainmentKind,
-    attribution: ContainmentAttribution,
-    deletes: bool,
-    detail: String,
+pub(in crate::orchestrator) struct ContainmentDrop {
+    pub(in crate::orchestrator) kind: ContainmentKind,
+    pub(in crate::orchestrator) attribution: ContainmentAttribution,
+    pub(in crate::orchestrator) deletes: bool,
+    pub(in crate::orchestrator) detail: String,
 }
 
 /// Return why a deferred task should be dropped from the queue because a
@@ -683,6 +683,19 @@ async fn task_dropped_by_containment(
     task: &DeferredTask,
     state: &crate::orchestrator::state::SharedState,
 ) -> Option<ContainmentDrop> {
+    payload_dropped_by_containment(&task.task_type, &task.payload, state).await
+}
+
+pub(in crate::orchestrator) async fn payload_dropped_by_containment(
+    task_type: &str,
+    payload: &serde_json::Value,
+    state: &crate::orchestrator::state::SharedState,
+) -> Option<ContainmentDrop> {
+    struct Task<'a> {
+        task_type: &'a str,
+        payload: &'a serde_json::Value,
+    }
+    let task = Task { task_type, payload };
     let state = state.read().await;
     let attribution = state.containment_attribution();
 
@@ -736,7 +749,7 @@ async fn task_dropped_by_containment(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let kerberos_shaped = matches!(
-        task.task_type.as_str(),
+        task.task_type,
         "authentication" | "kerberos" | "kerberoast" | "asrep_roast"
     ) || technique.to_lowercase().contains("kerberos")
         || technique.to_lowercase().contains("kerberoast")

@@ -26,6 +26,8 @@ const DEFAULT_CAPACITY: usize = 200;
 const DEFAULT_REJECTION_TTL_SECS: u64 = 600;
 const SWEEP_INTERVAL_SECS: u64 = 5;
 
+const BEHIND_THRESHOLD: u32 = 2;
+
 pub fn mediation_enabled() -> bool {
     match std::env::var("ARES_ORCHESTRATOR_MEDIATION") {
         Ok(v) => !matches!(
@@ -64,6 +66,7 @@ pub enum ProposalOutcome {
     Duplicate,
     PreviouslyRejected,
     Full,
+    ReviewerBehind,
 }
 
 struct PoolInner {
@@ -71,6 +74,7 @@ struct PoolInner {
     signatures: HashSet<String>,
     rejected: HashMap<String, Instant>,
     next_id: u64,
+    consecutive_expiries: u32,
 }
 
 pub struct ProposalPool {
@@ -89,6 +93,7 @@ impl ProposalPool {
                 signatures: HashSet::new(),
                 rejected: HashMap::new(),
                 next_id: 1,
+                consecutive_expiries: 0,
             }),
             window,
             capacity,
@@ -140,6 +145,9 @@ impl ProposalPool {
         if inner.proposals.len() >= self.capacity {
             return ProposalOutcome::Full;
         }
+        if inner.consecutive_expiries >= BEHIND_THRESHOLD {
+            return ProposalOutcome::ReviewerBehind;
+        }
 
         let id = format!("p{:04}", inner.next_id);
         inner.next_id += 1;
@@ -174,6 +182,7 @@ impl ProposalPool {
                 Some(idx) => {
                     let p = inner.proposals.remove(idx);
                     inner.signatures.remove(&p.task.signature());
+                    inner.consecutive_expiries = 0;
                     approved.push(p.task);
                 }
                 None => unknown.push(id.clone()),
@@ -189,6 +198,7 @@ impl ProposalPool {
         let signature = p.task.signature();
         inner.signatures.remove(&signature);
         inner.rejected.insert(signature, Instant::now());
+        inner.consecutive_expiries = 0;
         Some(p.task)
     }
 
@@ -206,6 +216,11 @@ impl ProposalPool {
             } else {
                 i += 1;
             }
+        }
+        if !expired.is_empty() {
+            inner.consecutive_expiries = inner.consecutive_expiries.saturating_add(1);
+        } else if inner.proposals.is_empty() {
+            inner.consecutive_expiries = 0;
         }
         expired
     }
@@ -480,6 +495,70 @@ mod tests {
 
         assert_eq!(
             p.propose(task("recon", "recon", "192.168.58.10", 1)).await,
+            ProposalOutcome::Parked
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_expiry_stops_parking_so_review_latency_cannot_stall_red() {
+        let p = ProposalPool::new(Duration::from_millis(1), 10, Duration::from_secs(600));
+        for _ in 0..BEHIND_THRESHOLD {
+            p.propose(task("exploit", "privesc", "192.168.58.10", 1))
+                .await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(p.take_expired().await.len(), 1);
+        }
+        assert_eq!(
+            p.propose(task("exploit", "privesc", "192.168.58.11", 1))
+                .await,
+            ProposalOutcome::ReviewerBehind
+        );
+    }
+
+    #[tokio::test]
+    async fn parking_resumes_once_the_backlog_drains() {
+        let p = ProposalPool::new(Duration::from_millis(1), 10, Duration::from_secs(600));
+        for _ in 0..BEHIND_THRESHOLD {
+            p.propose(task("exploit", "privesc", "192.168.58.10", 1))
+                .await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            p.take_expired().await;
+        }
+        assert_eq!(
+            p.propose(task("exploit", "privesc", "192.168.58.11", 1))
+                .await,
+            ProposalOutcome::ReviewerBehind
+        );
+
+        assert!(p.take_expired().await.is_empty());
+
+        assert_eq!(
+            p.propose(task("exploit", "privesc", "192.168.58.12", 1))
+                .await,
+            ProposalOutcome::Parked
+        );
+    }
+
+    #[tokio::test]
+    async fn ruling_on_work_clears_the_behind_counter() {
+        let p = ProposalPool::new(Duration::from_millis(1), 10, Duration::from_secs(600));
+        p.propose(task("exploit", "privesc", "192.168.58.10", 1))
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        p.take_expired().await;
+
+        p.propose(task("exploit", "privesc", "192.168.58.11", 1))
+            .await;
+        let (approved, _) = p.approve(&["p0002".to_string()]).await;
+        assert_eq!(approved.len(), 1);
+
+        p.propose(task("exploit", "privesc", "192.168.58.12", 1))
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        p.take_expired().await;
+        assert_eq!(
+            p.propose(task("exploit", "privesc", "192.168.58.13", 1))
+                .await,
             ProposalOutcome::Parked
         );
     }

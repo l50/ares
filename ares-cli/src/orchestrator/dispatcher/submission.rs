@@ -60,6 +60,30 @@ impl Dispatcher {
         payload: serde_json::Value,
         priority: i32,
     ) -> Result<SubmissionOutcome> {
+        if let Some(drop) = crate::orchestrator::deferred::payload_dropped_by_containment(
+            task_type,
+            &payload,
+            &self.state,
+        )
+        .await
+        {
+            if drop.deletes {
+                info!(
+                    task_type = %task_type,
+                    target_role = %target_role,
+                    reason = %drop.detail,
+                    "Suppressing approved work — containment invalidated it while it was parked"
+                );
+                self.deferred
+                    .record_blue_invalidation(task_type, target_role, drop.kind, drop.attribution)
+                    .await;
+                return Ok(SubmissionOutcome::Dropped);
+            }
+            self.deferred
+                .record_containment_retention(target_role)
+                .await;
+        }
+
         let span = info_span!(
             "automation.dispatch",
             task_type = task_type,
@@ -123,6 +147,15 @@ impl Dispatcher {
                     task_type,
                     target_role,
                     "Proposal pool full — dispatching directly so the pool cap cannot stall red"
+                );
+                None
+            }
+            ProposalOutcome::ReviewerBehind => {
+                span.record("automation.decision", "proposal_reviewer_behind");
+                warn!(
+                    task_type,
+                    target_role,
+                    "Orchestrator is not ruling within the window — dispatching directly so review latency cannot stall red"
                 );
                 None
             }
