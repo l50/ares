@@ -542,8 +542,6 @@ async fn dispatch_crack_refuses_ntlm_of_an_already_dominated_domain() {
         name: "dispatch_crack".into(),
         arguments: json!({"username": "bob", "domain": "contoso.local"}),
     };
-    // No dispatcher is configured, so reaching request_crack would error —
-    // the refusal must short-circuit before that.
     match handler.dispatch_crack(&call).await.unwrap() {
         CallbackResult::Continue(msg) => {
             assert!(msg.starts_with("Refused:"), "expected refusal, got {msg}");
@@ -572,8 +570,6 @@ async fn dispatch_crack_still_accepts_a_roastable_in_a_dominated_domain() {
         name: "dispatch_crack".into(),
         arguments: json!({"username": "alice", "domain": "contoso.local"}),
     };
-    // Roastables are never refused, so this falls through to the missing
-    // dispatcher — proving the owned-domain guard did not swallow it.
     let err = handler.dispatch_crack(&call).await.unwrap_err();
     assert!(
         err.to_string().contains("Dispatcher not configured"),

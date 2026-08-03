@@ -33,6 +33,27 @@ use crate::orchestrator::throttling::{ThrottleDecision, Throttler};
 /// Redis key prefix for deferred queues.
 pub const DEFERRED_QUEUE_PREFIX: &str = "ares:deferred";
 
+const MAX_BLOCKED_BEFORE_YIELD: u32 = 25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainAction {
+    Dispatch,
+    Recheck(std::time::Duration),
+    SetAside,
+}
+
+fn drain_action(
+    decision: &ThrottleDecision,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> DrainAction {
+    match decision {
+        ThrottleDecision::Allow => DrainAction::Dispatch,
+        ThrottleDecision::Wait(d) if now + *d < deadline => DrainAction::Recheck(*d),
+        ThrottleDecision::Wait(_) | ThrottleDecision::Defer => DrainAction::SetAside,
+    }
+}
+
 /// Atomic enqueue: signature dedup → per-type cap → global cap → ZADD →
 /// INCR counter → SADD signature.
 ///
@@ -781,6 +802,7 @@ pub fn spawn_deferred_processor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.deferred_poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -797,8 +819,16 @@ pub fn spawn_deferred_processor(
             }
 
             // Try to drain as many as possible while slots are open
+            let cycle_deadline = tokio::time::Instant::now() + config.deferred_poll_interval;
             let mut dispatched = 0_u32;
+            let mut blocked = 0_u32;
+            let mut requeue: Vec<DeferredTask> = Vec::new();
             loop {
+                if tokio::time::Instant::now() >= cycle_deadline
+                    || blocked >= MAX_BLOCKED_BEFORE_YIELD
+                {
+                    break;
+                }
                 let Some(task) = (match deferred.pop_best().await {
                     Ok(t) => t,
                     Err(e) => {
@@ -859,20 +889,26 @@ pub fn spawn_deferred_processor(
                     continue;
                 }
 
-                // Not contained — the sig no longer needs to be held. Release
-                // it before any dispatch or re-enqueue path so a future
-                // equivalent enqueue (either by submit_to_llm internally, or by
-                // a re-enqueue below) doesn't collapse on the held sig and
-                // silently lose the task.
-                deferred.release_signature(&task).await;
-
                 // Re-check throttle before submitting
-                let decision = throttler
+                let mut decision = throttler
                     .check(&task.task_type, &task.target_role, Some(&task.payload))
                     .await;
 
-                match decision {
-                    ThrottleDecision::Allow => {
+                if let DrainAction::Recheck(d) =
+                    drain_action(&decision, tokio::time::Instant::now(), cycle_deadline)
+                {
+                    tokio::time::sleep(d).await;
+                    if *shutdown.borrow() {
+                        requeue.push(task);
+                        break;
+                    }
+                    decision = throttler
+                        .check(&task.task_type, &task.target_role, Some(&task.payload))
+                        .await;
+                }
+
+                match drain_action(&decision, tokio::time::Instant::now(), cycle_deadline) {
+                    DrainAction::Dispatch => {
                         // Pre-check credential concurrency to avoid a hot
                         // re-enqueue loop: submit_to_llm would re-defer the
                         // task if the credential is at capacity, but this
@@ -883,10 +919,18 @@ pub fn spawn_deferred_processor(
                             )
                         {
                             if !dispatcher.credential_inflight.can_acquire(&cred_key).await {
-                                let _ = deferred.enqueue(&task).await;
-                                break;
+                                requeue.push(task);
+                                blocked += 1;
+                                continue;
                             }
                         }
+
+                        // Not contained — the sig no longer needs to be held.
+                        // Release it before any dispatch or re-enqueue path so a
+                        // future equivalent enqueue (either by submit_to_llm
+                        // internally, or by a re-enqueue below) doesn't collapse
+                        // on the held sig and silently lose the task.
+                        deferred.release_signature(&task).await;
 
                         // Route directly to the LLM agent loop via Dispatcher.
                         // do_submit handles tracker.add() and throttler.record_dispatch().
@@ -901,6 +945,7 @@ pub fn spawn_deferred_processor(
                         {
                             Ok(Some(tid)) => {
                                 dispatched += 1;
+                                blocked = 0;
                                 info!(
                                     task_id = %tid,
                                     task_type = %task.task_type,
@@ -909,28 +954,31 @@ pub fn spawn_deferred_processor(
                             }
                             Ok(None) => {
                                 // Credential concurrency block or no role mapping.
-                                // Task may have been re-enqueued by submit_to_llm;
-                                // break to avoid hot loop.
-                                break;
+                                // Task may have been re-enqueued by submit_to_llm.
+                                blocked += 1;
                             }
                             Err(e) => {
                                 warn!(err = %e, "Failed to dispatch deferred task");
-                                // Re-enqueue so it is not lost
-                                let _ = deferred.enqueue(&task).await;
-                                break;
+                                requeue.push(task);
+                                blocked += 1;
                             }
                         }
                     }
-                    ThrottleDecision::Defer | ThrottleDecision::Wait(_) => {
-                        // Put it back; stop draining since capacity is full.
-                        let _ = deferred.enqueue(&task).await;
-                        break;
+                    DrainAction::Recheck(_) | DrainAction::SetAside => {
+                        requeue.push(task);
+                        blocked += 1;
                     }
                 }
             }
 
-            if dispatched > 0 {
-                info!(dispatched, "Deferred queue drain cycle");
+            let requeued = requeue.len();
+            for task in requeue {
+                deferred.release_signature(&task).await;
+                let _ = deferred.enqueue(&task).await;
+            }
+
+            if dispatched > 0 || requeued > 0 {
+                info!(dispatched, requeued, blocked, "Deferred queue drain cycle");
             }
         }
     })
@@ -940,6 +988,7 @@ pub fn spawn_deferred_processor(
 mod tests {
     use super::*;
     use crate::orchestrator::state::SharedState;
+    use std::time::Duration;
 
     fn make_task(priority: i32, enqueue_time: f64) -> DeferredTask {
         DeferredTask {
@@ -1232,6 +1281,104 @@ mod tests {
         assert_eq!(drop.kind, ContainmentKind::KrbtgtRotated);
         assert_eq!(drop.attribution, ContainmentAttribution::BlueActive);
         assert!(drop.detail.contains("krbtgt rotated"));
+    }
+
+    fn budget(secs: u64) -> (tokio::time::Instant, tokio::time::Instant) {
+        let now = tokio::time::Instant::now();
+        (now, now + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn allow_dispatches() {
+        let (now, deadline) = budget(10);
+        assert_eq!(
+            drain_action(&ThrottleDecision::Allow, now, deadline),
+            DrainAction::Dispatch
+        );
+    }
+
+    #[test]
+    fn defer_sets_aside() {
+        let (now, deadline) = budget(10);
+        assert_eq!(
+            drain_action(&ThrottleDecision::Defer, now, deadline),
+            DrainAction::SetAside
+        );
+    }
+
+    #[test]
+    fn dispatch_delay_wait_is_rechecked_not_stopped() {
+        let (now, deadline) = budget(10);
+        let delay = Duration::from_millis(200);
+        assert_eq!(
+            drain_action(&ThrottleDecision::Wait(delay), now, deadline),
+            DrainAction::Recheck(delay)
+        );
+    }
+
+    #[test]
+    fn wait_longer_than_budget_sets_aside() {
+        let (now, deadline) = budget(10);
+        assert_eq!(
+            drain_action(
+                &ThrottleDecision::Wait(Duration::from_secs(60)),
+                now,
+                deadline
+            ),
+            DrainAction::SetAside
+        );
+    }
+
+    #[test]
+    fn wait_exactly_at_deadline_sets_aside() {
+        let (now, deadline) = budget(10);
+        assert_eq!(
+            drain_action(
+                &ThrottleDecision::Wait(Duration::from_secs(10)),
+                now,
+                deadline
+            ),
+            DrainAction::SetAside
+        );
+    }
+
+    #[test]
+    fn wait_just_inside_budget_is_rechecked() {
+        let (now, deadline) = budget(10);
+        let d = Duration::from_millis(9_999);
+        assert_eq!(
+            drain_action(&ThrottleDecision::Wait(d), now, deadline),
+            DrainAction::Recheck(d)
+        );
+    }
+
+    #[test]
+    fn wait_near_an_exhausted_budget_sets_aside() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_millis(50);
+        assert_eq!(
+            drain_action(
+                &ThrottleDecision::Wait(Duration::from_millis(200)),
+                now,
+                deadline
+            ),
+            DrainAction::SetAside
+        );
+    }
+
+    #[test]
+    fn a_full_delay_cycle_drains_many_tasks() {
+        let (now, deadline) = budget(10);
+        let delay = Duration::from_millis(200);
+        let mut at = now;
+        let mut admitted = 0;
+        while drain_action(&ThrottleDecision::Wait(delay), at, deadline)
+            == DrainAction::Recheck(delay)
+        {
+            at += delay;
+            admitted += 1;
+        }
+        assert_eq!(admitted, 49);
     }
 
     #[test]

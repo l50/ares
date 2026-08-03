@@ -118,10 +118,6 @@ const NTLM_TURN_AFTER_ROASTABLE_STREAK: u32 = 2;
 const DEFAULT_MAX_ACTIVE_CRACK_TASKS: usize = 2;
 const CRACK_INFLIGHT_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Backstop for a direct crack dispatch that never returns. The spawned task
-/// releases its own slot on completion, so this only fires if the dispatch
-/// hangs well past the hash-cracking budget. Without it a wedged task holds a
-/// slot for the rest of the operation and the cap starves the tick again.
 const CRACK_TASK_STALL_TTL: Duration = Duration::from_secs(30 * 60);
 
 fn max_active_crack_tasks() -> usize {
@@ -132,10 +128,6 @@ fn max_active_crack_tasks() -> usize {
         .unwrap_or(DEFAULT_MAX_ACTIVE_CRACK_TASKS)
 }
 
-/// Decrements the tick's in-flight crack count on every exit path, including
-/// a panic inside the spawned dispatch. A leaked slot is unrecoverable: the
-/// count never returns below the cap and the tick stops dispatching for the
-/// rest of the op.
 struct InflightCrackSlot(Arc<AtomicUsize>);
 
 impl Drop for InflightCrackSlot {
@@ -243,13 +235,6 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
         // trigger deleted the guard every tick, letting the same hash be
         // re-selected, re-dispatched, and burn all MAX_CRACK_ATTEMPTS retries in
         // ~45s before the first hashcat run had a chance to finish.
-        //
-        // For the same reason the concurrency cap below counts this tick's own
-        // spawned dispatches rather than `tracker.count_for_role("cracker")`:
-        // that counter only ever sees LLM-submitted crack tasks, so an
-        // orchestrator holding both slots pinned it at the cap and silently
-        // starved deterministic cracking for the rest of the op — the AS-REP
-        // foothold into an unowned forest never reached hashcat.
         let active_crack_tasks = inflight_crack_tasks.load(Ordering::Relaxed);
         let now = Instant::now();
         inflight_crack_dedup

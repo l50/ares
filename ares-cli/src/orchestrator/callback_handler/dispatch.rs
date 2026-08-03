@@ -264,10 +264,6 @@ impl OrchestratorCallbackHandler {
             )));
         };
 
-        // hashcat runs in a cap-limited pool shared with deterministic
-        // cracking. NTLM of a domain we already dominate is PtH-usable as-is,
-        // so spending a slot on it buys no access while delaying the
-        // roastable footholds into forests we do not own yet.
         if crate::orchestrator::automation::is_owned_domain_ntlm(&hash, &dominated) {
             return Ok(CallbackResult::Continue(format!(
                 "Refused: {username}@{} is NTLM for a domain already fully compromised, and \
