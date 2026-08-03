@@ -522,3 +522,61 @@ async fn worker_role_may_still_query_state() {
         other => panic!("Expected Continue, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn dispatch_crack_refuses_ntlm_of_an_already_dominated_domain() {
+    let handler = make_handler();
+    {
+        let mut s = handler.state.write().await;
+        s.dominated_domains.insert("contoso.local".to_string());
+        s.hashes.push(make_hash(
+            "bob",
+            "contoso.local",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+            None,
+        ));
+    }
+    let call = ToolCall {
+        id: "c-1".into(),
+        name: "dispatch_crack".into(),
+        arguments: json!({"username": "bob", "domain": "contoso.local"}),
+    };
+    // No dispatcher is configured, so reaching request_crack would error —
+    // the refusal must short-circuit before that.
+    match handler.dispatch_crack(&call).await.unwrap() {
+        CallbackResult::Continue(msg) => {
+            assert!(msg.starts_with("Refused:"), "expected refusal, got {msg}");
+            assert!(msg.contains("pass-the-hash"), "{msg}");
+        }
+        other => panic!("Expected Continue, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_crack_still_accepts_a_roastable_in_a_dominated_domain() {
+    let handler = make_handler();
+    {
+        let mut s = handler.state.write().await;
+        s.dominated_domains.insert("contoso.local".to_string());
+        s.hashes.push(make_hash(
+            "alice",
+            "contoso.local",
+            "asrep",
+            "$krb5asrep$23$alice@CONTOSO.LOCAL:abc$def",
+            None,
+        ));
+    }
+    let call = ToolCall {
+        id: "c-2".into(),
+        name: "dispatch_crack".into(),
+        arguments: json!({"username": "alice", "domain": "contoso.local"}),
+    };
+    // Roastables are never refused, so this falls through to the missing
+    // dispatcher — proving the owned-domain guard did not swallow it.
+    let err = handler.dispatch_crack(&call).await.unwrap_err();
+    assert!(
+        err.to_string().contains("Dispatcher not configured"),
+        "roastable must reach dispatch, got {err}"
+    );
+}

@@ -231,18 +231,18 @@ impl OrchestratorCallbackHandler {
     }
 
     pub(super) async fn dispatch_crack(&self, call: &ToolCall) -> Result<CallbackResult> {
-        let dispatcher = self
-            .dispatcher
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Dispatcher not configured"))?;
-
         let username = call.arguments["username"].as_str().unwrap_or("");
         let domain = call.arguments["domain"].as_str().unwrap_or("");
         let hash_type = call.arguments["hash_type"].as_str();
 
-        let hash = {
+        let (hash, dominated) = {
             let state = self.state.read().await;
-            state
+            let dominated: std::collections::HashSet<String> = state
+                .dominated_domains
+                .iter()
+                .map(|d| d.trim().to_lowercase())
+                .collect();
+            let hash = state
                 .hashes
                 .iter()
                 .find(|h| {
@@ -253,7 +253,8 @@ impl OrchestratorCallbackHandler {
                             .map(|t| h.hash_type.eq_ignore_ascii_case(t))
                             .unwrap_or(true)
                 })
-                .cloned()
+                .cloned();
+            (hash, dominated)
         };
 
         let Some(hash) = hash else {
@@ -262,6 +263,25 @@ impl OrchestratorCallbackHandler {
                  and pick a principal whose cracked field is false."
             )));
         };
+
+        // hashcat runs in a cap-limited pool shared with deterministic
+        // cracking. NTLM of a domain we already dominate is PtH-usable as-is,
+        // so spending a slot on it buys no access while delaying the
+        // roastable footholds into forests we do not own yet.
+        if crate::orchestrator::automation::is_owned_domain_ntlm(&hash, &dominated) {
+            return Ok(CallbackResult::Continue(format!(
+                "Refused: {username}@{} is NTLM for a domain already fully compromised, and \
+                 its hash is already usable for pass-the-hash. Cracking it buys no new access \
+                 and would delay roastable (AS-REP/kerberoast) hashes that unlock domains we \
+                 do not own. Pick an uncracked AS-REP or kerberoast hash instead.",
+                hash.domain
+            )));
+        }
+
+        let dispatcher = self
+            .dispatcher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Dispatcher not configured"))?;
 
         let hash_type_label = hash.hash_type.clone();
         let task_id = dispatcher.request_crack(&hash).await?;
