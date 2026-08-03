@@ -18,7 +18,9 @@ use crate::orchestrator::throttling::ThrottleDecision;
 use ares_llm::LoopEndReason;
 
 use super::{Dispatcher, SubmissionOutcome};
-use crate::orchestrator::proposals::{mediation_enabled, ProposalOutcome};
+use crate::orchestrator::proposals::{
+    mediation_enabled, mediation_scope_is_all, task_type_is_vetoable, ProposalOutcome,
+};
 
 tokio::task_local! {
     static ORCHESTRATOR_DIRECTED: bool;
@@ -40,11 +42,14 @@ pub(crate) fn should_mediate(
     mediation_on: bool,
     target_role: &str,
     orchestrator_directed: bool,
+    task_type: &str,
+    scope_is_all: bool,
 ) -> bool {
     caller_wants_mediation
         && mediation_on
         && target_role != "orchestrator"
         && !orchestrator_directed
+        && (scope_is_all || task_type_is_vetoable(task_type))
 }
 
 impl Dispatcher {
@@ -189,6 +194,8 @@ impl Dispatcher {
             mediation_enabled(),
             target_role,
             is_orchestrator_directed(),
+            task_type,
+            mediation_scope_is_all(),
         ) {
             match self
                 .park_as_proposal(task_type, target_role, payload, priority, &span)
@@ -1423,40 +1430,66 @@ mod mediation_gate_tests {
 
     #[test]
     fn mediation_off_leaves_every_dispatch_alone() {
-        assert!(!should_mediate(true, false, "recon", false));
-        assert!(!should_mediate(true, false, "credential_access", false));
+        assert!(!should_mediate(
+            true, false, "privesc", false, "exploit", false
+        ));
+        assert!(!should_mediate(
+            true, false, "lateral", false, "lateral", false
+        ));
     }
 
     #[test]
-    fn automation_dispatch_is_mediated_when_enabled() {
-        for role in [
+    fn only_vetoable_work_is_mediated() {
+        for task_type in ["exploit", "lateral", "coercion", "acl_chain_step"] {
+            assert!(
+                should_mediate(true, true, "privesc", false, task_type, false),
+                "{task_type} is expensive or failure-prone and must be reviewable"
+            );
+        }
+        for task_type in [
             "recon",
+            "crack",
             "credential_access",
-            "privesc",
-            "lateral",
-            "coercion",
-            "acl",
+            "acl_analysis",
+            "nmap",
         ] {
             assert!(
-                should_mediate(true, true, role, false),
-                "{role} dispatch should be proposed for review"
+                !should_mediate(true, true, "recon", false, task_type, false),
+                "{task_type} is routine — mediating it only adds latency"
             );
         }
     }
 
     #[test]
+    fn scope_all_restores_full_mediation() {
+        assert!(should_mediate(true, true, "recon", false, "recon", true));
+        assert!(should_mediate(true, true, "cracker", false, "crack", true));
+    }
+
+    #[test]
     fn the_orchestrator_planning_task_is_never_mediated() {
-        assert!(!should_mediate(true, true, "orchestrator", false));
+        assert!(!should_mediate(
+            true,
+            true,
+            "orchestrator",
+            false,
+            "orchestrator_plan",
+            true
+        ));
     }
 
     #[test]
     fn orchestrator_directed_dispatch_bypasses_mediation() {
-        assert!(!should_mediate(true, true, "recon", true));
+        assert!(!should_mediate(
+            true, true, "privesc", true, "exploit", true
+        ));
     }
 
     #[test]
     fn approved_release_is_never_re_mediated() {
-        assert!(!should_mediate(false, true, "recon", false));
+        assert!(!should_mediate(
+            false, true, "privesc", false, "exploit", true
+        ));
     }
 
     #[tokio::test]
