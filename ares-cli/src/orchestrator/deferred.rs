@@ -33,8 +33,6 @@ use crate::orchestrator::throttling::{ThrottleDecision, Throttler};
 /// Redis key prefix for deferred queues.
 pub const DEFERRED_QUEUE_PREFIX: &str = "ares:deferred";
 
-const MAX_BLOCKED_BEFORE_YIELD: u32 = 25;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainAction {
     Dispatch,
@@ -314,6 +312,14 @@ impl DeferredQueue {
     /// signature SET — see [`DeferredTask::signature`] for what's
     /// considered equivalent.
     pub async fn enqueue(&self, task: &DeferredTask) -> Result<bool> {
+        self.enqueue_inner(task, true).await
+    }
+
+    pub async fn requeue(&self, task: &DeferredTask) -> Result<bool> {
+        self.enqueue_inner(task, false).await
+    }
+
+    async fn enqueue_inner(&self, task: &DeferredTask, log_accept: bool) -> Result<bool> {
         let key = self.zset_key(&task.task_type);
         let total_key = self.total_key();
         let sig_key = self.sig_key(&task.task_type);
@@ -337,14 +343,16 @@ impl DeferredQueue {
 
         match result {
             1 => {
-                info!(
-                    task_type = %task.task_type,
-                    role = %task.target_role,
-                    priority = task.priority,
-                    score,
-                    signature = %signature,
-                    "Task deferred"
-                );
+                if log_accept {
+                    info!(
+                        task_type = %task.task_type,
+                        role = %task.target_role,
+                        priority = task.priority,
+                        score,
+                        signature = %signature,
+                        "Task deferred"
+                    );
+                }
                 Ok(true)
             }
             0 => {
@@ -824,9 +832,7 @@ pub fn spawn_deferred_processor(
             let mut blocked = 0_u32;
             let mut requeue: Vec<DeferredTask> = Vec::new();
             loop {
-                if tokio::time::Instant::now() >= cycle_deadline
-                    || blocked >= MAX_BLOCKED_BEFORE_YIELD
-                {
+                if tokio::time::Instant::now() >= cycle_deadline {
                     break;
                 }
                 let Some(task) = (match deferred.pop_best().await {
@@ -945,7 +951,6 @@ pub fn spawn_deferred_processor(
                         {
                             Ok(Some(tid)) => {
                                 dispatched += 1;
-                                blocked = 0;
                                 info!(
                                     task_id = %tid,
                                     task_type = %task.task_type,
@@ -972,9 +977,23 @@ pub fn spawn_deferred_processor(
             }
 
             let requeued = requeue.len();
+            let mut requeue_rejected = 0_u32;
             for task in requeue {
                 deferred.release_signature(&task).await;
-                let _ = deferred.enqueue(&task).await;
+                match deferred.requeue(&task).await {
+                    Ok(true) => {}
+                    Ok(false) => requeue_rejected += 1,
+                    Err(e) => {
+                        warn!(err = %e, task_type = %task.task_type, "Deferred requeue failed");
+                        requeue_rejected += 1;
+                    }
+                }
+            }
+            if requeue_rejected > 0 {
+                warn!(
+                    requeue_rejected,
+                    requeued, "Deferred requeue rejected by cap — queued work dropped"
+                );
             }
 
             if dispatched > 0 || requeued > 0 {
