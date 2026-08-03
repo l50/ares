@@ -230,6 +230,8 @@ pub struct StateInner {
     // fresh budget (acceptable mild leak).
     pub crack_attempts: HashMap<String, u32>,
 
+    pub golden_ticket_forge_attempts: HashMap<String, u32>,
+
     // Forged inter-realm Kerberos tickets (source→target forest, cached path)
     pub kerberos_tickets: Vec<ares_core::models::KerberosTicket>,
 
@@ -382,6 +384,7 @@ impl StateInner {
             containment_reject_counts: HashMap::new(),
             krbtgt_transient_counts: HashMap::new(),
             crack_attempts: HashMap::new(),
+            golden_ticket_forge_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,

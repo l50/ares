@@ -155,12 +155,35 @@ deterministic rules as the only scheduler. This default is what makes the
 orchestrator the decision-maker rather than a supervisor over an
 already-scheduled system.
 
-With mediation on, an automation's dispatch does not run immediately. It is
+With mediation on, dispatch of *vetoable* work does not run immediately. It is
 parked in a **proposal pool** (`orchestrator/proposals.rs`) and the orchestrator
 rules on it with `get_proposed_work` / `approve_work` / `reject_work`. The
 automations keep their detection logic and payload construction unchanged — the
 orchestrator selects from validated, executable work rather than composing tool
 calls, so it cannot name a `vuln_id`, host or principal that does not exist.
+
+**Only a veto changes what runs.** Approved work dispatches; unreviewed work
+auto-releases and dispatches too. The two paths are indistinguishable in
+outcome, so approving is not what makes mediation worth its latency — rejecting
+is. Measured on `op-20260731-174811` with every task type mediated: 71 approved,
+353 auto-released, and **8 rejected**. Only those 8 dispatches differed from
+the un-mediated run, at the cost of a review window on all 432.
+
+`VETOABLE_TASK_TYPES` (`proposals.rs`) therefore scopes mediation to work where
+a veto has value — `exploit`, `lateral`, `coercion`, `acl_chain_step`. Routine
+enumeration, credential access and cracking dispatch straight through. This cuts
+review volume by roughly an order of magnitude so the orchestrator can actually
+keep up with the queue it is shown, instead of rubber-stamping a fraction of it
+while the rest expires. `ARES_ORCHESTRATOR_MEDIATION_SCOPE=all` restores full
+mediation.
+
+The narrower scope buys a longer window: 180s rather than 60s. The tradeoff is
+per-item latency — an exploit the orchestrator never looks at now waits three
+minutes before auto-release instead of one. Fewer dispatches pay that cost, but
+each pays more of it, so an orchestrator whose turn cadence exceeds the window
+adds roughly three minutes to every exploit in the operation. Shorten
+`ARES_ORCHESTRATOR_MEDIATION_WINDOW_SECS` if time-to-DA matters more than review
+coverage.
 
 The gate is a single line in `throttled_submit_outcome_inner`, which every
 automation dispatch already passes through. Dedup reuses
@@ -188,7 +211,8 @@ the same work can be proposed again later.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `ARES_ORCHESTRATOR_MEDIATION` | on | Route automation dispatch through the orchestrator |
-| `ARES_ORCHESTRATOR_MEDIATION_WINDOW_SECS` | 60 | How long work waits before auto-release |
+| `ARES_ORCHESTRATOR_MEDIATION_SCOPE` | vetoable | `all` mediates every task type instead |
+| `ARES_ORCHESTRATOR_MEDIATION_WINDOW_SECS` | 180 | How long work waits before auto-release |
 | `ARES_ORCHESTRATOR_MEDIATION_CAPACITY` | 200 | Pool cap before fall-through |
 | `ARES_ORCHESTRATOR_MEDIATION_REJECTION_TTL_SECS` | 600 | Rejection cooldown |
 

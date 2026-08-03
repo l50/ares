@@ -9,7 +9,19 @@ use tracing::{debug, info, warn};
 use super::deferred::DeferredTask;
 use super::dispatcher::Dispatcher;
 
-const DEFAULT_WINDOW_SECS: u64 = 60;
+const DEFAULT_WINDOW_SECS: u64 = 180;
+
+const VETOABLE_TASK_TYPES: &[&str] = &["exploit", "lateral", "coercion", "acl_chain_step"];
+
+pub(crate) fn task_type_is_vetoable(task_type: &str) -> bool {
+    VETOABLE_TASK_TYPES.contains(&task_type)
+}
+
+pub(crate) fn mediation_scope_is_all() -> bool {
+    std::env::var("ARES_ORCHESTRATOR_MEDIATION_SCOPE")
+        .map(|v| v.trim().eq_ignore_ascii_case("all"))
+        .unwrap_or(false)
+}
 const DEFAULT_CAPACITY: usize = 200;
 const DEFAULT_REJECTION_TTL_SECS: u64 = 600;
 const SWEEP_INTERVAL_SECS: u64 = 5;
@@ -223,6 +235,15 @@ fn proposal_view(p: &Proposal, window: Duration) -> serde_json::Value {
                 Some(format!("{user}@{dom}"))
             }
         })
+        .or_else(|| {
+            let user = payload_str(payload, &["username"]);
+            let dom = payload_str(payload, &["domain"]);
+            match (user.is_empty(), dom.is_empty()) {
+                (true, _) => None,
+                (false, true) => Some(user),
+                (false, false) => Some(format!("{user}@{dom}")),
+            }
+        })
         .unwrap_or_default();
     let age = p.proposed_at.elapsed();
     json!({
@@ -231,7 +252,7 @@ fn proposal_view(p: &Proposal, window: Duration) -> serde_json::Value {
         "target_role": p.task.target_role,
         "priority": p.task.priority,
         "technique": payload_str(payload, &["technique"]),
-        "target": payload_str(payload, &["target_ip", "dc_ip", "target"]),
+        "target": payload_str(payload, &["target_ip", "dc_ip", "target", "domain"]),
         "vuln_id": payload_str(payload, &["vuln_id"]),
         "principal": principal,
         "age_secs": age.as_secs(),
@@ -306,6 +327,58 @@ mod tests {
 
     fn pool() -> ProposalPool {
         ProposalPool::new(Duration::from_secs(60), 10, Duration::from_secs(600))
+    }
+
+    #[test]
+    fn golden_ticket_proposal_shows_its_domain_and_principal() {
+        let p = Proposal {
+            id: "p0112".to_string(),
+            task: DeferredTask {
+                priority: 1,
+                enqueue_time: 0.0,
+                task_type: "exploit".to_string(),
+                target_role: "privesc".to_string(),
+                payload: json!({
+                    "technique": "golden_ticket",
+                    "vuln_type": "golden_ticket",
+                    "domain": "contoso.local",
+                    "username": "Administrator",
+                    "krbtgt_hash": "aad3b435b51404eeaad3b435b51404ee",
+                }),
+                source_agent: "automation".to_string(),
+            },
+            proposed_at: Instant::now(),
+        };
+
+        let view = proposal_view(&p, Duration::from_secs(180));
+
+        assert_eq!(view["technique"], "golden_ticket");
+        assert_eq!(view["target"], "contoso.local");
+        assert_eq!(view["principal"], "Administrator@contoso.local");
+        assert_eq!(view["vuln_id"], "");
+    }
+
+    #[test]
+    fn a_principal_without_a_domain_is_not_suffixed() {
+        let p = Proposal {
+            id: "p0113".to_string(),
+            task: DeferredTask {
+                priority: 1,
+                enqueue_time: 0.0,
+                task_type: "exploit".to_string(),
+                target_role: "privesc".to_string(),
+                payload: json!({
+                    "technique": "shadow_credentials",
+                    "username": "svc_backup",
+                }),
+                source_agent: "automation".to_string(),
+            },
+            proposed_at: Instant::now(),
+        };
+
+        let view = proposal_view(&p, Duration::from_secs(180));
+
+        assert_eq!(view["principal"], "svc_backup");
     }
 
     #[tokio::test]

@@ -96,6 +96,7 @@ pub use foreign_group_enum::auto_foreign_group_enum;
 pub use gmsa::auto_gmsa_extraction;
 pub use golden_cert::auto_golden_cert;
 pub use golden_ticket::auto_golden_ticket;
+pub(crate) use golden_ticket::GOLDEN_TICKET_DISPATCHED;
 pub use gpo::auto_gpo_abuse;
 pub use gpp_sysvol::auto_gpp_sysvol;
 pub use group_enumeration::auto_group_enumeration;
