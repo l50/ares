@@ -662,4 +662,34 @@ mod tests {
             assert_eq!(exploitation_techniques(vuln), vec!["T1210".to_string()]);
         }
     }
+
+    #[test]
+    fn mssql_linked_server_rule_matches_mssql_and_not_nopac() {
+        let (_, entry) = ares_core::detection::find_template("detect_mssql_linked_server")
+            .expect("detect_mssql_linked_server must exist");
+        let matches = |red: &str| {
+            ares_core::correlation::redblue::RedBlueCorrelator::techniques_match(
+                Some(red),
+                Some(&entry.mitre_id),
+            )
+        };
+
+        for red in exploitation_techniques("mssql_linked_server_sql01") {
+            assert!(
+                matches(&red),
+                "a blue MSSQL rule that no MSSQL vuln can match is coverage red never gets \
+                 credited for: red={red} blue={}",
+                entry.mitre_id
+            );
+        }
+
+        for red in exploitation_techniques("nopac_dc01") {
+            assert!(
+                !matches(&red),
+                "an MSSQL linked-server alert must not credit NoPac coverage: red={red} \
+                 blue={}",
+                entry.mitre_id
+            );
+        }
+    }
 }
