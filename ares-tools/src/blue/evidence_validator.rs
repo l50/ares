@@ -4,6 +4,7 @@
 //! extracts IOCs (IPs, hostnames, users, hashes) via regex, and validates
 //! evidence values against the stored results for confidence adjustment.
 
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
@@ -178,8 +179,51 @@ fn is_hostname_like(value: &str) -> bool {
     true
 }
 
+fn decode_json_escapes(text: &str) -> Cow<'_, str> {
+    if !text.contains('\\') {
+        return Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Extract IOC values from a text string (query result output).
 fn extract_iocs_from_text(text: &str) -> HashSet<String> {
+    let decoded = decode_json_escapes(text);
+    let text: &str = decoded.as_ref();
     let mut values = HashSet::new();
 
     // IPv4 addresses
@@ -467,6 +511,47 @@ mod tests {
         let text = "Hash: aad3b435b51404eeaad3b435b51404ee";
         let iocs = extract_iocs_from_text(text);
         assert!(iocs.contains("aad3b435b51404eeaad3b435b51404ee"));
+    }
+
+    #[test]
+    fn xml_escape_does_not_glue_onto_the_account_name() {
+        let text = r"<Data Name='TargetUserName'>alice.admin</Data>";
+        let iocs = extract_iocs_from_text(text);
+        assert!(
+            iocs.contains("alice.admin"),
+            "expected the decoded account name, got {iocs:?}"
+        );
+        assert!(
+            !iocs.contains("u003ealice.admin"),
+            "escape payload must not survive into the IOC: {iocs:?}"
+        );
+    }
+
+    #[test]
+    fn tab_escape_does_not_glue_onto_an_address() {
+        let iocs = extract_iocs_from_text(r"logon from\t192.168.58.172 as\talice.admin");
+        assert!(iocs.contains("192.168.58.172"), "got {iocs:?}");
+        assert!(!iocs.contains("t192.168.58.172"), "got {iocs:?}");
+        assert!(!iocs.contains("talice.admin"), "got {iocs:?}");
+    }
+
+    #[test]
+    fn escaped_backslash_yields_the_domain_user_pair() {
+        let iocs = extract_iocs_from_text(r"Account: CONTOSO\\alice.admin");
+        assert!(iocs.contains(r"contoso\alice.admin"), "got {iocs:?}");
+    }
+
+    #[test]
+    fn unrecognized_escapes_are_left_alone() {
+        assert_eq!(
+            decode_json_escapes(r"C:\Windows\System32"),
+            r"C:\Windows\System32"
+        );
+        assert_eq!(decode_json_escapes(r"\uZZZZ"), r"\uZZZZ");
+        assert_eq!(
+            decode_json_escapes("no backslash here"),
+            "no backslash here"
+        );
     }
 
     #[test]
