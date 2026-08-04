@@ -21,6 +21,23 @@ fn find_usable_credential(
         .cloned()
 }
 
+fn realm_from_hosts(hosts: &[ares_core::models::Host], target_ip: &str) -> Option<String> {
+    hosts
+        .iter()
+        .find(|h| h.ip == target_ip)
+        .and_then(|h| h.hostname.split_once('.').map(|(_, d)| d.to_lowercase()))
+}
+
+pub(super) fn is_cross_realm(cred_domain: &str, target_realm: &str) -> bool {
+    let cd = cred_domain.to_lowercase();
+    let td = target_realm.to_lowercase();
+    !cd.is_empty()
+        && !td.is_empty()
+        && cd != td
+        && !td.ends_with(&format!(".{cd}"))
+        && !cd.ends_with(&format!(".{td}"))
+}
+
 impl OrchestratorCallbackHandler {
     pub(super) async fn dispatch_recon(&self, call: &ToolCall) -> Result<CallbackResult> {
         let dispatcher = self
@@ -50,11 +67,6 @@ impl OrchestratorCallbackHandler {
         &self,
         call: &ToolCall,
     ) -> Result<CallbackResult> {
-        let dispatcher = self
-            .dispatcher
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Dispatcher not configured"))?;
-
         let technique = call.arguments["technique"]
             .as_str()
             .unwrap_or("secretsdump");
@@ -63,10 +75,38 @@ impl OrchestratorCallbackHandler {
         let username = call.arguments["username"].as_str().unwrap_or("");
         let priority = call.arguments["priority"].as_i64().unwrap_or(5) as i32;
 
-        let cred = {
+        let (target_realm, cred) = {
             let state = self.state.read().await;
-            find_usable_credential(&state.credentials, username, domain)
+            (
+                realm_from_hosts(&state.hosts, target_ip),
+                find_usable_credential(&state.credentials, username, domain),
+            )
         };
+
+        if let Some(td) = target_realm {
+            if is_cross_realm(domain, &td) {
+                warn!(
+                    target_ip = target_ip,
+                    target_realm = %td,
+                    cred_domain = domain,
+                    cred_user = username,
+                    technique = technique,
+                    "Rejecting cross-realm credential access from LLM — returning dead-end message"
+                );
+                return Ok(CallbackResult::Continue(format!(
+                    "REJECTED: cross-realm credential access ({domain} cred → {td} target at \
+                     {target_ip}) will not work, and any secrets it returned would be stamped \
+                     with the wrong realm. DCSync/{technique} requires replication rights held \
+                     in {td}. Instead: dispatch forest_trust_escalation, exploit ESC8/MSSQL/ACL \
+                     paths to acquire a {td}-realm credential, then re-dispatch with domain={td}."
+                )));
+            }
+        }
+
+        let dispatcher = self
+            .dispatcher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Dispatcher not configured"))?;
 
         let Some(cred) = cred else {
             warn!(
@@ -98,11 +138,6 @@ impl OrchestratorCallbackHandler {
     }
 
     pub(super) async fn dispatch_lateral(&self, call: &ToolCall) -> Result<CallbackResult> {
-        let dispatcher = self
-            .dispatcher
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Dispatcher not configured"))?;
-
         let target_ip = call.arguments["target_ip"].as_str().unwrap_or("");
         let technique = call.arguments["technique"].as_str().unwrap_or("psexec");
         let username = call.arguments["username"].as_str().unwrap_or("");
@@ -110,23 +145,14 @@ impl OrchestratorCallbackHandler {
 
         let (target_realm, cred) = {
             let state = self.state.read().await;
-            let realm = state
-                .hosts
-                .iter()
-                .find(|h| h.ip == target_ip)
-                .and_then(|h| h.hostname.split_once('.').map(|(_, d)| d.to_lowercase()));
             (
-                realm,
+                realm_from_hosts(&state.hosts, target_ip),
                 find_usable_credential(&state.credentials, username, domain),
             )
         };
         if let Some(td) = target_realm {
-            let cd = domain.to_lowercase();
-            if !cd.is_empty()
-                && cd != td
-                && !td.ends_with(&format!(".{cd}"))
-                && !cd.ends_with(&format!(".{td}"))
-            {
+            if is_cross_realm(domain, &td) {
+                let cd = domain.to_lowercase();
                 warn!(
                     target_ip = target_ip,
                     target_realm = %td,
@@ -145,6 +171,11 @@ impl OrchestratorCallbackHandler {
                 )));
             }
         }
+
+        let dispatcher = self
+            .dispatcher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Dispatcher not configured"))?;
 
         let Some(cred) = cred else {
             warn!(

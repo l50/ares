@@ -1,3 +1,4 @@
+use super::dispatch::is_cross_realm;
 use super::*;
 use serde_json::json;
 
@@ -575,4 +576,110 @@ async fn dispatch_crack_still_accepts_a_roastable_in_a_dominated_domain() {
         err.to_string().contains("Dispatcher not configured"),
         "roastable must reach dispatch, got {err}"
     );
+}
+
+fn make_host(ip: &str, hostname: &str) -> ares_core::models::Host {
+    ares_core::models::Host {
+        ip: ip.into(),
+        hostname: hostname.into(),
+        os: String::new(),
+        roles: vec![],
+        services: vec![],
+        is_dc: true,
+        owned: false,
+    }
+}
+
+async fn handler_with_host(ip: &str, hostname: &str) -> OrchestratorCallbackHandler {
+    let handler = make_handler();
+    {
+        let mut s = handler.state.write().await;
+        s.hosts.push(make_host(ip, hostname));
+        s.credentials
+            .push(make_cred("alice", "P@ssw0rd!", "contoso.local", true));
+    }
+    handler
+}
+
+fn cred_access_call(target_ip: &str, domain: &str) -> ToolCall {
+    ToolCall {
+        id: "ca-1".into(),
+        name: "dispatch_credential_access".into(),
+        arguments: json!({
+            "technique": "secretsdump",
+            "target_ip": target_ip,
+            "domain": domain,
+            "username": "alice",
+        }),
+    }
+}
+
+#[test]
+fn is_cross_realm_allows_same_and_parent_child_pairs() {
+    assert!(!is_cross_realm("contoso.local", "contoso.local"));
+    assert!(!is_cross_realm("CONTOSO.LOCAL", "contoso.local"));
+    assert!(!is_cross_realm("contoso.local", "child.contoso.local"));
+    assert!(!is_cross_realm("child.contoso.local", "contoso.local"));
+    assert!(!is_cross_realm("", "contoso.local"));
+    assert!(is_cross_realm("contoso.local", "fabrikam.local"));
+}
+
+#[tokio::test]
+async fn dispatch_credential_access_rejects_cross_forest_target() {
+    let handler = handler_with_host("192.168.58.5", "dc01.fabrikam.local").await;
+    let call = cred_access_call("192.168.58.5", "contoso.local");
+
+    let result = handler.dispatch_credential_access(&call).await.unwrap();
+    let CallbackResult::Continue(msg) = result else {
+        panic!("expected a Continue rejection");
+    };
+    assert!(
+        msg.contains("REJECTED") && msg.contains("fabrikam.local"),
+        "cross-forest dump must be refused with the target realm named, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_credential_access_allows_child_realm_target() {
+    let handler = handler_with_host("192.168.58.6", "dc02.child.contoso.local").await;
+    let call = cred_access_call("192.168.58.6", "contoso.local");
+
+    let err = handler.dispatch_credential_access(&call).await.unwrap_err();
+    assert!(
+        err.to_string().contains("Dispatcher not configured"),
+        "parent credential against a child DC must reach dispatch, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_credential_access_allows_target_with_unknown_realm() {
+    let handler = handler_with_host("192.168.58.7", "dc03.contoso.local").await;
+    let call = cred_access_call("192.168.58.99", "contoso.local");
+
+    let err = handler.dispatch_credential_access(&call).await.unwrap_err();
+    assert!(
+        err.to_string().contains("Dispatcher not configured"),
+        "an unmapped target must not be guessed as cross-realm, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_lateral_still_rejects_cross_forest_target() {
+    let handler = handler_with_host("192.168.58.5", "dc01.fabrikam.local").await;
+    let call = ToolCall {
+        id: "lat-1".into(),
+        name: "dispatch_lateral_movement".into(),
+        arguments: json!({
+            "technique": "psexec",
+            "target_ip": "192.168.58.5",
+            "domain": "contoso.local",
+            "username": "alice",
+        }),
+    };
+
+    let result = handler.dispatch_lateral(&call).await.unwrap();
+    let CallbackResult::Continue(msg) = result else {
+        panic!("expected a Continue rejection");
+    };
+    assert!(msg.contains("REJECTED"), "got: {msg}");
 }
