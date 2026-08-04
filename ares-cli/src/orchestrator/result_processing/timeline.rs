@@ -298,9 +298,6 @@ pub(super) fn exploitation_techniques(vuln_id: &str) -> Vec<String> {
     if vuln_lower.contains("nopac") {
         techniques.push("T1210".to_string());
     }
-    if techniques.is_empty() {
-        techniques.push("T1210".to_string());
-    }
     techniques
 }
 
@@ -464,7 +461,10 @@ mod tests {
     #[test]
     fn exploitation_techniques_base() {
         let t = exploitation_techniques("some_vuln");
-        assert!(t.contains(&"T1210".to_string()));
+        assert!(
+            t.is_empty(),
+            "an unclassified vuln must claim no technique at all: {t:?}"
+        );
     }
 
     #[test]
@@ -657,9 +657,14 @@ mod tests {
     }
 
     #[test]
-    fn exploitation_techniques_unrecognized_vuln_falls_back_to_t1210() {
+    fn unrecognized_vuln_claims_no_technique_instead_of_t1210() {
         for vuln in ["zerologon_dc01", "printnightmare_web01", "some_vuln"] {
-            assert_eq!(exploitation_techniques(vuln), vec!["T1210".to_string()]);
+            let t = exploitation_techniques(vuln);
+            assert!(
+                t.is_empty(),
+                "{vuln} is unclassified, and emitting T1210 for it lets any blue rule \
+                 carrying T1210 claim coverage red never earned: {t:?}"
+            );
         }
     }
 }
