@@ -194,8 +194,11 @@ fn decode_json_escapes(text: &str) -> Cow<'_, str> {
         match chars.next() {
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
-                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    Some(decoded) => out.push(decoded),
+                let decoded = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                    .then(|| u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32))
+                    .flatten();
+                match decoded {
+                    Some(c) => out.push(c),
                     None => {
                         out.push_str("\\u");
                         out.push_str(&hex);
@@ -515,7 +518,11 @@ mod tests {
 
     #[test]
     fn xml_escape_does_not_glue_onto_the_account_name() {
-        let text = r"<Data Name='TargetUserName'>alice.admin</Data>";
+        let text = r"<Data Name='TargetUserName'\u003ealice.admin\u003c/Data\u003e";
+        assert!(
+            text.contains(r"\u003e"),
+            "fixture must carry the escape the bug hinges on, else the test is vacuous"
+        );
         let iocs = extract_iocs_from_text(text);
         assert!(
             iocs.contains("alice.admin"),
@@ -525,6 +532,14 @@ mod tests {
             !iocs.contains("u003ealice.admin"),
             "escape payload must not survive into the IOC: {iocs:?}"
         );
+    }
+
+    #[test]
+    fn truncated_unicode_escape_is_not_decoded_from_short_hex() {
+        assert_eq!(decode_json_escapes(r"\uAB"), r"\uAB");
+        assert_eq!(decode_json_escapes(r"\u00"), r"\u00");
+        assert_eq!(decode_json_escapes(r"\uZZZZ"), r"\uZZZZ");
+        assert_eq!(decode_json_escapes(r"\u+123"), r"\u+123");
     }
 
     #[test]
