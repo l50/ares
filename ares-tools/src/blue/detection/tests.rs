@@ -665,3 +665,37 @@ fn nopac_template_carries_the_technique_red_records() {
         tmpl.logql
     );
 }
+
+#[test]
+fn acl_manipulation_template_anchors_on_message_text_not_bare_event_ids() {
+    let (_, entry) = ares_core::detection::find_template("detect_acl_account_manipulation")
+        .expect("detect_acl_account_manipulation must exist");
+    assert_eq!(entry.mitre_id, "T1098");
+
+    let tmpl = build_detection_template("detect_acl_account_manipulation", None).unwrap();
+    for id in ["4724", "4728", "4732", "4756"] {
+        assert!(
+            tmpl.logql.contains(id),
+            "event id {id} missing: {}",
+            tmpl.logql
+        );
+    }
+    assert!(
+        tmpl.logql
+            .contains("member was added to a security.enabled"),
+        "the event-id prefilter matches those digits anywhere in the line (SIDs, logon \
+         IDs, ports); the rendered message text is what actually scopes this rule: {}",
+        tmpl.logql
+    );
+    assert!(
+        tmpl.logql.contains("!~"),
+        "machine-account targets must be excluded: creating a computer account emits a \
+         4724 password set that is not ACL abuse: {}",
+        tmpl.logql
+    );
+    assert!(
+        tmpl.logql.contains(".u003e"),
+        "the exclusion must use the Loki-escaped XML shape: {}",
+        tmpl.logql
+    );
+}
