@@ -697,6 +697,19 @@ templates:
       - 'msds-allowedtoactonbehalf'
       - 'rbcd'
 
+  detect_shadow_credentials:
+    description: "Shadow Credentials Detection (msDS-KeyCredentialLink write)"
+    mitre_id: "T1098"
+    tactic: privilege_escalation
+    severity: critical
+    red_team_tool: certipy_shadow
+    auto_pivot: true
+    event_ids: ["5136"]
+    patterns:
+      - 'msDS-KeyCredentialLink'
+      - 'msds-keycredentiallink'
+      - 'keycredential'
+
   detect_acl_account_manipulation:
     description: "ACL Edge Abuse Detection (security-group addition / forced password reset)"
     mitre_id: "T1098"
