@@ -705,9 +705,10 @@ fn shadow_credentials_template_covers_the_key_credential_attribute() {
     let (_, entry) = ares_core::detection::find_template("detect_shadow_credentials")
         .expect("detect_shadow_credentials must exist");
     assert_eq!(
-        entry.mitre_id, "T1098",
-        "shadow credentials add alternate credential material to an account, and red \
-         emits T1098 for the acl_* edges that grant the write"
+        entry.mitre_id, "T1556.006",
+        "certipy_shadow and pywhisker both emit T1556.006; the scorecard join is \
+         exact-or-parent/child, so T1098 would never match the tool this template \
+         is named for"
     );
 
     let tmpl = build_detection_template("detect_shadow_credentials", None).unwrap();

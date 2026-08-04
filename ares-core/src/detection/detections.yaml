@@ -699,8 +699,8 @@ templates:
 
   detect_shadow_credentials:
     description: "Shadow Credentials Detection (msDS-KeyCredentialLink write)"
-    mitre_id: "T1098"
-    tactic: privilege_escalation
+    mitre_id: "T1556.006"
+    tactic: credential_access
     severity: critical
     red_team_tool: certipy_shadow
     auto_pivot: true
