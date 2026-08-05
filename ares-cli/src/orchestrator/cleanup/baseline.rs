@@ -47,6 +47,7 @@ pub const DEFAULT_CONFIG_PATHS: &[&str] = &[
 ];
 
 /// Expand a leading `~/` against `$HOME`.
+#[cfg(not(test))]
 fn expand_home(path: &str) -> Option<String> {
     let Some(rest) = path.strip_prefix("~/") else {
         return Some(path.to_string());
@@ -55,6 +56,11 @@ fn expand_home(path: &str) -> Option<String> {
 }
 
 /// First readable lab config: the env override if set, else the search path.
+///
+/// The default search is compiled out of test builds. One of the search paths
+/// is under `$HOME`, so a developer with the range checked out would otherwise
+/// have the real lab config loaded into unit tests — making every assertion
+/// about "no baseline" pass or fail depending on whose machine ran it.
 fn locate_config() -> Option<String> {
     if let Ok(explicit) = std::env::var(BASELINE_CONFIG_ENV) {
         let explicit = explicit.trim().to_string();
@@ -62,6 +68,9 @@ fn locate_config() -> Option<String> {
             return Some(explicit);
         }
     }
+    #[cfg(test)]
+    return None;
+    #[cfg(not(test))]
     DEFAULT_CONFIG_PATHS
         .iter()
         .filter_map(|p| expand_home(p))
