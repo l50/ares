@@ -48,6 +48,7 @@ use crate::orchestrator::recovery::{
 /// from the LLM.
 pub const CREDENTIAL_KEYS: &[&str] = &[
     "password",
+    "new_password",
     "hash",
     "nt_hash",
     "ntlm_hash",
@@ -108,6 +109,17 @@ pub async fn resolve_credentials(
     // state has nothing, we never want a `[HASH]` or `<password>` literal to
     // reach the dispatch layer.
     strip_placeholder_credentials(args_obj);
+
+    // A password reset needs a value to write, and the model is not allowed to
+    // author one. `new_password` is off the tool schema; whatever reaches here
+    // is either absent or something the model invented anyway, so it is
+    // overwritten unconditionally with a generated value.
+    if tool_name == "bloodyad_set_password" {
+        args_obj.insert(
+            "new_password".to_string(),
+            Value::String(generate_reset_password()),
+        );
+    }
 
     let reader = RedisStateReader::new(op_id.to_string());
 
@@ -452,6 +464,31 @@ fn guard_unauthenticated_principal(
 
 /// Remove any credential-shaped argument whose value is empty, null, or a
 /// placeholder literal (e.g. `[HASH]`, `<password>`, `N/A`, `unknown`).
+/// Build the value a `bloodyad_set_password` dispatch writes to the target.
+///
+/// Random rather than derived: nothing downstream may reconstruct this string
+/// without observing a tool's output, which is the point. It satisfies the
+/// default AD complexity policy (upper, lower, digit, symbol, 16 chars) so a
+/// reset does not fail on `unwillingToPerform` for a policy reason.
+fn generate_reset_password() -> String {
+    use rand::RngExt;
+
+    const LOWER: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const DIGIT: &[u8] = b"23456789";
+    const SYMBOL: &[u8] = b"!@#$%^&*-_=+";
+
+    let mut rng = rand::rng();
+    let mut pick = |set: &[u8]| set[rng.random_range(0..set.len())] as char;
+
+    let mut out: Vec<char> = vec![pick(UPPER), pick(LOWER), pick(DIGIT), pick(SYMBOL)];
+    let all: Vec<u8> = [LOWER, UPPER, DIGIT, SYMBOL].concat();
+    while out.len() < 16 {
+        out.push(pick(&all));
+    }
+    out.into_iter().collect()
+}
+
 fn strip_placeholder_credentials(args: &mut Map<String, Value>) {
     let mut to_remove = Vec::new();
     for key in CREDENTIAL_KEYS {
