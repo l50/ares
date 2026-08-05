@@ -3778,7 +3778,7 @@ const ACL_GRANTS_SRC: &str = include_str!("acl_grants.rs");
 const TIMELINE_SRC: &str = include_str!("timeline.rs");
 
 #[test]
-fn every_credential_publish_path_routes_through_the_shared_helper() {
+fn no_credential_publish_path_bypasses_the_shared_helper() {
     for (name, src) in [
         ("mod.rs", RESULT_PROCESSING_SRC),
         ("discovery_polling.rs", DISCOVERY_POLLING_SRC),
@@ -3825,6 +3825,16 @@ fn acl_grants_never_reads_a_credential_out_of_tool_arguments() {
         !ACL_GRANTS_SRC.contains(r#"arg("new_password")"#),
         "acl_grants.rs reads new_password out of the tool arguments again — that is \
          model-authored input, not parsed tool output, and it lands in state.credentials"
+    );
+}
+
+#[test]
+fn acl_grants_credits_no_credential_from_a_model_authored_password() {
+    assert!(
+        !ACL_GRANTS_SRC.contains("publish_credential_credited("),
+        "acl_grants.rs credits a credential again — a bloodyAD reset only proves \
+         the write landed, never what the password now is, so the value could \
+         only have come from the model's own new_password argument"
     );
 }
 

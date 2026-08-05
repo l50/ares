@@ -189,6 +189,16 @@ async fn run_inner() -> Result<()> {
     let blue_enabled = false;
     shared_state.set_blue_enabled(blue_enabled).await;
 
+    if let Err(e) = ares_core::blue_invalidation::record_blue_team_enablement(
+        &mut queue.connection(),
+        &config.operation_id,
+        blue_enabled,
+    )
+    .await
+    {
+        warn!(err = %e, "Failed to record blue-team enablement for the operation");
+    }
+
     if let Some(cfg) = ares_config.as_deref() {
         shared_state
             .set_acl_publish_cap(cfg.operation.acl_publish_cap)

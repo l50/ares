@@ -875,7 +875,7 @@ pub fn spawn_deferred_processor(
                                 task_type = %task.task_type,
                                 target_role = %task.target_role,
                                 reason = %kept.detail,
-                                "Keeping deferred task — inferred credential rejection is too weak to delete queued work (blue not running, no KDC_ERR_CLIENT_REVOKED)"
+                                "Keeping deferred task — inferred credential rejection is too weak to delete queued work (no blue revocation on the principal, no KDC_ERR_CLIENT_REVOKED)"
                             );
                             deferred
                                 .record_containment_retention(&task.target_role)
@@ -893,7 +893,7 @@ pub fn spawn_deferred_processor(
                                     task_type = %task.task_type,
                                     target_role = %task.target_role,
                                     reason = %drop.detail,
-                                    "Dropping deferred task — invalidated by inferred credential/host failure (blue not running, NOT containment)"
+                                    "Dropping deferred task — invalidated by inferred credential/host failure with no blue action behind it (NOT containment)"
                                 ),
                             }
                             // Signature is left in the SET by pop_best (POP_HOLD_SCRIPT
