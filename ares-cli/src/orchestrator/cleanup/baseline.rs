@@ -7,13 +7,19 @@
 //! config, so the pre-op password for any account an operation can reset is
 //! sitting in that file the whole time.
 //!
-//! Pointing `ARES_LAB_BASELINE_CONFIG` at it turns the reset from an
-//! unrecoverable mutation into a `Clean` one — teardown sets the account back
-//! to exactly what the range provisioned.
+//! Loading it turns the reset from an unrecoverable mutation into a `Clean`
+//! one — teardown sets the account back to exactly what the range provisioned.
+//!
+//! Restoration is not opt-in. The conventional deployment paths in
+//! [`DEFAULT_CONFIG_PATHS`] are searched with no configuration at all, and
+//! `ARES_LAB_BASELINE_CONFIG` only overrides *where* to look. When no baseline
+//! is found, [`provisioned_password`] returns `None` for every account and the
+//! credential resolver refuses the reset outright rather than performing a
+//! mutation it cannot undo — so every reset an operation actually lands is
+//! restorable by construction.
 //!
 //! Deliberately read at runtime from a path outside this repo. No lab
-//! credential is ever compiled in, and an unset var simply leaves the mutation
-//! classed as it was before.
+//! credential is ever compiled in.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -26,6 +32,41 @@ pub const BASELINE_CONFIG_ENV: &str = "ARES_LAB_BASELINE_CONFIG";
 
 /// Optional deployment overlay merged over the base config.
 pub const BASELINE_OVERLAY_ENV: &str = "ARES_LAB_BASELINE_OVERLAY";
+
+/// Where the lab config is looked for when the env var is unset, in order.
+///
+/// The deployed locations come first so an orchestrator on the box wins over a
+/// developer checkout; `~`-prefixed entries expand against `$HOME`. Restoration
+/// has to work without anyone remembering to configure it, which is the whole
+/// point of searching rather than requiring the var.
+pub const DEFAULT_CONFIG_PATHS: &[&str] = &[
+    "/etc/ares/lab-config.json",
+    "/opt/ares/lab-config.json",
+    "~/dreadnode/DreadOps/apps/DreadGOAD/ad/GOAD/data/config.json",
+    "~/DreadOps/apps/DreadGOAD/ad/GOAD/data/config.json",
+];
+
+/// Expand a leading `~/` against `$HOME`.
+fn expand_home(path: &str) -> Option<String> {
+    let Some(rest) = path.strip_prefix("~/") else {
+        return Some(path.to_string());
+    };
+    std::env::var("HOME").ok().map(|h| format!("{h}/{rest}"))
+}
+
+/// First readable lab config: the env override if set, else the search path.
+fn locate_config() -> Option<String> {
+    if let Ok(explicit) = std::env::var(BASELINE_CONFIG_ENV) {
+        let explicit = explicit.trim().to_string();
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+    }
+    DEFAULT_CONFIG_PATHS
+        .iter()
+        .filter_map(|p| expand_home(p))
+        .find(|p| std::path::Path::new(p).is_file())
+}
 
 /// `(domain, sam)` both lowercased → provisioned password.
 type PasswordMap = HashMap<(String, String), String>;
@@ -43,7 +84,13 @@ pub fn provisioned_password(domain: &str, sam: &str) -> Option<String> {
 }
 
 fn load() -> PasswordMap {
-    let Ok(path) = std::env::var(BASELINE_CONFIG_ENV) else {
+    let Some(path) = locate_config() else {
+        warn!(
+            searched = ?DEFAULT_CONFIG_PATHS,
+            "No lab baseline config found — password resets will be REFUSED before dispatch \
+             so no operation can leave an account it cannot restore. Set {} to enable them",
+            BASELINE_CONFIG_ENV
+        );
         return PasswordMap::new();
     };
     let mut map = match read_users(&path) {
@@ -52,8 +99,8 @@ fn load() -> PasswordMap {
             warn!(
                 path = %path,
                 err = %e,
-                "Lab baseline config unreadable — password resets stay classed IMPOSSIBLE and \
-                 teardown will report them for manual restore"
+                "Lab baseline config unreadable — password resets will be REFUSED before \
+                 dispatch rather than left unrestorable"
             );
             return PasswordMap::new();
         }
