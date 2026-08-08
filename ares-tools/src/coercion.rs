@@ -399,7 +399,6 @@ fn build_relay_args(target_url: &str, template: &str, icpr_ca_name: Option<&str>
     args
 }
 
-// === Trait-based execution seam =====================================
 //
 // The phase-progression logic (spawn relay → run coerce phases → poll
 // log → extract cert) is exercised by unit tests via FakeCoerceProcs,
@@ -532,8 +531,6 @@ pub(crate) async fn wait_for_port_free(
         sleep(Duration::from_millis(250)).await;
     }
 }
-
-// --- Real (production) implementation -------------------------------
 
 struct RealCoerceProcs;
 
@@ -1629,7 +1626,7 @@ mod tests {
         );
     }
 
-    // ── Phase-progression coverage via FakeCoerceProcs ─────────────────────
+    // Phase-progression coverage via FakeCoerceProcs
 
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;

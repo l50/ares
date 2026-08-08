@@ -1148,7 +1148,6 @@ mod runner_tests {
         assert_eq!(p["err"], "network timeout");
     }
 
-    // --- wrap-up nudge ---------------------------------------------------
     //
     // The full nudge-injection path lives inside `run_agent_loop`, which
     // is end-to-end (provider + dispatcher + tool registry). The unit
@@ -1235,7 +1234,7 @@ mod runner_tests {
         assert!(should_inject_wrapup_nudge(1, 6, false));
     }
 
-    // ── should_prune_for_spawn_failure: pruning contract ─────────────────────
+    // should_prune_for_spawn_failure: pruning contract
     //
     // The whole point of the ToolFailureKind split. These tests lock in the
     // invariant that ONLY confirmed ENOENT prunes a tool from the LLM's

@@ -1278,8 +1278,6 @@ mod tests {
         assert!(removed.is_empty());
     }
 
-    // --- assist-abandoned TTL ----------------------------------------
-
     #[test]
     fn assist_abandoned_starts_false() {
         let state = StateInner::new("op-1".into());
@@ -1897,8 +1895,6 @@ mod tests {
         // Should not be quarantined (expired)
         assert!(!state.is_principal_quarantined("jdoe", "child.contoso.local"));
     }
-
-    // --- push_hash_capped ---------------------------------------------------
 
     fn make_test_hash(username: &str, hash_value: &str) -> Hash {
         Hash {
