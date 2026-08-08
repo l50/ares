@@ -1216,7 +1216,6 @@ mod tests {
         assert!(!state.has_golden_ticket);
         assert!(!state.completed);
 
-        // All 19 dedup sets should be initialized
         for name in ALL_DEDUP_SETS {
             assert!(state.dedup.contains_key(*name), "Missing dedup set: {name}");
             assert!(state.dedup[*name].is_empty());

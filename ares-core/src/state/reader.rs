@@ -187,8 +187,6 @@ impl RedisStateReader {
     }
 
     /// Load the full SharedRedTeamState from Redis.
-    ///
-    /// This is the Rust equivalent of `_load_state_from_redis()` in cli_ops.py.
     pub async fn load_state(
         &self,
         conn: &mut impl AsyncCommands,

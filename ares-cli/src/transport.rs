@@ -177,7 +177,6 @@ pub(crate) fn maybe_exec_k8s() -> Option<i32> {
 
 // EC2 transport (AWS SSM — async send/poll/fetch)
 
-/// Resolve EC2 instance ID from a Name tag pattern.
 /// Return `["--profile", profile]` unless session env credentials are already
 /// exported (assume, aws-vault, instance metadata) — in that case the AWS CLI
 /// should use the env session, and passing `--profile` would send it looking
@@ -190,6 +189,7 @@ fn profile_args(profile: &str) -> Vec<&str> {
     }
 }
 
+/// Resolve EC2 instance ID from a Name tag pattern.
 fn resolve_ec2_instance(name: &str, profile: &str, region: &str) -> Result<String, String> {
     // Pass-through: if the caller already provided an instance ID (`i-…`),
     // skip the tag lookup. Lets operators pin a specific box when the Name

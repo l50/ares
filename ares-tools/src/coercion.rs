@@ -478,10 +478,6 @@ impl RunOptions {
     }
 }
 
-/// Wait for the given TCP port to become free on `0.0.0.0`. Polls every
-/// 250ms via a connect probe to `127.0.0.1:<port>`; a connection refused
-/// means nothing is listening. Returns `Ok(())` as soon as the port is
-/// free, `Err(reason)` if `timeout` elapses while it's still held.
 /// True when `ip` parses as a routable address bound to a local interface.
 /// Rejects loopback, unspecified and multicast addresses outright.
 pub(crate) fn is_local_interface_ip(ip: &str) -> bool {
@@ -496,6 +492,10 @@ pub(crate) fn is_local_interface_ip(ip: &str) -> bool {
     UdpSocket::bind((parsed, 0)).is_ok()
 }
 
+/// Wait for the given TCP port to become free on `0.0.0.0`. Polls every
+/// 250ms via a connect probe to `127.0.0.1:<port>`; a connection refused
+/// means nothing is listening. Returns `Ok(())` as soon as the port is
+/// free, `Err(reason)` if `timeout` elapses while it's still held.
 pub(crate) async fn wait_for_port_free(
     port: u16,
     timeout: Duration,

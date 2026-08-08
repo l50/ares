@@ -1155,7 +1155,7 @@ mod runner_tests {
     // so we can verify the boundary math without firing the loop.
 
     fn should_inject_wrapup_nudge(steps: u32, max_steps: u32, already_injected: bool) -> bool {
-        // Mirrors the gate at runner.rs:~265 — keeps the math testable
+        // Mirrors the wrap-up nudge gate in run_agent_loop — keeps the math testable
         // even though the side-effect (messages.push) is inside the loop.
         !already_injected
             && max_steps > super::WRAPUP_THRESHOLD_STEPS
