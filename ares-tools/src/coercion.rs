@@ -500,13 +500,14 @@ pub(crate) async fn wait_for_port_free(
     port: u16,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use tokio::net::TcpStream;
     let deadline = std::time::Instant::now() + timeout;
-    let addr = format!("127.0.0.1:{port}");
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let mut last_reason;
     loop {
         let probe =
-            tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(&addr)).await;
+            tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await;
         match probe {
             // Connection refused → no listener → port is free.
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
