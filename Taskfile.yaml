@@ -14,9 +14,6 @@ includes:
   pre-commit:
     taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/pre-commit/Taskfile.yaml"
     optional: true
-  renovate:
-    taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/renovate/Taskfile.yaml"
-    optional: true
   secrets:
     taskfile: "https://raw.githubusercontent.com/CowDogMoo/taskfile-templates/main/secrets/Taskfile.yaml"  # pragma: allowlist secret
     optional: true

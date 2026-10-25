@@ -1,7 +1,6 @@
 # Ansible Collection: Dreadnode Nimbus Range
 
 [![Pre-Commit](https://github.com/dreadnode/ansible-collection-nimbus_range/actions/workflows/pre-commit.yaml/badge.svg)](https://github.com/dreadnode/ansible-collection-nimbus_range/actions/workflows/pre-commit.yaml)
-[![Renovate](https://github.com/dreadnode/ansible-collection-nimbus_range/actions/workflows/renovate.yaml/badge.svg)](https://github.com/dreadnode/ansible-collection-nimbus_range/actions/workflows/renovate.yaml)
 
 This Ansible collection provides agent and logging setup functionality for
 cloud-based ephemeral environments, focusing on operational telemetry
